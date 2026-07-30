@@ -113,7 +113,11 @@ class TestGetHosts:
                 _gpu_host(
                     "h1",
                     gpus=[
-                        {"processor_type": "GPU", "vendor": "NVIDIA", "product": "A100"},
+                        {
+                            "processor_type": "GPU",
+                            "vendor": "NVIDIA",
+                            "product": "A100",
+                        },
                     ],
                 )
             ],
@@ -133,10 +137,26 @@ class TestGetHosts:
                 _gpu_host(
                     "h1",
                     gpus=[
-                        {"processor_type": "GPU", "vendor": "NVIDIA", "product": "A100"},
-                        {"processor_type": "GPU", "vendor": "NVIDIA", "product": "A100"},
-                        {"processor_type": "GPU", "vendor": "NVIDIA", "product": "A100"},
-                        {"processor_type": "GPU", "vendor": "NVIDIA", "product": "A100"},
+                        {
+                            "processor_type": "GPU",
+                            "vendor": "NVIDIA",
+                            "product": "A100",
+                        },
+                        {
+                            "processor_type": "GPU",
+                            "vendor": "NVIDIA",
+                            "product": "A100",
+                        },
+                        {
+                            "processor_type": "GPU",
+                            "vendor": "NVIDIA",
+                            "product": "A100",
+                        },
+                        {
+                            "processor_type": "GPU",
+                            "vendor": "NVIDIA",
+                            "product": "A100",
+                        },
                     ],
                 )
             ],

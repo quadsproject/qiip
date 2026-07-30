@@ -12,7 +12,6 @@ from inference_proxy.resilience.circuit_breaker import (
     CircuitBreakerRegistry,
 )
 
-
 # -- CircuitBreaker tests --
 
 

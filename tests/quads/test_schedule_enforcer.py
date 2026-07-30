@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 from inference_proxy.discovery.registry import NodeRegistry
@@ -18,7 +18,7 @@ def _node(hostname: str, status: NodeStatus = NodeStatus.HEALTHY) -> Node:
         endpoint=f"{hostname}:8000",
         status=status,
         model="meta-llama/Llama-3",
-        last_heartbeat=datetime.now(tz=timezone.utc),
+        last_heartbeat=datetime.now(tz=UTC),
     )
 
 

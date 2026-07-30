@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 # Set required env vars before any app imports trigger Settings() at module level.
-os.environ.setdefault("INFERENCE_PROXY_HUGGINGFACE__CACHE_DIR", "/tmp/test-hf-cache")
+_TEST_HF_CACHE = Path("/tmp/test-hf-cache")
+_TEST_HF_CACHE.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault(
+    "INFERENCE_PROXY_HUGGINGFACE__CACHE_DIR",
+    str(_TEST_HF_CACHE),
+)
 
 from collections.abc import AsyncIterator, Generator
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
-from unittest.mock import AsyncMock, MagicMock
 
 from inference_proxy.config.dependencies import (
     get_catalog_service,
@@ -54,9 +59,11 @@ def test_settings() -> Settings:
     """Return a Settings instance with test-safe defaults."""
     return Settings(
         gateway=GatewaySettings(host="127.0.0.1", port=9999),
-        etcd=EtcdSettings(endpoints=["http://localhost:2379"], node_prefix="/test-nodes/"),
+        etcd=EtcdSettings(
+            endpoints=["http://localhost:2379"], node_prefix="/test-nodes/"
+        ),
         routing=RoutingSettings(strategy="least_connections", max_retries=3, timeout=5),
-        huggingface=HuggingFaceSettings(cache_dir="/tmp/test-hf-cache"),
+        huggingface=HuggingFaceSettings(cache_dir=str(_TEST_HF_CACHE)),
     )
 
 
@@ -133,12 +140,10 @@ def app(
     application.dependency_overrides[get_quads_poller] = lambda: None
     application.dependency_overrides[get_redfish_client] = lambda: None
     application.dependency_overrides[get_node_selector] = lambda: node_selector
-    application.dependency_overrides[get_circuit_breaker_registry] = (
-        lambda: circuit_breaker_registry
+    application.dependency_overrides[get_circuit_breaker_registry] = lambda: (
+        circuit_breaker_registry
     )
-    application.dependency_overrides[get_request_metrics] = (
-        lambda: request_metrics
-    )
+    application.dependency_overrides[get_request_metrics] = lambda: request_metrics
     # UnifiedNodeService with no QUADS by default
     _unified_svc = UnifiedNodeService(
         registry=test_registry,
@@ -165,7 +170,9 @@ def app(
     mock_download_service.get_status = MagicMock(return_value=None)
     mock_download_service.get_all_statuses = MagicMock(return_value=[])
     application.state.download_service = mock_download_service
-    application.dependency_overrides[get_download_service] = lambda: mock_download_service
+    application.dependency_overrides[get_download_service] = lambda: (
+        mock_download_service
+    )
     yield application
     application.dependency_overrides.clear()
     get_settings.cache_clear()

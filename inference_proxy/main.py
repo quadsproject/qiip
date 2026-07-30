@@ -18,6 +18,7 @@ import threading
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 import structlog
@@ -34,11 +35,11 @@ from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.logging import configure_logging
 from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.etcd_client import EtcdClient
-from inference_proxy.huggingface.catalog import ModelCatalogService
-from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_from_etcd
 from inference_proxy.discovery.watcher import run_watcher
+from inference_proxy.huggingface.catalog import ModelCatalogService
+from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
 from inference_proxy.provisioning.provisioner import NodeProvisioner
@@ -74,9 +75,8 @@ def _initial_load(etcd_client: EtcdClient, registry: NodeRegistry) -> None:
         results = etcd_client.get_prefix()
         count = 0
         for value_bytes, metadata in results:
-            key = metadata["key"]
-            if isinstance(key, bytes):
-                key = key.decode("utf-8")
+            raw_key: bytes | str = metadata["key"]
+            key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key
             node = node_from_etcd(key, value_bytes, etcd_client.prefix)
             if node is not None:
                 registry.add(node)
@@ -122,7 +122,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         import os as _os
 
         _os.environ["HF_HUB_DISABLE_XET"] = "1"
-        from huggingface_hub.utils import disable_progress_bars
+        if TYPE_CHECKING:
+            from huggingface_hub.utils.tqdm import disable_progress_bars
+        else:
+            from huggingface_hub.utils import disable_progress_bars
 
         disable_progress_bars()
 
@@ -247,9 +250,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 timeout=httpx.Timeout(resolved_settings.quads.timeout),
                 verify=resolved_settings.quads.verify_ssl,
             )
-            quads_client = QUADSClient(
-                quads_http, resolved_settings.quads.base_url
-            )
+            quads_client = QUADSClient(quads_http, resolved_settings.quads.base_url)
             app.state.quads_client = quads_client
             quads_poller = QUADSPoller(
                 quads_client, resolved_settings.quads.poll_interval

@@ -10,7 +10,7 @@ Tests cover:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -56,7 +56,7 @@ class TestProvisioningStateModel:
     """ProvisioningState is frozen with 6 fields (D-07)."""
 
     def test_create_minimal(self) -> None:
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         state = ProvisioningState(
             hostname="gpu-01.example.com",
             current_step=ProvisioningStep.PENDING,
@@ -69,7 +69,7 @@ class TestProvisioningStateModel:
         assert state.error is None
 
     def test_round_trip(self) -> None:
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         state = ProvisioningState(
             hostname="gpu-01.example.com",
             current_step=ProvisioningStep.NVIDIA_DRIVER,
@@ -84,7 +84,7 @@ class TestProvisioningStateModel:
         assert roundtripped.updated_at == state.updated_at
 
     def test_frozen_rejects_mutation(self) -> None:
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         state = ProvisioningState(
             hostname="gpu-01.example.com",
             current_step=ProvisioningStep.PENDING,
@@ -96,7 +96,7 @@ class TestProvisioningStateModel:
 
     def test_failed_state_with_error(self) -> None:
         """D-08: FAILED state includes failed_step and error fields."""
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         state = ProvisioningState(
             hostname="gpu-01.example.com",
             current_step=ProvisioningStep.FAILED,

@@ -9,6 +9,7 @@ scheduling.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 
 import structlog
@@ -62,10 +63,8 @@ class ScheduleEnforcer:
     async def stop(self) -> None:
         if self._task is not None and not self._task.done():
             self._task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
         self._task = None
 
     async def _loop(self) -> None:
@@ -101,9 +100,7 @@ class ScheduleEnforcer:
                 lookahead_hours=self._lookahead_hours,
             )
             self._teardown_initiated.add(node.node_id)
-            self._provisioner.fire_background(
-                self._provisioner.teardown(node.node_id)
-            )
+            self._provisioner.fire_background(self._provisioner.teardown(node.node_id))
 
     def _prune_completed(self) -> None:
         """Remove hostnames from tracking once they leave the registry."""

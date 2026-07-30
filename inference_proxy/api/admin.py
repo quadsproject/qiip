@@ -30,7 +30,10 @@ from inference_proxy.config.dependencies import (
     get_unified_node_service,
 )
 from inference_proxy.discovery.registry import NodeRegistry
-from inference_proxy.huggingface.catalog import ModelCatalogResponse, ModelCatalogService
+from inference_proxy.huggingface.catalog import (
+    ModelCatalogResponse,
+    ModelCatalogService,
+)
 from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.llmfit.errors import LLMFitParseError, LLMFitTimeoutError
 from inference_proxy.llmfit.runner import LLMFitRunner
@@ -186,7 +189,9 @@ async def setup_node(
 
     async def _provision_and_cleanup() -> None:
         try:
-            await provisioner.provision(hostname, managed=body.managed, model=body.model)
+            await provisioner.provision(
+                hostname, managed=body.managed, model=body.model
+            )
         finally:
             pending_hosts.discard(hostname)
 

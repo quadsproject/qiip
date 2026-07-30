@@ -9,8 +9,6 @@ Tests cover:
 
 from __future__ import annotations
 
-import json
-
 import structlog
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -49,7 +47,9 @@ class TestRequestLoggingFields:
         assert response.status_code == 200
 
         request_logs = [log for log in captured if log.get("event") == "request"]
-        assert len(request_logs) >= 1, f"Expected a 'request' log entry, got: {captured}"
+        assert len(request_logs) >= 1, (
+            f"Expected a 'request' log entry, got: {captured}"
+        )
 
         log = request_logs[0]
         assert log["method"] == "GET"
@@ -70,7 +70,9 @@ class TestRequestLoggingFields:
         assert response.status_code == 200
 
         request_logs = [log for log in captured if log.get("event") == "request"]
-        assert len(request_logs) >= 1, f"Expected a 'request' log entry, got: {captured}"
+        assert len(request_logs) >= 1, (
+            f"Expected a 'request' log entry, got: {captured}"
+        )
 
         log = request_logs[0]
         assert log["method"] == "GET"
@@ -114,7 +116,9 @@ class TestRequestLoggingTargetNode:
         assert response.status_code == 200
 
         request_logs = [log for log in captured if log.get("event") == "request"]
-        assert len(request_logs) >= 1, f"Expected a 'request' log entry, got: {captured}"
+        assert len(request_logs) >= 1, (
+            f"Expected a 'request' log entry, got: {captured}"
+        )
 
         log = request_logs[0]
         assert log["target_node"] == "10.0.1.100:8000"
@@ -155,7 +159,9 @@ class TestRequestLoggingTargetNode:
         assert response.status_code == 200
 
         request_logs = [log for log in captured if log.get("event") == "request"]
-        assert len(request_logs) >= 1, f"Expected a 'request' log entry, got: {captured}"
+        assert len(request_logs) >= 1, (
+            f"Expected a 'request' log entry, got: {captured}"
+        )
 
         log = request_logs[0]
         assert log["target_node"] == "10.0.1.100:8000"
@@ -198,7 +204,9 @@ class TestRequestLoggingTargetNode:
         assert response.status_code == 200
 
         request_logs = [log for log in captured if log.get("event") == "request"]
-        assert len(request_logs) >= 1, f"Expected a 'request' log entry, got: {captured}"
+        assert len(request_logs) >= 1, (
+            f"Expected a 'request' log entry, got: {captured}"
+        )
 
         log = request_logs[0]
         assert log["target_node"] == "10.0.1.100:8000"
@@ -226,7 +234,9 @@ class TestRequestLoggingErrorCases:
         assert response.status_code == 503
 
         request_logs = [log for log in captured if log.get("event") == "request"]
-        assert len(request_logs) >= 1, f"Expected a 'request' log entry, got: {captured}"
+        assert len(request_logs) >= 1, (
+            f"Expected a 'request' log entry, got: {captured}"
+        )
 
         log = request_logs[0]
         assert log["status_code"] == 503

@@ -1,13 +1,12 @@
 """LLMFit remote execution via SSH.
 
-Runs ``llmfit recommend --json --force-runtime vllm`` on a remote host
+Runs ``llmfit recommend --json --runtime vllm -n 30`` on a remote host
 and returns a typed ``LLMFitResult``.  SSH transport is injected via
 constructor (DIP).
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 
 import structlog
@@ -40,7 +39,7 @@ class LLMFitRunner:
         cmd = (
             f"wget -q '{url}' -O /tmp/llmfit.tar.gz"
             " && tar -xzf /tmp/llmfit.tar.gz -C /tmp/"
-            " && sudo install -m 755 \"$(find /tmp/ -name llmfit -type f -print -quit)\" {binary}"
+            ' && sudo install -m 755 "$(find /tmp/ -name llmfit -type f -print -quit)" {binary}'
             " && rm -rf /tmp/llmfit.tar.gz /tmp/llmfit-*"
         ).format(binary=self._settings.binary_path)
         await self._ssh.run(hostname, cmd, timeout=self._settings.timeout)
@@ -72,10 +71,10 @@ class LLMFitRunner:
             await self._install(hostname)
             try:
                 stdout, _stderr, _exit = await self._run_recommend(hostname)
-            except asyncio.TimeoutError:
-                raise LLMFitTimeoutError(hostname, self._settings.timeout)
-        except asyncio.TimeoutError:
-            raise LLMFitTimeoutError(hostname, self._settings.timeout)
+            except TimeoutError as exc:
+                raise LLMFitTimeoutError(hostname, self._settings.timeout) from exc
+        except TimeoutError as exc:
+            raise LLMFitTimeoutError(hostname, self._settings.timeout) from exc
 
         if not stdout.strip():
             raise LLMFitParseError("empty output", raw_output=stdout)

@@ -31,7 +31,9 @@ class ShutdownMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint,
+        self,
+        request: Request,
+        call_next: RequestResponseEndpoint,
     ) -> Response:
         """Check shutdown state and either reject or pass through."""
         shutting_down: bool = getattr(request.app.state, "shutting_down", False)

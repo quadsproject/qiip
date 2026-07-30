@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
 from inference_proxy.discovery.registry import NodeRegistry
@@ -49,13 +49,18 @@ def _poller(
 
 def _service(
     registry: NodeRegistry | None = None,
-    poller: MagicMock | None = MagicMock(),
+    poller: MagicMock | None = None,
     cb_registry: CircuitBreakerRegistry | None = None,
     tracker: ConnectionTracker | None = None,
+    *,
+    include_poller: bool = True,
 ) -> UnifiedNodeService:
+    resolved_poller = poller
+    if resolved_poller is None and include_poller:
+        resolved_poller = MagicMock()
     return UnifiedNodeService(
         registry=registry or NodeRegistry(),
-        poller=poller,
+        poller=resolved_poller,
         cb_registry=cb_registry or CircuitBreakerRegistry(),
         tracker=tracker or ConnectionTracker(),
     )
@@ -177,7 +182,7 @@ class TestGracefulDegradation:
     def test_none_poller_returns_etcd_nodes(self) -> None:
         registry = NodeRegistry()
         registry.add(_node("gpu01", status=NodeStatus.HEALTHY))
-        svc = _service(registry=registry, poller=None)
+        svc = _service(registry=registry, include_poller=False)
 
         nodes = svc.get_unified_nodes()
         assert len(nodes) == 1
@@ -186,7 +191,7 @@ class TestGracefulDegradation:
         assert nodes[0].gpu_vendor is None
 
     def test_none_poller_empty_registry(self) -> None:
-        svc = _service(poller=None)
+        svc = _service(include_poller=False)
         assert svc.get_unified_nodes() == []
 
 
@@ -253,7 +258,7 @@ class TestFailedState:
         poller = _poller(hosts=[_host("gpu01")], available=["gpu01"])
         svc = _service(registry=registry, poller=poller)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         task_map = {
             "gpu01": TaskStatusResponse(
                 hostname="gpu01",

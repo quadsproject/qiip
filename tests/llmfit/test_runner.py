@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -98,7 +97,7 @@ class TestRecommend:
         assert result.models[1].fit_level == "good"
         mock_ssh_client.run.assert_called_once_with(
             "gpu-host-01",
-            "/usr/local/bin/llmfit recommend --json --force-runtime vllm",
+            "/usr/local/bin/llmfit recommend --json --runtime vllm -n 30",
             timeout=60.0,
         )
 
@@ -108,7 +107,7 @@ class TestRecommendTimeout:
     async def test_timeout_raises_typed_error(
         self, runner: LLMFitRunner, mock_ssh_client: MagicMock
     ) -> None:
-        mock_ssh_client.run.side_effect = asyncio.TimeoutError()
+        mock_ssh_client.run.side_effect = TimeoutError()
         with pytest.raises(LLMFitTimeoutError) as exc_info:
             await runner.recommend("gpu-host-01")
         assert exc_info.value.host == "gpu-host-01"
@@ -163,9 +162,7 @@ class TestRecommendProviderFilter:
         assert result.models[0].provider == "Meta"
 
     @pytest.mark.asyncio
-    async def test_filter_is_case_insensitive(
-        self, mock_ssh_client: MagicMock
-    ) -> None:
+    async def test_filter_is_case_insensitive(self, mock_ssh_client: MagicMock) -> None:
         from inference_proxy.config.settings import LLMFitSettings
 
         settings = LLMFitSettings(allowed_providers=["alibaba"])
@@ -184,6 +181,30 @@ class TestRecommendProviderFilter:
         result = await runner.recommend("gpu-host-01")
 
         assert len(result.models) == 2
+
+    @pytest.mark.asyncio
+    async def test_caps_filtered_results_to_ten(
+        self, mock_ssh_client: MagicMock
+    ) -> None:
+        from inference_proxy.config.settings import LLMFitSettings
+
+        payload = json.loads(FIXTURE_JSON)
+        template = payload["models"][0]
+        payload["models"] = [
+            {**template, "name": f"meta-model-{index}"} for index in range(12)
+        ]
+        mock_ssh_client.run.return_value = (json.dumps(payload), "", 0)
+        runner = LLMFitRunner(
+            ssh_client=mock_ssh_client,
+            settings=LLMFitSettings(allowed_providers=["Meta"]),
+        )
+
+        result = await runner.recommend("gpu-host-01")
+
+        assert len(result.models) == 10
+        assert [model.name for model in result.models] == [
+            f"meta-model-{index}" for index in range(10)
+        ]
 
 
 class TestRecommendSSHErrorBubbles:

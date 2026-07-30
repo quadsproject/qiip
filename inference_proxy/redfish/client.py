@@ -13,6 +13,7 @@ D-06: httpx uses httpcore, not urllib3 -- no InsecureRequestWarning emitted.
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 
 import httpx
 import structlog
@@ -70,11 +71,19 @@ class RedfishClient:
             resp.raise_for_status()
         except httpx.HTTPError as exc:
             msg = extract_error_message(exc)
-            logger.error("redfish_get_power_state_failed", hostname=hostname, bmc_host=bmc, error=msg)
+            logger.error(
+                "redfish_get_power_state_failed",
+                hostname=hostname,
+                bmc_host=bmc,
+                error=msg,
+            )
             raise RedfishError(msg) from exc
-        return resp.json()["PowerState"]
+        # B12 tracks runtime validation and typed error mapping for this field.
+        return cast(str, resp.json()["PowerState"])
 
-    async def power_action(self, hostname: str, action: str, *, timeout: float | None = None) -> str:
+    async def power_action(
+        self, hostname: str, action: str, *, timeout: float | None = None
+    ) -> str:
         """Issue a power action with check-before-act (D-03) and polling (D-04).
 
         Returns the final PowerState after the action completes or times out.
@@ -84,10 +93,17 @@ class RedfishClient:
         target = _ACTION_TARGET_STATE[action]
         current = await self.get_power_state(hostname)
         if current == target:
-            logger.info("redfish_power_action_skipped", hostname=hostname, action=action, state=current)
+            logger.info(
+                "redfish_power_action_skipped",
+                hostname=hostname,
+                action=action,
+                state=current,
+            )
             return current
         await self._post_reset(hostname, action)
-        return await self._poll_power_state(hostname, target, timeout or self._poll_timeout)
+        return await self._poll_power_state(
+            hostname, target, timeout or self._poll_timeout
+        )
 
     async def _post_reset(self, hostname: str, action: str) -> None:
         """POST a ComputerSystem.Reset action to the BMC."""
@@ -98,11 +114,19 @@ class RedfishClient:
             resp.raise_for_status()
         except httpx.HTTPError as exc:
             msg = extract_error_message(exc)
-            logger.error("redfish_post_reset_failed", hostname=hostname, bmc_host=bmc, action=action, error=msg)
+            logger.error(
+                "redfish_post_reset_failed",
+                hostname=hostname,
+                bmc_host=bmc,
+                action=action,
+                error=msg,
+            )
             raise RedfishError(msg) from exc
         logger.info("redfish_reset_issued", hostname=hostname, action=action)
 
-    async def _poll_power_state(self, hostname: str, target: str, timeout: float) -> str:
+    async def _poll_power_state(
+        self, hostname: str, target: str, timeout: float
+    ) -> str:
         """Poll PowerState until target reached or timeout (D-04)."""
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI
@@ -22,7 +22,6 @@ from fastapi.testclient import TestClient
 
 from inference_proxy.config.dependencies import (
     get_catalog_service,
-    get_llmfit_runner,
     get_quads_client,
     get_quads_poller,
     get_redfish_client,
@@ -98,10 +97,20 @@ class TestAdminNodesPopulated:
         assert len(data) == 1
         node = data[0]
         expected = {
-            "node_id", "endpoint", "model", "status",
-            "active_connections", "circuit_breaker_state",
-            "state", "actions", "gpu_vendor", "gpu_model", "gpu_count",
-            "managed", "failed_step", "error",
+            "node_id",
+            "endpoint",
+            "model",
+            "status",
+            "active_connections",
+            "circuit_breaker_state",
+            "state",
+            "actions",
+            "gpu_vendor",
+            "gpu_model",
+            "gpu_count",
+            "managed",
+            "failed_step",
+            "error",
         }
         assert set(node.keys()) == expected
         assert "last_heartbeat" not in node
@@ -294,6 +303,7 @@ class TestSetupModelPassthrough:
         # fire_background receives a coroutine; await it to trigger provision
         coro = mock_provisioner.fire_background.call_args[0][0]
         import asyncio
+
         asyncio.get_event_loop().run_until_complete(coro)
         mock_provisioner.provision.assert_awaited_once_with(
             "gpu01", managed=True, model="org/model"
@@ -309,6 +319,7 @@ class TestSetupModelPassthrough:
         assert response.status_code == 202
         coro = mock_provisioner.fire_background.call_args[0][0]
         import asyncio
+
         asyncio.get_event_loop().run_until_complete(coro)
         mock_provisioner.provision.assert_awaited_once_with(
             "gpu01", managed=True, model=None
@@ -402,8 +413,12 @@ class TestUnifiedNodeList:
         test_registry.add(_make_node(node_id="gpu01"))
         poller = MagicMock()
         poller.hosts = [
-            QUADSHost(hostname="gpu01", gpu_vendor="NVIDIA", gpu_model="A100", gpu_count=4),
-            QUADSHost(hostname="gpu02", gpu_vendor="AMD", gpu_model="MI300X", gpu_count=8),
+            QUADSHost(
+                hostname="gpu01", gpu_vendor="NVIDIA", gpu_model="A100", gpu_count=4
+            ),
+            QUADSHost(
+                hostname="gpu02", gpu_vendor="AMD", gpu_model="MI300X", gpu_count=8
+            ),
         ]
         poller.available_hostnames = ["gpu01", "gpu02"]
         svc = UnifiedNodeService(
@@ -432,7 +447,9 @@ class TestUnifiedNodeList:
         """NODES-02: Each node includes state and actions."""
         poller = MagicMock()
         poller.hosts = [
-            QUADSHost(hostname="gpu01", gpu_vendor="NVIDIA", gpu_model="A100", gpu_count=4),
+            QUADSHost(
+                hostname="gpu01", gpu_vendor="NVIDIA", gpu_model="A100", gpu_count=4
+            ),
         ]
         poller.available_hostnames = ["gpu01"]
         svc = UnifiedNodeService(
@@ -474,6 +491,7 @@ class TestUnifiedNodeList:
 def _clear_pending_hosts() -> None:
     """Clear the module-level pending_hosts between tests."""
     import inference_proxy.api.admin as admin_mod
+
     if hasattr(admin_mod, "pending_hosts"):
         admin_mod.pending_hosts.clear()
 
@@ -487,6 +505,7 @@ class TestSetupDedupGuard:
         mock_provisioner: MagicMock,
     ) -> None:
         import inference_proxy.api.admin as admin_mod
+
         admin_mod.pending_hosts.add("gpu01")
 
         response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
@@ -498,7 +517,6 @@ class TestSetupDedupGuard:
         mock_provisioner: MagicMock,
     ) -> None:
         """Pending host is removed after provisioning task fires."""
-        import inference_proxy.api.admin as admin_mod
 
         response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
         assert response.status_code == 202
@@ -605,9 +623,7 @@ class TestQuadsStatus:
         data = client.get("/admin/quads/status").json()
         assert data["status"] == "connected"
 
-    def test_stale_when_one_failure(
-        self, app: FastAPI, client: TestClient
-    ) -> None:
+    def test_stale_when_one_failure(self, app: FastAPI, client: TestClient) -> None:
         poller = MagicMock()
         poller.last_sync = datetime(2026, 7, 17, 10, 0, 0, tzinfo=UTC)
         poller.consecutive_failures = 1
@@ -616,9 +632,7 @@ class TestQuadsStatus:
         data = client.get("/admin/quads/status").json()
         assert data["status"] == "stale"
 
-    def test_stale_when_two_failures(
-        self, app: FastAPI, client: TestClient
-    ) -> None:
+    def test_stale_when_two_failures(self, app: FastAPI, client: TestClient) -> None:
         poller = MagicMock()
         poller.last_sync = datetime(2026, 7, 17, 10, 0, 0, tzinfo=UTC)
         poller.consecutive_failures = 2
@@ -656,9 +670,7 @@ class TestQuadsStatus:
 class TestGetPowerState:
     """GET /admin/nodes/{hostname}/power returns BMC power state."""
 
-    def test_returns_current_state(
-        self, app: FastAPI, client: TestClient
-    ) -> None:
+    def test_returns_current_state(self, app: FastAPI, client: TestClient) -> None:
         mock_redfish = AsyncMock()
         mock_redfish.get_power_state.return_value = "On"
         app.dependency_overrides[get_redfish_client] = lambda: mock_redfish
@@ -667,15 +679,11 @@ class TestGetPowerState:
         assert response.status_code == 200
         assert response.json() == {"hostname": "gpu01", "power_state": "On"}
 
-    def test_returns_503_when_not_configured(
-        self, client: TestClient
-    ) -> None:
+    def test_returns_503_when_not_configured(self, client: TestClient) -> None:
         response = client.get("/admin/nodes/gpu01/power")
         assert response.status_code == 503
 
-    def test_normalizes_hostname(
-        self, app: FastAPI, client: TestClient
-    ) -> None:
+    def test_normalizes_hostname(self, app: FastAPI, client: TestClient) -> None:
         mock_redfish = AsyncMock()
         mock_redfish.get_power_state.return_value = "Off"
         app.dependency_overrides[get_redfish_client] = lambda: mock_redfish
@@ -703,9 +711,7 @@ class TestExecutePowerAction:
         mock_redfish.power_action.return_value = "On"
         app.dependency_overrides[get_redfish_client] = lambda: mock_redfish
 
-        response = client.post(
-            "/admin/nodes/gpu01/power", json={"action": "On"}
-        )
+        response = client.post("/admin/nodes/gpu01/power", json={"action": "On"})
         assert response.status_code == 200
         assert response.json() == {"hostname": "gpu01", "power_state": "On"}
         mock_redfish.power_action.assert_called_once_with("gpu01", "On")
@@ -715,9 +721,7 @@ class TestExecutePowerAction:
         mock_redfish.power_action.return_value = "Off"
         app.dependency_overrides[get_redfish_client] = lambda: mock_redfish
 
-        response = client.post(
-            "/admin/nodes/gpu01/power", json={"action": "ForceOff"}
-        )
+        response = client.post("/admin/nodes/gpu01/power", json={"action": "ForceOff"})
         assert response.status_code == 200
         assert response.json()["power_state"] == "Off"
 
@@ -743,25 +747,15 @@ class TestExecutePowerAction:
         assert response.status_code == 200
         assert response.json()["power_state"] == "On"
 
-    def test_returns_503_when_not_configured(
-        self, client: TestClient
-    ) -> None:
-        response = client.post(
-            "/admin/nodes/gpu01/power", json={"action": "On"}
-        )
+    def test_returns_503_when_not_configured(self, client: TestClient) -> None:
+        response = client.post("/admin/nodes/gpu01/power", json={"action": "On"})
         assert response.status_code == 503
 
-    def test_returns_422_for_invalid_action(
-        self, client: TestClient
-    ) -> None:
-        response = client.post(
-            "/admin/nodes/gpu01/power", json={"action": "Shutdown"}
-        )
+    def test_returns_422_for_invalid_action(self, client: TestClient) -> None:
+        response = client.post("/admin/nodes/gpu01/power", json={"action": "Shutdown"})
         assert response.status_code == 422
 
-    def test_normalizes_hostname(
-        self, app: FastAPI, client: TestClient
-    ) -> None:
+    def test_normalizes_hostname(self, app: FastAPI, client: TestClient) -> None:
         mock_redfish = AsyncMock()
         mock_redfish.power_action.return_value = "On"
         app.dependency_overrides[get_redfish_client] = lambda: mock_redfish
@@ -776,9 +770,7 @@ class TestExecutePowerAction:
         mock_redfish.power_action.side_effect = RedfishError("Poll timeout")
         app.dependency_overrides[get_redfish_client] = lambda: mock_redfish
 
-        response = client.post(
-            "/admin/nodes/gpu01/power", json={"action": "On"}
-        )
+        response = client.post("/admin/nodes/gpu01/power", json={"action": "On"})
         assert response.status_code == 502
         assert "Poll timeout" in response.json()["detail"]
 
@@ -884,9 +876,7 @@ class TestRecommendations:
         client: TestClient,
     ) -> None:
         # '@' is not in the allowed hostname regex, triggers _validated_hostname 400
-        response = client.get(
-            "/admin/nodes/host@evil/recommendations"
-        )
+        response = client.get("/admin/nodes/host@evil/recommendations")
         assert response.status_code == 400
 
 

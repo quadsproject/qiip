@@ -24,6 +24,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=1.4",
     "pytest-httpx>=0.36",
+    "httpx2>=2.7,<3.0",
     "coverage>=7.0",
 ]
 
@@ -38,9 +39,24 @@ asyncio_mode = "auto"
 [tool.ruff]
 target-version = "py312"
 line-length = 88
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "N"]
+# Ruff's formatter intentionally leaves long strings and comments intact.
+ignore = ["E501"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI dependency declarations are intentionally evaluated as defaults.
+extend-immutable-calls = ["fastapi.Depends"]
+
+[tool.ruff.lint.per-file-ignores]
+# Keep the existing str/Enum stringification contract for API values.
+"inference_proxy/models/admin.py" = ["UP042"]
+# Test settings must be installed before importing the application.
+"tests/conftest.py" = ["E402"]
+# Nested patch contexts keep the setup readable in this legacy test module.
+"tests/provisioning/test_provisioner.py" = ["SIM117"]
 
 [tool.mypy]
 python_version = "3.12"

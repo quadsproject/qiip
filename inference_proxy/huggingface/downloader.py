@@ -92,7 +92,9 @@ class DownloadService:
                     token=self._token,
                 )
             except GatedRepoError:
-                self._set_failed(repo_id, f"Repository '{repo_id}' requires access approval")
+                self._set_failed(
+                    repo_id, f"Repository '{repo_id}' requires access approval"
+                )
                 return
             except RepositoryNotFoundError:
                 self._set_failed(repo_id, f"Repository '{repo_id}' not found")

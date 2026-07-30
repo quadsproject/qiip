@@ -26,10 +26,12 @@ class TestListModels:
     @pytest.mark.asyncio
     @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
     async def test_returns_model_repos(self, mock_scan: MagicMock) -> None:
-        mock_scan.return_value = _mock_cache_info([
-            _mock_repo("meta-llama/Llama-3-8B"),
-            _mock_repo("mistralai/Mistral-7B"),
-        ])
+        mock_scan.return_value = _mock_cache_info(
+            [
+                _mock_repo("meta-llama/Llama-3-8B"),
+                _mock_repo("mistralai/Mistral-7B"),
+            ]
+        )
         svc = ModelCatalogService(cache_dir="/data/hf")
         result = await svc.list_models()
 
@@ -42,11 +44,13 @@ class TestListModels:
     @pytest.mark.asyncio
     @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
     async def test_filters_non_model_repos(self, mock_scan: MagicMock) -> None:
-        mock_scan.return_value = _mock_cache_info([
-            _mock_repo("meta-llama/Llama-3-8B", "model"),
-            _mock_repo("some-org/some-dataset", "dataset"),
-            _mock_repo("some-org/some-space", "space"),
-        ])
+        mock_scan.return_value = _mock_cache_info(
+            [
+                _mock_repo("meta-llama/Llama-3-8B", "model"),
+                _mock_repo("some-org/some-dataset", "dataset"),
+                _mock_repo("some-org/some-space", "space"),
+            ]
+        )
         svc = ModelCatalogService(cache_dir="/data/hf")
         result = await svc.list_models()
 

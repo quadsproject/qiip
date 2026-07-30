@@ -72,9 +72,7 @@ class TestSelectNode:
         registry.add(
             _make_node("node-2", "http://10.0.1.200:8000", NodeStatus.DRAINING)
         )
-        registry.add(
-            _make_node("node-3", "http://10.0.1.300:8000", NodeStatus.UNKNOWN)
-        )
+        registry.add(_make_node("node-3", "http://10.0.1.300:8000", NodeStatus.UNKNOWN))
 
         result = select_node(registry)
 

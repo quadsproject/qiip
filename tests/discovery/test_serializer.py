@@ -7,7 +7,7 @@ missing required fields, bytes/str key handling, and roundtrip consistency.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 from inference_proxy.discovery.serializer import node_from_etcd, node_to_etcd
@@ -162,7 +162,7 @@ class TestNodeToEtcdRoundtrip:
     """node_to_etcd roundtrips with node_from_etcd preserving all fields."""
 
     def test_roundtrip_preserves_fields(self) -> None:
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         original = Node(
             node_id="roundtrip-node",
             endpoint="http://10.0.1.200:8000",

@@ -13,7 +13,7 @@ Tests cover:
 from __future__ import annotations
 
 import threading
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock
 
 from inference_proxy.discovery.etcd_client import EtcdClient
 from inference_proxy.discovery.registry import NodeRegistry
@@ -49,7 +49,13 @@ class TestDeleteEventDrainsNode:
         registry = NodeRegistry()
         prefix = "/nodes/"
         # Pre-populate registry with HEALTHY node
-        registry.add(Node(node_id="node-1", endpoint="http://10.0.1.100:8000", status=NodeStatus.HEALTHY))
+        registry.add(
+            Node(
+                node_id="node-1",
+                endpoint="http://10.0.1.100:8000",
+                status=NodeStatus.HEALTHY,
+            )
+        )
 
         event = {
             "kv": {"key": "/nodes/node-1"},

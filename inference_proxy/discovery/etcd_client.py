@@ -11,13 +11,17 @@ Per D-14: Created from ``EtcdSettings`` (endpoints, node_prefix).
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import structlog
 from etcd3gw.client import Etcd3Client
 
 from inference_proxy.config.settings import EtcdSettings
+
+if TYPE_CHECKING:
+    from etcd3gw.types import Event, KeyValue
 
 logger = structlog.get_logger()
 
@@ -60,7 +64,7 @@ class EtcdClient:
         """Return the configured node key prefix."""
         return self._prefix
 
-    def get_prefix(self, prefix: str | None = None) -> list[tuple[bytes, dict[str, Any]]]:
+    def get_prefix(self, prefix: str | None = None) -> list[tuple[bytes, KeyValue]]:
         """Fetch all key-value pairs under a prefix.
 
         Args:
@@ -71,7 +75,7 @@ class EtcdClient:
             A list of ``(value_bytes, metadata_dict)`` tuples where
             ``metadata_dict`` contains the key under ``metadata["key"]``.
         """
-        return self._client.get_prefix(prefix or self._prefix)  # type: ignore[no-any-return]
+        return self._client.get_prefix(prefix or self._prefix)
 
     def put(self, key: str, value: str | bytes) -> bool:
         """Put a key-value pair into etcd.
@@ -83,7 +87,7 @@ class EtcdClient:
         Returns:
             True on success.
         """
-        return self._client.put(key, value)  # type: ignore[no-any-return]
+        return self._client.put(key, value)
 
     def delete(self, key: str) -> bool:
         """Delete a key from etcd.
@@ -94,9 +98,9 @@ class EtcdClient:
         Returns:
             True if the key was deleted.
         """
-        return self._client.delete(key)  # type: ignore[no-any-return]
+        return self._client.delete(key)
 
-    def watch_prefix(self) -> tuple[Any, Any]:
+    def watch_prefix(self) -> tuple[Iterator[Event], Callable[[], None]]:
         """Start watching for changes under the configured node prefix.
 
         Returns:
@@ -104,4 +108,4 @@ class EtcdClient:
             blocks on an internal ``queue.Queue`` and yields event dicts.
             Call ``cancel_fn()`` to stop the watch.
         """
-        return self._client.watch_prefix(self._prefix)  # type: ignore[no-any-return]
+        return self._client.watch_prefix(self._prefix)

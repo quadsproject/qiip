@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from inference_proxy.models.llmfit import LLMFitResult, SystemInfo
 
@@ -85,7 +86,7 @@ class TestSystemInfoDefaults:
 class TestFrozenModels:
     def test_assignment_raises(self) -> None:
         info = SystemInfo(has_gpu=True)
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             info.has_gpu = False  # type: ignore[misc]
 
 

@@ -73,9 +73,7 @@ class TestPowerActionIdempotent:
 
 
 class TestPowerAction:
-    async def test_force_off_posts_reset_and_polls(
-        self, httpx_mock: HTTPXMock
-    ) -> None:
+    async def test_force_off_posts_reset_and_polls(self, httpx_mock: HTTPXMock) -> None:
         # GET: current state is On
         httpx_mock.add_response(url=SYSTEMS_URL, json={"PowerState": "On"})
         # POST: reset accepted

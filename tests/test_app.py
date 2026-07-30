@@ -7,8 +7,15 @@ from unittest.mock import MagicMock, patch
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
+
+
+def _lifespan_settings(settings: Settings) -> Settings:
+    """Disable the production drain delay only for lifespan smoke tests."""
+    gateway = settings.gateway.model_copy(update={"graceful_shutdown_timeout": 0})
+    return settings.model_copy(update={"gateway": gateway})
 
 
 def test_health_endpoint(client: TestClient) -> None:
@@ -78,6 +85,7 @@ class TestLifespanRegistryIntegration:
         self,
         mock_etcd_cls: MagicMock,
         mock_run_watcher: MagicMock,
+        test_settings: Settings,
     ) -> None:
         """Lifespan populates app.state.registry with a NodeRegistry."""
         mock_client = MagicMock()
@@ -87,7 +95,7 @@ class TestLifespanRegistryIntegration:
 
         from inference_proxy.main import create_app
 
-        app = create_app()
+        app = create_app(settings=_lifespan_settings(test_settings))
         with TestClient(app):
             assert hasattr(app.state, "registry")
             assert isinstance(app.state.registry, NodeRegistry)
@@ -98,6 +106,7 @@ class TestLifespanRegistryIntegration:
         self,
         mock_etcd_cls: MagicMock,
         mock_run_watcher: MagicMock,
+        test_settings: Settings,
     ) -> None:
         """Lifespan starts with empty registry when etcd is unavailable."""
         mock_client = MagicMock()
@@ -107,7 +116,7 @@ class TestLifespanRegistryIntegration:
 
         from inference_proxy.main import create_app
 
-        app = create_app()
+        app = create_app(settings=_lifespan_settings(test_settings))
         with TestClient(app):
             registry = app.state.registry
             assert isinstance(registry, NodeRegistry)

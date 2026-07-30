@@ -6,10 +6,9 @@ connections, and circuit breaker state for the operations dashboard.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from enum import Enum
-
-import re
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 

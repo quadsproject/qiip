@@ -56,9 +56,7 @@ class QUADSClient:
             if raw.get("broken") or raw.get("retired"):
                 continue
             gpus = [
-                p
-                for p in raw.get("processors", [])
-                if p.get("processor_type") == "GPU"
+                p for p in raw.get("processors", []) if p.get("processor_type") == "GPU"
             ]
             if not gpus:
                 continue
@@ -73,9 +71,7 @@ class QUADSClient:
         logger.debug("fetched QUADS hosts", count=len(hosts))
         return hosts
 
-    async def get_available(
-        self, *, end: datetime | None = None
-    ) -> list[str]:
+    async def get_available(self, *, end: datetime | None = None) -> list[str]:
         """Fetch available hostnames from QUADS, normalized (D-07/D-08).
 
         When *end* is given, passes it as a query param so QUADS returns

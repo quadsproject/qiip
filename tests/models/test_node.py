@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -42,7 +42,7 @@ class TestNodeMinimalCreation:
 
 class TestNodeFullCreation:
     def test_node_full_creation(self) -> None:
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         node = Node(
             node_id="gpu-node-42",
             endpoint="http://10.0.1.200:8000",

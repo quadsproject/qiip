@@ -59,7 +59,10 @@ class TestHealthyNodeStaysHealthy:
                 return True
             return original_wait(timeout)
 
-        with patch("inference_proxy.resilience.health_checker.httpx.Client", return_value=mock_client):
+        with patch(
+            "inference_proxy.resilience.health_checker.httpx.Client",
+            return_value=mock_client,
+        ):
             stop_event.wait = stop_after_one_iteration  # type: ignore[assignment]
             run_health_checker(registry, cb_registry, stop_event, interval=0.01)
 
@@ -93,11 +96,17 @@ class TestUnhealthyAfterThreeFailures:
                 return True
             return False
 
-        with patch("inference_proxy.resilience.health_checker.httpx.Client", return_value=mock_client):
+        with patch(
+            "inference_proxy.resilience.health_checker.httpx.Client",
+            return_value=mock_client,
+        ):
             stop_event.wait = stop_after_three_iterations  # type: ignore[assignment]
             run_health_checker(
-                registry, cb_registry, stop_event,
-                interval=0.01, failure_threshold=3,
+                registry,
+                cb_registry,
+                stop_event,
+                interval=0.01,
+                failure_threshold=3,
             )
 
         result_node = registry.get("node-1")
@@ -129,11 +138,17 @@ class TestUnhealthyAfterThreeFailures:
                 return True
             return False
 
-        with patch("inference_proxy.resilience.health_checker.httpx.Client", return_value=mock_client):
+        with patch(
+            "inference_proxy.resilience.health_checker.httpx.Client",
+            return_value=mock_client,
+        ):
             stop_event.wait = stop_after_three_iterations  # type: ignore[assignment]
             run_health_checker(
-                registry, cb_registry, stop_event,
-                interval=0.01, failure_threshold=3,
+                registry,
+                cb_registry,
+                stop_event,
+                interval=0.01,
+                failure_threshold=3,
             )
 
         result_node = registry.get("node-1")
@@ -177,7 +192,10 @@ class TestRecoveryAfterOneSuccess:
                 return True
             return False
 
-        with patch("inference_proxy.resilience.health_checker.httpx.Client", return_value=mock_client):
+        with patch(
+            "inference_proxy.resilience.health_checker.httpx.Client",
+            return_value=mock_client,
+        ):
             stop_event.wait = stop_after_one_iteration  # type: ignore[assignment]
             run_health_checker(registry, cb_registry, stop_event, interval=0.01)
 
@@ -203,7 +221,10 @@ class TestStopEventExitsImmediately:
         mock_client.__enter__ = MagicMock(return_value=mock_client)
         mock_client.__exit__ = MagicMock(return_value=False)
 
-        with patch("inference_proxy.resilience.health_checker.httpx.Client", return_value=mock_client):
+        with patch(
+            "inference_proxy.resilience.health_checker.httpx.Client",
+            return_value=mock_client,
+        ):
             run_health_checker(registry, cb_registry, stop_event, interval=0.01)
 
         # Should not have made any HTTP calls
@@ -235,11 +256,17 @@ class TestProbeExceptionDoesNotCrash:
                 return True
             return False
 
-        with patch("inference_proxy.resilience.health_checker.httpx.Client", return_value=mock_client):
+        with patch(
+            "inference_proxy.resilience.health_checker.httpx.Client",
+            return_value=mock_client,
+        ):
             stop_event.wait = stop_after_two_iterations  # type: ignore[assignment]
             run_health_checker(
-                registry, cb_registry, stop_event,
-                interval=0.01, failure_threshold=3,
+                registry,
+                cb_registry,
+                stop_event,
+                interval=0.01,
+                failure_threshold=3,
             )
 
         # Thread should have completed without crashing
@@ -290,7 +317,10 @@ class TestProvisioningNodeSkipped:
                 return True
             return False
 
-        with patch("inference_proxy.resilience.health_checker.httpx.Client", return_value=mock_client):
+        with patch(
+            "inference_proxy.resilience.health_checker.httpx.Client",
+            return_value=mock_client,
+        ):
             stop_event.wait = stop_after_one_iteration  # type: ignore[assignment]
             run_health_checker(registry, cb_registry, stop_event, interval=0.01)
 

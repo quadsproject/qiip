@@ -16,7 +16,8 @@ FastAPI's EventSourceResponse for downstream re-emission.
 from __future__ import annotations
 
 import json
-from typing import Any, AsyncGenerator
+from collections.abc import AsyncGenerator
+from typing import Any
 
 import httpx
 import structlog
@@ -205,7 +206,8 @@ async def _proxy_non_streaming(
             _record_failure_and_trip(node, circuit_breaker_registry, node_selector)
             status, error_resp = map_proxy_error(exc)
             last_error_response = JSONResponse(
-                content=error_resp.model_dump(), status_code=status,
+                content=error_resp.model_dump(),
+                status_code=status,
             )
             if _is_retryable(exc):
                 excluded.add(node.node_id)
@@ -393,7 +395,9 @@ async def _stream_completion(
         except Exception as exc:
             logger.error("streaming proxy error", error=str(exc), url=url)
             _record_failure_and_trip(
-                node, circuit_breaker_registry, node_selector,
+                node,
+                circuit_breaker_registry,
+                node_selector,
             )
             _, error_resp = map_proxy_error(exc)
             error_json = json.dumps(error_resp.model_dump())

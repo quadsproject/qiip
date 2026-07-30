@@ -63,7 +63,7 @@ class TestIterFrom:
     async def test_iter_unknown_host_yields_nothing(self) -> None:
         buf = ProvisioningLogBuffer()
         collected = []
-        async for pos, entry in buf.iter_from("ghost"):
+        async for _pos, entry in buf.iter_from("ghost"):
             collected.append(entry)
         assert collected == []
 
@@ -77,7 +77,7 @@ class TestIterFrom:
         buf.mark_complete("host1")
 
         collected = []
-        async for pos, entry in buf.iter_from("host1", pos=1):
+        async for _pos, entry in buf.iter_from("host1", pos=1):
             collected.append(entry["msg"])
         assert collected == ["b", "c"]
 

@@ -51,9 +51,9 @@ def _setup_mock_asyncssh(
     mock_process.exit_status = exit_status
 
     mock_conn = MagicMock()
-    mock_conn.create_process = MagicMock(return_value=_async_cm(mock_process))
+    mock_conn.create_process = MagicMock(return_value=_AsyncCM(mock_process))
 
-    mock_asyncssh.connect = MagicMock(return_value=_async_cm(mock_conn))
+    mock_asyncssh.connect = MagicMock(return_value=_AsyncCM(mock_conn))
 
 
 class TestSSHClientConnectParams:
@@ -152,7 +152,7 @@ class TestSSHClientConnectionError:
             "DisconnectError", (Exception,), {"reason": "test"}
         )
         mock_asyncssh.connect = MagicMock(
-            return_value=_async_cm_raises(mock_asyncssh.PermissionDenied("denied"))
+            return_value=_AsyncCMRaises(mock_asyncssh.PermissionDenied("denied"))
         )
         client = SSHClient(_make_settings())
 
@@ -171,7 +171,7 @@ class TestSSHClientConnectionError:
             "DisconnectError", (Exception,), {"reason": "test"}
         )
         mock_asyncssh.connect = MagicMock(
-            return_value=_async_cm_raises(OSError("Connection refused"))
+            return_value=_AsyncCMRaises(OSError("Connection refused"))
         )
         client = SSHClient(_make_settings())
 
@@ -200,7 +200,7 @@ class _AsyncLineIter:
             yield line
 
 
-class _async_cm:
+class _AsyncCM:
     """Minimal async context manager wrapping a return value."""
 
     def __init__(self, value: object) -> None:
@@ -213,7 +213,7 @@ class _async_cm:
         pass
 
 
-class _async_cm_raises:
+class _AsyncCMRaises:
     """Async context manager that raises on __aenter__."""
 
     def __init__(self, exc: BaseException) -> None:
@@ -246,7 +246,7 @@ def _setup_mock_asyncssh_run(
     mock_conn = MagicMock()
     mock_conn.run = AsyncMock(return_value=mock_result)
 
-    mock_asyncssh.connect = MagicMock(return_value=_async_cm(mock_conn))
+    mock_asyncssh.connect = MagicMock(return_value=_AsyncCM(mock_conn))
 
 
 class TestSSHClientRun:
@@ -255,7 +255,9 @@ class TestSSHClientRun:
     @pytest.mark.asyncio
     @patch("inference_proxy.provisioning.ssh_client.asyncssh")
     async def test_returns_tuple(self, mock_asyncssh: MagicMock) -> None:
-        _setup_mock_asyncssh_run(mock_asyncssh, stdout="hello", stderr="", exit_status=0)
+        _setup_mock_asyncssh_run(
+            mock_asyncssh, stdout="hello", stderr="", exit_status=0
+        )
         client = SSHClient(_make_settings())
 
         result = await client.run("host1", "echo hello")
@@ -287,7 +289,7 @@ class TestSSHClientRunConnectionError:
             "DisconnectError", (Exception,), {"reason": "test"}
         )
         mock_asyncssh.connect = MagicMock(
-            return_value=_async_cm_raises(mock_asyncssh.PermissionDenied("denied"))
+            return_value=_AsyncCMRaises(mock_asyncssh.PermissionDenied("denied"))
         )
         client = SSHClient(_make_settings())
 
@@ -308,8 +310,8 @@ class TestSSHClientRunTimeoutBubbles:
         )
 
         mock_conn = MagicMock()
-        mock_conn.run = AsyncMock(side_effect=asyncio.TimeoutError())
-        mock_asyncssh.connect = MagicMock(return_value=_async_cm(mock_conn))
+        mock_conn.run = AsyncMock(side_effect=TimeoutError())
+        mock_asyncssh.connect = MagicMock(return_value=_AsyncCM(mock_conn))
         client = SSHClient(_make_settings())
 
         with pytest.raises(asyncio.TimeoutError):

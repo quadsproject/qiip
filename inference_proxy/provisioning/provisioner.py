@@ -13,7 +13,9 @@ import json
 import re
 import shlex
 from collections.abc import Coroutine
-from datetime import datetime, timezone
+from contextlib import suppress
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import httpx
 import structlog
@@ -33,6 +35,9 @@ from inference_proxy.provisioning.state import ProvisioningState, ProvisioningSt
 from inference_proxy.redfish.client import RedfishClient
 from inference_proxy.redfish.errors import RedfishError
 from inference_proxy.routing.connection_tracker import ConnectionTracker
+
+if TYPE_CHECKING:
+    from etcd3gw.types import KeyValue
 
 logger = structlog.get_logger()
 
@@ -108,11 +113,9 @@ class NodeProvisioner:
     ) -> None:
         self._log_buffer.append(hostname, level, msg, stream=stream)
 
-    async def list_tasks_raw(self) -> list[tuple[bytes, object]]:
+    async def list_tasks_raw(self) -> list[tuple[bytes, KeyValue]]:
         """Return raw provisioning task entries from etcd."""
-        return await asyncio.to_thread(
-            self._etcd_client.get_prefix, "/provisioning/"
-        )
+        return await asyncio.to_thread(self._etcd_client.get_prefix, "/provisioning/")
 
     async def _update_state(
         self,
@@ -124,7 +127,7 @@ class NodeProvisioner:
         started_at: datetime | None = None,
     ) -> None:
         """Write provisioning state to etcd (D-05). Best-effort (Pitfall 3)."""
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         state = ProvisioningState(
             hostname=hostname,
             current_step=step,
@@ -184,7 +187,7 @@ class NodeProvisioner:
                 await writer.wait_closed()
                 logger.info("ssh_ready", hostname=hostname)
                 return
-            except (OSError, TimeoutError, asyncio.TimeoutError):
+            except (OSError, TimeoutError):
                 pass
             await asyncio.sleep(self._settings.boot_wait_interval)
         logger.warning(
@@ -215,7 +218,7 @@ class NodeProvisioner:
             )
             writer.close()
             await writer.wait_closed()
-        except (OSError, TimeoutError, asyncio.TimeoutError) as exc:
+        except (OSError, TimeoutError) as exc:
             failures.append(f"SSH port 22 unreachable: {exc}")
             raise PreflightError(hostname, failures) from exc
 
@@ -233,26 +236,34 @@ class NodeProvisioner:
         except (SSHConnectionError, RemoteCommandError) as exc:
             failures.append(f"SSH diagnostic failed: {exc}")
         except (ValueError, IndexError) as exc:
-            failures.append(f"SSH diagnostic failed: could not parse disk output: {exc}")
+            failures.append(
+                f"SSH diagnostic failed: could not parse disk output: {exc}"
+            )
 
         if failures:
             raise PreflightError(hostname, failures)
 
-    async def provision(self, hostname: str, *, managed: bool = True, model: str | None = None) -> None:
+    async def provision(
+        self, hostname: str, *, managed: bool = True, model: str | None = None
+    ) -> None:
         """Run full provisioning sequence on *hostname*.
 
         Sequence: preflight -> register PROVISIONING -> setup.sh ->
         start-vllm.sh -> health poll -> register HEALTHY.
         Tracks state in etcd at each step (D-05 through D-11).
         """
-        provision_started_at = datetime.now(timezone.utc)
+        provision_started_at = datetime.now(UTC)
         logger.info("provisioning_start", hostname=hostname)
         self._log_buffer.create(hostname)
         self._log(hostname, "info", "Provisioning started")
 
-        await self._update_state(hostname, ProvisioningStep.PENDING, started_at=provision_started_at)
+        await self._update_state(
+            hostname, ProvisioningStep.PENDING, started_at=provision_started_at
+        )
         await self._power_on_if_needed(hostname)
-        await self._update_state(hostname, ProvisioningStep.PREFLIGHT, started_at=provision_started_at)
+        await self._update_state(
+            hostname, ProvisioningStep.PREFLIGHT, started_at=provision_started_at
+        )
         self._log(hostname, "info", "Running pre-flight checks")
 
         # D-04: preflight before any setup work
@@ -261,8 +272,10 @@ class NodeProvisioner:
         except PreflightError as exc:
             self._log(hostname, "error", f"Pre-flight failed: {exc}")
             await self._update_state(
-                hostname, ProvisioningStep.FAILED,
-                failed_step="preflight", error=str(exc),
+                hostname,
+                ProvisioningStep.FAILED,
+                failed_step="preflight",
+                error=str(exc),
                 started_at=provision_started_at,
             )
             self._log_buffer.mark_complete(hostname)
@@ -274,7 +287,7 @@ class NodeProvisioner:
             endpoint=f"{hostname}:{self._settings.vllm_port}",
             status=NodeStatus.PROVISIONING,
             model="",
-            last_heartbeat=datetime.now(timezone.utc),
+            last_heartbeat=datetime.now(UTC),
             managed=managed,
         )
         key, value = node_to_etcd(node, self._etcd_client.prefix)
@@ -285,7 +298,11 @@ class NodeProvisioner:
 
         current_step = "uploading_scripts"
         try:
-            await self._update_state(hostname, ProvisioningStep.UPLOADING_SCRIPTS, started_at=provision_started_at)
+            await self._update_state(
+                hostname,
+                ProvisioningStep.UPLOADING_SCRIPTS,
+                started_at=provision_started_at,
+            )
             self._log(hostname, "info", "Uploading provisioning scripts")
             await self._upload_scripts(hostname)
             self._log(hostname, "info", "Running setup.sh")
@@ -293,24 +310,36 @@ class NodeProvisioner:
             current_step = "gpu_verify"
             await self._verify_gpu(hostname)
             current_step = "starting_vllm"
-            await self._update_state(hostname, ProvisioningStep.STARTING_VLLM, started_at=provision_started_at)
+            await self._update_state(
+                hostname,
+                ProvisioningStep.STARTING_VLLM,
+                started_at=provision_started_at,
+            )
             self._log(hostname, "info", "Running start-vllm.sh")
             model_name = await self._run_start_vllm(hostname, model=model)
             current_step = "health_poll"
-            await self._update_state(hostname, ProvisioningStep.HEALTH_POLL, started_at=provision_started_at)
+            await self._update_state(
+                hostname, ProvisioningStep.HEALTH_POLL, started_at=provision_started_at
+            )
             self._log(hostname, "info", "Waiting for vLLM health endpoint")
             await self._poll_health(hostname)
             current_step = "registering"
-            await self._update_state(hostname, ProvisioningStep.REGISTERING, started_at=provision_started_at)
+            await self._update_state(
+                hostname, ProvisioningStep.REGISTERING, started_at=provision_started_at
+            )
             self._log(hostname, "info", f"Registering node (model={model_name})")
             await self._register_node(hostname, model_name, managed=managed)
-            await self._update_state(hostname, ProvisioningStep.COMPLETE, started_at=provision_started_at)
+            await self._update_state(
+                hostname, ProvisioningStep.COMPLETE, started_at=provision_started_at
+            )
             self._log(hostname, "info", "Provisioning complete")
         except (RemoteCommandError, SSHConnectionError, ProvisioningError) as exc:
             self._log(hostname, "error", f"Failed at step '{current_step}': {exc}")
             await self._update_state(
-                hostname, ProvisioningStep.FAILED,
-                failed_step=current_step, error=str(exc),
+                hostname,
+                ProvisioningStep.FAILED,
+                failed_step=current_step,
+                error=str(exc),
                 started_at=provision_started_at,
             )
             # Update node entry to FAILED so it doesn't stay stuck as PROVISIONING
@@ -319,7 +348,7 @@ class NodeProvisioner:
                 endpoint=f"{hostname}:{self._settings.vllm_port}",
                 status=NodeStatus.FAILED,
                 model="",
-                last_heartbeat=datetime.now(timezone.utc),
+                last_heartbeat=datetime.now(UTC),
                 managed=managed,
             )
             f_key, f_value = node_to_etcd(failed_node, self._etcd_client.prefix)
@@ -347,15 +376,20 @@ class NodeProvisioner:
                 if match:
                     step_name, status = match.group(1), match.group(2)
                     if status == "START":
-                        try:
-                            await self._update_state(hostname, ProvisioningStep(step_name))
-                        except ValueError:
-                            pass
+                        with suppress(ValueError):
+                            await self._update_state(
+                                hostname, ProvisioningStep(step_name)
+                            )
                     if status == "FAIL":
                         logger.error("step_failed", step=step_name, hostname=hostname)
                         self._log(hostname, "error", f"[STEP:{step_name}:FAIL]")
                     else:
-                        logger.info("step_marker", step=step_name, status=status, hostname=hostname)
+                        logger.info(
+                            "step_marker",
+                            step=step_name,
+                            status=status,
+                            hostname=hostname,
+                        )
                         self._log(hostname, "info", f"[STEP:{step_name}:{status}]")
                 else:
                     logger.debug("setup_stdout", line=line, hostname=hostname)
@@ -380,10 +414,10 @@ class NodeProvisioner:
         if model:
             command = f"VLLM_MODEL={shlex.quote(model)} {command}"
         model_name: str | None = None
-        async for stream, line in self._ssh_client.run_streaming(
-            hostname, command
-        ):
-            logger.debug("start_vllm_output", stream=stream, line=line, hostname=hostname)
+        async for stream, line in self._ssh_client.run_streaming(hostname, command):
+            logger.debug(
+                "start_vllm_output", stream=stream, line=line, hostname=hostname
+            )
             self._log(hostname, "debug", line, stream=stream)
             if stream == "stdout":
                 match = MODEL_PATTERN.search(line)
@@ -416,7 +450,9 @@ class NodeProvisioner:
         tail_task = asyncio.create_task(self._tail_vllm_log(hostname))
 
         url = f"http://{hostname}:{self._settings.vllm_port}/health"
-        deadline = asyncio.get_running_loop().time() + self._settings.health_poll_timeout
+        deadline = (
+            asyncio.get_running_loop().time() + self._settings.health_poll_timeout
+        )
 
         try:
             async with httpx.AsyncClient() as client:
@@ -446,19 +482,19 @@ class NodeProvisioner:
                     await asyncio.sleep(self._settings.health_poll_interval)
         finally:
             tail_task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await tail_task
-            except asyncio.CancelledError:
-                pass
 
-    async def _register_node(self, hostname: str, model: str, *, managed: bool = True) -> None:
+    async def _register_node(
+        self, hostname: str, model: str, *, managed: bool = True
+    ) -> None:
         """Register node in etcd with correct fields (D-11, D-12)."""
         node = Node(
             node_id=hostname,
             endpoint=f"{hostname}:{self._settings.vllm_port}",
             status=NodeStatus.HEALTHY,
             model=model,
-            last_heartbeat=datetime.now(timezone.utc),
+            last_heartbeat=datetime.now(UTC),
             managed=managed,
         )
         key, value = node_to_etcd(node, self._etcd_client.prefix)
@@ -466,7 +502,9 @@ class NodeProvisioner:
         await asyncio.to_thread(self._etcd_client.put, key, value)
         logger.info("node_registered", hostname=hostname, model=model, key=key)
 
-    def fire_background(self, coro: Coroutine[object, object, None]) -> asyncio.Task[None]:
+    def fire_background(
+        self, coro: Coroutine[object, object, None]
+    ) -> asyncio.Task[None]:
         """Schedule a coroutine as a background task, preventing GC."""
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
@@ -493,21 +531,25 @@ class NodeProvisioner:
         Graceful: drain -> kill vllm -> deregister.
         Force: kill -9 -> deregister.
         """
-        teardown_started_at = datetime.now(timezone.utc)
+        teardown_started_at = datetime.now(UTC)
         logger.info("teardown_start", hostname=hostname, force=force)
         self._log_buffer.create(hostname)
         self._log(hostname, "info", f"Teardown started (force={force})")
 
         try:
             if not force:
-                await self._update_state(hostname, ProvisioningStep.DRAINING, started_at=teardown_started_at)
+                await self._update_state(
+                    hostname, ProvisioningStep.DRAINING, started_at=teardown_started_at
+                )
                 self._log(hostname, "info", "Draining active connections")
                 if self._registry is not None:
                     self._registry.drain(hostname)
                 await self._drain_wait(hostname)
                 self._log(hostname, "info", "Drain complete")
 
-            await self._update_state(hostname, ProvisioningStep.STOPPING_VLLM, started_at=teardown_started_at)
+            await self._update_state(
+                hostname, ProvisioningStep.STOPPING_VLLM, started_at=teardown_started_at
+            )
             self._log(hostname, "info", "Stopping vLLM process")
             if force:
                 await self._ssh_run_command(
@@ -520,7 +562,9 @@ class NodeProvisioner:
                     "kill $(cat /var/run/vllm.pid) 2>/dev/null; rm -f /var/run/vllm.pid",
                 )
 
-            await self._update_state(hostname, ProvisioningStep.DEREGISTERING, started_at=teardown_started_at)
+            await self._update_state(
+                hostname, ProvisioningStep.DEREGISTERING, started_at=teardown_started_at
+            )
             self._log(hostname, "info", "Deregistering node from etcd")
             await asyncio.to_thread(
                 self._etcd_client.delete, f"{self._etcd_client.prefix}{hostname}"
@@ -528,13 +572,19 @@ class NodeProvisioner:
             if self._registry is not None:
                 self._registry.remove(hostname)
 
-            await self._update_state(hostname, ProvisioningStep.TEARDOWN_COMPLETE, started_at=teardown_started_at)
+            await self._update_state(
+                hostname,
+                ProvisioningStep.TEARDOWN_COMPLETE,
+                started_at=teardown_started_at,
+            )
             self._log(hostname, "info", "Teardown complete")
         except (RemoteCommandError, SSHConnectionError) as exc:
             self._log(hostname, "error", f"Teardown failed: {exc}")
             await self._update_state(
-                hostname, ProvisioningStep.FAILED,
-                failed_step="teardown", error=str(exc),
+                hostname,
+                ProvisioningStep.FAILED,
+                failed_step="teardown",
+                error=str(exc),
                 started_at=teardown_started_at,
             )
             raise ProvisioningError(str(exc)) from exc

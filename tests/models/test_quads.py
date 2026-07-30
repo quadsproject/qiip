@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from inference_proxy.models.quads import QUADSHost
 
@@ -29,7 +30,7 @@ class TestQUADSHostFrozen:
             gpu_model="A100",
             gpu_count=4,
         )
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             host.hostname = "other"  # type: ignore[misc]
 
 

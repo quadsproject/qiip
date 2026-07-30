@@ -15,8 +15,8 @@ from inference_proxy.config.settings import (
     QUADSSettings,
     RedfishSettings,
     RoutingSettings,
-    SSHSettings,
     Settings,
+    SSHSettings,
 )
 
 
@@ -44,21 +44,27 @@ class TestDefaultRoutingSettings:
 
 
 class TestEnvVarOverrideGatewayPort:
-    def test_env_var_override_gateway_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_env_var_override_gateway_port(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setenv("INFERENCE_PROXY_GATEWAY__PORT", "9090")
         settings = Settings(_env_file=None)
         assert settings.gateway.port == 9090
 
 
 class TestEnvVarOverrideEtcdPrefix:
-    def test_env_var_override_etcd_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_env_var_override_etcd_prefix(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setenv("INFERENCE_PROXY_ETCD__NODE_PREFIX", "/test-nodes/")
         settings = Settings(_env_file=None)
         assert settings.etcd.node_prefix == "/test-nodes/"
 
 
 class TestEnvVarOverrideRoutingStrategy:
-    def test_env_var_override_routing_strategy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_env_var_override_routing_strategy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setenv("INFERENCE_PROXY_ROUTING__STRATEGY", "round_robin")
         settings = Settings(_env_file=None)
         assert settings.routing.strategy == "round_robin"
@@ -95,7 +101,9 @@ class TestEtcdSettingsEmptyEndpointsRejected:
     """EtcdSettings rejects an empty endpoints list with a validation error."""
 
     def test_empty_endpoints_raises_validation_error(self) -> None:
-        with pytest.raises(ValidationError, match="At least one etcd endpoint must be configured"):
+        with pytest.raises(
+            ValidationError, match="At least one etcd endpoint must be configured"
+        ):
             EtcdSettings(endpoints=[])
 
 
@@ -134,7 +142,9 @@ class TestDefaultProvisioningSettings:
 
 
 class TestEnvVarOverrideSSHUsername:
-    def test_env_var_override_ssh_username(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_env_var_override_ssh_username(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.setenv("INFERENCE_PROXY_SSH__USERNAME", "deploy")
         settings = Settings(_env_file=None)
         assert settings.ssh.username == "deploy"
@@ -173,7 +183,9 @@ class TestEnvVarOverrideQUADSBaseUrl:
     def test_env_var_override_quads_base_url(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com")
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com"
+        )
         settings = Settings(_env_file=None)
         assert settings.quads.base_url == "http://quads.example.com"
 

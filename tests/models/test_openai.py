@@ -7,23 +7,22 @@ import pytest
 from pydantic import ValidationError
 
 from inference_proxy.models.openai import (
+    ChatCompletionChoice,
     ChatCompletionChunk,
     ChatCompletionChunkChoice,
     ChatCompletionChunkDelta,
-    ChatCompletionChoice,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
+    CompletionChoice,
     CompletionChunk,
     CompletionChunkChoice,
-    CompletionChoice,
     CompletionRequest,
     CompletionResponse,
     ErrorDetail,
     ErrorResponse,
     Usage,
 )
-
 
 # --- ChatMessage tests ---
 
@@ -260,9 +259,7 @@ class TestChatCompletionChunk:
             choices=[
                 ChatCompletionChunkChoice(
                     index=0,
-                    delta=ChatCompletionChunkDelta(
-                        role="assistant", content="Hello"
-                    ),
+                    delta=ChatCompletionChunkDelta(role="assistant", content="Hello"),
                     finish_reason=None,
                 )
             ],

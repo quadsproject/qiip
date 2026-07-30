@@ -480,15 +480,36 @@ class TestLeastConnectionsRouting:
         httpx_mock: HTTPXMock,
     ) -> None:
         """With 2 nodes serving same model, routes to node with fewer connections."""
-        test_registry.add(_make_node(node_id="node-1", endpoint="10.0.1.100:8000", model="llama-3"))
-        test_registry.add(_make_node(node_id="node-2", endpoint="10.0.1.101:8000", model="llama-3"))
+        test_registry.add(
+            _make_node(node_id="node-1", endpoint="10.0.1.100:8000", model="llama-3")
+        )
+        test_registry.add(
+            _make_node(node_id="node-2", endpoint="10.0.1.101:8000", model="llama-3")
+        )
 
         # Increment connections on node-1 so node-2 has fewer
         node_selector.tracker.increment("node-1")
 
         httpx_mock.add_response(
             url="http://10.0.1.101:8000/v1/chat/completions",
-            json={"id": "chatcmpl-1", "object": "chat.completion", "created": 1234, "model": "llama-3", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+            json={
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1234,
+                "model": "llama-3",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Hi"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
             status_code=200,
         )
 
@@ -514,12 +535,33 @@ class TestModelFiltering:
         httpx_mock: HTTPXMock,
     ) -> None:
         """With different models, routes to node serving requested model."""
-        test_registry.add(_make_node(node_id="node-1", endpoint="10.0.1.100:8000", model="llama-3"))
-        test_registry.add(_make_node(node_id="node-2", endpoint="10.0.1.101:8000", model="mistral-7b"))
+        test_registry.add(
+            _make_node(node_id="node-1", endpoint="10.0.1.100:8000", model="llama-3")
+        )
+        test_registry.add(
+            _make_node(node_id="node-2", endpoint="10.0.1.101:8000", model="mistral-7b")
+        )
 
         httpx_mock.add_response(
             url="http://10.0.1.100:8000/v1/chat/completions",
-            json={"id": "chatcmpl-1", "object": "chat.completion", "created": 1234, "model": "llama-3", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+            json={
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1234,
+                "model": "llama-3",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Hi"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
             status_code=200,
         )
 
@@ -547,7 +589,10 @@ class TestModelNotFound:
 
         response = client.post(
             "/v1/chat/completions",
-            json={"model": "nonexistent", "messages": [{"role": "user", "content": "Hi"}]},
+            json={
+                "model": "nonexistent",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
         )
 
         assert response.status_code == 404
@@ -565,7 +610,9 @@ class TestModelUnavailable:
         test_registry: NodeRegistry,
     ) -> None:
         """Requesting a model where all nodes are DRAINING returns 503."""
-        test_registry.add(_make_node(node_id="node-1", model="llama-3", status=NodeStatus.DRAINING))
+        test_registry.add(
+            _make_node(node_id="node-1", model="llama-3", status=NodeStatus.DRAINING)
+        )
 
         response = client.post(
             "/v1/chat/completions",
@@ -586,8 +633,17 @@ class TestDrainingExcludedFromModels:
         test_registry: NodeRegistry,
     ) -> None:
         """Only healthy nodes appear in model listing."""
-        test_registry.add(_make_node(node_id="node-1", model="llama-3", status=NodeStatus.HEALTHY))
-        test_registry.add(_make_node(node_id="node-2", endpoint="10.0.1.101:8000", model="mistral-7b", status=NodeStatus.DRAINING))
+        test_registry.add(
+            _make_node(node_id="node-1", model="llama-3", status=NodeStatus.HEALTHY)
+        )
+        test_registry.add(
+            _make_node(
+                node_id="node-2",
+                endpoint="10.0.1.101:8000",
+                model="mistral-7b",
+                status=NodeStatus.DRAINING,
+            )
+        )
 
         response = client.get("/v1/models")
 
@@ -631,7 +687,11 @@ class TestStreamingModelFiltering:
 
         response = client.post(
             "/v1/chat/completions",
-            json={"model": "nonexistent", "messages": [{"role": "user", "content": "Hi"}], "stream": True},
+            json={
+                "model": "nonexistent",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+            },
         )
 
         assert response.status_code == 404
@@ -659,7 +719,24 @@ class TestConnectionTracking:
 
         httpx_mock.add_response(
             url="http://10.0.1.100:8000/v1/chat/completions",
-            json={"id": "chatcmpl-1", "object": "chat.completion", "created": 1234, "model": "llama-3", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+            json={
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1234,
+                "model": "llama-3",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Hi"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
             status_code=200,
         )
 
@@ -697,7 +774,11 @@ class TestStreamingConnectionTracking:
 
         response = client.post(
             "/v1/chat/completions",
-            json={"model": "llama-3", "messages": [{"role": "user", "content": "Hi"}], "stream": True},
+            json={
+                "model": "llama-3",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": True,
+            },
         )
 
         assert response.status_code == 200
@@ -718,12 +799,43 @@ class TestDrainAutoRemoval:
     ) -> None:
         """DRAINING node with 0 connections is removed after proxy call completes."""
         # Add a healthy node and a draining node both serving same model
-        test_registry.add(_make_node(node_id="node-1", endpoint="10.0.1.100:8000", model="llama-3", status=NodeStatus.HEALTHY))
-        test_registry.add(_make_node(node_id="node-2", endpoint="10.0.1.101:8000", model="llama-3", status=NodeStatus.DRAINING))
+        test_registry.add(
+            _make_node(
+                node_id="node-1",
+                endpoint="10.0.1.100:8000",
+                model="llama-3",
+                status=NodeStatus.HEALTHY,
+            )
+        )
+        test_registry.add(
+            _make_node(
+                node_id="node-2",
+                endpoint="10.0.1.101:8000",
+                model="llama-3",
+                status=NodeStatus.DRAINING,
+            )
+        )
 
         httpx_mock.add_response(
             url="http://10.0.1.100:8000/v1/chat/completions",
-            json={"id": "chatcmpl-1", "object": "chat.completion", "created": 1234, "model": "llama-3", "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+            json={
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "created": 1234,
+                "model": "llama-3",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Hi"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
             status_code=200,
         )
 
@@ -780,7 +892,11 @@ class TestNonStreamingRetry:
                         "finish_reason": "stop",
                     }
                 ],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
             },
             status_code=200,
         )
@@ -829,7 +945,11 @@ class TestNonStreamingRetry:
                         "finish_reason": "stop",
                     }
                 ],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
             },
             status_code=200,
         )
@@ -919,7 +1039,11 @@ class TestCircuitBreakerRecording:
                         "finish_reason": "stop",
                     }
                 ],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
             },
             status_code=200,
         )

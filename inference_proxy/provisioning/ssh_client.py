@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import cast
 
 import asyncssh
 import structlog
@@ -82,42 +83,45 @@ class SSHClient:
             RemoteCommandError: When the remote process exits non-zero.
         """
         try:
-            async with asyncssh.connect(
-                host,
-                username=self._username,
-                client_keys=[str(self._key_path)],
-                known_hosts=None,  # D-03: lab servers reimaged frequently
-                connect_timeout=self._connect_timeout,
-            ) as conn:
-                async with conn.create_process(command) as process:
-                    async for line in process.stdout:
-                        yield ("stdout", line.rstrip("\n"))
+            async with (
+                asyncssh.connect(
+                    host,
+                    username=self._username,
+                    client_keys=[str(self._key_path)],
+                    known_hosts=None,  # D-03: lab servers reimaged frequently
+                    connect_timeout=self._connect_timeout,
+                ) as conn,
+                conn.create_process(command) as process,
+            ):
+                async for line in process.stdout:
+                    yield ("stdout", line.rstrip("\n"))
 
-                    # D-07: read stderr after stdout exhausted
-                    stderr_output = await process.stderr.read()
-                    if stderr_output:
-                        for err_line in stderr_output.splitlines():
-                            if err_line:
-                                yield ("stderr", err_line)
+                # D-07: read stderr after stdout exhausted
+                stderr_output = await process.stderr.read()
+                if stderr_output:
+                    for err_line in stderr_output.splitlines():
+                        if err_line:
+                            yield ("stderr", err_line)
 
-                    if process.exit_status is not None and process.exit_status != 0:
-                        raise RemoteCommandError(
-                            host, command, process.exit_status,
-                            stderr=stderr_output or "",
-                        )
+                if process.exit_status is not None and process.exit_status != 0:
+                    raise RemoteCommandError(
+                        host,
+                        command,
+                        process.exit_status,
+                        stderr=stderr_output or "",
+                    )
         except asyncssh.PermissionDenied as exc:
-            raise SSHConnectionError(
-                host, f"authentication failed: {exc}"
-            ) from exc
+            raise SSHConnectionError(host, f"authentication failed: {exc}") from exc
         except asyncssh.DisconnectError as exc:
-            raise SSHConnectionError(
-                host, f"disconnected: {exc.reason}"
-            ) from exc
+            raise SSHConnectionError(host, f"disconnected: {exc.reason}") from exc
         except OSError as exc:
             raise SSHConnectionError(host, str(exc)) from exc
 
     async def run(
-        self, host: str, command: str, timeout: float = 60.0,
+        self,
+        host: str,
+        command: str,
+        timeout: float = 60.0,
     ) -> tuple[str, str, int]:
         """Run *command* on *host*, return ``(stdout, stderr, exit_status)``.
 
@@ -137,34 +141,39 @@ class SSHClient:
                 connect_timeout=self._connect_timeout,
             ) as conn:
                 result = await asyncio.wait_for(
-                    conn.run(command), timeout=timeout,
+                    conn.run(command),
+                    timeout=timeout,
                 )
-                exit_status = result.exit_status if result.exit_status is not None else 0
-                stdout = result.stdout or ""
-                stderr = result.stderr or ""
+                exit_status = (
+                    result.exit_status if result.exit_status is not None else 0
+                )
+                stdout = cast(str, result.stdout or "")
+                stderr = cast(str, result.stderr or "")
 
                 if exit_status != 0:
                     raise RemoteCommandError(
-                        host, command, exit_status, stderr=stderr,
+                        host,
+                        command,
+                        exit_status,
+                        stderr=stderr,
                     )
 
                 log.debug("ssh_run_complete", exit_status=exit_status)
                 return (stdout, stderr, exit_status)
         except asyncssh.PermissionDenied as exc:
-            raise SSHConnectionError(
-                host, f"authentication failed: {exc}"
-            ) from exc
+            raise SSHConnectionError(host, f"authentication failed: {exc}") from exc
         except asyncssh.DisconnectError as exc:
-            raise SSHConnectionError(
-                host, f"disconnected: {exc.reason}"
-            ) from exc
+            raise SSHConnectionError(host, f"disconnected: {exc.reason}") from exc
         except TimeoutError:
             raise  # asyncio.TimeoutError is TimeoutError is OSError in 3.11+
         except OSError as exc:
             raise SSHConnectionError(host, str(exc)) from exc
 
     async def upload(
-        self, host: str, local_path: Path, remote_path: str = ".",
+        self,
+        host: str,
+        local_path: Path,
+        remote_path: str = ".",
     ) -> None:
         """Copy *local_path* to *host* via SCP.
 
@@ -179,15 +188,13 @@ class SSHClient:
                 connect_timeout=self._connect_timeout,
             ) as conn:
                 await asyncssh.scp(
-                    str(local_path), (conn, remote_path), recurse=True,
+                    str(local_path),
+                    (conn, remote_path),
+                    recurse=True,
                 )
         except asyncssh.PermissionDenied as exc:
-            raise SSHConnectionError(
-                host, f"authentication failed: {exc}"
-            ) from exc
+            raise SSHConnectionError(host, f"authentication failed: {exc}") from exc
         except asyncssh.DisconnectError as exc:
-            raise SSHConnectionError(
-                host, f"disconnected: {exc.reason}"
-            ) from exc
+            raise SSHConnectionError(host, f"disconnected: {exc.reason}") from exc
         except OSError as exc:
             raise SSHConnectionError(host, str(exc)) from exc

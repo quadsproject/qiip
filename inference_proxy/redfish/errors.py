@@ -7,6 +7,8 @@ truncated to 200 chars for safety.
 
 from __future__ import annotations
 
+from typing import cast
+
 import httpx
 
 
@@ -47,8 +49,8 @@ def extract_error_message(exc: Exception) -> str:
                 key = msg_id.rsplit(".", 1)[-1] if msg_id else ""
                 if key in REDFISH_ERROR_MAP:
                     return REDFISH_ERROR_MAP[key]
-                return ext_info[0].get("Message", str(exc))[:200]
-            return body.get("error", {}).get("message", str(exc))[:200]
+                return cast(str, ext_info[0].get("Message", str(exc)))[:200]
+            return cast(str, body.get("error", {}).get("message", str(exc)))[:200]
         except Exception:
             pass
     return str(exc)[:200]

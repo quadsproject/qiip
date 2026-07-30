@@ -12,7 +12,6 @@ Design decisions:
 
 from pydantic import BaseModel, ConfigDict, Field
 
-
 # ---------------------------------------------------------------------------
 # Chat Completion Models
 # ---------------------------------------------------------------------------

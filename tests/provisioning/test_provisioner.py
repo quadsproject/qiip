@@ -6,10 +6,9 @@ provisioning sequence: setup.sh -> start-vllm.sh -> health poll -> register.
 
 from __future__ import annotations
 
-import asyncio
 import json
-from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -25,7 +24,6 @@ from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
     SSHConnectionError,
 )
-from inference_proxy.provisioning.state import ProvisioningStep
 from inference_proxy.redfish.errors import RedfishError
 
 
@@ -42,7 +40,8 @@ def _make_provisioner(
     return NodeProvisioner(
         ssh_client=ssh_client or MagicMock(),
         etcd_client=etcd_client or MagicMock(),
-        settings=settings or ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0),
+        settings=settings
+        or ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0),
         registry=registry,
         connection_tracker=connection_tracker,
         redfish_client=redfish_client,
@@ -71,11 +70,16 @@ class TestProvisionSequence:
         async def mock_streaming(host: str, command: str):
             if "setup.sh" in command:
                 call_order.append("setup")
-                for item in [("stdout", "[STEP:system_update:START]"), ("stdout", "[STEP:system_update:OK]")]:
+                for item in [
+                    ("stdout", "[STEP:system_update:START]"),
+                    ("stdout", "[STEP:system_update:OK]"),
+                ]:
                     yield item
             elif "start-vllm.sh" in command:
                 call_order.append("start_vllm")
-                for item in [("stdout", "# Model:              Qwen/Qwen2.5-72B-Instruct")]:
+                for item in [
+                    ("stdout", "# Model:              Qwen/Qwen2.5-72B-Instruct")
+                ]:
                     yield item
 
         ssh.run_streaming = mock_streaming
@@ -93,7 +97,10 @@ class TestProvisionSequence:
 
         with patch.object(provisioner, "preflight", new_callable=AsyncMock):
             with patch.object(provisioner, "_verify_gpu", new_callable=AsyncMock):
-                with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+                with patch(
+                    "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                ) as mock_to_thread:
                     mock_to_thread.return_value = True
                     await provisioner.provision("host1")
                     call_order.append("register")
@@ -125,7 +132,9 @@ class TestScriptUpload:
                 for item in [("stdout", "[STEP:system_update:START]")]:
                     yield item
             elif "start-vllm.sh" in command:
-                for item in [("stdout", "# Model:              Qwen/Qwen2.5-72B-Instruct")]:
+                for item in [
+                    ("stdout", "# Model:              Qwen/Qwen2.5-72B-Instruct")
+                ]:
                     yield item
 
         ssh.upload = mock_upload
@@ -143,7 +152,10 @@ class TestScriptUpload:
 
         with patch.object(provisioner, "preflight", new_callable=AsyncMock):
             with patch.object(provisioner, "_verify_gpu", new_callable=AsyncMock):
-                with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_tt:
+                with patch(
+                    "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                ) as mock_tt:
                     mock_tt.return_value = True
                     await provisioner.provision("host1")
 
@@ -163,7 +175,10 @@ class TestScriptUpload:
         provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
 
         with patch.object(provisioner, "preflight", new_callable=AsyncMock):
-            with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_tt:
+            with patch(
+                "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_tt:
                 mock_tt.return_value = True
                 with pytest.raises(ProvisioningError):
                     await provisioner.provision("host1")
@@ -334,9 +349,14 @@ class TestNodeRegistration:
 
         provisioner = _make_provisioner(etcd_client=etcd)
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            new_callable=AsyncMock,
+        ) as mock_to_thread:
             mock_to_thread.return_value = True
-            with patch("inference_proxy.provisioning.provisioner.node_to_etcd") as mock_serialize:
+            with patch(
+                "inference_proxy.provisioning.provisioner.node_to_etcd"
+            ) as mock_serialize:
                 mock_serialize.return_value = ("/nodes/host1", b'{"model":"test"}')
                 await provisioner._register_node("host1", "test-model")
 
@@ -350,7 +370,9 @@ class TestNodeRegistration:
                 assert node.last_heartbeat is not None
 
                 # Verify etcd.put called via asyncio.to_thread
-                mock_to_thread.assert_called_once_with(etcd.put, "/nodes/host1", b'{"model":"test"}')
+                mock_to_thread.assert_called_once_with(
+                    etcd.put, "/nodes/host1", b'{"model":"test"}'
+                )
 
 
 class TestSetupFailure:
@@ -372,7 +394,10 @@ class TestSetupFailure:
         provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
 
         with patch.object(provisioner, "preflight", new_callable=AsyncMock):
-            with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+            with patch(
+                "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_to_thread:
                 mock_to_thread.return_value = True
                 with pytest.raises(ProvisioningError):
                     await provisioner.provision("host1")
@@ -394,7 +419,10 @@ class TestSetupFailure:
         provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
 
         with patch.object(provisioner, "preflight", new_callable=AsyncMock):
-            with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+            with patch(
+                "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_to_thread:
                 mock_to_thread.return_value = True
                 with pytest.raises(ProvisioningError):
                     await provisioner.provision("host1")
@@ -408,8 +436,13 @@ class TestPreflight:
         """TCP probe failure raises PreflightError immediately."""
         provisioner = _make_provisioner()
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.open_connection", side_effect=OSError("Connection refused")):
-            with pytest.raises(PreflightError, match="SSH port 22 unreachable") as exc_info:
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.open_connection",
+            side_effect=OSError("Connection refused"),
+        ):
+            with pytest.raises(
+                PreflightError, match="SSH port 22 unreachable"
+            ) as exc_info:
                 await provisioner.preflight("host1")
             assert exc_info.value.hostname == "host1"
             assert len(exc_info.value.failures) == 1
@@ -417,30 +450,46 @@ class TestPreflight:
     @pytest.mark.asyncio
     async def test_insufficient_disk(self) -> None:
         """Insufficient disk space raises PreflightError."""
-        settings = ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0, min_disk_gb=20)
+        settings = ProvisioningSettings(
+            health_poll_timeout=2, health_poll_interval=0, min_disk_gb=20
+        )
         provisioner = _make_provisioner(settings=settings)
         mock_writer = MagicMock()
         mock_writer.close = MagicMock()
         mock_writer.wait_closed = AsyncMock()
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.open_connection", return_value=(MagicMock(), mock_writer)):
-            with patch.object(provisioner, "_ssh_run_command", new_callable=AsyncMock) as mock_cmd:
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.open_connection",
+            return_value=(MagicMock(), mock_writer),
+        ):
+            with patch.object(
+                provisioner, "_ssh_run_command", new_callable=AsyncMock
+            ) as mock_cmd:
                 mock_cmd.return_value = "5242880"
-                with pytest.raises(PreflightError, match="Insufficient disk") as exc_info:
+                with pytest.raises(
+                    PreflightError, match="Insufficient disk"
+                ) as exc_info:
                     await provisioner.preflight("host1")
                 assert "5.0" in str(exc_info.value) or "5" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_collects_all_failures(self) -> None:
         """D-03: All failures collected before raising single PreflightError."""
-        settings = ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0, min_disk_gb=20)
+        settings = ProvisioningSettings(
+            health_poll_timeout=2, health_poll_interval=0, min_disk_gb=20
+        )
         provisioner = _make_provisioner(settings=settings)
         mock_writer = MagicMock()
         mock_writer.close = MagicMock()
         mock_writer.wait_closed = AsyncMock()
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.open_connection", return_value=(MagicMock(), mock_writer)):
-            with patch.object(provisioner, "_ssh_run_command", new_callable=AsyncMock) as mock_cmd:
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.open_connection",
+            return_value=(MagicMock(), mock_writer),
+        ):
+            with patch.object(
+                provisioner, "_ssh_run_command", new_callable=AsyncMock
+            ) as mock_cmd:
                 # Disk check fails + SSH diagnostic error on a second call
                 mock_cmd.side_effect = [
                     "5242880",  # disk: 5GB, below min_disk_gb=20
@@ -457,8 +506,13 @@ class TestPreflight:
         mock_writer.close = MagicMock()
         mock_writer.wait_closed = AsyncMock()
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.open_connection", return_value=(MagicMock(), mock_writer)):
-            with patch.object(provisioner, "_ssh_run_command", new_callable=AsyncMock) as mock_cmd:
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.open_connection",
+            return_value=(MagicMock(), mock_writer),
+        ):
+            with patch.object(
+                provisioner, "_ssh_run_command", new_callable=AsyncMock
+            ) as mock_cmd:
                 mock_cmd.return_value = "52428800"  # 50GB disk in KB
                 await provisioner.preflight("host1")  # Should not raise
 
@@ -470,10 +524,17 @@ class TestPreflight:
         mock_writer.close = MagicMock()
         mock_writer.wait_closed = AsyncMock()
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.open_connection", return_value=(MagicMock(), mock_writer)):
-            with patch.object(provisioner, "_ssh_run_command", new_callable=AsyncMock) as mock_cmd:
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.open_connection",
+            return_value=(MagicMock(), mock_writer),
+        ):
+            with patch.object(
+                provisioner, "_ssh_run_command", new_callable=AsyncMock
+            ) as mock_cmd:
                 mock_cmd.side_effect = SSHConnectionError("host1", "connection reset")
-                with pytest.raises(PreflightError, match="SSH diagnostic failed") as exc_info:
+                with pytest.raises(
+                    PreflightError, match="SSH diagnostic failed"
+                ) as exc_info:
                     await provisioner.preflight("host1")
                 assert len(exc_info.value.failures) >= 1
 
@@ -485,7 +546,9 @@ class TestVerifyGpu:
     async def test_no_gpu_after_setup(self) -> None:
         """No GPUs detected raises ProvisioningError."""
         provisioner = _make_provisioner()
-        with patch.object(provisioner, "_ssh_run_command", new_callable=AsyncMock, return_value=""):
+        with patch.object(
+            provisioner, "_ssh_run_command", new_callable=AsyncMock, return_value=""
+        ):
             with pytest.raises(ProvisioningError, match="No GPUs detected"):
                 await provisioner._verify_gpu("host1")
 
@@ -493,7 +556,12 @@ class TestVerifyGpu:
     async def test_gpu_detected(self) -> None:
         """GPUs detected passes without error."""
         provisioner = _make_provisioner()
-        with patch.object(provisioner, "_ssh_run_command", new_callable=AsyncMock, return_value="Tesla V100\nTesla V100"):
+        with patch.object(
+            provisioner,
+            "_ssh_run_command",
+            new_callable=AsyncMock,
+            return_value="Tesla V100\nTesla V100",
+        ):
             await provisioner._verify_gpu("host1")  # Should not raise
 
 
@@ -503,7 +571,10 @@ def _make_full_provisioner(etcd: MagicMock) -> tuple[NodeProvisioner, MagicMock]
 
     async def mock_streaming(host: str, command: str):
         if "setup.sh" in command:
-            for item in [("stdout", "[STEP:system_update:START]"), ("stdout", "[STEP:system_update:OK]")]:
+            for item in [
+                ("stdout", "[STEP:system_update:START]"),
+                ("stdout", "[STEP:system_update:OK]"),
+            ]:
                 yield item
         elif "start-vllm.sh" in command:
             for item in [("stdout", "# Model:              Qwen/Qwen2.5-72B-Instruct")]:
@@ -539,7 +610,10 @@ class TestStateTracking:
 
         with patch.object(provisioner, "preflight", new_callable=AsyncMock):
             with patch.object(provisioner, "_verify_gpu", new_callable=AsyncMock):
-                with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+                with patch(
+                    "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                ) as mock_to_thread:
                     mock_to_thread.return_value = True
                     await provisioner.provision("host1")
 
@@ -578,10 +652,15 @@ class TestStateTracking:
         etcd.put = MagicMock(return_value=True)
 
         settings = ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0)
-        provisioner = NodeProvisioner(ssh_client=ssh, etcd_client=etcd, settings=settings)
+        provisioner = NodeProvisioner(
+            ssh_client=ssh, etcd_client=etcd, settings=settings
+        )
 
         with patch.object(provisioner, "preflight", new_callable=AsyncMock):
-            with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+            with patch(
+                "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_to_thread:
                 mock_to_thread.return_value = True
                 with pytest.raises(ProvisioningError):
                     await provisioner.provision("host1")
@@ -609,9 +688,14 @@ class TestStateTracking:
 
         with patch.object(provisioner, "preflight", new_callable=AsyncMock):
             with patch.object(provisioner, "_verify_gpu", new_callable=AsyncMock):
-                with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+                with patch(
+                    "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                ) as mock_to_thread:
                     mock_to_thread.return_value = True
-                    with patch("inference_proxy.provisioning.provisioner.httpx.AsyncClient") as mock_httpx:
+                    with patch(
+                        "inference_proxy.provisioning.provisioner.httpx.AsyncClient"
+                    ) as mock_httpx:
                         mock_resp = MagicMock()
                         mock_resp.status_code = 200
                         mock_cl = AsyncMock()
@@ -631,7 +715,9 @@ class TestStateTracking:
 
     @pytest.mark.asyncio
     @patch("inference_proxy.provisioning.provisioner.httpx.AsyncClient")
-    async def test_state_write_failure_continues(self, mock_httpx_cls: MagicMock) -> None:
+    async def test_state_write_failure_continues(
+        self, mock_httpx_cls: MagicMock
+    ) -> None:
         """State write exceptions are swallowed -- provisioning continues (Pitfall 3)."""
         etcd = MagicMock()
         provisioner, _ = _make_full_provisioner(etcd)
@@ -657,13 +743,18 @@ class TestStateTracking:
 
         with patch.object(provisioner, "preflight", new_callable=AsyncMock):
             with patch.object(provisioner, "_verify_gpu", new_callable=AsyncMock):
-                with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", side_effect=flaky_to_thread):
+                with patch(
+                    "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                    side_effect=flaky_to_thread,
+                ):
                     # Should complete despite state write failures
                     await provisioner.provision("host1")
 
     @pytest.mark.asyncio
     @patch("inference_proxy.provisioning.provisioner.httpx.AsyncClient")
-    async def test_registers_provisioning_before_setup(self, mock_httpx_cls: MagicMock) -> None:
+    async def test_registers_provisioning_before_setup(
+        self, mock_httpx_cls: MagicMock
+    ) -> None:
         """D-09: First /nodes/ write creates node with status=provisioning."""
         etcd = MagicMock()
         provisioner, _ = _make_full_provisioner(etcd)
@@ -678,10 +769,18 @@ class TestStateTracking:
 
         with patch.object(provisioner, "preflight", new_callable=AsyncMock):
             with patch.object(provisioner, "_verify_gpu", new_callable=AsyncMock):
-                with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+                with patch(
+                    "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                    new_callable=AsyncMock,
+                ) as mock_to_thread:
                     mock_to_thread.return_value = True
-                    with patch("inference_proxy.provisioning.provisioner.node_to_etcd") as mock_ser:
-                        mock_ser.return_value = ("/nodes/host1", b'{"status":"provisioning"}')
+                    with patch(
+                        "inference_proxy.provisioning.provisioner.node_to_etcd"
+                    ) as mock_ser:
+                        mock_ser.return_value = (
+                            "/nodes/host1",
+                            b'{"status":"provisioning"}',
+                        )
                         await provisioner.provision("host1")
 
                         # Find the first call to node_to_etcd
@@ -709,7 +808,10 @@ class TestStateTracking:
 
         with patch.object(provisioner, "preflight", new_callable=AsyncMock) as mock_pf:
             mock_pf.side_effect = PreflightError("host1", ["no gpus"])
-            with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+            with patch(
+                "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                new_callable=AsyncMock,
+            ) as mock_to_thread:
                 mock_to_thread.return_value = True
                 with pytest.raises(PreflightError):
                     await provisioner.provision("host1")
@@ -742,7 +844,7 @@ def _make_teardown_provisioner(
         endpoint="host1:8000",
         status=NodeStatus.HEALTHY,
         model=model,
-        last_heartbeat=datetime.now(timezone.utc),
+        last_heartbeat=datetime.now(UTC),
     )
     registry.get.return_value = node
     registry.drain.return_value = True
@@ -764,7 +866,9 @@ def _make_teardown_provisioner(
         etcd_client=etcd,
         registry=registry,
         connection_tracker=tracker,
-        settings=ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0, drain_timeout=2),
+        settings=ProvisioningSettings(
+            health_poll_timeout=2, health_poll_interval=0, drain_timeout=2
+        ),
     )
     return provisioner, ssh, etcd, registry, tracker
 
@@ -786,7 +890,10 @@ class TestTeardownGraceful:
                     state_steps.append(data["current_step"])
             return True
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", side_effect=capture_to_thread):
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            side_effect=capture_to_thread,
+        ):
             await provisioner.teardown("host1")
 
         # Verify drain was called
@@ -809,7 +916,10 @@ class TestTeardownGraceful:
 
         ssh.run_streaming = mock_streaming
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_tt:
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            new_callable=AsyncMock,
+        ) as mock_tt:
             mock_tt.return_value = True
             await provisioner.teardown("host1")
 
@@ -826,7 +936,10 @@ class TestTeardownGraceful:
                 deleted_keys.append(args[0])
             return True
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", side_effect=capture_to_thread):
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            side_effect=capture_to_thread,
+        ):
             await provisioner.teardown("host1")
 
         # D-11: should delete /nodes/host1
@@ -847,7 +960,10 @@ class TestTeardownForce:
                 state_steps.append(data["current_step"])
             return True
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", side_effect=capture_to_thread):
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            side_effect=capture_to_thread,
+        ):
             await provisioner.teardown("host1", force=True)
 
         # Force mode should NOT have DRAINING step
@@ -871,7 +987,10 @@ class TestTeardownForce:
 
         ssh.run_streaming = mock_streaming
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_tt:
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            new_callable=AsyncMock,
+        ) as mock_tt:
             mock_tt.return_value = True
             await provisioner.teardown("host1", force=True)
 
@@ -895,7 +1014,10 @@ class TestDrainTimeout:
                 state_steps.append(data["current_step"])
             return True
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", side_effect=capture_to_thread):
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            side_effect=capture_to_thread,
+        ):
             await provisioner.teardown("host1")
 
         # Should still complete despite never draining
@@ -917,10 +1039,18 @@ class TestTeardownStateProgression:
                 state_steps.append(data["current_step"])
             return True
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", side_effect=capture_to_thread):
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            side_effect=capture_to_thread,
+        ):
             await provisioner.teardown("host1")
 
-        expected_order = ["draining", "stopping_vllm", "deregistering", "teardown_complete"]
+        expected_order = [
+            "draining",
+            "stopping_vllm",
+            "deregistering",
+            "teardown_complete",
+        ]
         assert state_steps == expected_order
 
     @pytest.mark.asyncio
@@ -934,7 +1064,10 @@ class TestTeardownStateProgression:
                 state_steps.append(data["current_step"])
             return True
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", side_effect=capture_to_thread):
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            side_effect=capture_to_thread,
+        ):
             await provisioner.teardown("host1", force=True)
 
         expected_order = ["stopping_vllm", "deregistering", "teardown_complete"]
@@ -961,7 +1094,10 @@ class TestTeardownSSHFailure:
                 state_steps.append(data["current_step"])
             return True
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", side_effect=capture_to_thread):
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            side_effect=capture_to_thread,
+        ):
             with pytest.raises(ProvisioningError):
                 await provisioner.teardown("host1", force=True)
 
@@ -978,8 +1114,10 @@ class TestPowerOnIfNeeded:
         etcd.put = MagicMock()
         provisioner = _make_provisioner(etcd_client=etcd)
 
-
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock) as mock_tt:
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            new_callable=AsyncMock,
+        ) as mock_tt:
             mock_tt.return_value = True
             await provisioner._power_on_if_needed("host1")
 
@@ -996,7 +1134,6 @@ class TestPowerOnIfNeeded:
 
         provisioner = _make_provisioner(etcd_client=etcd, redfish_client=redfish)
 
-
         state_steps: list[str] = []
 
         async def capture_to_thread(fn, *args):
@@ -1005,7 +1142,10 @@ class TestPowerOnIfNeeded:
                 state_steps.append(data["current_step"])
             return True
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", side_effect=capture_to_thread):
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            side_effect=capture_to_thread,
+        ):
             with patch.object(provisioner, "_wait_for_ssh", new_callable=AsyncMock):
                 await provisioner._power_on_if_needed("host1")
 
@@ -1020,9 +1160,13 @@ class TestPowerOnIfNeeded:
 
         provisioner = _make_provisioner(redfish_client=redfish)
 
-
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", new_callable=AsyncMock):
-            with patch.object(provisioner, "_wait_for_ssh", new_callable=AsyncMock) as mock_wait:
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            new_callable=AsyncMock,
+        ):
+            with patch.object(
+                provisioner, "_wait_for_ssh", new_callable=AsyncMock
+            ) as mock_wait:
                 await provisioner._power_on_if_needed("host1")
 
         # _wait_for_ssh should still be called despite RedfishError
@@ -1045,7 +1189,6 @@ class TestPowerOnIfNeeded:
 
         provisioner = _make_provisioner(etcd_client=etcd, redfish_client=redfish)
 
-
         async def tracking_to_thread(fn, *args):
             if fn == etcd.put and len(args) >= 2 and "/provisioning/" in str(args[0]):
                 data = json.loads(args[1])
@@ -1053,7 +1196,10 @@ class TestPowerOnIfNeeded:
                     call_order.append("state_write")
             return True
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.to_thread", side_effect=tracking_to_thread):
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+            side_effect=tracking_to_thread,
+        ):
             with patch.object(provisioner, "_wait_for_ssh", new_callable=AsyncMock):
                 await provisioner._power_on_if_needed("host1")
 
@@ -1071,14 +1217,21 @@ class TestWaitForSsh:
         mock_writer.wait_closed = AsyncMock()
 
         settings = ProvisioningSettings(
-            health_poll_timeout=2, health_poll_interval=0,
-            boot_wait_timeout=10, boot_wait_interval=0,
+            health_poll_timeout=2,
+            health_poll_interval=0,
+            boot_wait_timeout=10,
+            boot_wait_interval=0,
         )
         provisioner = _make_provisioner(settings=settings)
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.open_connection",
-                   return_value=(MagicMock(), mock_writer)) as mock_conn:
-            with patch("inference_proxy.provisioning.provisioner.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.open_connection",
+            return_value=(MagicMock(), mock_writer),
+        ) as mock_conn:
+            with patch(
+                "inference_proxy.provisioning.provisioner.asyncio.sleep",
+                new_callable=AsyncMock,
+            ) as mock_sleep:
                 await provisioner._wait_for_ssh("host1")
 
         mock_conn.assert_called_once()
@@ -1101,13 +1254,21 @@ class TestWaitForSsh:
             return (MagicMock(), mock_writer)
 
         settings = ProvisioningSettings(
-            health_poll_timeout=2, health_poll_interval=0,
-            boot_wait_timeout=60, boot_wait_interval=0,
+            health_poll_timeout=2,
+            health_poll_interval=0,
+            boot_wait_timeout=60,
+            boot_wait_interval=0,
         )
         provisioner = _make_provisioner(settings=settings)
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.open_connection", side_effect=flaky_open):
-            with patch("inference_proxy.provisioning.provisioner.asyncio.sleep", new_callable=AsyncMock):
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.open_connection",
+            side_effect=flaky_open,
+        ):
+            with patch(
+                "inference_proxy.provisioning.provisioner.asyncio.sleep",
+                new_callable=AsyncMock,
+            ):
                 await provisioner._wait_for_ssh("host1")
 
         assert attempt == 3
@@ -1116,12 +1277,16 @@ class TestWaitForSsh:
     async def test_timeout_logs_warning(self) -> None:
         """When open_connection never succeeds, returns after timeout without raising."""
         settings = ProvisioningSettings(
-            health_poll_timeout=2, health_poll_interval=0,
-            boot_wait_timeout=0, boot_wait_interval=0,
+            health_poll_timeout=2,
+            health_poll_interval=0,
+            boot_wait_timeout=0,
+            boot_wait_interval=0,
         )
         provisioner = _make_provisioner(settings=settings)
 
-        with patch("inference_proxy.provisioning.provisioner.asyncio.open_connection",
-                   side_effect=OSError("refused")):
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.open_connection",
+            side_effect=OSError("refused"),
+        ):
             # Should not raise -- just returns after timeout
             await provisioner._wait_for_ssh("host1")

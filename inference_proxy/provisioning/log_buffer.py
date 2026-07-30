@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TypedDict
 
 
@@ -50,7 +50,7 @@ class ProvisioningLogBuffer:
         if host_log is None:
             return
         entry: LogEntry = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": datetime.now(UTC).isoformat(),
             "level": level,
             "msg": msg,
             "stream": stream,

@@ -12,7 +12,9 @@ from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
 
 
-def _make_node(node_id: str = "node-1", endpoint: str = "http://10.0.1.100:8000") -> Node:
+def _make_node(
+    node_id: str = "node-1", endpoint: str = "http://10.0.1.100:8000"
+) -> Node:
     """Create a minimal Node for testing."""
     return Node(node_id=node_id, endpoint=endpoint)
 
@@ -116,7 +118,13 @@ class TestDrain:
 
     def test_drain_existing_node_returns_true(self) -> None:
         registry = NodeRegistry()
-        registry.add(Node(node_id="node-1", endpoint="http://10.0.1.100:8000", status=NodeStatus.HEALTHY))
+        registry.add(
+            Node(
+                node_id="node-1",
+                endpoint="http://10.0.1.100:8000",
+                status=NodeStatus.HEALTHY,
+            )
+        )
 
         result = registry.drain("node-1")
 
@@ -124,7 +132,13 @@ class TestDrain:
 
     def test_drain_sets_status_to_draining(self) -> None:
         registry = NodeRegistry()
-        registry.add(Node(node_id="node-1", endpoint="http://10.0.1.100:8000", status=NodeStatus.HEALTHY))
+        registry.add(
+            Node(
+                node_id="node-1",
+                endpoint="http://10.0.1.100:8000",
+                status=NodeStatus.HEALTHY,
+            )
+        )
 
         registry.drain("node-1")
 
@@ -141,7 +155,14 @@ class TestDrain:
 
     def test_drain_preserves_other_fields(self) -> None:
         registry = NodeRegistry()
-        registry.add(Node(node_id="node-1", endpoint="http://10.0.1.100:8000", status=NodeStatus.HEALTHY, model="llama-3"))
+        registry.add(
+            Node(
+                node_id="node-1",
+                endpoint="http://10.0.1.100:8000",
+                status=NodeStatus.HEALTHY,
+                model="llama-3",
+            )
+        )
 
         registry.drain("node-1")
 

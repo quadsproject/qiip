@@ -28,12 +28,16 @@ Usage::
 from __future__ import annotations
 
 import threading
+from typing import TYPE_CHECKING
 
 import structlog
 
 from inference_proxy.discovery.etcd_client import EtcdClient
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_from_etcd
+
+if TYPE_CHECKING:
+    from etcd3gw.types import Event
 
 logger = structlog.get_logger()
 
@@ -82,7 +86,7 @@ def run_watcher(
                 break
 
 
-def _handle_event(event: dict, registry: NodeRegistry, prefix: str) -> None:
+def _handle_event(event: Event, registry: NodeRegistry, prefix: str) -> None:
     """Dispatch a single watch event to the appropriate registry operation.
 
     Per Pitfall 3 (proto3 JSON): PUT events have no ``type`` field (the
@@ -98,14 +102,13 @@ def _handle_event(event: dict, registry: NodeRegistry, prefix: str) -> None:
     if kv is None:
         logger.debug("skipping event without kv", event_type=event.get("type"))
         return
-    key = kv.get("key")
-    if key is None:
+    raw_key: bytes | str | None = kv.get("key")
+    if raw_key is None:
         logger.warning("skipping event with missing key")
         return
 
     # Handle both bytes and str keys (Pitfall 2)
-    if isinstance(key, bytes):
-        key = key.decode("utf-8")
+    key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key
 
     event_type = event.get("type", "PUT")
 

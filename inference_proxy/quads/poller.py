@@ -8,6 +8,7 @@ the last good data is retained (D-08).
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from datetime import UTC, datetime
 
 import structlog
@@ -65,10 +66,8 @@ class QUADSPoller:
         """Cancel the poll loop and wait for it to finish."""
         if self._task is not None and not self._task.done():
             self._task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
         self._task = None
 
     # -- internals --

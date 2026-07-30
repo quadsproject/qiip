@@ -25,7 +25,9 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     """Log every request with method, path, status, duration, and target node."""
 
     async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint,
+        self,
+        request: Request,
+        call_next: RequestResponseEndpoint,
     ) -> Response:
         """Time the request, read target_node from state, and emit a log entry."""
         start = time.perf_counter()

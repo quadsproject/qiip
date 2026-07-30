@@ -134,6 +134,4 @@ class TestTokenPassing:
         await svc.trigger_download("org/model")
         await asyncio.sleep(0.1)
 
-        mock_sd.assert_called_once_with(
-            "org/model", cache_dir="/tmp/test", token=None
-        )
+        mock_sd.assert_called_once_with("org/model", cache_dir="/tmp/test", token=None)

@@ -59,9 +59,7 @@ class TestTriggerDownload:
             started_at=datetime.now(UTC),
         )
 
-        response = client.post(
-            "/admin/models/download", json={"repo_id": "org/model"}
-        )
+        response = client.post("/admin/models/download", json={"repo_id": "org/model"})
 
         assert response.json()["status"] == "downloading"
 
