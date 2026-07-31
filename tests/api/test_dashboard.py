@@ -11,9 +11,16 @@ Tests cover:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
+
+from inference_proxy.config.dependencies import get_settings
+from inference_proxy.config.settings import DashboardSettings, Settings
+from inference_proxy.main import create_app
 
 
 class TestDashboardRoute:
@@ -106,6 +113,32 @@ class TestDashboardPolling:
         """Default poll interval is 10s = 10000ms in the JS variable."""
         response = client.get("/dashboard")
         assert "10000" in response.text
+
+    async def test_create_app_explicit_settings_reach_dashboard(
+        self,
+        test_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The factory's explicit settings own route dependency resolution."""
+        monkeypatch.setenv("INFERENCE_PROXY_DASHBOARD__POLL_INTERVAL", "23")
+        get_settings.cache_clear()
+        explicit = test_settings.model_copy(
+            update={"dashboard": DashboardSettings(poll_interval=17)}
+        )
+        application = create_app(settings=explicit)
+
+        try:
+            transport = httpx.ASGITransport(app=application)
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                response = await asyncio.wait_for(client.get("/dashboard"), timeout=2)
+        finally:
+            get_settings.cache_clear()
+
+        assert response.status_code == 200
+        assert "const POLL_INTERVAL_MS = 17000;" in response.text
 
     def test_contains_last_updated_element(self, client: TestClient) -> None:
         """HTML contains element with id='last-updated'."""

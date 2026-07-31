@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# Set required env vars before any app imports trigger Settings() at module level.
+# Provide the required cache path for tests that explicitly load environment settings.
 _TEST_HF_CACHE = Path("/tmp/test-hf-cache")
 _TEST_HF_CACHE.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault(
@@ -131,7 +131,6 @@ def app(
 ) -> Generator[FastAPI, None, None]:
     """Create a FastAPI app with test settings, registry, and proxy client injected."""
     application = create_app(settings=test_settings)
-    application.dependency_overrides[get_settings] = lambda: test_settings
     application.state.registry = test_registry
     application.state.proxy_client = proxy_client
     application.state.node_selector = node_selector

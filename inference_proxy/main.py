@@ -3,7 +3,7 @@
 Usage::
 
     # Development server
-    uv run uvicorn inference_proxy.main:app --host 0.0.0.0 --port 8000
+    uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 8000
 
     # Programmatic access (tests)
     from inference_proxy.main import create_app
@@ -354,6 +354,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    application.dependency_overrides[get_settings] = lambda: resolved_settings
 
     application.add_middleware(ShutdownMiddleware)
     application.add_middleware(RequestLoggingMiddleware)
@@ -378,6 +379,3 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
     return application
-
-
-app = create_app()

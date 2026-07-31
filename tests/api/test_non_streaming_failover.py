@@ -5,10 +5,11 @@ from __future__ import annotations
 import httpx
 import pytest
 import structlog
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pytest_httpx import HTTPXMock
 
-import inference_proxy.api.routes as routes_module
+from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
@@ -62,13 +63,13 @@ def _success_response() -> dict[str, object]:
 
 
 def _set_attempt_budget(
-    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
     settings: Settings,
     attempts: int,
 ) -> None:
     routing = settings.routing.model_copy(update={"max_retries": attempts})
     configured = settings.model_copy(update={"routing": routing})
-    monkeypatch.setattr(routes_module, "get_settings", lambda: configured)
+    app.dependency_overrides[get_settings] = lambda: configured
 
 
 def test_5xx_records_failure_and_fails_over(
@@ -290,14 +291,14 @@ def test_mixed_statuses_returns_last_attempt(
 
 
 def test_budget_exhaustion_marks_only_attempted_nodes(
+    app: FastAPI,
     client: TestClient,
     test_settings: Settings,
     test_registry: NodeRegistry,
     node_selector: NodeSelector,
     httpx_mock: HTTPXMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _set_attempt_budget(monkeypatch, test_settings, attempts=2)
+    _set_attempt_budget(app, test_settings, attempts=2)
     nodes = _add_ranked_nodes(test_registry, node_selector, 3)
     for index, node in enumerate(nodes[:2]):
         httpx_mock.add_response(
@@ -385,14 +386,14 @@ def test_exhausted_transport_error_returns_502(
 
 
 def test_retry_budget_counts_total_attempts(
+    app: FastAPI,
     client: TestClient,
     test_settings: Settings,
     test_registry: NodeRegistry,
     node_selector: NodeSelector,
     httpx_mock: HTTPXMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _set_attempt_budget(monkeypatch, test_settings, attempts=1)
+    _set_attempt_budget(app, test_settings, attempts=1)
     nodes = _add_ranked_nodes(test_registry, node_selector, 2)
     httpx_mock.add_response(
         url=_backend_url(nodes[0]),

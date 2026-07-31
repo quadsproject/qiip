@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from fastapi import FastAPI
@@ -49,6 +53,30 @@ def test_health_with_nodes(client: TestClient, test_registry: NodeRegistry) -> N
 def test_app_is_fastapi_instance(app: FastAPI) -> None:
     """The app fixture yields a FastAPI instance."""
     assert isinstance(app, FastAPI)
+
+
+def test_importing_main_does_not_resolve_settings(tmp_path: Path) -> None:
+    """Importing the factory module neither loads settings nor constructs an app."""
+    env = os.environ.copy()
+    env.pop("INFERENCE_PROXY_HUGGINGFACE__CACHE_DIR", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import inference_proxy.main as module; "
+                "assert not hasattr(module, 'app')"
+            ),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_default_allowlist_rejects_lab_endpoint_from_admin_nodes(

@@ -8,10 +8,11 @@ from collections.abc import AsyncIterator
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pytest_httpx import HTTPXMock
 
-import inference_proxy.api.routes as routes_module
+from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
@@ -118,7 +119,7 @@ def _sse_data(response_body: bytes) -> list[bytes]:
 
 
 def _set_streaming_limits(
-    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
     settings: Settings,
     *,
     attempts: int,
@@ -129,7 +130,7 @@ def _set_streaming_limits(
         updates["timeout"] = timeout
     routing = settings.routing.model_copy(update=updates)
     configured = settings.model_copy(update={"routing": routing})
-    monkeypatch.setattr(routes_module, "get_settings", lambda: configured)
+    app.dependency_overrides[get_settings] = lambda: configured
 
 
 def test_streaming_5xx_exhaustion_returns_status_with_failover_marker(
@@ -378,6 +379,7 @@ def test_streaming_5xx_before_first_event_fails_over(
 
 
 def test_streaming_failover_honors_attempt_budget(
+    app: FastAPI,
     client: TestClient,
     test_settings: Settings,
     test_registry: NodeRegistry,
@@ -385,7 +387,7 @@ def test_streaming_failover_honors_attempt_budget(
     httpx_mock: HTTPXMock,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _set_streaming_limits(monkeypatch, test_settings, attempts=2)
+    _set_streaming_limits(app, test_settings, attempts=2)
     nodes = _add_nodes(test_registry, monkeypatch, 3)
     first = _TrackedStream([b'{"error":{"message":"node 1 unavailable"}}'])
     second = _TrackedStream([b'{"error":{"message":"node 2 failed"}}'])
@@ -420,15 +422,15 @@ def test_streaming_failover_honors_attempt_budget(
 
 
 def test_streaming_handshake_uses_total_routing_timeout(
+    app: FastAPI,
     client: TestClient,
     test_settings: Settings,
     test_registry: NodeRegistry,
     node_selector: NodeSelector,
     httpx_mock: HTTPXMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _set_streaming_limits(
-        monkeypatch,
+        app,
         test_settings,
         attempts=3,
         timeout=0.01,

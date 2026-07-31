@@ -43,6 +43,7 @@ from inference_proxy.config.dependencies import (
     get_request_metrics,
     get_settings,
 )
+from inference_proxy.config.settings import Settings
 from inference_proxy.models.endpoint import build_backend_url
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.models.openai import (
@@ -336,6 +337,7 @@ async def chat_completions(
         get_circuit_breaker_registry,
     ),
     request_metrics: RequestMetrics = Depends(get_request_metrics),
+    settings: Settings = Depends(get_settings),
 ) -> JSONResponse | EventSourceResponse:
     """Proxy a chat completion request to a vLLM backend.
 
@@ -343,7 +345,6 @@ async def chat_completions(
     Otherwise, returns the full JSON response from the backend.
     """
     body = request.model_dump(exclude_none=True)
-    settings = get_settings()
     if request.stream:
         return await _stream_completion(
             endpoint_path="/v1/chat/completions",
@@ -378,6 +379,7 @@ async def text_completions(
         get_circuit_breaker_registry,
     ),
     request_metrics: RequestMetrics = Depends(get_request_metrics),
+    settings: Settings = Depends(get_settings),
 ) -> JSONResponse | EventSourceResponse:
     """Proxy a text completion request to a vLLM backend.
 
@@ -385,7 +387,6 @@ async def text_completions(
     Otherwise, returns the full JSON response from the backend.
     """
     body = request.model_dump(exclude_none=True)
-    settings = get_settings()
     if request.stream:
         return await _stream_completion(
             endpoint_path="/v1/completions",

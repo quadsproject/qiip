@@ -43,7 +43,7 @@ uv sync
 cp .env.example .env
 
 # Run the gateway
-uv run uvicorn inference_proxy.main:app --host 0.0.0.0 --port 8080
+uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 8080
 ```
 
 The gateway starts, connects to etcd, discovers available vLLM nodes, and begins accepting requests.
