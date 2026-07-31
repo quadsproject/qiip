@@ -7,6 +7,7 @@ responses and the no-nodes-available helper.
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from inference_proxy.api.errors import (
     map_proxy_error,
@@ -38,6 +39,21 @@ class TestMapProxyError:
         assert response.error.type == "upstream_error"
         assert response.error.code == "backend_timeout"
         assert "timed out" in response.error.message.lower()
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ReadError("response ended early"),
+            httpx.RemoteProtocolError("malformed response"),
+        ],
+        ids=["read_error", "remote_protocol_error"],
+    )
+    def test_transport_error_returns_502(self, exc: httpx.TransportError) -> None:
+        status, response = map_proxy_error(exc)
+
+        assert status == 502
+        assert response.error.type == "upstream_error"
+        assert response.error.code == "backend_transport_error"
 
     def test_http_status_error_returns_upstream_status(self) -> None:
         mock_request = httpx.Request("POST", "http://node1:8000/v1/chat/completions")

@@ -396,7 +396,7 @@ class TestProxyErrors:
         test_registry: NodeRegistry,
         httpx_mock: HTTPXMock,
     ) -> None:
-        """Backend read timeout maps to 504 with backend_timeout code."""
+        """An exhausted backend timeout preserves 504 and marks failover."""
         test_registry.add(_make_node())
 
         httpx_mock.add_exception(
@@ -414,7 +414,9 @@ class TestProxyErrors:
 
         assert response.status_code == 504
         data = response.json()
-        assert data["error"]["code"] == "backend_timeout"
+        assert data["error"]["code"] == "failover_exhausted"
+        assert response.headers["X-Inference-Proxy-Failover"] == "exhausted"
+        assert response.headers["X-Inference-Proxy-Attempts"] == "1"
         assert data["error"]["type"] == "upstream_error"
 
     def test_upstream_connect_error_returns_502(
@@ -423,7 +425,7 @@ class TestProxyErrors:
         test_registry: NodeRegistry,
         httpx_mock: HTTPXMock,
     ) -> None:
-        """Backend connection failure maps to 502 with backend_unavailable code."""
+        """An exhausted connection failure returns 502 and marks failover."""
         test_registry.add(_make_node())
 
         httpx_mock.add_exception(
@@ -441,7 +443,9 @@ class TestProxyErrors:
 
         assert response.status_code == 502
         data = response.json()
-        assert data["error"]["code"] == "backend_unavailable"
+        assert data["error"]["code"] == "failover_exhausted"
+        assert response.headers["X-Inference-Proxy-Failover"] == "exhausted"
+        assert response.headers["X-Inference-Proxy-Attempts"] == "1"
         assert data["error"]["type"] == "upstream_error"
 
 
@@ -993,7 +997,9 @@ class TestNonStreamingRetry:
 
         assert response.status_code == 502
         data = response.json()
-        assert data["error"]["code"] == "backend_unavailable"
+        assert data["error"]["code"] == "failover_exhausted"
+        assert response.headers["X-Inference-Proxy-Failover"] == "exhausted"
+        assert response.headers["X-Inference-Proxy-Attempts"] == "2"
 
 
 class TestCircuitBreakerStatusTransition:

@@ -42,7 +42,11 @@ from inference_proxy.config.dependencies import (
     get_settings,
 )
 from inference_proxy.models.node import Node, NodeStatus
-from inference_proxy.models.openai import ChatCompletionRequest, CompletionRequest
+from inference_proxy.models.openai import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    ErrorResponse,
+)
 from inference_proxy.proxy.client import ProxyClient
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 from inference_proxy.routing.node_selector import NodeSelector
@@ -78,11 +82,10 @@ def _is_retryable(exc: Exception) -> bool:
     """Return True if the exception should trigger a retry on another node.
 
     Retryable exceptions:
-    - ConnectError: backend is unreachable
-    - TimeoutException: backend timed out (includes ReadTimeout)
+    - TransportError: backend connection or protocol failed
     - HTTPStatusError with status >= 500: backend returned a server error
     """
-    if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException)):
+    if isinstance(exc, httpx.TransportError):
         return True
     return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code >= 500
 
@@ -111,6 +114,29 @@ def _record_failure_and_trip(
         )
 
 
+def _proxy_error_response(
+    status: int,
+    error: ErrorResponse,
+    *,
+    failover_exhausted: bool = False,
+    attempts: int = 0,
+) -> JSONResponse:
+    """Build an OpenAI-compatible proxy error response.
+
+    Exhaustion is marked here, outside ``map_proxy_error``, so the shared
+    streaming HTTP-status mapping remains untouched for PR 3.
+    """
+    content = error.model_dump()
+    headers: dict[str, str] | None = None
+    if failover_exhausted:
+        content["error"]["code"] = "failover_exhausted"
+        headers = {
+            "X-Inference-Proxy-Failover": "exhausted",
+            "X-Inference-Proxy-Attempts": str(attempts),
+        }
+    return JSONResponse(content=content, status_code=status, headers=headers)
+
+
 async def _proxy_non_streaming(
     endpoint_path: str,
     body: dict[str, Any],
@@ -127,25 +153,34 @@ async def _proxy_non_streaming(
     retryable error (ConnectError, TimeoutException, 5xx).  Each failed
     node is excluded from subsequent selection via ``exclude_node_ids``.
 
-    Per T-05-05: retry count bounded by ``max_retries``; each retry
-    goes to a different node.
+    ``max_retries`` is the legacy setting name; its value is the maximum
+    number of total attempts, including the initial request. Each retry goes
+    to a different node.
     """
     model = body.get("model")
     excluded: set[str] = set()
-    last_error_response: JSONResponse | None = None
+    last_error: tuple[int, ErrorResponse] | None = None
     first_attempt = True
+    attempts = 0
 
-    for attempt in range(1, max_retries + 1):
+    for _ in range(max_retries):
         reservation = node_selector.select_and_reserve(
             model=model,
             exclude_node_ids=excluded or None,
         )
         if reservation is None:
-            if last_error_response is not None:
-                return last_error_response
+            if last_error is not None:
+                status, error = last_error
+                return _proxy_error_response(
+                    status,
+                    error,
+                    failover_exhausted=True,
+                    attempts=attempts,
+                )
             status, error_resp = _select_error(model, node_selector)
             return JSONResponse(content=error_resp.model_dump(), status_code=status)
         node = reservation.node
+        attempts += 1
 
         if first_attempt:
             request_metrics.record_request(node.node_id, model)
@@ -166,29 +201,37 @@ async def _proxy_non_streaming(
                 content = {"raw": response.text}
             return JSONResponse(content=content, status_code=response.status_code)
         except Exception as exc:
-            _record_failure_and_trip(node, circuit_breaker_registry, node_selector)
-            status, error_resp = map_proxy_error(exc)
-            last_error_response = JSONResponse(
-                content=error_resp.model_dump(),
-                status_code=status,
+            retryable = _is_retryable(exc)
+            _record_failure_and_trip(
+                node,
+                circuit_breaker_registry,
+                node_selector,
             )
-            if _is_retryable(exc):
+            status, error_resp = map_proxy_error(exc)
+            last_error = (status, error_resp)
+            if retryable:
                 excluded.add(node.node_id)
                 logger.warning(
                     "retrying on different node",
                     failed_node=node.node_id,
-                    attempt=attempt,
-                    max_retries=max_retries,
+                    attempt=attempts,
+                    max_attempts=max_retries,
                     error=str(exc),
                 )
                 continue
-            return last_error_response
+            return _proxy_error_response(status, error_resp)
         finally:
             reservation.release()
 
-    # All retries exhausted
-    assert last_error_response is not None
-    return last_error_response
+    if last_error is None:
+        raise RuntimeError("attempt budget exhausted without a backend failure")
+    status, error = last_error
+    return _proxy_error_response(
+        status,
+        error,
+        failover_exhausted=True,
+        attempts=attempts,
+    )
 
 
 @router.post("/v1/chat/completions", response_model=None)

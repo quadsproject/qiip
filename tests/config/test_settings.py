@@ -42,6 +42,12 @@ class TestDefaultRoutingSettings:
         assert settings.routing.max_retries == 3
         assert settings.routing.timeout == 30
 
+    def test_max_retries_rejects_zero(self) -> None:
+        with pytest.raises(ValidationError) as caught:
+            RoutingSettings(max_retries=0)
+
+        assert caught.value.errors()[0]["loc"] == ("max_retries",)
+
 
 class TestEnvVarOverrideGatewayPort:
     def test_env_var_override_gateway_port(

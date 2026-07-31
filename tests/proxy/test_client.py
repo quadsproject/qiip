@@ -72,6 +72,55 @@ class TestProxyClientForward:
                     {"model": "llama", "messages": []},
                 )
 
+    async def test_forward_raises_for_error_status(
+        self,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        httpx_mock.add_response(
+            url="http://node1:8000/v1/chat/completions",
+            status_code=500,
+            text="backend failed",
+        )
+        async with httpx.AsyncClient() as http_client:
+            proxy = ProxyClient(http_client)
+
+            with pytest.raises(httpx.HTTPStatusError) as caught:
+                await proxy.forward(
+                    "POST",
+                    "http://node1:8000/v1/chat/completions",
+                    {"model": "llama", "messages": []},
+                )
+
+        assert caught.value.response.status_code == 500
+
+    async def test_forward_returns_client_error_response(
+        self,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        expected = {
+            "error": {
+                "message": "context window exceeded",
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded",
+            }
+        }
+        httpx_mock.add_response(
+            url="http://node1:8000/v1/chat/completions",
+            status_code=400,
+            json=expected,
+        )
+        async with httpx.AsyncClient() as http_client:
+            proxy = ProxyClient(http_client)
+
+            response = await proxy.forward(
+                "POST",
+                "http://node1:8000/v1/chat/completions",
+                {"model": "llama", "messages": []},
+            )
+
+        assert response.status_code == 400
+        assert response.json() == expected
+
 
 class TestProxyClientProperty:
     """client property returns the underlying httpx.AsyncClient."""

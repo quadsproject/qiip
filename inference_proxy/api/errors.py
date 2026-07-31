@@ -44,6 +44,16 @@ def map_proxy_error(exc: Exception) -> tuple[int, ErrorResponse]:
             )
         )
 
+    if isinstance(exc, httpx.TransportError):
+        logger.error("backend transport failed", error=str(exc))
+        return 502, ErrorResponse(
+            error=ErrorDetail(
+                message="Inference backend connection failed during request",
+                type="upstream_error",
+                code="backend_transport_error",
+            )
+        )
+
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         response_text = exc.response.text

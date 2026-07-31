@@ -39,7 +39,7 @@ class RoutingSettings(BaseModel):
 
     strategy: str = "least_connections"
     health_check_interval: int = 30
-    max_retries: int = 3
+    max_retries: int = Field(default=3, ge=1)
     timeout: int = 30
 
 

@@ -53,15 +53,22 @@ class ProxyClient:
             body: JSON-serialisable request body.
 
         Returns:
-            The raw ``httpx.Response`` from the backend.
+            The raw ``httpx.Response`` from the backend. Client-error
+            responses are returned unchanged.
+
+        Raises:
+            httpx.HTTPStatusError: The backend returned a server-error status.
         """
         logger.debug(
             "forwarding request to backend",
             method=method,
             url=url,
         )
-        return await self._client.request(
+        response = await self._client.request(
             method=method,
             url=url,
             json=body,
         )
+        if response.status_code >= 500:
+            response.raise_for_status()
+        return response
