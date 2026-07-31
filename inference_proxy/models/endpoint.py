@@ -166,6 +166,31 @@ class EndpointPolicy:
             )
         return endpoint.origin
 
+    def normalize_hostname(self, value: str) -> str:
+        """Validate a DNS hostname against the host allowlist.
+
+        Redfish BMC destinations are derived from node names rather than
+        backend origins, so this entry point deliberately does not accept a
+        port. IP literals are rejected even when a backend CIDR would allow
+        them because the BMC template is a hostname pattern.
+        """
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise EndpointValidationError(f"invalid node hostname: {value!r}")
+
+        candidate = value.lower().rstrip(".")
+        try:
+            ip_address(candidate)
+        except ValueError:
+            hostname = _normalize_dns_name(value, context="node hostname")
+        else:
+            raise EndpointValidationError(
+                f"IP-literal node hostnames are not allowed: {value!r}"
+            )
+
+        if not self._host_allowed(hostname):
+            raise EndpointValidationError(f"node hostname is not allowed: {value!r}")
+        return hostname
+
     def _host_allowed(self, host: str) -> bool:
         try:
             address: IPv4Address | IPv6Address = ip_address(host)

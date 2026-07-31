@@ -7,12 +7,13 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
-from inference_proxy.config.settings import RoutingSettings, Settings
+from inference_proxy.config.settings import RedfishSettings, RoutingSettings, Settings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.main import _initial_load
 from inference_proxy.models.node import Node, NodeStatus
@@ -265,6 +266,74 @@ class TestLifespanRegistryIntegration:
             registry.remove("node-1")
 
             assert breaker_registry.get("node-1") is None
+
+    @patch("inference_proxy.main.RedfishClient")
+    @patch("inference_proxy.main.EtcdWatcher")
+    @patch("inference_proxy.main.EtcdClient")
+    def test_redfish_disabled_without_credentials(
+        self,
+        mock_etcd_cls: MagicMock,
+        _mock_watcher_cls: MagicMock,
+        mock_redfish_cls: MagicMock,
+        test_settings: Settings,
+    ) -> None:
+        mock_client = MagicMock()
+        mock_client.get_prefix.return_value = []
+        mock_client.prefix = "/nodes/"
+        mock_etcd_cls.return_value = mock_client
+
+        from inference_proxy.main import create_app
+
+        app = create_app(settings=_lifespan_settings(test_settings))
+        with TestClient(app):
+            assert app.state.redfish_client is None
+        mock_redfish_cls.assert_not_called()
+
+    def test_redfish_http_client_has_no_ambient_auth(
+        self,
+        test_settings: Settings,
+    ) -> None:
+        mock_etcd = MagicMock()
+        mock_etcd.get_prefix.return_value = []
+        mock_etcd.prefix = "/nodes/"
+        redfish_http = MagicMock(aclose=AsyncMock())
+        proxy_http = MagicMock(aclose=AsyncMock())
+        redfish = RedfishSettings(
+            bmc_username="operator",
+            bmc_password=SecretStr("redfish-secret"),
+        )
+        settings = _lifespan_settings(
+            test_settings.model_copy(update={"redfish": redfish})
+        )
+
+        from inference_proxy.main import create_app
+
+        with (
+            patch("inference_proxy.main.EtcdClient", return_value=mock_etcd),
+            patch("inference_proxy.main.EtcdWatcher"),
+            patch(
+                "inference_proxy.main.httpx.AsyncClient",
+                side_effect=[redfish_http, proxy_http],
+            ) as async_client_cls,
+            patch("inference_proxy.main.RedfishClient") as redfish_client_cls,
+        ):
+            app = create_app(settings=settings)
+            with TestClient(app):
+                assert app.state.redfish_client is redfish_client_cls.return_value
+
+        redfish_http_call = next(
+            call for call in async_client_cls.call_args_list if "verify" in call.kwargs
+        )
+        assert "auth" not in redfish_http_call.kwargs
+        redfish_client_cls.assert_called_once_with(
+            redfish_http,
+            bmc_host_template="mgmt-{hostname}",
+            system_id="1",
+            hostname_policy=ANY,
+            auth=ANY,
+            poll_timeout=60.0,
+            poll_interval=5.0,
+        )
 
 
 class TestGetRegistryDependency:

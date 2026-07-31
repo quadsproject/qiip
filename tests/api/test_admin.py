@@ -13,13 +13,16 @@ Tests cover:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from datetime import UTC, datetime
 from unittest.mock import ANY, AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pytest_httpx import HTTPXMock
 
 from inference_proxy.config.dependencies import (
     get_catalog_service,
@@ -30,7 +33,7 @@ from inference_proxy.config.dependencies import (
 )
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.llmfit.errors import LLMFitParseError, LLMFitTimeoutError
-from inference_proxy.models.endpoint import EndpointValidationError
+from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
 from inference_proxy.models.llmfit import LLMFitResult, ModelRecommendation, SystemInfo
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.models.quads import QUADSHost
@@ -39,6 +42,7 @@ from inference_proxy.provisioning.ssh_client import (
     SSHConnectionError,
 )
 from inference_proxy.quads.client import QUADSConnectionError
+from inference_proxy.redfish.client import RedfishClient
 from inference_proxy.redfish.errors import RedfishError
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 from inference_proxy.routing.connection_tracker import ConnectionTracker
@@ -58,6 +62,25 @@ def _make_node(
         endpoint=endpoint,
         status=status,
         model=model,
+    )
+
+
+def _real_redfish_client(http_client: httpx.AsyncClient) -> RedfishClient:
+    auth = httpx.BasicAuth("operator", "redfish-secret")
+    if "hostname_policy" not in inspect.signature(RedfishClient).parameters:
+        http_client.auth = auth
+        return RedfishClient(http_client, "mgmt-{hostname}", "1")
+    policy = EndpointPolicy.from_values(
+        allowed_hosts=["gpu01"],
+        allowed_networks=["10.0.0.0/8"],
+        allowed_ports=[8000],
+    )
+    return RedfishClient(
+        http_client,
+        "mgmt-{hostname}",
+        "1",
+        hostname_policy=policy,
+        auth=auth,
     )
 
 
@@ -1040,6 +1063,111 @@ class TestGetPowerState:
         response = client.get("/admin/nodes/gpu01/power")
         assert response.status_code == 502
         assert "BMC unreachable" in response.json()["detail"]
+
+    @pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
+    def test_unapproved_bmc_destination_sends_no_credentials(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_http_client: httpx.AsyncClient,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        httpx_mock.add_response(
+            url="https://mgmt-attacker.example.net/redfish/v1/Systems/1",
+            json={"PowerState": "On"},
+        )
+        app.dependency_overrides[get_redfish_client] = lambda: _real_redfish_client(
+            mock_http_client
+        )
+
+        response = client.get("/admin/nodes/attacker.example.net/power")
+
+        assert response.status_code == 400
+        assert "not allowed" in response.json()["detail"]
+        assert httpx_mock.get_requests() == []
+
+    def test_approved_bmc_destination_sends_credentials(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_http_client: httpx.AsyncClient,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        url = "https://mgmt-gpu01/redfish/v1/Systems/1"
+        httpx_mock.add_response(url=url, json={"PowerState": "On"})
+        app.dependency_overrides[get_redfish_client] = lambda: _real_redfish_client(
+            mock_http_client
+        )
+
+        response = client.get("/admin/nodes/GPU01/power")
+
+        assert response.status_code == 200
+        [request] = httpx_mock.get_requests()
+        assert str(request.url) == url
+        assert (
+            request.headers["Authorization"] == "Basic b3BlcmF0b3I6cmVkZmlzaC1zZWNyZXQ="
+        )
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            b"{}",
+            b"<html>error</html>",
+            b'{"PowerState": null}',
+            b'{"PowerState": 7}',
+            b'{"PowerState": "Paused"}',
+        ],
+    )
+    def test_malformed_power_state_returns_502(
+        self,
+        app: FastAPI,
+        mock_http_client: httpx.AsyncClient,
+        httpx_mock: HTTPXMock,
+        content: bytes,
+    ) -> None:
+        httpx_mock.add_response(
+            url="https://mgmt-gpu01/redfish/v1/Systems/1",
+            content=content,
+        )
+        app.dependency_overrides[get_redfish_client] = lambda: _real_redfish_client(
+            mock_http_client
+        )
+
+        bounded_client = TestClient(app, raise_server_exceptions=False)
+        try:
+            response = bounded_client.get("/admin/nodes/gpu01/power")
+        finally:
+            bounded_client.close()
+
+        assert response.status_code == 502
+        assert isinstance(response.json()["detail"], str)
+
+    def test_programming_error_returns_500_not_redfish_502(
+        self,
+        app: FastAPI,
+        mock_http_client: httpx.AsyncClient,
+        httpx_mock: HTTPXMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        httpx_mock.add_response(
+            url="https://mgmt-gpu01/redfish/v1/Systems/1",
+            json={"PowerState": "On"},
+        )
+        app.dependency_overrides[get_redfish_client] = lambda: _real_redfish_client(
+            mock_http_client
+        )
+
+        def broken_json(_response: httpx.Response) -> object:
+            raise AttributeError("programming defect")
+
+        monkeypatch.setattr(httpx.Response, "json", broken_json)
+        bounded_client = TestClient(app, raise_server_exceptions=False)
+        try:
+            response = bounded_client.get("/admin/nodes/gpu01/power")
+        finally:
+            bounded_client.close()
+
+        assert response.status_code == 500
 
 
 class TestExecutePowerAction:

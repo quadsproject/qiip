@@ -6,12 +6,17 @@ Only the root Settings class inherits from BaseSettings.
 """
 
 from pathlib import Path
+from string import Formatter
 from typing import Self
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from inference_proxy.models.endpoint import EndpointPolicy
+from inference_proxy.models.endpoint import (
+    EndpointPolicy,
+    EndpointValidationError,
+    parse_endpoint,
+)
 
 
 class GatewaySettings(BaseModel):
@@ -181,9 +186,8 @@ class HuggingFaceSettings(BaseModel):
 class RedfishSettings(BaseModel):
     """Redfish BMC configuration.
 
-    When ``bmc_username`` is ``None`` (the default), Redfish features
-    are disabled.  Setting it via ``INFERENCE_PROXY_REDFISH__BMC_USERNAME``
-    activates the Redfish integration.
+    Redfish is disabled when both credentials are absent. Username and
+    password must be configured together to activate the integration.
     """
 
     bmc_username: str | None = None
@@ -195,6 +199,50 @@ class RedfishSettings(BaseModel):
     power_poll_timeout: float = 60.0
     power_poll_interval: float = 5.0
     verify_ssl: bool = False  # D-05: always False for self-signed BMC certs
+
+    @field_validator("bmc_host_template")
+    @classmethod
+    def bmc_template_is_plain_hostname(cls, value: str) -> str:
+        """Require one safe hostname placeholder and no URL components."""
+        try:
+            parsed_fields = list(Formatter().parse(value))
+        except ValueError as exc:
+            raise ValueError("bmc_host_template is malformed") from exc
+
+        fields = [
+            (field_name, format_spec, conversion)
+            for _literal, field_name, format_spec, conversion in parsed_fields
+            if field_name is not None
+        ]
+        if fields != [("hostname", "", None)]:
+            raise ValueError(
+                "bmc_host_template must contain exactly one plain {hostname} field"
+            )
+
+        rendered = value.format(hostname="node.example")
+        try:
+            endpoint = parse_endpoint(f"https://{rendered}:443")
+        except EndpointValidationError as exc:
+            raise ValueError(
+                "bmc_host_template must render a plain hostname without a "
+                "scheme, port, path, query, or fragment"
+            ) from exc
+        if endpoint.host != rendered.lower().rstrip("."):
+            raise ValueError("bmc_host_template must render a plain hostname")
+        return value
+
+    @model_validator(mode="after")
+    def credentials_are_paired(self) -> Self:
+        """Require both BMC credentials or neither of them."""
+        if self.bmc_username is None and self.bmc_password is not None:
+            raise ValueError(
+                "redfish.bmc_username must be configured with bmc_password"
+            )
+        if self.bmc_username is not None and self.bmc_password is None:
+            raise ValueError(
+                "redfish.bmc_password must be configured with bmc_username"
+            )
+        return self
 
 
 class Settings(BaseSettings):

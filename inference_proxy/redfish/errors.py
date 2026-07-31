@@ -20,6 +20,10 @@ class RedfishError(Exception):
         super().__init__(human_message)
 
 
+class RedfishDestinationError(RedfishError):
+    """Raised before I/O when a caller names an untrusted BMC destination."""
+
+
 REDFISH_ERROR_MAP: dict[str, str] = {
     "ActionNotSupported": "This action is not supported by the BMC",
     "ActionParameterNotSupported": "This action parameter is not supported",

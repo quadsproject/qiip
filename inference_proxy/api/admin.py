@@ -65,7 +65,7 @@ from inference_proxy.quads.client import (
 )
 from inference_proxy.quads.poller import QUADSPoller
 from inference_proxy.redfish.client import RedfishClient
-from inference_proxy.redfish.errors import RedfishError
+from inference_proxy.redfish.errors import RedfishDestinationError, RedfishError
 from inference_proxy.routing.request_metrics import RequestMetrics
 from inference_proxy.services.unified_nodes import UnifiedNodeService
 
@@ -434,6 +434,8 @@ async def get_power_state(
     hostname = _validated_hostname(hostname)
     try:
         state = await redfish.get_power_state(hostname)
+    except RedfishDestinationError as exc:
+        raise HTTPException(status_code=400, detail=exc.human_message) from exc
     except RedfishError as exc:
         raise HTTPException(status_code=502, detail=exc.human_message) from exc
     return PowerStateResponse(hostname=hostname, power_state=state)
@@ -451,6 +453,8 @@ async def execute_power_action(
     hostname = _validated_hostname(hostname)
     try:
         final_state = await redfish.power_action(hostname, body.action.value)
+    except RedfishDestinationError as exc:
+        raise HTTPException(status_code=400, detail=exc.human_message) from exc
     except RedfishError as exc:
         raise HTTPException(status_code=502, detail=exc.human_message) from exc
     return PowerStateResponse(hostname=hostname, power_state=final_state)

@@ -88,6 +88,31 @@ def test_empty_endpoint_host_allowlist_denies_all() -> None:
         policy.normalize("gpu01:8000")
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("GPU01", "gpu01"),
+        ("worker.example.com.", "worker.example.com"),
+    ],
+)
+def test_hostname_policy_normalizes_allowed_dns_names(
+    value: str,
+    expected: str,
+) -> None:
+    assert _policy().normalize_hostname(value) == expected
+
+
+def test_hostname_policy_rejects_unapproved_name() -> None:
+    with pytest.raises(EndpointValidationError, match="not allowed"):
+        _policy().normalize_hostname("attacker.example.net")
+
+
+@pytest.mark.parametrize("value", ["10.0.1.42", "2001:db8::10"])
+def test_hostname_policy_rejects_ip_literals_allowed_as_backends(value: str) -> None:
+    with pytest.raises(EndpointValidationError, match="IP-literal"):
+        _policy().normalize_hostname(value)
+
+
 def test_build_backend_url_preserves_scheme_and_ipv6_brackets() -> None:
     assert (
         build_backend_url("https://gpu01:8443", "/health")

@@ -180,6 +180,22 @@ power, SSH, or installation work and name the allowlist setting to update.
 | `INFERENCE_PROXY_LOGGING__JSON_OUTPUT` | `false` | `true` for JSON logs (production), `false` for pretty console |
 | `INFERENCE_PROXY_LOGGING__LEVEL` | `INFO` | Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
+### Redfish BMC
+
+Redfish power management is enabled only when both
+`INFERENCE_PROXY_REDFISH__BMC_USERNAME` and
+`INFERENCE_PROXY_REDFISH__BMC_PASSWORD` are set. Partial credentials fail
+configuration validation. Caller-supplied node names must be DNS names allowed
+by `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_HOSTS`; IP literals are not
+accepted for BMC template expansion. The host template must contain exactly one
+plain `{hostname}` field and may not contain a scheme, port, path, query, or
+fragment.
+
+`INFERENCE_PROXY_REDFISH__VERIFY_SSL` remains `false` by default for BMCs with
+self-signed certificates. Credentials are attached per request only after the
+node hostname passes the allowlist and the validated template resolves the BMC
+destination.
+
 ## Architecture
 
 ```

@@ -235,12 +235,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         app.state.download_service = download_service
 
-        if resolved_settings.redfish.bmc_username is not None:
+        redfish_username = resolved_settings.redfish.bmc_username
+        redfish_password = resolved_settings.redfish.bmc_password
+        if redfish_username is not None and redfish_password is not None:
             redfish_http = httpx.AsyncClient(
-                auth=httpx.BasicAuth(
-                    username=resolved_settings.redfish.bmc_username,
-                    password=resolved_settings.redfish.bmc_password.get_secret_value(),  # type: ignore[union-attr]
-                ),
                 verify=resolved_settings.redfish.verify_ssl,
                 timeout=httpx.Timeout(
                     connect=resolved_settings.redfish.connect_timeout,
@@ -253,6 +251,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 redfish_http,
                 bmc_host_template=resolved_settings.redfish.bmc_host_template,
                 system_id=resolved_settings.redfish.system_id,
+                hostname_policy=endpoint_policy,
+                auth=httpx.BasicAuth(
+                    username=redfish_username,
+                    password=redfish_password.get_secret_value(),
+                ),
                 poll_timeout=resolved_settings.redfish.power_poll_timeout,
                 poll_interval=resolved_settings.redfish.power_poll_interval,
             )
@@ -261,7 +264,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         else:
             app.state.redfish_client = None
             redfish_http = None
-            logger.info("redfish disabled (no bmc_username configured)")
+            logger.info("redfish disabled (BMC credentials not configured)")
 
         log_buffer = ProvisioningLogBuffer()
 

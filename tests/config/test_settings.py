@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, SecretStr, ValidationError
 from pydantic_settings import BaseSettings
 
 from inference_proxy.config.settings import (
@@ -292,6 +292,7 @@ class TestEnvVarOverrideRedfishBmcUsername:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("INFERENCE_PROXY_REDFISH__BMC_USERNAME", "admin")
+        monkeypatch.setenv("INFERENCE_PROXY_REDFISH__BMC_PASSWORD", "secret123")
         settings = Settings(_env_file=None)
         assert settings.redfish.bmc_username == "admin"
 
@@ -300,6 +301,7 @@ class TestEnvVarOverrideRedfishBmcPassword:
     def test_env_var_override_redfish_bmc_password(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        monkeypatch.setenv("INFERENCE_PROXY_REDFISH__BMC_USERNAME", "admin")
         monkeypatch.setenv("INFERENCE_PROXY_REDFISH__BMC_PASSWORD", "secret123")
         settings = Settings(_env_file=None)
         assert settings.redfish.bmc_password is not None
@@ -319,17 +321,71 @@ class TestEnvVarOverrideRedfishBmcHostTemplate:
 
 class TestRedfishSettingsSecretStr:
     def test_repr_does_not_contain_password(self) -> None:
-        from pydantic import SecretStr
-
-        rs = RedfishSettings(bmc_password=SecretStr("hunter2"))
+        rs = RedfishSettings(
+            bmc_username="admin",
+            bmc_password=SecretStr("hunter2"),
+        )
         assert "hunter2" not in repr(rs)
 
     def test_model_dump_masks_password(self) -> None:
-        from pydantic import SecretStr
-
-        rs = RedfishSettings(bmc_password=SecretStr("hunter2"))
+        rs = RedfishSettings(
+            bmc_username="admin",
+            bmc_password=SecretStr("hunter2"),
+        )
         dumped = rs.model_dump()
         assert dumped["bmc_password"] != "hunter2"
+
+
+@pytest.mark.parametrize(
+    ("values", "missing_field"),
+    [
+        ({"bmc_username": "admin"}, "bmc_password"),
+        ({"bmc_password": SecretStr("secret")}, "bmc_username"),
+    ],
+)
+def test_redfish_partial_config_rejected(
+    values: dict[str, object],
+    missing_field: str,
+) -> None:
+    with pytest.raises(ValidationError, match=missing_field):
+        RedfishSettings.model_validate(values)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "mgmt-static",
+        "{hostname}-{hostname}",
+        "mgmt-{other}",
+        "mgmt-{hostname!r}",
+        "mgmt-{hostname:>10}",
+        "https://mgmt-{hostname}",
+        "mgmt-{hostname}:443",
+        "mgmt-{hostname}/redfish",
+        "mgmt-{hostname}?target=other",
+        "mgmt-{hostname}#fragment",
+        "mgmt-{hostname",
+    ],
+)
+def test_bmc_host_template_validation_matrix_rejects_unsafe(
+    template: str,
+) -> None:
+    with pytest.raises(ValidationError, match="bmc_host_template"):
+        RedfishSettings(bmc_host_template=template)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "mgmt-{hostname}",
+        "bmc-{hostname}.lab.example.com",
+        "{hostname}.bmc.example.com",
+    ],
+)
+def test_bmc_host_template_validation_matrix_accepts_plain_hostname(
+    template: str,
+) -> None:
+    assert RedfishSettings(bmc_host_template=template).bmc_host_template == template
 
 
 class TestRedfishSettingsIsNotBaseSettings:
