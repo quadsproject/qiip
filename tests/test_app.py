@@ -79,12 +79,12 @@ class TestRegistryInAppState:
 class TestLifespanRegistryIntegration:
     """Lifespan creates registry and watcher on startup, cleans up on shutdown."""
 
-    @patch("inference_proxy.main.run_watcher")
+    @patch("inference_proxy.main.EtcdWatcher")
     @patch("inference_proxy.main.EtcdClient")
     def test_lifespan_creates_registry(
         self,
         mock_etcd_cls: MagicMock,
-        mock_run_watcher: MagicMock,
+        mock_watcher_cls: MagicMock,
         test_settings: Settings,
     ) -> None:
         """Lifespan populates app.state.registry with a NodeRegistry."""
@@ -99,13 +99,16 @@ class TestLifespanRegistryIntegration:
         with TestClient(app):
             assert hasattr(app.state, "registry")
             assert isinstance(app.state.registry, NodeRegistry)
+        watcher = mock_watcher_cls.return_value
+        watcher.run.assert_called_once()
+        watcher.stop.assert_called_once()
 
-    @patch("inference_proxy.main.run_watcher")
+    @patch("inference_proxy.main.EtcdWatcher")
     @patch("inference_proxy.main.EtcdClient")
     def test_lifespan_handles_etcd_unavailability(
         self,
         mock_etcd_cls: MagicMock,
-        mock_run_watcher: MagicMock,
+        mock_watcher_cls: MagicMock,
         test_settings: Settings,
     ) -> None:
         """Lifespan starts with empty registry when etcd is unavailable."""

@@ -1,31 +1,66 @@
-"""Unit tests for the etcd client wrapper.
-
-Tests verify that EtcdClient correctly parses endpoint URLs from
-EtcdSettings and delegates operations to the underlying etcd3gw client.
-All tests mock etcd3gw to avoid requiring a live etcd server.
-"""
+"""Contract tests for the etcd3gw adapter boundary."""
 
 from __future__ import annotations
 
+import base64
+import json
+import socket
+from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
 
 from inference_proxy.config.settings import EtcdSettings
-from inference_proxy.discovery.etcd_client import EtcdClient
+from inference_proxy.discovery.etcd_client import (
+    EtcdClient,
+    EtcdWatchStream,
+    WatchCompactedError,
+    WatchReadTimeoutError,
+)
+
+
+def _settings(
+    endpoint: str = "http://localhost:2379",
+    prefix: str = "/nodes/",
+) -> EtcdSettings:
+    return EtcdSettings(endpoints=[endpoint], node_prefix=prefix)
+
+
+def _b64(value: bytes) -> str:
+    return base64.b64encode(value).decode("ascii")
+
+
+class _StreamingResponse:
+    def __init__(
+        self,
+        payloads: list[dict[str, object]],
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self._lines = [json.dumps(payload).encode() for payload in payloads]
+        self._error = error
+        self.closed = False
+        self.raise_calls = 0
+
+    def raise_for_status(self) -> None:
+        self.raise_calls += 1
+
+    def iter_lines(self, *, decode_unicode: bool = False) -> Iterator[bytes]:
+        assert decode_unicode is False
+        yield from self._lines
+        if self._error is not None:
+            raise self._error
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class TestEtcdClientInit:
-    """EtcdClient.__init__ parses endpoint URL and creates Etcd3Client."""
-
     @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
     def test_parses_endpoint_url(self, mock_etcd3_cls: MagicMock) -> None:
-        settings = EtcdSettings(
-            endpoints=["http://etcd.internal:2379"],
-            node_prefix="/nodes/",
-        )
-
-        EtcdClient(settings)
+        EtcdClient(_settings("http://etcd.internal:2379"))
 
         mock_etcd3_cls.assert_called_once_with(
             host="etcd.internal",
@@ -33,77 +68,10 @@ class TestEtcdClientInit:
             protocol="http",
             timeout=5,
         )
-
-
-class TestEtcdClientGetPrefix:
-    """get_prefix() delegates to underlying client with configured prefix."""
-
-    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
-    def test_delegates_get_prefix(self, mock_etcd3_cls: MagicMock) -> None:
-        mock_instance = MagicMock()
-        mock_instance.get_prefix.return_value = [
-            (b'{"endpoint": "http://10.0.1.100:8000"}', {"key": b"/nodes/node-1"}),
-        ]
-        mock_etcd3_cls.return_value = mock_instance
-
-        settings = EtcdSettings(
-            endpoints=["http://localhost:2379"],
-            node_prefix="/test-nodes/",
-        )
-        client = EtcdClient(settings)
-        result = client.get_prefix()
-
-        mock_instance.get_prefix.assert_called_once_with("/test-nodes/")
-        assert len(result) == 1
-
-
-class TestEtcdClientWatchPrefix:
-    """watch_prefix() delegates to underlying client and returns (iter, cancel)."""
-
-    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
-    def test_delegates_watch_prefix(self, mock_etcd3_cls: MagicMock) -> None:
-        mock_instance = MagicMock()
-        mock_events = iter([{"kv": {"key": "/nodes/node-1"}}])
-        mock_cancel = MagicMock()
-        mock_instance.watch_prefix.return_value = (mock_events, mock_cancel)
-        mock_etcd3_cls.return_value = mock_instance
-
-        settings = EtcdSettings(
-            endpoints=["http://localhost:2379"],
-            node_prefix="/nodes/",
-        )
-        client = EtcdClient(settings)
-        events_iter, cancel_fn = client.watch_prefix()
-
-        mock_instance.watch_prefix.assert_called_once_with("/nodes/")
-        assert cancel_fn is mock_cancel
-
-
-class TestEtcdClientPrefixProperty:
-    """EtcdClient exposes prefix property returning the configured node_prefix."""
-
-    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
-    def test_prefix_property(self, mock_etcd3_cls: MagicMock) -> None:
-        settings = EtcdSettings(
-            endpoints=["http://localhost:2379"],
-            node_prefix="/custom-prefix/",
-        )
-        client = EtcdClient(settings)
-
-        assert client.prefix == "/custom-prefix/"
-
-
-class TestEtcdClientDefaultPort:
-    """EtcdClient.__init__ handles endpoint without explicit port (defaults to 2379)."""
 
     @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
     def test_default_port(self, mock_etcd3_cls: MagicMock) -> None:
-        settings = EtcdSettings(
-            endpoints=["http://etcd.internal"],
-            node_prefix="/nodes/",
-        )
-
-        EtcdClient(settings)
+        EtcdClient(_settings("http://etcd.internal"))
 
         mock_etcd3_cls.assert_called_once_with(
             host="etcd.internal",
@@ -112,18 +80,9 @@ class TestEtcdClientDefaultPort:
             timeout=5,
         )
 
-
-class TestEtcdClientHttpsProtocol:
-    """EtcdClient.__init__ handles https protocol in endpoint URL."""
-
     @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
     def test_https_protocol(self, mock_etcd3_cls: MagicMock) -> None:
-        settings = EtcdSettings(
-            endpoints=["https://secure-etcd.internal:2380"],
-            node_prefix="/nodes/",
-        )
-
-        EtcdClient(settings)
+        EtcdClient(_settings("https://secure-etcd.internal:2380"))
 
         mock_etcd3_cls.assert_called_once_with(
             host="secure-etcd.internal",
@@ -132,103 +91,259 @@ class TestEtcdClientHttpsProtocol:
             timeout=5,
         )
 
-
-class TestEtcdClientSchemelessEndpointRejected:
-    """EtcdClient.__init__ raises ValueError for endpoint URLs missing a scheme."""
-
-    def test_schemeless_endpoint_raises_value_error(self) -> None:
-        settings = EtcdSettings(
-            endpoints=["etcd.internal:2379"],
-            node_prefix="/nodes/",
-        )
+    @pytest.mark.parametrize("endpoint", ["etcd.internal:2379", "etcd.internal"])
+    def test_schemeless_endpoint_is_rejected(self, endpoint: str) -> None:
         with pytest.raises(ValueError, match="Invalid etcd endpoint URL"):
-            EtcdClient(settings)
+            EtcdClient(_settings(endpoint))
 
-    def test_hostname_only_endpoint_raises_value_error(self) -> None:
-        settings = EtcdSettings(
-            endpoints=["etcd.internal"],
-            node_prefix="/nodes/",
-        )
-        with pytest.raises(ValueError, match="Invalid etcd endpoint URL"):
-            EtcdClient(settings)
-
-
-class TestEtcdClientPut:
-    """EtcdClient.put() delegates to underlying etcd3gw client."""
-
-    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
-    def test_delegates_put(self, mock_etcd3_cls: MagicMock) -> None:
-        mock_instance = MagicMock()
-        mock_instance.put.return_value = True
-        mock_etcd3_cls.return_value = mock_instance
-
-        settings = EtcdSettings(
-            endpoints=["http://localhost:2379"],
-            node_prefix="/nodes/",
-        )
-        client = EtcdClient(settings)
-        result = client.put("/nodes/host-1", b'{"endpoint": "http://host-1:8000"}')
-
-        mock_instance.put.assert_called_once_with(
-            "/nodes/host-1", b'{"endpoint": "http://host-1:8000"}'
-        )
-        assert result is True
-
-
-class TestEtcdClientDelete:
-    """EtcdClient.delete() delegates to underlying etcd3gw client."""
-
-    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
-    def test_delegates_delete(self, mock_etcd3_cls: MagicMock) -> None:
-        mock_instance = MagicMock()
-        mock_instance.delete.return_value = True
-        mock_etcd3_cls.return_value = mock_instance
-
-        settings = EtcdSettings(
-            endpoints=["http://localhost:2379"],
-            node_prefix="/nodes/",
-        )
-        client = EtcdClient(settings)
-        result = client.delete("/nodes/host-1")
-
-        mock_instance.delete.assert_called_once_with("/nodes/host-1")
-        assert result is True
-
-
-class TestEtcdClientGetPrefixCustomPrefix:
-    """get_prefix() accepts an optional custom prefix."""
-
-    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
-    def test_custom_prefix(self, mock_etcd3_cls: MagicMock) -> None:
-        mock_instance = MagicMock()
-        mock_instance.get_prefix.return_value = []
-        mock_etcd3_cls.return_value = mock_instance
-
-        settings = EtcdSettings(
-            endpoints=["http://localhost:2379"],
-            node_prefix="/nodes/",
-        )
-        client = EtcdClient(settings)
-        client.get_prefix("/provisioning/")
-
-        mock_instance.get_prefix.assert_called_once_with("/provisioning/")
-
-
-class TestEtcdClientMultipleEndpointsWarning:
-    """EtcdClient.__init__ logs warning when multiple endpoints configured."""
-
-    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
     @patch("inference_proxy.discovery.etcd_client.logger")
-    def test_multiple_endpoints_logs_warning(
-        self, mock_logger: MagicMock, mock_etcd3_cls: MagicMock
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_multiple_endpoints_warns(
+        self,
+        mock_etcd3_cls: MagicMock,
+        mock_logger: MagicMock,
     ) -> None:
         settings = EtcdSettings(
             endpoints=["http://etcd1:2379", "http://etcd2:2379"],
             node_prefix="/nodes/",
         )
+
         EtcdClient(settings)
+
+        mock_etcd3_cls.assert_called_once()
         mock_logger.warning.assert_called_once_with(
             "multiple etcd endpoints configured but only the first is used",
             endpoint="http://etcd1:2379",
             ignored=["http://etcd2:2379"],
         )
+
+
+class TestEtcdSnapshot:
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_snapshot_revision_comes_from_range_header(
+        self,
+        mock_etcd3_cls: MagicMock,
+    ) -> None:
+        mock_instance = mock_etcd3_cls.return_value
+        mock_instance.get_url.return_value = "http://etcd/v3/kv/range"
+        mock_instance.post.return_value = {
+            "header": {"revision": "4711"},
+            "kvs": [
+                {
+                    "key": _b64(b"/nodes/node-1"),
+                    "value": _b64(b'{"endpoint":"node-1:8000"}'),
+                    # Deliberately not the store revision. Taking max KV
+                    # revision would lose deletions and activity elsewhere.
+                    "mod_revision": "9",
+                }
+            ],
+        }
+        client = EtcdClient(_settings())
+
+        snapshot = client.get_snapshot()
+
+        assert snapshot.revision == 4711
+        assert isinstance(snapshot.revision, int)
+        assert snapshot.records[0].mod_revision == 9
+        assert isinstance(snapshot.records[0].mod_revision, int)
+        assert snapshot.records[0].key == b"/nodes/node-1"
+        assert snapshot.records[0].value == b'{"endpoint":"node-1:8000"}'
+        mock_instance.post.assert_called_once_with(
+            "http://etcd/v3/kv/range",
+            json={
+                "key": _b64(b"/nodes/"),
+                "range_end": _b64(b"/nodes0"),
+            },
+        )
+
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_custom_snapshot_prefix_is_encoded(
+        self,
+        mock_etcd3_cls: MagicMock,
+    ) -> None:
+        mock_instance = mock_etcd3_cls.return_value
+        mock_instance.get_url.return_value = "http://etcd/v3/kv/range"
+        mock_instance.post.return_value = {
+            "header": {"revision": "2"},
+            "kvs": [],
+        }
+
+        EtcdClient(_settings()).get_snapshot("/provisioning/")
+
+        mock_instance.post.assert_called_once_with(
+            "http://etcd/v3/kv/range",
+            json={
+                "key": _b64(b"/provisioning/"),
+                "range_end": _b64(b"/provisioning0"),
+            },
+        )
+
+
+class TestRawWatch:
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_watch_forwards_start_revision_and_preserves_batch(
+        self,
+        mock_etcd3_cls: MagicMock,
+    ) -> None:
+        response = _StreamingResponse(
+            [
+                {"result": {"created": True, "header": {"revision": "9"}}},
+                {
+                    "result": {
+                        "header": {"revision": "10"},
+                        "events": [
+                            {
+                                "kv": {
+                                    "key": _b64(b"/nodes/node-1"),
+                                    "value": _b64(b'{"endpoint":"one:8000"}'),
+                                    "mod_revision": "10",
+                                }
+                            },
+                            {
+                                "type": "DELETE",
+                                "kv": {
+                                    "key": _b64(b"/nodes/node-2"),
+                                    "mod_revision": "10",
+                                },
+                            },
+                        ],
+                    }
+                },
+            ]
+        )
+        mock_instance = mock_etcd3_cls.return_value
+        mock_instance.timeout = 5
+        mock_instance.get_url.return_value = "http://etcd/v3/watch"
+        mock_instance.session.post.return_value = response
+        client = EtcdClient(_settings())
+
+        stream = client.watch_prefix(start_revision=10)
+        batches = list(stream)
+
+        assert len(batches) == 1
+        assert batches[0].revision == 10
+        assert isinstance(batches[0].revision, int)
+        assert [event.mod_revision for event in batches[0].events] == [10, 10]
+        assert all(isinstance(event.mod_revision, int) for event in batches[0].events)
+        assert batches[0].events[0].value == b'{"endpoint":"one:8000"}'
+        assert batches[0].events[1].is_delete is True
+        assert response.raise_calls == 1
+        mock_instance.session.post.assert_called_once_with(
+            "http://etcd/v3/watch",
+            json={
+                "create_request": {
+                    "key": _b64(b"/nodes/"),
+                    "range_end": _b64(b"/nodes0"),
+                    "start_revision": 10,
+                    "progress_notify": True,
+                }
+            },
+            stream=True,
+            timeout=(5, 30.0),
+        )
+
+    def test_compaction_cancellation_is_not_silently_dropped(self) -> None:
+        response = _StreamingResponse(
+            [
+                {
+                    "result": {
+                        "canceled": True,
+                        "compact_revision": "4711",
+                        "cancel_reason": "required revision has been compacted",
+                    }
+                }
+            ]
+        )
+
+        with pytest.raises(WatchCompactedError) as error:
+            list(EtcdWatchStream(response))
+
+        assert error.value.compact_revision == 4711
+        assert isinstance(error.value.compact_revision, int)
+
+    def test_streamed_read_timeout_is_normalized(self) -> None:
+        wrapped_timeout = RequestsConnectionError(
+            Urllib3ReadTimeoutError(None, None, "read timed out")
+        )
+        response = _StreamingResponse([], error=wrapped_timeout)
+
+        with pytest.raises(WatchReadTimeoutError):
+            list(EtcdWatchStream(response))
+
+    def test_close_is_idempotent(self) -> None:
+        response = MagicMock()
+        response.raw._fp.fileno.return_value = 42
+        transport = MagicMock()
+        stream = EtcdWatchStream(response)
+
+        with patch(
+            "inference_proxy.discovery.etcd_client.socket.fromfd",
+            return_value=transport,
+        ) as mock_fromfd:
+            stream.close()
+            stream.close()
+
+        mock_fromfd.assert_called_once_with(42, socket.AF_INET, socket.SOCK_STREAM)
+        transport.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+        transport.close.assert_called_once()
+        response.close.assert_called_once()
+
+
+class TestLegacyOperations:
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_get_prefix_remains_available_for_startup_load(
+        self,
+        mock_etcd3_cls: MagicMock,
+    ) -> None:
+        mock_instance = mock_etcd3_cls.return_value
+        mock_instance.get_prefix.return_value = [
+            (b'{"endpoint":"node-1:8000"}', {"key": b"/nodes/node-1"})
+        ]
+        client = EtcdClient(_settings(prefix="/test-nodes/"))
+
+        result = client.get_prefix()
+
+        assert len(result) == 1
+        mock_instance.get_prefix.assert_called_once_with("/test-nodes/")
+
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_get_prefix_accepts_custom_prefix(
+        self,
+        mock_etcd3_cls: MagicMock,
+    ) -> None:
+        client = EtcdClient(_settings())
+
+        client.get_prefix("/provisioning/")
+
+        mock_etcd3_cls.return_value.get_prefix.assert_called_once_with("/provisioning/")
+
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_put_delegates(self, mock_etcd3_cls: MagicMock) -> None:
+        mock_instance = mock_etcd3_cls.return_value
+        mock_instance.put.return_value = True
+        client = EtcdClient(_settings())
+
+        result = client.put("/nodes/host-1", b'{"endpoint":"host-1:8000"}')
+
+        assert result is True
+        mock_instance.put.assert_called_once_with(
+            "/nodes/host-1",
+            b'{"endpoint":"host-1:8000"}',
+        )
+
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_delete_delegates(self, mock_etcd3_cls: MagicMock) -> None:
+        mock_instance = mock_etcd3_cls.return_value
+        mock_instance.delete.return_value = True
+        client = EtcdClient(_settings())
+
+        result = client.delete("/nodes/host-1")
+
+        assert result is True
+        mock_instance.delete.assert_called_once_with("/nodes/host-1")
+
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_prefix_property(self, mock_etcd3_cls: MagicMock) -> None:
+        client = EtcdClient(_settings(prefix="/custom-prefix/"))
+
+        assert client.prefix == "/custom-prefix/"

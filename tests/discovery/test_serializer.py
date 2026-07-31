@@ -114,11 +114,11 @@ class TestNodeFromEtcdBytesAndStrKey:
     """node_from_etcd handles both bytes and str key input defensively."""
 
     def test_handles_bytes_key(self) -> None:
-        key = b"/nodes/bytes-node"  # type: ignore[assignment]
+        key = b"/nodes/bytes-node"
         value = json.dumps({"endpoint": "http://10.0.1.100:8000"}).encode("utf-8")
         prefix = "/nodes/"
 
-        node = node_from_etcd(key, value, prefix)  # type: ignore[arg-type]
+        node = node_from_etcd(key, value, prefix)
 
         assert node is not None
         assert node.node_id == "bytes-node"

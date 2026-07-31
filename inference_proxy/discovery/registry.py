@@ -17,6 +17,12 @@ from contextlib import contextmanager
 
 from inference_proxy.models.node import Node, NodeStatus
 
+_LIVENESS_STATUSES = {
+    NodeStatus.HEALTHY,
+    NodeStatus.UNHEALTHY,
+    NodeStatus.UNKNOWN,
+}
+
 
 class NodeRegistry:
     """Thread-safe registry of discovered vLLM nodes.
@@ -47,6 +53,47 @@ class NodeRegistry:
         """Store or replace a node by its ``node_id``."""
         with self._lock:
             self._nodes[node.node_id] = node
+
+    def add_discovered(self, node: Node) -> None:
+        """Merge an etcd node without overwriting a local liveness decision.
+
+        HEALTHY, UNHEALTHY, and UNKNOWN are locally probed liveness states.
+        When both the current and discovered state are in that set, retain the
+        current state while refreshing etcd-owned fields. Lifecycle
+        transitions involving PROVISIONING, FAILED, or DRAINING remain
+        authoritative so provisioning can complete and fresh registrations
+        can replace drained nodes.
+        """
+        with self._lock:
+            current = self._nodes.get(node.node_id)
+            if (
+                current is not None
+                and current.status in _LIVENESS_STATUSES
+                and node.status in _LIVENESS_STATUSES
+            ):
+                node = node.model_copy(update={"status": current.status})
+            self._nodes[node.node_id] = node
+
+    def reconcile_discovered(
+        self,
+        nodes: dict[str, Node],
+        present_node_ids: set[str],
+    ) -> set[str]:
+        """Converge etcd-owned node data while draining keys absent in etcd.
+
+        ``present_node_ids`` includes malformed entries that could not be
+        deserialized. Such entries are left untouched instead of being
+        mistaken for deletions. Missing nodes transition to DRAINING rather
+        than being removed so existing request reservations remain valid.
+        Returns the missing node IDs while still under the same atomic view.
+        """
+        with self._lock:
+            for node in nodes.values():
+                self.add_discovered(node)
+            missing_node_ids = self._nodes.keys() - present_node_ids
+            for node_id in missing_node_ids:
+                self.drain(node_id)
+            return missing_node_ids
 
     def remove(self, node_id: str) -> None:
         """Remove a node by its ``node_id``.  No-op if absent."""

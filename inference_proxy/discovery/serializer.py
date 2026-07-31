@@ -23,7 +23,7 @@ from inference_proxy.models.node import Node
 logger = structlog.get_logger()
 
 
-def node_from_etcd(key: str, value: bytes, prefix: str) -> Node | None:
+def node_from_etcd(key: str | bytes, value: bytes, prefix: str) -> Node | None:
     """Parse an etcd key-value pair into a Node.
 
     Handles both ``bytes`` and ``str`` keys defensively (Pitfall 2).

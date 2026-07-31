@@ -37,7 +37,7 @@ from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.etcd_client import EtcdClient
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_from_etcd
-from inference_proxy.discovery.watcher import run_watcher
+from inference_proxy.discovery.watcher import EtcdWatcher
 from inference_proxy.huggingface.catalog import ModelCatalogService
 from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.llmfit.runner import LLMFitRunner
@@ -141,9 +141,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _initial_load(etcd_client, registry)
 
         stop_event = threading.Event()
+        etcd_watcher = EtcdWatcher(etcd_client, registry, stop_event)
         watch_thread = threading.Thread(
-            target=run_watcher,
-            args=(etcd_client, registry, stop_event),
+            target=etcd_watcher.run,
             daemon=True,
         )
         watch_thread.start()
@@ -310,6 +310,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if redfish_http is not None:
             await redfish_http.aclose()
         stop_event.set()
+        etcd_watcher.stop()
         watch_thread.join(timeout=10)
         health_thread.join(timeout=10)
 
