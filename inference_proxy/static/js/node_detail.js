@@ -13,6 +13,24 @@ function showToast(message, type) {
   }, 4000);
 }
 
+function renderTableMessage(tbody, colSpan, message) {
+  tbody.textContent = "";
+  var row = document.createElement("tr");
+  var cell = document.createElement("td");
+  cell.colSpan = colSpan;
+  cell.textContent = message;
+  row.appendChild(cell);
+  tbody.appendChild(row);
+}
+
+function renderStatusMessage(container, message, className) {
+  container.textContent = "";
+  var span = document.createElement("span");
+  if (className) span.className = className;
+  span.textContent = message;
+  container.appendChild(span);
+}
+
 var ACTION_CONFIG = {
   setup: {
     method: "POST", url: function () { return "/admin/nodes/setup"; },
@@ -62,8 +80,7 @@ async function handleAction(action, nodeId, node) {
     var resp = await fetch(config.url(nodeId), options);
     if (resp.ok) {
       showToast(config.successMsg(nodeId), "success");
-      logReceivedAny = false; logStreamDone = false;
-      if (logSource) { logSource.close(); logSource = null; }
+      resetLogStreamState();
     } else {
       var data = await resp.json().catch(function () { return { detail: "HTTP " + resp.status }; });
       showToast(data.detail || "HTTP " + resp.status, "error");
@@ -146,13 +163,14 @@ async function refreshDetail() {
     if (!nodesResp.ok) throw new Error("HTTP " + nodesResp.status);
     var nodes = await nodesResp.json();
     var metrics = metricsResp.ok ? await metricsResp.json() : {};
-    var allTasks = tasksResp.ok ? await tasksResp.json() : [];
+    var taskDataAvailable = tasksResp.ok;
+    var allTasks = taskDataAvailable ? await tasksResp.json() : [];
     var perNode = metrics.per_node || {};
 
     var node = nodes.find(function (n) { return n.node_id === NODE_ID; });
     if (!node) {
       stateEl.textContent = "Node not found";
-      infoBody.innerHTML = '<tr><td colspan="9">Node not found in registry</td></tr>';
+      renderTableMessage(infoBody, 9, "Node not found in registry");
     } else {
       stateEl.textContent = node.state;
 
@@ -190,9 +208,11 @@ async function refreshDetail() {
 
     // ponytail: filter tasks by hostname — matching against node_id (which is the hostname)
     var tasks = allTasks.filter(function (t) { return t.hostname === NODE_ID; });
-    if (tasks.length > 0) connectLogStream();
+    if (taskDataAvailable) updateLogTaskState(tasks);
+    else markLogTaskStateUnavailable();
+    if (tasks.length > 0 && (!logTaskTerminal || !logStreamStarted)) connectLogStream();
     if (tasks.length === 0) {
-      tasksBody.innerHTML = '<tr><td colspan="5">No provisioning tasks for this node</td></tr>';
+      renderTableMessage(tasksBody, 5, "No provisioning tasks for this node");
     } else {
       tasksBody.textContent = "";
       for (var j = 0; j < tasks.length; j++) {
@@ -235,6 +255,7 @@ async function refreshDetail() {
       lastUpdatedEl.className = "last-updated";
     }
   } catch (err) {
+    markLogTaskStateUnavailable();
     lastUpdatedEl.textContent = "Update failed — retrying...";
   }
 }
@@ -243,6 +264,101 @@ async function refreshDetail() {
 var logSource = null;
 var logReceivedAny = false;
 var logStreamDone = false;
+var logTaskTerminal = false;
+var logTaskStateKnown = false;
+var logTaskObserved = false;
+var logReconnectTimer = null;
+var logReconnectAttempts = 0;
+var logReconnectStartedAt = null;
+var logSeenEntries = new Set();
+var logStreamStarted = false;
+var LOG_RECONNECT_BASE_MS = 1000;
+var LOG_RECONNECT_MAX_DELAY_MS = 30000;
+var LOG_RECONNECT_MAX_ELAPSED_MS = 5 * 60 * 1000;
+
+function isTerminalTask(task) {
+  return ["complete", "failed", "teardown_complete"].indexOf(task.current_step) !== -1;
+}
+
+function updateLogTaskState(tasks) {
+  logTaskStateKnown = true;
+  if (tasks.length > 0) logTaskObserved = true;
+  logTaskTerminal = logTaskObserved && (tasks.length === 0 || tasks.every(isTerminalTask));
+  if (logTaskTerminal) {
+    // Let an active stream deliver its final buffered entries. If it already
+    // disconnected, terminal task state cancels the pending reconnect.
+    if (logStreamStarted && logSource === null) {
+      finishLogStream("ended", "badge badge-complete");
+    }
+    return;
+  }
+
+  // A successful task poll proves the operation is still observable. A later
+  // task-API outage gets a fresh, bounded reconnect window.
+  logReconnectStartedAt = null;
+  logReconnectAttempts = 0;
+}
+
+function markLogTaskStateUnavailable() {
+  logTaskStateKnown = false;
+}
+
+function finishLogStream(message, className) {
+  if (logReconnectTimer !== null) {
+    clearTimeout(logReconnectTimer);
+    logReconnectTimer = null;
+  }
+  if (logSource) {
+    logSource.close();
+    logSource = null;
+  }
+  logStreamDone = true;
+  var status = document.getElementById("logs-status");
+  status.textContent = message;
+  status.className = className;
+}
+
+function resetLogStreamState() {
+  if (logReconnectTimer !== null) clearTimeout(logReconnectTimer);
+  if (logSource) logSource.close();
+  logSource = null;
+  logReconnectTimer = null;
+  logReceivedAny = false;
+  logStreamDone = false;
+  logTaskTerminal = false;
+  logTaskStateKnown = false;
+  logTaskObserved = false;
+  logReconnectAttempts = 0;
+  logReconnectStartedAt = null;
+  logSeenEntries = new Set();
+  logStreamStarted = false;
+}
+
+function scheduleLogReconnect() {
+  if (logStreamDone || logReconnectTimer !== null) return;
+
+  var now = Date.now();
+  if (logReconnectStartedAt === null) logReconnectStartedAt = now;
+  var elapsed = now - logReconnectStartedAt;
+  if (elapsed >= LOG_RECONNECT_MAX_ELAPSED_MS) {
+    finishLogStream("status unavailable — reload to retry", "badge badge-failed");
+    return;
+  }
+
+  logReconnectAttempts += 1;
+  var delay = Math.min(
+    LOG_RECONNECT_BASE_MS * Math.pow(2, Math.min(logReconnectAttempts - 1, 15)),
+    LOG_RECONNECT_MAX_DELAY_MS,
+    LOG_RECONNECT_MAX_ELAPSED_MS - elapsed,
+  );
+  var status = document.getElementById("logs-status");
+  status.textContent = logTaskStateKnown ? "reconnecting" : "status unavailable — retrying";
+  status.className = "badge badge-in-progress";
+  logReconnectTimer = setTimeout(function () {
+    logReconnectTimer = null;
+    connectLogStream();
+  }, delay);
+}
 
 function connectLogStream() {
   if (logSource || logStreamDone) return;
@@ -256,15 +372,19 @@ function connectLogStream() {
 
   var es = new EventSource("/admin/provisioning/" + encodeURIComponent(NODE_ID) + "/logs");
   logSource = es;
+  logStreamStarted = true;
 
   es.addEventListener("open", function () {
     status.textContent = "streaming";
   });
 
   es.addEventListener("message", function (ev) {
-    logReceivedAny = true;
     try {
       var entry = JSON.parse(ev.data);
+      var entryKey = JSON.stringify(entry);
+      if (logSeenEntries.has(entryKey)) return;
+      logSeenEntries.add(entryKey);
+      logReceivedAny = true;
       var line = document.createElement("div");
       line.className = "log-line";
       if (entry.level) line.dataset.level = entry.level;
@@ -289,16 +409,18 @@ function connectLogStream() {
   es.addEventListener("error", function () {
     es.close();
     logSource = null;
-    if (logReceivedAny) {
-      logStreamDone = true;
-      status.textContent = "ended";
-      status.className = "badge badge-complete";
-    } else {
-      // ponytail: 404 or premature close — show placeholder, retry on next poll
-      status.textContent = "waiting";
-      status.className = "badge";
-      output.innerHTML = '<span class="log-placeholder">Logs will appear here when provisioning starts.</span>';
+    if (logTaskTerminal) {
+      finishLogStream("ended", "badge badge-complete");
+      return;
     }
+    if (!logReceivedAny) {
+      renderStatusMessage(
+        output,
+        "Logs will appear here when provisioning starts.",
+        "log-placeholder",
+      );
+    }
+    scheduleLogReconnect();
   });
 }
 
@@ -381,16 +503,28 @@ async function pollDownloadStatuses() {
     var downloads = await resp.json();
 
     var downloadMap = {};
-    for (var i = 0; i < downloads.length; i++) downloadMap[downloads[i].repo_id] = downloads[i];
+    var catalogChanged = false;
+    for (var i = 0; i < downloads.length; i++) {
+      var download = downloads[i];
+      downloadMap[download.repo_id] = download;
+      if (download.status === "complete" && !catalogSetCache.has(download.repo_id)) {
+        catalogSetCache.add(download.repo_id);
+        catalogChanged = true;
+      }
+    }
 
     var cells = document.querySelectorAll("td[data-repo-id]");
     for (var j = 0; j < cells.length; j++) {
       var cell = cells[j];
       var repoId = cell.dataset.repoId;
       if (downloadMap[repoId]) {
-        if (downloadMap[repoId].status === "complete") catalogSetCache.add(repoId);
         renderDownloadCell(cell, repoId, catalogSetCache, downloadMap);
       }
+    }
+
+    if (catalogChanged) {
+      await fetchCatalog();
+      await refreshDetail();
     }
 
     var anyActive = downloads.some(function (d) { return d.status === "downloading"; });
@@ -409,7 +543,7 @@ async function loadRecommendations() {
 
   btn.disabled = true;
   btn.textContent = "Loading...";
-  content.innerHTML = '<span style="color:var(--muted);font-size:0.875rem">Fetching recommendations...</span>';
+  renderStatusMessage(content, "Fetching recommendations...", "muted-status");
 
   try {
     var resp = await fetch("/admin/nodes/" + encodeURIComponent(NODE_ID) + "/recommendations");
@@ -471,7 +605,11 @@ async function loadRecommendations() {
 
     // Model table
     if (data.models.length === 0) {
-      content.innerHTML = '<span style="color:var(--muted);font-size:0.875rem">No model recommendations available for this hardware.</span>';
+      renderStatusMessage(
+        content,
+        "No model recommendations available for this hardware.",
+        "muted-status",
+      );
     } else {
       var FIT_BADGE = { perfect: "badge-complete", good: "badge-in-progress", marginal: "badge-failed" };
       var wrap = document.createElement("div");
@@ -543,8 +681,10 @@ var POWER_BADGE = {
   Off: { cls: "badge-failed",   text: "Power: Off" },
 };
 var POWER_UNKNOWN = { cls: "badge-unknown", text: "Power: Unknown" };
+var POWER_UNCONFIGURED = { cls: "badge-unknown", text: "Power: unavailable" };
 
 var currentPowerState = null;
+var powerControlsState = "unknown";
 
 var POWER_ACTIONS = [
   { action: "On", label: "Power On", css: "btn-setup", confirm: false },
@@ -558,6 +698,8 @@ var POWER_ACTIONS = [
 function renderPowerButtons() {
   var container = document.getElementById("power-actions");
   container.textContent = "";
+  container.hidden = powerControlsState === "unconfigured";
+  if (container.hidden) return;
   var visible;
   if (currentPowerState === "On") {
     visible = ["ForceOff", "GracefulRestart", "ForceRestart"];
@@ -573,6 +715,10 @@ function renderPowerButtons() {
       btn.type = "button";
       btn.className = pa.css;
       btn.textContent = pa.label;
+      if (powerControlsState === "unknown") {
+        btn.disabled = true;
+        btn.title = "Power state is temporarily unavailable; controls are disabled.";
+      }
       btn.addEventListener("click", function () { handlePowerAction(pa.action); });
       container.appendChild(btn);
     })(POWER_ACTIONS[i]);
@@ -625,12 +771,22 @@ async function refreshPowerState() {
   var el = document.querySelector("#power-state span");
   try {
     var resp = await fetch("/admin/nodes/" + encodeURIComponent(NODE_ID) + "/power");
+    if (resp.status === 503) {
+      currentPowerState = null;
+      powerControlsState = "unconfigured";
+      el.className = "badge " + POWER_UNCONFIGURED.cls;
+      el.textContent = POWER_UNCONFIGURED.text;
+      renderPowerButtons();
+      return;
+    }
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     var data = await resp.json();
     currentPowerState = data.power_state;
     var info = POWER_BADGE[data.power_state] || POWER_UNKNOWN;
+    powerControlsState = POWER_BADGE[data.power_state] ? "configured" : "unknown";
   } catch (_) {
     currentPowerState = null;
+    powerControlsState = "unknown";
     var info = POWER_UNKNOWN;
   }
   el.className = "badge " + info.cls;

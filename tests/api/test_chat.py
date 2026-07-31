@@ -2,7 +2,7 @@
 
 Tests cover:
 - GET /chat returns 200 with text/html content type (CHAT-01)
-- Chat page assets: chat.css, chat.js, marked.js CDN (CHAT-02)
+- Chat page assets: chat.css, chat.js, locally vendored Markdown rendering (CHAT-02)
 - Chat page elements: model selector, message area, textarea, send button (CHAT-01, CHAT-03)
 - Accessibility: role="log", aria-live="polite"
 - Navigation: Chat link on dashboard, Dashboard link on chat (D-03)
@@ -47,10 +47,12 @@ class TestChatTemplate:
         response = client.get("/chat")
         assert "chat.js" in response.text
 
-    def test_contains_marked_cdn_script(self, client: TestClient) -> None:
-        """HTML contains marked.js CDN script (CHAT-02)."""
+    def test_contains_local_markdown_scripts(self, client: TestClient) -> None:
+        """HTML loads pinned local Marked and DOMPurify assets (CHAT-02)."""
         response = client.get("/chat")
-        assert "marked" in response.text
+        assert "/static/vendor/marked-18.0.7/marked.umd.js" in response.text
+        assert "/static/vendor/dompurify-3.4.12/purify.min.js" in response.text
+        assert "cdn.jsdelivr.net" not in response.text
 
     def test_contains_model_select(self, client: TestClient) -> None:
         """HTML contains select element with id='model-select' (CHAT-03)."""

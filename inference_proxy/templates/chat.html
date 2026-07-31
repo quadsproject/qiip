@@ -51,13 +51,14 @@
 
         <div class="input-bar">
             <textarea id="chat-input" placeholder="Type a message..." rows="1"></textarea>
-            <button id="send-btn" type="button">Send</button>
+            <button id="send-btn" type="button" disabled>Send</button>
         </div>
     </div>
 
     <div id="toast-container"></div>
 
-    <script src="https://cdn.jsdelivr.net/npm/marked@18/lib/marked.umd.min.js"></script>
+    <script src="{{ url_for('static', path='vendor/marked-18.0.7/marked.umd.js') }}"></script>
+    <script src="{{ url_for('static', path='vendor/dompurify-3.4.12/purify.min.js') }}"></script>
     <script src="{{ url_for('static', path='js/chat.js') }}"></script>
 </body>
 </html>

@@ -93,7 +93,7 @@ sandbox.showToast = function () {{}};
     assert body == {"hostname": "gpu01", "managed": managed}
 
 
-def test_dashboard_renders_task_data_degradation() -> None:
+def test_task_data_degradation_survives_poll_rewrite() -> None:
     harness = """
 const fs = require("fs");
 const vm = require("vm");
@@ -125,7 +125,7 @@ const sandbox = {
     createTextNode(text) { return { textContent: text }; },
   },
   window: { confirm() { return true; } },
-  requestAnimationFrame() {},
+  requestAnimationFrame(callback) { callback(); },
   setTimeout() { return 0; },
   setInterval() { return 0; },
   fetch: async function (url) {
@@ -171,3 +171,667 @@ vm.runInContext(source, sandbox);
         ),
         "className": "poll-warning",
     }
+
+
+_NODE_DETAIL_HARNESS = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const elements = new Map();
+const eventSources = [];
+const timers = [];
+let fakeNow = 0;
+
+class Element {
+  constructor(tagName) {
+    this.tagName = tagName || "div";
+    this.children = [];
+    this.listeners = {};
+    this.attributes = {};
+    this.className = "";
+    this.style = {};
+    this.dataset = {};
+    this.value = "";
+    this.hidden = false;
+    this.disabled = false;
+    this.title = "";
+    this._textContent = "";
+    this.scrollHeight = 100;
+    this.scrollTop = 0;
+    this.clientHeight = 100;
+  }
+  get textContent() { return this._textContent; }
+  set textContent(value) {
+    this._textContent = String(value);
+    if (value === "") this.children = [];
+  }
+  appendChild(child) { this.children.push(child); child.parentNode = this; return child; }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  getAttribute(name) { return this.attributes[name] || null; }
+  remove() {}
+  querySelector() { return null; }
+  getBoundingClientRect() { return { top: 0, right: 0 }; }
+}
+
+function byId(id) {
+  if (!elements.has(id)) elements.set(id, new Element("div"));
+  return elements.get(id);
+}
+
+class FakeEventSource {
+  constructor(url) {
+    this.url = url;
+    this.listeners = {};
+    this.closed = false;
+    eventSources.push(this);
+  }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  emit(name, event) { this.listeners[name](event || {}); }
+  close() { this.closed = true; }
+}
+
+class FakeDate extends Date {
+  static now() { return fakeNow; }
+}
+
+const sandbox = {
+  console,
+  NODE_ID: "gpu01",
+  POLL_INTERVAL_MS: 10000,
+  Date: FakeDate,
+  document: {
+    getElementById: byId,
+    addEventListener() {},
+    querySelectorAll() { return []; },
+    querySelector(selector) {
+      if (selector === "#power-state span") return byId("power-badge");
+      return new Element("div");
+    },
+    createElement(tagName) { return new Element(tagName); },
+    createTextNode(text) { const node = new Element("text"); node.textContent = text; return node; },
+  },
+  window: { confirm() { return true; } },
+  requestAnimationFrame() {},
+  setTimeout(callback, delay) {
+    const timer = { callback, delay, active: true };
+    timers.push(timer);
+    return timers.length;
+  },
+  clearTimeout(id) { if (timers[id - 1]) timers[id - 1].active = false; },
+  setInterval() { return 1; },
+  clearInterval() {},
+  EventSource: FakeEventSource,
+  fetch: async function () { return { ok: false, status: 404, json: async function () { return {}; } }; },
+};
+
+vm.createContext(sandbox);
+vm.runInContext(source, sandbox);
+sandbox.showToast = function () {};
+
+function runNextTimer() {
+  const timer = timers.find(function (candidate) { return candidate.active; });
+  if (!timer) throw new Error("no active timer");
+  timer.active = false;
+  timer.callback();
+  return timer.delay;
+}
+
+function installDetailFetch(tasks, tasksOk) {
+  sandbox.fetch = async function (url) {
+    if (url === "/admin/nodes") {
+      return {
+        ok: true,
+        headers: { get() { return null; } },
+        json: async function () { return [{
+          node_id: "gpu01", state: "provisioning", model: "org/model",
+          endpoint: "gpu01:8000", active_connections: 0,
+          circuit_breaker_state: "closed", actions: [],
+        }]; },
+      };
+    }
+    if (url === "/admin/metrics") {
+      return { ok: true, json: async function () { return { per_node: {} }; } };
+    }
+    if (url === "/admin/provisioning/tasks") {
+      return {
+        ok: tasksOk !== false,
+        json: async function () { return tasks; },
+      };
+    }
+    throw new Error("unexpected URL " + url);
+  };
+}
+
+__SCENARIO__
+"""
+
+
+def _run_node_detail_scenario(scenario: str) -> object:
+    return _run_node(
+        _NODE_DETAIL_JS,
+        _NODE_DETAIL_HARNESS.replace("__SCENARIO__", scenario),
+    )
+
+
+def test_log_stream_reconnects_after_transient_drop() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([{
+  hostname: "gpu01", current_step: "health_poll", started_at: "2026-07-31T12:00:00Z",
+  updated_at: "2026-07-31T12:00:00Z", failed_step: null, error: null,
+}], true);
+(async function () {
+  await sandbox.refreshDetail();
+  const first = eventSources[0];
+  const entry = { ts: "2026-07-31T12:00:00Z", level: "info", msg: "loading", stream: "stdout" };
+  first.emit("message", { data: JSON.stringify(entry) });
+  first.emit("error");
+  const statusAfterDrop = byId("logs-status").textContent;
+  const activeTimersAfterDrop = timers.filter(function (timer) { return timer.active; }).length;
+  const delay = activeTimersAfterDrop > 0 ? runNextTimer() : null;
+  const second = eventSources[1];
+  if (second) second.emit("message", { data: JSON.stringify(entry) });
+  process.stdout.write(JSON.stringify({
+    statusAfterDrop,
+    activeTimersAfterDrop,
+    delay,
+    sourceCount: eventSources.length,
+    done: sandbox.logStreamDone,
+    renderedLines: byId("logs-output").children.length,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "statusAfterDrop": "reconnecting",
+        "activeTimersAfterDrop": 1,
+        "delay": 1000,
+        "sourceCount": 2,
+        "done": False,
+        "renderedLines": 1,
+    }
+
+
+def test_log_stream_stops_after_terminal_task_state() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([{
+  hostname: "gpu01", current_step: "health_poll", started_at: "2026-07-31T12:00:00Z",
+  updated_at: "2026-07-31T12:00:00Z", failed_step: null, error: null,
+}], true);
+(async function () {
+  await sandbox.refreshDetail();
+  const sourceBeforeCompletion = eventSources[0];
+  installDetailFetch([{
+    hostname: "gpu01", current_step: "failed", started_at: "2026-07-31T12:00:00Z",
+    updated_at: "2026-07-31T12:01:00Z", failed_step: "health_poll", error: "failed",
+  }], true);
+  await sandbox.refreshDetail();
+  const closedBeforeStreamEnded = sourceBeforeCompletion.closed;
+  sourceBeforeCompletion.emit("error");
+  process.stdout.write(JSON.stringify({
+    closedBeforeStreamEnded,
+    closed: sourceBeforeCompletion.closed,
+    sourceCount: eventSources.length,
+    done: sandbox.logStreamDone,
+    status: byId("logs-status").textContent,
+    activeTimers: timers.filter(function (timer) { return timer.active; }).length,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "closedBeforeStreamEnded": False,
+        "closed": True,
+        "sourceCount": 1,
+        "done": True,
+        "status": "ended",
+        "activeTimers": 0,
+    }
+
+
+def test_completed_task_replays_buffered_logs_once() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([{
+  hostname: "gpu01", current_step: "failed", started_at: "2026-07-31T12:00:00Z",
+  updated_at: "2026-07-31T12:01:00Z", failed_step: "health_poll", error: "failed",
+}], true);
+(async function () {
+  await sandbox.refreshDetail();
+  const source = eventSources[0];
+  source.emit("message", { data: JSON.stringify({
+    ts: "2026-07-31T12:01:00Z", level: "error", msg: "failed", stream: "stderr",
+  }) });
+  source.emit("error");
+  process.stdout.write(JSON.stringify({
+    sourceCount: eventSources.length,
+    renderedLines: byId("logs-output").children.length,
+    done: sandbox.logStreamDone,
+    status: byId("logs-status").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "sourceCount": 1,
+        "renderedLines": 1,
+        "done": True,
+        "status": "ended",
+    }
+
+
+def test_log_reconnect_stops_when_task_status_stays_unavailable() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([{
+  hostname: "gpu01", current_step: "health_poll", started_at: "2026-07-31T12:00:00Z",
+  updated_at: "2026-07-31T12:00:00Z", failed_step: null, error: null,
+}], true);
+(async function () {
+  await sandbox.refreshDetail();
+  installDetailFetch([], false);
+  await sandbox.refreshDetail();
+  eventSources[0].emit("error");
+  if (timers.some(function (timer) { return timer.active; })) runNextTimer();
+  fakeNow = sandbox.LOG_RECONNECT_MAX_ELAPSED_MS + 1;
+  if (eventSources[1]) eventSources[1].emit("error");
+  process.stdout.write(JSON.stringify({
+    sourceCount: eventSources.length,
+    done: sandbox.logStreamDone,
+    status: byId("logs-status").textContent,
+    activeTimers: timers.filter(function (timer) { return timer.active; }).length,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "sourceCount": 2,
+        "done": True,
+        "status": "status unavailable — reload to retry",
+        "activeTimers": 0,
+    }
+
+
+def test_catalog_refreshes_after_download() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+const requested = [];
+sandbox.fetch = async function (url) {
+  requested.push(url);
+  if (url === "/admin/models/downloads") {
+    return { ok: true, json: async function () {
+      return [{ repo_id: "org/model", status: "complete" }];
+    } };
+  }
+  if (url === "/admin/models/catalog") {
+    return { ok: true, json: async function () {
+      return { models: [{ repo_id: "org/model" }] };
+    } };
+  }
+  if (url === "/admin/nodes") {
+    return {
+      ok: true,
+      headers: { get() { return null; } },
+      json: async function () { return [{
+        node_id: "gpu01", state: "available", model: null, endpoint: null,
+        active_connections: 0, circuit_breaker_state: "closed",
+        actions: ["setup"],
+      }]; },
+    };
+  }
+  if (url === "/admin/metrics") {
+    return { ok: true, json: async function () { return { per_node: {} }; } };
+  }
+  if (url === "/admin/provisioning/tasks") {
+    return { ok: true, json: async function () { return []; } };
+  }
+  throw new Error("unexpected URL " + url);
+};
+
+(async function () {
+  await sandbox.pollDownloadStatuses();
+  process.stdout.write(JSON.stringify({
+    requested,
+    catalogModels: sandbox.catalogModels,
+    selectorValues: byId("model-select").children.map(function (child) { return child.value; }),
+    selectorVisible: byId("model-select").style.display !== "none",
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result["requested"].count("/admin/models/catalog") == 1
+    assert result["catalogModels"] == [{"repo_id": "org/model"}]
+    assert result["selectorValues"] == ["org/model"]
+    assert result["selectorVisible"] is True
+
+
+def _power_controls_result(status_code: int) -> object:
+    return _run_node_detail_scenario(
+        f"""
+sandbox.fetch = async function () {{
+  return {{ ok: false, status: {status_code}, json: async function () {{ return {{}}; }} }};
+}};
+(async function () {{
+  await sandbox.refreshPowerState();
+  const controls = byId("power-actions");
+  process.stdout.write(JSON.stringify({{
+    hidden: controls.hidden,
+    disabled: controls.children.map(function (child) {{ return child.disabled; }}),
+    titles: controls.children.map(function (child) {{ return child.title; }}),
+  }}));
+}})().catch(function (error) {{ console.error(error); process.exit(1); }});
+"""
+    )
+
+
+def test_power_controls_hidden_when_redfish_unconfigured() -> None:
+    assert _power_controls_result(503) == {
+        "hidden": True,
+        "disabled": [],
+        "titles": [],
+    }
+
+
+def test_power_controls_disabled_when_state_unknown() -> None:
+    assert _power_controls_result(502) == {
+        "hidden": False,
+        "disabled": [True, True, True, True],
+        "titles": ["Power state is temporarily unavailable; controls are disabled."]
+        * 4,
+    }
+
+
+@pytest.mark.parametrize("action", ["ForceOff", "ForceRestart"])
+def test_force_power_actions_always_require_confirmation(action: str) -> None:
+    result = _run_node_detail_scenario(
+        f"""
+let requestCount = 0;
+sandbox.window.confirm = function () {{ return false; }};
+sandbox.fetch = async function () {{ requestCount += 1; return {{ ok: true }}; }};
+(async function () {{
+  await sandbox.handlePowerAction({json.dumps(action)});
+  process.stdout.write(JSON.stringify({{ requestCount }}));
+}})().catch(function (error) {{ console.error(error); process.exit(1); }});
+"""
+    )
+
+    assert result == {"requestCount": 0}
+
+
+_DASHBOARD_HARNESS = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const elements = new Map();
+const allElements = [];
+
+class Element {
+  constructor(tagName) {
+    this.tagName = tagName || "div";
+    this.children = [];
+    this.listeners = {};
+    this.attributes = {};
+    this._classes = new Set();
+    this._className = "";
+    this._textContent = "";
+    this.style = {};
+    this.dataset = {};
+    this.disabled = false;
+    this.offsetHeight = 10;
+    this.offsetWidth = 10;
+    this.classList = {
+      add: (...names) => names.forEach((name) => this._classes.add(name)),
+      remove: (...names) => names.forEach((name) => this._classes.delete(name)),
+      contains: (name) => this._classes.has(name),
+    };
+    allElements.push(this);
+  }
+  get className() { return this._className; }
+  set className(value) {
+    this._className = String(value);
+    this._classes = new Set(this._className.split(/\s+/).filter(Boolean));
+  }
+  get textContent() { return this._textContent; }
+  set textContent(value) {
+    this._textContent = String(value);
+    if (value === "") this.children = [];
+  }
+  appendChild(child) { this.children.push(child); child.parentNode = this; return child; }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  getAttribute(name) { return this.attributes[name] || null; }
+  getBoundingClientRect() { return { top: 20, right: 20 }; }
+  async click() {
+    if (this.disabled || !this.listeners.click) return;
+    return this.listeners.click({ stopPropagation() {}, preventDefault() {} });
+  }
+}
+
+function byId(id) {
+  if (!elements.has(id)) elements.set(id, new Element("div"));
+  return elements.get(id);
+}
+
+const sandbox = {
+  console,
+  POLL_INTERVAL_MS: 10000,
+  document: {
+    getElementById: byId,
+    addEventListener() {},
+    querySelectorAll(selector) {
+      if (selector === ".action-menu.open") {
+        return allElements.filter(function (element) {
+          return element.classList.contains("action-menu") && element.classList.contains("open");
+        });
+      }
+      return [];
+    },
+    createElement(tagName) { return new Element(tagName); },
+    createTextNode(text) { const node = new Element("text"); node.textContent = text; return node; },
+  },
+  window: { confirm() { return true; } },
+  requestAnimationFrame(callback) { callback(); },
+  setTimeout() { return 1; },
+  setInterval() { return 1; },
+  fetch: async function () { throw new Error("fetch stub not installed"); },
+};
+
+vm.createContext(sandbox);
+vm.runInContext(source, sandbox);
+sandbox.showToast = function () {};
+
+function response(data, headers) {
+  return {
+    ok: true,
+    headers: { get(name) { return headers && headers[name] || null; } },
+    json: async function () { return data; },
+  };
+}
+
+function node(id, state, actions) {
+  return {
+    node_id: id,
+    state,
+    actions: actions || [],
+    managed: true,
+    gpu_vendor: "NVIDIA",
+    gpu_model: "GPU",
+    model: "org/model",
+    failed_step: state === "failed" ? "health_poll" : null,
+    error: state === "failed" ? "backend failed" : null,
+  };
+}
+
+__SCENARIO__
+"""
+
+
+def _run_dashboard_scenario(scenario: str) -> object:
+    return _run_node(
+        _DASHBOARD_JS,
+        _DASHBOARD_HARNESS.replace("__SCENARIO__", scenario),
+    )
+
+
+def test_teardown_button_stays_disabled_across_refresh() -> None:
+    result = _run_dashboard_scenario(
+        r"""
+let deleteCount = 0;
+const deleteResolvers = [];
+sandbox.fetch = async function (url, options) {
+  if (url === "/admin/nodes" && !options) return response([node("gpu01", "healthy", ["teardown"])]);
+  if (url === "/admin/metrics") return response({ per_node: {} });
+  if (url === "/admin/quads/status") return response({ status: "connected" });
+  if (url === "/admin/nodes/gpu01" && options && options.method === "DELETE") {
+    deleteCount += 1;
+    return new Promise(function (resolve) { deleteResolvers.push(resolve); });
+  }
+  throw new Error("unexpected request " + url);
+};
+
+(async function () {
+  await sandbox.refreshDashboard();
+  const first = allElements.filter(function (el) { return el.textContent === "Teardown"; }).pop();
+  const action = first.click();
+  await Promise.resolve();
+  await sandbox.refreshDashboard();
+  const replacement = allElements.filter(function (el) { return el.textContent === "Teardown"; }).pop();
+  const replacementDisabled = replacement.disabled;
+  const replacementAction = replacement.click();
+  deleteResolvers.forEach(function (resolve) { resolve(response({})); });
+  await Promise.all([action, replacementAction]);
+  process.stdout.write(JSON.stringify({ replacementDisabled, deleteCount }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {"replacementDisabled": True, "deleteCount": 1}
+
+
+def test_dashboard_preserves_expanded_error_state_across_refresh() -> None:
+    result = _run_dashboard_scenario(
+        r"""
+sandbox.fetch = async function (url) {
+  if (url === "/admin/nodes") return response([node("gpu01", "failed", ["retry"])]);
+  if (url === "/admin/metrics") return response({ per_node: {} });
+  if (url === "/admin/quads/status") return response({ status: "connected" });
+  throw new Error("unexpected request " + url);
+};
+
+(async function () {
+  await sandbox.refreshDashboard();
+  const badge = allElements.filter(function (el) {
+    return el.textContent === "failed" && el.attributes.role === "button";
+  }).pop();
+  await badge.click();
+  await sandbox.refreshDashboard();
+  const subrow = allElements.filter(function (el) { return el.className === "error-subrow"; }).pop();
+  process.stdout.write(JSON.stringify({ display: subrow.style.display }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {"display": "table-row"}
+
+
+def test_dashboard_preserves_open_action_menu_across_refresh() -> None:
+    result = _run_dashboard_scenario(
+        r"""
+sandbox.fetch = async function (url) {
+  if (url === "/admin/nodes") return response([node("gpu01", "healthy", ["teardown", "force_teardown"])]);
+  if (url === "/admin/metrics") return response({ per_node: {} });
+  if (url === "/admin/quads/status") return response({ status: "connected" });
+  throw new Error("unexpected request " + url);
+};
+
+(async function () {
+  await sandbox.refreshDashboard();
+  const caret = allElements.filter(function (el) { return el.textContent === "▾"; }).pop();
+  await caret.click();
+  await sandbox.refreshDashboard();
+  const menu = allElements.filter(function (el) { return el.classList.contains("action-menu"); }).pop();
+  process.stdout.write(JSON.stringify({
+    open: menu.classList.contains("open"),
+    top: menu.style.top,
+    left: menu.style.left,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {"open": True, "top": "10px", "left": "10px"}
+
+
+def test_dashboard_skips_overlapping_poll() -> None:
+    result = _run_dashboard_scenario(
+        r"""
+let nodeRequests = 0;
+const nodeResolvers = [];
+sandbox.fetch = async function (url) {
+  if (url === "/admin/nodes") {
+    nodeRequests += 1;
+    return new Promise(function (resolve) { nodeResolvers.push(resolve); });
+  }
+  if (url === "/admin/metrics") return response({ per_node: {} });
+  if (url === "/admin/quads/status") return response({ status: "connected" });
+  throw new Error("unexpected request " + url);
+};
+
+(async function () {
+  const first = sandbox.refreshDashboard();
+  const second = sandbox.refreshDashboard();
+  nodeResolvers.forEach(function (resolve) { resolve(response([])); });
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  process.stdout.write(JSON.stringify({ nodeRequests, firstResult, secondResult }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "nodeRequests": 1,
+        "firstResult": True,
+        "secondResult": False,
+    }
+
+
+def test_stale_poll_response_does_not_overwrite_newer() -> None:
+    result = _run_dashboard_scenario(
+        r"""
+let nodeRequests = 0;
+let resolveOldNodes;
+sandbox.fetch = async function (url) {
+  if (url === "/admin/nodes") {
+    nodeRequests += 1;
+    if (nodeRequests === 1) {
+      return new Promise(function (resolve) { resolveOldNodes = resolve; });
+    }
+    return response([node("new-node", "healthy", [])]);
+  }
+  if (url === "/admin/metrics") return response({ per_node: {} });
+  if (url === "/admin/quads/status") return response({ status: "connected" });
+  throw new Error("unexpected request " + url);
+};
+
+(async function () {
+  const oldRequest = sandbox.refreshDashboard();
+  vm.runInContext("dashboardPollInFlight = false", sandbox);
+  await sandbox.refreshDashboard();
+  resolveOldNodes(response([node("old-node", "failed", [])]));
+  await oldRequest;
+  const links = allElements.filter(function (el) { return el.tagName === "a"; });
+  process.stdout.write(JSON.stringify({
+    nodeRequests,
+    renderedTitles: links.map(function (link) { return link.title; }),
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {"nodeRequests": 2, "renderedTitles": ["new-node"]}

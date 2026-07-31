@@ -69,10 +69,19 @@ const ACTION_CONFIG = {
   },
 };
 
+const inFlightNodes = new Set();
+const expandedErrorNodes = new Set();
+let openActionMenuNode = null;
+let dashboardPollInFlight = false;
+let dashboardRequestSequence = 0;
+let dashboardLastRenderedSequence = 0;
+
 async function handleAction(action, nodeId, node) {
   const config = ACTION_CONFIG[action];
   if (!config) return;
+  if (inFlightNodes.has(nodeId)) return;
   if (config.confirm && !window.confirm(config.confirmMsg(nodeId))) return;
+  inFlightNodes.add(nodeId);
   const options = { method: config.method };
   if (config.body) {
     options.headers = { "Content-Type": "application/json" };
@@ -88,6 +97,8 @@ async function handleAction(action, nodeId, node) {
     }
   } catch (err) {
     showToast(`${config.label} failed: ${err.message}`, "error");
+  } finally {
+    inFlightNodes.delete(nodeId);
   }
 }
 
@@ -123,18 +134,29 @@ function createActionButton(action, nodeId, node) {
   btn.type = "button";
   btn.className = config.css;
   btn.textContent = config.label;
+  btn.disabled = inFlightNodes.has(nodeId);
   btn.addEventListener("click", async function () {
+    if (inFlightNodes.has(nodeId)) return;
     btn.disabled = true;
     try {
       await handleAction(action, nodeId, node);
     } finally {
-      btn.disabled = false;
+      btn.disabled = inFlightNodes.has(nodeId);
     }
   });
   return btn;
 }
 
+function positionActionMenu(caret, menu) {
+  const rect = caret.getBoundingClientRect();
+  menu.style.top = (rect.top - menu.offsetHeight) + "px";
+  menu.style.left = (rect.right - menu.offsetWidth) + "px";
+}
+
 async function refreshDashboard() {
+  if (dashboardPollInFlight) return false;
+  dashboardPollInFlight = true;
+  const requestSequence = ++dashboardRequestSequence;
   const tbody = document.getElementById("node-table-body");
   const countEl = document.getElementById("node-count");
   const lastUpdatedEl = document.getElementById("last-updated");
@@ -150,6 +172,9 @@ async function refreshDashboard() {
     const nodes = await nodesResp.json();
     const metrics = await metricsResp.json();
     const perNode = metrics.per_node || {};
+
+    if (requestSequence < dashboardLastRenderedSequence) return false;
+    dashboardLastRenderedSequence = requestSequence;
 
     // ponytail: graceful degradation if QUADS endpoint unavailable
     if (quadsResp.ok) {
@@ -227,6 +252,10 @@ async function refreshDashboard() {
           caret.textContent = "▾";
           const menu = document.createElement("div");
           menu.className = "action-menu";
+          if (openActionMenuNode === node.node_id) {
+            menu.classList.add("open");
+            requestAnimationFrame(function () { positionActionMenu(caret, menu); });
+          }
           for (let i = 1; i < actions.length; i++) {
             const menuBtn = createActionButton(actions[i], node.node_id, node);
             menu.appendChild(menuBtn);
@@ -236,10 +265,11 @@ async function refreshDashboard() {
             var wasOpen = menu.classList.contains("open");
             document.querySelectorAll(".action-menu.open").forEach(function (m) { m.classList.remove("open"); });
             if (!wasOpen) {
+              openActionMenuNode = node.node_id;
               menu.classList.add("open");
-              var rect = caret.getBoundingClientRect();
-              menu.style.top = (rect.top - menu.offsetHeight) + "px";
-              menu.style.left = (rect.right - menu.offsetWidth) + "px";
+              positionActionMenu(caret, menu);
+            } else {
+              openActionMenuNode = null;
             }
           });
           group.appendChild(caret);
@@ -254,7 +284,8 @@ async function refreshDashboard() {
         if (node.state === "failed" && (node.failed_step || node.error)) {
           const subRow = document.createElement("tr");
           subRow.className = "error-subrow";
-          subRow.style.display = "none";
+          const expanded = expandedErrorNodes.has(node.node_id);
+          subRow.style.display = expanded ? "table-row" : "none";
 
           const subTd = document.createElement("td");
           subTd.colSpan = 7;
@@ -284,12 +315,14 @@ async function refreshDashboard() {
           stateBadge.style.cursor = "pointer";
           stateBadge.setAttribute("role", "button");
           stateBadge.setAttribute("tabindex", "0");
-          stateBadge.setAttribute("aria-expanded", "false");
+          stateBadge.setAttribute("aria-expanded", String(expanded));
 
           function toggleSubRow() {
             const visible = subRow.style.display !== "none";
             subRow.style.display = visible ? "none" : "table-row";
             stateBadge.setAttribute("aria-expanded", String(!visible));
+            if (visible) expandedErrorNodes.delete(node.node_id);
+            else expandedErrorNodes.add(node.node_id);
           }
 
           stateBadge.addEventListener("click", toggleSubRow);
@@ -307,9 +340,14 @@ async function refreshDashboard() {
       "Updated " + new Date().toLocaleTimeString();
     lastUpdatedEl.className = "last-updated";
   } catch (err) {
-    warningEl.textContent = "Update failed — retrying...";
-    warningEl.className = "poll-warning";
+    if (requestSequence >= dashboardLastRenderedSequence) {
+      warningEl.textContent = "Update failed — retrying...";
+      warningEl.className = "poll-warning";
+    }
+  } finally {
+    dashboardPollInFlight = false;
   }
+  return true;
 }
 
 function renderTaskDataWarning(nodesResponse, warningEl) {
@@ -334,6 +372,7 @@ document.addEventListener("DOMContentLoaded", function () {
       document.querySelectorAll(".action-menu.open").forEach(function (m) {
         m.classList.remove("open");
       });
+      openActionMenuNode = null;
     }
   });
 

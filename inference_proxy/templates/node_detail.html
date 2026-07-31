@@ -118,7 +118,7 @@
 
     <script>
         const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};
-        const NODE_ID = "{{ node_id }}";
+        const NODE_ID = {{ node_id | tojson }};
     </script>
     <script src="{{ url_for('static', path='js/node_detail.js') }}"></script>
 </body>

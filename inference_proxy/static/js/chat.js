@@ -22,8 +22,30 @@ var chatInput;
 var sendBtn;
 var modelSelect;
 var streaming = false;
+var modelsAvailable = false;
 var systemPromptTextarea;
 var systemPromptToggle;
+
+// Assistant Markdown is intentionally limited to inert formatting. Links render
+// as plain text and images/media/forms are removed, so model output cannot
+// trigger an outbound request or create an interactive control.
+var ASSISTANT_MARKDOWN_SANITIZE_CONFIG = {
+  ALLOWED_TAGS: [
+    "p", "br", "strong", "em", "del", "blockquote", "code", "pre",
+    "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6", "hr",
+    "table", "thead", "tbody", "tr", "th", "td",
+  ],
+  ALLOWED_ATTR: [],
+  ALLOW_ARIA_ATTR: false,
+  ALLOW_DATA_ATTR: false,
+};
+
+function renderAssistantMarkdown(target, content) {
+  target.innerHTML = DOMPurify.sanitize(
+    marked.parse(content || ""),
+    ASSISTANT_MARKDOWN_SANITIZE_CONFIG,
+  );
+}
 
 function isNearBottom(el, threshold) {
   return el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
@@ -42,8 +64,7 @@ function addMessage(role, content) {
   if (role === "user") {
     bubble.textContent = content;
   } else {
-    // ponytail: marked.parse for markdown; XSS accepted per threat model T-19-03 (internal tool)
-    bubble.innerHTML = marked.parse(content || "");
+    renderAssistantMarkdown(bubble, content);
   }
   messageAreaInner.appendChild(bubble);
   messageArea.scrollTop = messageArea.scrollHeight;
@@ -51,7 +72,7 @@ function addMessage(role, content) {
 }
 
 function setInputEnabled(enabled) {
-  sendBtn.disabled = !enabled;
+  sendBtn.disabled = !enabled || !modelsAvailable;
   chatInput.disabled = !enabled;
 }
 
@@ -113,7 +134,7 @@ async function streamResponse(bubble) {
           if (delta && delta.content) {
             rawText += delta.content;
             var shouldScroll = isNearBottom(messageArea, 40);
-            bubble.innerHTML = marked.parse(rawText);
+            renderAssistantMarkdown(bubble, rawText);
             bubble.appendChild(cursor);
             if (shouldScroll) {
               messageArea.scrollTop = messageArea.scrollHeight;
@@ -126,7 +147,7 @@ async function streamResponse(bubble) {
     }
 
     // finalize
-    bubble.innerHTML = marked.parse(rawText);
+    renderAssistantMarkdown(bubble, rawText);
     messages.push({ role: "assistant", content: rawText });
   } catch (err) {
     showToast("Could not reach the server. Check your connection.", "error");
@@ -165,14 +186,16 @@ async function loadModels() {
     var data = await resp.json();
     var models = data.data || [];
     modelSelect.textContent = "";
+    modelsAvailable = models.length > 0;
 
     if (models.length === 0) {
       var opt = document.createElement("option");
+      opt.value = "";
       opt.textContent = "No models available";
       opt.disabled = true;
       opt.selected = true;
       modelSelect.appendChild(opt);
-      sendBtn.disabled = true;
+      setInputEnabled(!streaming);
       return;
     }
 
@@ -182,14 +205,17 @@ async function loadModels() {
       opt.textContent = models[i].id;
       modelSelect.appendChild(opt);
     }
+    setInputEnabled(!streaming);
   } catch (e) {
     modelSelect.textContent = "";
+    modelsAvailable = false;
     var opt = document.createElement("option");
+    opt.value = "";
     opt.textContent = "No models available";
     opt.disabled = true;
     opt.selected = true;
     modelSelect.appendChild(opt);
-    sendBtn.disabled = true;
+    setInputEnabled(!streaming);
   }
 }
 

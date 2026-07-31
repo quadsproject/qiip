@@ -515,6 +515,7 @@ td button:focus-visible {
 .log-line[data-level="warning"] .log-msg { color: var(--warning); }
 .log-line[data-stream="stderr"] .log-msg { color: var(--danger); }
 .log-placeholder { color: var(--text-light); font-style: italic; }
+.muted-status { color: var(--muted); font-size: 0.875rem; }
 
 /* --- Misc --- */
 .error-text { color: var(--danger); font-size: 0.8125rem; }
