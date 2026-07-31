@@ -42,6 +42,44 @@ class TestChatMessage:
         msg = ChatMessage(role="system")
         assert msg.content is None
 
+    def test_tool_call_message_model_preserves_nested_fields(self) -> None:
+        payload = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-weather",
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "arguments": '{"city":"Raleigh"}',
+                    },
+                }
+            ],
+            "name": "weather-agent",
+            "vendor_extension": {"trace_id": "trace-123"},
+        }
+
+        message = ChatMessage.model_validate(payload)
+
+        assert message.model_dump(exclude_unset=True) == payload
+
+    def test_multimodal_content_parts_round_trip(self) -> None:
+        content = [
+            {"type": "text", "text": "What is shown?"},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,AA==",
+                    "detail": "low",
+                },
+            },
+        ]
+
+        message = ChatMessage(role="user", content=content)
+
+        assert message.model_dump()["content"] == content
+
 
 # --- ChatCompletionRequest tests ---
 
@@ -305,6 +343,28 @@ class TestCompletionRequest:
             prompt=["Hello", "World"],
         )
         assert req.prompt == ["Hello", "World"]
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [
+            [101, 202, 303],
+            [[101, 202], [303, 404]],
+        ],
+    )
+    def test_token_id_prompt_forms_preserve_integer_types(
+        self,
+        prompt: list[int] | list[list[int]],
+    ) -> None:
+        request = CompletionRequest(model="llama-2-7b", prompt=prompt)
+        dumped_prompt = request.model_dump()["prompt"]
+
+        assert dumped_prompt == prompt
+        if prompt and isinstance(prompt[0], list):
+            assert all(
+                type(token) is int for sequence in dumped_prompt for token in sequence
+            )
+        else:
+            assert all(type(token) is int for token in dumped_prompt)
 
     def test_request_extra_fields_pass_through(self) -> None:
         """D-10: unknown fields pass through to vLLM."""

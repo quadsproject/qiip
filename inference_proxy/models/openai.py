@@ -4,11 +4,15 @@ Covers chat completion (D-09, D-10, D-11) and text completion (D-12) endpoints:
 request models, response models, streaming chunk models, and error schema.
 
 Design decisions:
-- D-09: vLLM-relevant fields only (no tools, function_call, logprobs)
-- D-10: extra='allow' on request models for forward compatibility with vLLM
+- D-09: Preserve OpenAI message content and tool metadata without constraining
+  nested extensions understood by vLLM.
+- D-10: extra='allow' on request models and nested messages for forward
+  compatibility with vLLM.
 - D-11: Both request AND response models
 - D-12: Chat and text completion models are fully separate (no shared base class)
 """
+
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -20,8 +24,10 @@ from pydantic import BaseModel, ConfigDict, Field
 class ChatMessage(BaseModel):
     """A single message in a chat conversation."""
 
+    model_config = ConfigDict(extra="allow")
+
     role: str
-    content: str | None = None
+    content: str | list[dict[str, Any]] | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -110,7 +116,7 @@ class CompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     model: str
-    prompt: str | list[str]
+    prompt: str | list[str] | list[int] | list[list[int]]
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, gt=0)
     top_p: float | None = Field(default=None, gt=0, le=1)

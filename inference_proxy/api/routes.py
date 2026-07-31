@@ -345,6 +345,12 @@ async def chat_completions(
     Otherwise, returns the full JSON response from the backend.
     """
     body = request.model_dump(exclude_none=True)
+    # Keep top-level optional parameters clean while preserving the distinction
+    # between an omitted message field and an explicitly supplied null. Tool-call
+    # assistant turns canonically carry ``content: null``.
+    body["messages"] = [
+        message.model_dump(exclude_unset=True) for message in request.messages
+    ]
     if request.stream:
         return await _stream_completion(
             endpoint_path="/v1/chat/completions",
