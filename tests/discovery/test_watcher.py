@@ -17,6 +17,17 @@ from inference_proxy.discovery.serializer import node_to_etcd
 from inference_proxy.models.node import Node, NodeStatus
 
 try:
+    from inference_proxy.models.endpoint import EndpointPolicy as _EndpointPolicy
+except ImportError:
+    # PR 5's behavioral comparison runs these tests against production code
+    # that predates the endpoint-policy module.
+    class _EndpointPolicy:
+        @classmethod
+        def from_values(cls, **_kwargs: object) -> _EndpointPolicy:
+            return cls()
+
+
+try:
     from inference_proxy.discovery.etcd_client import (
         WatchCompactedError as _WatchCompactedError,
     )
@@ -63,6 +74,22 @@ except ImportError:
 
 
 _TIMEOUT = 1.0
+_ENDPOINT_POLICY = _EndpointPolicy.from_values(
+    allowed_hosts=[
+        "added",
+        "between",
+        "fresh",
+        "gpu01",
+        "new",
+        "node-1",
+        "node-2",
+        "old",
+        "removed",
+        "stale",
+    ],
+    allowed_networks=[],
+    allowed_ports=[8000, 9000],
+)
 
 
 @dataclass(frozen=True)
@@ -251,12 +278,23 @@ def _start_watcher(
     retry_delay: float = 0.001,
 ) -> tuple[_EtcdWatcher, threading.Thread]:
     stop_event = threading.Event()
-    watcher = _EtcdWatcher(
-        cast(EtcdClient, client),
-        registry,
-        stop_event,
-        retry_delay=retry_delay,
-    )
+    try:
+        watcher = _EtcdWatcher(
+            cast(EtcdClient, client),
+            registry,
+            stop_event,
+            endpoint_policy=_ENDPOINT_POLICY,
+            retry_delay=retry_delay,
+        )
+    except TypeError:
+        # Unfixed PR 6 predates endpoint-policy injection. Retaining this
+        # entry-point shape makes PR 5's comparison fail on behavior.
+        watcher = _EtcdWatcher(
+            cast(EtcdClient, client),
+            registry,
+            stop_event,
+            retry_delay=retry_delay,
+        )
     thread = threading.Thread(
         target=watcher.run,
         daemon=True,
@@ -431,7 +469,7 @@ def test_registry_reconciles_after_watch_gap() -> None:
 
     current = registry.get("old")
     assert current is not None
-    assert current.endpoint == "new:9000"
+    assert current.endpoint == "http://new:9000"
     assert current.model == "model-b"
     assert current.managed is False
     assert registry.get("added") is not None
@@ -506,7 +544,7 @@ def test_stale_watch_event_does_not_override_reconciled_node(
 
     current = registry.get("node-1")
     assert current is not None
-    assert current.endpoint == "fresh:8000"
+    assert current.endpoint == "http://fresh:8000"
     assert current.status == NodeStatus.HEALTHY
 
 
@@ -578,7 +616,7 @@ def test_late_cleanup_delete_does_not_drain_new_registration() -> None:
     current = registry.get("gpu01")
     assert current is not None
     assert current.status == NodeStatus.HEALTHY
-    assert current.endpoint == "gpu01:8000"
+    assert current.endpoint == "http://gpu01:8000"
 
 
 def test_reconcile_preserves_local_liveness_status() -> None:
@@ -614,7 +652,7 @@ def test_reconcile_preserves_local_liveness_status() -> None:
     current = registry.get("node-1")
     assert current is not None
     assert current.status == NodeStatus.UNHEALTHY
-    assert current.endpoint == "new:9000"
+    assert current.endpoint == "http://new:9000"
     assert current.model == "new-model"
     assert current.managed is False
 
@@ -688,7 +726,7 @@ def test_compacted_watch_takes_fresh_snapshot_and_recovers() -> None:
     assert client.start_revisions[:2] == [6, 21]
     current = registry.get("node-1")
     assert current is not None
-    assert current.endpoint == "fresh:9000"
+    assert current.endpoint == "http://fresh:9000"
     missing = registry.get("removed")
     assert missing is not None
     assert missing.status == NodeStatus.DRAINING
@@ -756,4 +794,38 @@ def test_numeric_revision_order_is_not_lexicographic() -> None:
 
     current = registry.get("node-1")
     assert current is not None
-    assert current.endpoint == "new:9000"
+    assert current.endpoint == "http://new:9000"
+
+
+def test_watch_rejects_disallowed_endpoint() -> None:
+    """A live etcd PUT cannot add a backend outside the endpoint policy."""
+    disallowed = _node("metadata", "169.254.169.254:8000")
+    events = _FakeStream((_Batch((_put(disallowed, 2),), revision=2),))
+    settled = _FakeStream(block_after=True)
+    legacy_events = _LegacyStream((_legacy_event(_put(disallowed, 2)),))
+    legacy_settled = _LegacyStream(block_after=True)
+    client = _FakeEtcdClient(
+        (_snapshot(1),),
+        (events, settled),
+        legacy_watches=(legacy_events, legacy_settled),
+    )
+    registry = NodeRegistry()
+
+    with capture_logs() as logs:
+        watcher, thread = _start_watcher(client, registry)
+        assert _wait_for_stream(settled, legacy_settled)
+        _stop_watcher(
+            watcher,
+            thread,
+            events,
+            settled,
+            legacy_events,
+            legacy_settled,
+        )
+
+    assert registry.get("metadata") is None
+    rejection = [log for log in logs if log["event"] == "skipping malformed node"]
+    assert len(rejection) == 1
+    assert rejection[0]["log_level"] == "warning"
+    assert rejection[0]["endpoint"] == "http://169.254.169.254:8000"
+    assert "host is not allowed" in rejection[0]["error"]

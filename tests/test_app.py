@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from inference_proxy.config.settings import Settings
+from inference_proxy.config.settings import RoutingSettings, Settings
 from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.main import _initial_load
 from inference_proxy.models.node import Node, NodeStatus
 
 
@@ -47,6 +49,45 @@ def test_health_with_nodes(client: TestClient, test_registry: NodeRegistry) -> N
 def test_app_is_fastapi_instance(app: FastAPI) -> None:
     """The app fixture yields a FastAPI instance."""
     assert isinstance(app, FastAPI)
+
+
+def test_default_allowlist_rejects_lab_endpoint_from_admin_nodes(
+    client: TestClient,
+    test_registry: NodeRegistry,
+) -> None:
+    """A secure-default rejection is visible and absent from the admin view."""
+    etcd_client = MagicMock()
+    etcd_client.prefix = "/nodes/"
+    etcd_client.get_prefix.return_value = [
+        (
+            json.dumps(
+                {
+                    "endpoint": "10.0.1.100:8000",
+                    "status": "healthy",
+                    "model": "llama-3",
+                }
+            ).encode(),
+            {"key": b"/nodes/gpu01"},
+        )
+    ]
+
+    with patch("inference_proxy.discovery.serializer.logger") as serializer_logger:
+        routing = RoutingSettings()
+        policy_factory = getattr(routing, "endpoint_policy", None)
+        if policy_factory is None:
+            _initial_load(etcd_client, test_registry)
+        else:
+            _initial_load(etcd_client, test_registry, policy_factory())
+
+    assert test_registry.get_all() == []
+    response = client.get("/admin/nodes")
+
+    assert response.status_code == 200
+    assert response.json() == []
+    serializer_logger.warning.assert_called_once()
+    fields = serializer_logger.warning.call_args.kwargs
+    assert fields["endpoint"] == "10.0.1.100:8000"
+    assert "host is not allowed" in fields["error"]
 
 
 def test_subpackages_importable() -> None:
@@ -102,6 +143,41 @@ class TestLifespanRegistryIntegration:
         watcher = mock_watcher_cls.return_value
         watcher.run.assert_called_once()
         watcher.stop.assert_called_once()
+
+    @patch("inference_proxy.main.logger")
+    @patch("inference_proxy.main.EtcdWatcher")
+    @patch("inference_proxy.main.EtcdClient")
+    def test_unset_endpoint_allowlist_warns_at_startup(
+        self,
+        mock_etcd_cls: MagicMock,
+        _mock_watcher_cls: MagicMock,
+        mock_logger: MagicMock,
+        test_settings: Settings,
+    ) -> None:
+        """Secure loopback defaults are announced loudly during startup."""
+        mock_client = MagicMock()
+        mock_client.get_prefix.return_value = []
+        mock_client.prefix = "/nodes/"
+        mock_etcd_cls.return_value = mock_client
+
+        from inference_proxy.main import create_app
+
+        app = create_app(settings=_lifespan_settings(test_settings))
+        with TestClient(app):
+            pass
+
+        warnings = [
+            call
+            for call in mock_logger.warning.call_args_list
+            if call.args
+            and call.args[0].startswith("backend endpoint allowlist is unset")
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].kwargs == {
+            "allowed_hosts": ["localhost"],
+            "allowed_networks": ["127.0.0.0/8", "::1/128"],
+            "allowed_ports": [8000],
+        }
 
     @patch("inference_proxy.main.EtcdWatcher")
     @patch("inference_proxy.main.EtcdClient")

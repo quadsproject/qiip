@@ -10,10 +10,17 @@ import pytest
 
 from inference_proxy.config.settings import ProvisioningSettings
 from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.quads.client import QUADSClient, QUADSConnectionError
 from inference_proxy.quads.schedule_enforcer import ScheduleEnforcer
+
+_ENDPOINT_POLICY = EndpointPolicy.from_values(
+    allowed_hosts=["gpu01"],
+    allowed_networks=[],
+    allowed_ports=[8000],
+)
 
 
 def _node(hostname: str, status: NodeStatus = NodeStatus.HEALTHY) -> Node:
@@ -192,6 +199,7 @@ async def test_schedule_enforcer_uses_same_host_lifecycle_lock(
         ssh_client=MagicMock(),
         etcd_client=etcd,
         settings=ProvisioningSettings(),
+        endpoint_policy=_ENDPOINT_POLICY,
         registry=registry,
     )
     provision_entered = asyncio.Event()

@@ -30,6 +30,7 @@ from inference_proxy.config.dependencies import (
 )
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.llmfit.errors import LLMFitParseError, LLMFitTimeoutError
+from inference_proxy.models.endpoint import EndpointValidationError
 from inference_proxy.models.llmfit import LLMFitResult, ModelRecommendation, SystemInfo
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.models.quads import QUADSHost
@@ -286,6 +287,24 @@ class TestSetupEndpoint:
     ) -> None:
         client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
         mock_provisioner.fire_background.assert_called_once()
+
+    def test_rejects_disallowed_endpoint_before_reserving_host(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.validate_endpoint.side_effect = EndpointValidationError(
+            "add 'gpu01' to routing.allowed_endpoint_hosts"
+        )
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 400
+        assert response.json()["detail"] == (
+            "add 'gpu01' to routing.allowed_endpoint_hosts"
+        )
+        mock_provisioner.try_reserve_host.assert_not_awaited()
+        mock_provisioner.fire_background.assert_not_called()
 
 
 class TestSetupModelPassthrough:

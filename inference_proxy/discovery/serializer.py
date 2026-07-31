@@ -18,12 +18,19 @@ import json
 import structlog
 from pydantic import ValidationError
 
+from inference_proxy.models.endpoint import EndpointPolicy, parse_endpoint
 from inference_proxy.models.node import Node
 
 logger = structlog.get_logger()
 
 
-def node_from_etcd(key: str | bytes, value: bytes, prefix: str) -> Node | None:
+def node_from_etcd(
+    key: str | bytes,
+    value: bytes,
+    prefix: str,
+    *,
+    endpoint_policy: EndpointPolicy,
+) -> Node | None:
     """Parse an etcd key-value pair into a Node.
 
     Handles both ``bytes`` and ``str`` keys defensively (Pitfall 2).
@@ -36,14 +43,26 @@ def node_from_etcd(key: str | bytes, value: bytes, prefix: str) -> Node | None:
     Returns:
         A ``Node`` instance, or ``None`` if parsing fails.
     """
+    raw_endpoint: object = None
     try:
         if isinstance(key, bytes):
             key = key.decode("utf-8")
         node_id = key.removeprefix(prefix)
         data = json.loads(value)
+        if not isinstance(data, dict):
+            raise ValueError("node payload must be a JSON object")
+        raw_endpoint = data.get("endpoint")
+        if not isinstance(raw_endpoint, str):
+            raise ValueError("node endpoint must be a string")
+        data["endpoint"] = endpoint_policy.normalize(raw_endpoint)
         return Node(node_id=node_id, **data)
     except (json.JSONDecodeError, TypeError, ValueError, ValidationError) as exc:
-        logger.warning("skipping malformed node", key=key, error=str(exc))
+        logger.warning(
+            "skipping malformed node",
+            key=key,
+            endpoint=raw_endpoint,
+            error=str(exc),
+        )
         return None
 
 
@@ -62,5 +81,6 @@ def node_to_etcd(node: Node, prefix: str) -> tuple[str, bytes]:
     """
     key = prefix + node.node_id
     data = node.model_dump(exclude={"node_id"}, mode="json")
+    data["endpoint"] = parse_endpoint(node.endpoint).origin
     value_bytes = json.dumps(data).encode("utf-8")
     return key, value_bytes

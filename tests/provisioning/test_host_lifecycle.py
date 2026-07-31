@@ -9,12 +9,18 @@ import pytest
 
 from inference_proxy.config.settings import ProvisioningSettings
 from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 from inference_proxy.routing.connection_tracker import ConnectionTracker
 
 _TIMEOUT = 1.0
+_ENDPOINT_POLICY = EndpointPolicy.from_values(
+    allowed_hosts=["gpu01"],
+    allowed_networks=[],
+    allowed_ports=[8000],
+)
 
 
 def _provisioner(
@@ -30,6 +36,7 @@ def _provisioner(
         ssh_client=MagicMock(),
         etcd_client=etcd,
         settings=ProvisioningSettings(),
+        endpoint_policy=_ENDPOINT_POLICY,
         registry=registry,
         connection_tracker=tracker,
         circuit_breaker_registry=breakers,

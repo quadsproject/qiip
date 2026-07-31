@@ -10,8 +10,17 @@ import json
 from datetime import UTC, datetime
 from unittest.mock import patch
 
+from structlog.testing import capture_logs
+
 from inference_proxy.discovery.serializer import node_from_etcd, node_to_etcd
+from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.node import Node, NodeCapabilities, NodeStatus
+
+_ENDPOINT_POLICY = EndpointPolicy.from_values(
+    allowed_hosts=[],
+    allowed_networks=["10.0.1.0/24"],
+    allowed_ports=[8000],
+)
 
 
 class TestNodeFromEtcdValidFullJson:
@@ -31,7 +40,7 @@ class TestNodeFromEtcdValidFullJson:
         ).encode("utf-8")
         prefix = "/nodes/"
 
-        node = node_from_etcd(key, value, prefix)
+        node = node_from_etcd(key, value, prefix, endpoint_policy=_ENDPOINT_POLICY)
 
         assert node is not None
         assert node.node_id == "node-abc"
@@ -52,7 +61,7 @@ class TestNodeFromEtcdMinimalJson:
         value = json.dumps({"endpoint": "http://10.0.1.200:8000"}).encode("utf-8")
         prefix = "/nodes/"
 
-        node = node_from_etcd(key, value, prefix)
+        node = node_from_etcd(key, value, prefix, endpoint_policy=_ENDPOINT_POLICY)
 
         assert node is not None
         assert node.node_id == "node-min"
@@ -65,6 +74,43 @@ class TestNodeFromEtcdMinimalJson:
         assert node.active_connections == 0
 
 
+def test_node_from_etcd_normalizes_schemeless_endpoint() -> None:
+    value = json.dumps({"endpoint": "10.0.1.200:8000"}).encode()
+
+    node = node_from_etcd(
+        "/nodes/node-min",
+        value,
+        "/nodes/",
+        endpoint_policy=_ENDPOINT_POLICY,
+    )
+
+    assert node is not None
+    assert node.endpoint == "http://10.0.1.200:8000"
+
+
+def test_node_from_etcd_rejects_disallowed_endpoint_with_reason() -> None:
+    value = json.dumps({"endpoint": "169.254.169.254:8000"}).encode()
+
+    with capture_logs() as logs:
+        node = node_from_etcd(
+            "/nodes/metadata",
+            value,
+            "/nodes/",
+            endpoint_policy=_ENDPOINT_POLICY,
+        )
+
+    assert node is None
+    assert logs == [
+        {
+            "event": "skipping malformed node",
+            "key": "/nodes/metadata",
+            "endpoint": "169.254.169.254:8000",
+            "error": ("backend endpoint host is not allowed: '169.254.169.254:8000'"),
+            "log_level": "warning",
+        }
+    ]
+
+
 class TestNodeFromEtcdMalformedJson:
     """node_from_etcd returns None and logs warning for malformed JSON."""
 
@@ -74,7 +120,9 @@ class TestNodeFromEtcdMalformedJson:
         prefix = "/nodes/"
 
         with patch("inference_proxy.discovery.serializer.logger") as mock_logger:
-            result = node_from_etcd(key, value, prefix)
+            result = node_from_etcd(
+                key, value, prefix, endpoint_policy=_ENDPOINT_POLICY
+            )
 
         assert result is None
         mock_logger.warning.assert_called_once()
@@ -89,7 +137,9 @@ class TestNodeFromEtcdEmptyBytes:
         prefix = "/nodes/"
 
         with patch("inference_proxy.discovery.serializer.logger") as mock_logger:
-            result = node_from_etcd(key, value, prefix)
+            result = node_from_etcd(
+                key, value, prefix, endpoint_policy=_ENDPOINT_POLICY
+            )
 
         assert result is None
         mock_logger.warning.assert_called_once()
@@ -104,7 +154,9 @@ class TestNodeFromEtcdMissingEndpoint:
         prefix = "/nodes/"
 
         with patch("inference_proxy.discovery.serializer.logger") as mock_logger:
-            result = node_from_etcd(key, value, prefix)
+            result = node_from_etcd(
+                key, value, prefix, endpoint_policy=_ENDPOINT_POLICY
+            )
 
         assert result is None
         mock_logger.warning.assert_called_once()
@@ -118,7 +170,7 @@ class TestNodeFromEtcdBytesAndStrKey:
         value = json.dumps({"endpoint": "http://10.0.1.100:8000"}).encode("utf-8")
         prefix = "/nodes/"
 
-        node = node_from_etcd(key, value, prefix)
+        node = node_from_etcd(key, value, prefix, endpoint_policy=_ENDPOINT_POLICY)
 
         assert node is not None
         assert node.node_id == "bytes-node"
@@ -128,7 +180,7 @@ class TestNodeFromEtcdBytesAndStrKey:
         value = json.dumps({"endpoint": "http://10.0.1.100:8000"}).encode("utf-8")
         prefix = "/nodes/"
 
-        node = node_from_etcd(key, value, prefix)
+        node = node_from_etcd(key, value, prefix, endpoint_policy=_ENDPOINT_POLICY)
 
         assert node is not None
         assert node.node_id == "str-node"
@@ -175,7 +227,9 @@ class TestNodeToEtcdRoundtrip:
         prefix = "/nodes/"
 
         key, value_bytes = node_to_etcd(original, prefix)
-        restored = node_from_etcd(key, value_bytes, prefix)
+        restored = node_from_etcd(
+            key, value_bytes, prefix, endpoint_policy=_ENDPOINT_POLICY
+        )
 
         assert restored is not None
         assert restored.node_id == original.node_id
@@ -186,3 +240,19 @@ class TestNodeToEtcdRoundtrip:
         assert restored.capabilities.max_tokens == original.capabilities.max_tokens
         assert restored.capabilities.gpu_memory == original.capabilities.gpu_memory
         assert restored.active_connections == original.active_connections
+
+
+def test_endpoint_roundtrip_preserves_canonical_form() -> None:
+    original = Node(node_id="node-1", endpoint="10.0.1.100:8000")
+
+    key, value = node_to_etcd(original, "/nodes/")
+    restored = node_from_etcd(
+        key,
+        value,
+        "/nodes/",
+        endpoint_policy=_ENDPOINT_POLICY,
+    )
+
+    assert json.loads(value)["endpoint"] == "http://10.0.1.100:8000"
+    assert restored is not None
+    assert restored.endpoint == "http://10.0.1.100:8000"

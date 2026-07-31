@@ -40,6 +40,7 @@ import httpx
 import structlog
 
 from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.models.endpoint import build_backend_url
 from inference_proxy.models.node import NodeStatus
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 
@@ -171,7 +172,7 @@ def _probe_node(
         failure_threshold: Consecutive failures before marking UNHEALTHY.
     """
     try:
-        url = f"http://{endpoint}/health"
+        url = build_backend_url(endpoint, "/health")
         response = client.get(url)
         if response.status_code == 200:
             _handle_probe_success(
@@ -233,7 +234,7 @@ def _handle_probe_success(
             return
         try:
             response = client.post(
-                f"http://{current.endpoint}/v1/completions",
+                build_backend_url(current.endpoint, "/v1/completions"),
                 json={
                     "model": current.model,
                     "prompt": "ping",

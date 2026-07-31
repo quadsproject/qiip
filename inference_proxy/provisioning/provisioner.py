@@ -16,6 +16,7 @@ from collections.abc import Coroutine
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from ipaddress import ip_address
 from typing import TYPE_CHECKING
 
 import httpx
@@ -25,6 +26,7 @@ from inference_proxy.config.settings import ProvisioningSettings
 from inference_proxy.discovery.etcd_client import EtcdClient
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_to_etcd
+from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.provisioning.host_lifecycle import (
     HostLifecycleCoordinator,
@@ -77,8 +79,8 @@ class _ProvisioningTask:
 class NodeProvisioner:
     """Orchestrates full provisioning of a vLLM node on a remote host.
 
-    Accepts SSHClient, EtcdClient, and ProvisioningSettings via
-    constructor injection (DIP).
+    Accepts SSHClient, EtcdClient, ProvisioningSettings, and EndpointPolicy
+    via constructor injection (DIP).
     """
 
     def __init__(
@@ -86,6 +88,7 @@ class NodeProvisioner:
         ssh_client: SSHClient,
         etcd_client: EtcdClient,
         settings: ProvisioningSettings,
+        endpoint_policy: EndpointPolicy,
         registry: NodeRegistry | None = None,
         connection_tracker: ConnectionTracker | None = None,
         circuit_breaker_registry: CircuitBreakerRegistry | None = None,
@@ -96,6 +99,7 @@ class NodeProvisioner:
         self._ssh_client = ssh_client
         self._etcd_client = etcd_client
         self._settings = settings
+        self._endpoint_policy = endpoint_policy
         self._registry = registry
         self._tracker = connection_tracker
         self._cb_registry = circuit_breaker_registry
@@ -108,6 +112,29 @@ class NodeProvisioner:
     @property
     def log_buffer(self) -> ProvisioningLogBuffer:
         return self._log_buffer
+
+    def validate_endpoint(self, hostname: str) -> str:
+        """Return the canonical provisioned endpoint or fail with a config hint."""
+        candidate = f"{hostname}:{self._settings.vllm_port}"
+        try:
+            return self._endpoint_policy.normalize(candidate)
+        except EndpointValidationError as exc:
+            try:
+                ip_address(hostname.strip("[]"))
+            except ValueError:
+                allowlist_hint = (
+                    f"add {hostname!r} to routing.allowed_endpoint_hosts "
+                    "or add an approved wildcard suffix"
+                )
+            else:
+                allowlist_hint = (
+                    f"add a CIDR containing {hostname!r} to "
+                    "routing.allowed_endpoint_networks"
+                )
+            raise EndpointValidationError(
+                f"Provisioning host {hostname!r} would create disallowed backend "
+                f"endpoint {candidate!r}: {exc}; {allowlist_hint}"
+            ) from exc
 
     def _script_env_prefix(self) -> str:
         """Build env var prefix for remote script invocation."""
@@ -302,6 +329,10 @@ class NodeProvisioner:
         lifecycle_lease: HostLifecycleLease | None = None,
     ) -> None:
         """Provision *hostname* under the shared host lifecycle coordinator."""
+        # Validate before acquiring the lifecycle lease or touching the host.
+        # The API also calls this synchronously so configuration errors become
+        # immediate 400 responses instead of failed background operations.
+        self.validate_endpoint(hostname)
         lease = lifecycle_lease
         if lease is None:
             lease = await self._lifecycle.acquire(hostname)
@@ -364,7 +395,7 @@ class NodeProvisioner:
         # D-09: Register node as PROVISIONING before setup
         node = Node(
             node_id=hostname,
-            endpoint=f"{hostname}:{self._settings.vllm_port}",
+            endpoint=self.validate_endpoint(hostname),
             status=NodeStatus.PROVISIONING,
             model="",
             last_heartbeat=datetime.now(UTC),
@@ -425,7 +456,7 @@ class NodeProvisioner:
             # Update node entry to FAILED so it doesn't stay stuck as PROVISIONING
             failed_node = Node(
                 node_id=hostname,
-                endpoint=f"{hostname}:{self._settings.vllm_port}",
+                endpoint=self.validate_endpoint(hostname),
                 status=NodeStatus.FAILED,
                 model="",
                 last_heartbeat=datetime.now(UTC),
@@ -582,7 +613,7 @@ class NodeProvisioner:
         """Register node in etcd with correct fields (D-11, D-12)."""
         node = Node(
             node_id=hostname,
-            endpoint=f"{hostname}:{self._settings.vllm_port}",
+            endpoint=self.validate_endpoint(hostname),
             status=NodeStatus.HEALTHY,
             model=model,
             last_heartbeat=datetime.now(UTC),

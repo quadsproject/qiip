@@ -6,9 +6,12 @@ Only the root Settings class inherits from BaseSettings.
 """
 
 from pathlib import Path
+from typing import Self
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from inference_proxy.models.endpoint import EndpointPolicy
 
 
 class GatewaySettings(BaseModel):
@@ -41,6 +44,25 @@ class RoutingSettings(BaseModel):
     health_check_interval: int = 30
     max_retries: int = Field(default=3, ge=1)
     timeout: int = 30
+    allowed_endpoint_hosts: list[str] = Field(default_factory=lambda: ["localhost"])
+    allowed_endpoint_networks: list[str] = Field(
+        default_factory=lambda: ["127.0.0.0/8", "::1/128"]
+    )
+    allowed_endpoint_ports: list[int] = Field(default_factory=lambda: [8000])
+
+    @model_validator(mode="after")
+    def endpoint_allowlist_is_valid(self) -> Self:
+        """Reject malformed endpoint trust rules during settings loading."""
+        self.endpoint_policy()
+        return self
+
+    def endpoint_policy(self) -> EndpointPolicy:
+        """Build the immutable endpoint policy used by discovery."""
+        return EndpointPolicy.from_values(
+            allowed_hosts=self.allowed_endpoint_hosts,
+            allowed_networks=self.allowed_endpoint_networks,
+            allowed_ports=self.allowed_endpoint_ports,
+        )
 
 
 class ProxySettings(BaseModel):
@@ -204,3 +226,13 @@ class Settings(BaseSettings):
     redfish: RedfishSettings = RedfishSettings()
     llmfit: LLMFitSettings = LLMFitSettings()
     huggingface: HuggingFaceSettings
+
+    @model_validator(mode="after")
+    def provisioned_port_is_allowed(self) -> Self:
+        """Fail fast when provisioned nodes would be rejected by discovery."""
+        if self.provisioning.vllm_port not in self.routing.allowed_endpoint_ports:
+            raise ValueError(
+                "provisioning.vllm_port must be included in "
+                "routing.allowed_endpoint_ports"
+            )
+        return self

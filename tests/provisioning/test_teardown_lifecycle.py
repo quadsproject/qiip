@@ -14,8 +14,15 @@ from inference_proxy.api.admin import setup_node, teardown_node
 from inference_proxy.config.settings import ProvisioningSettings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.admin import SetupRequest
+from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.provisioning.ssh_client import RemoteCommandError
+
+_ENDPOINT_POLICY = EndpointPolicy.from_values(
+    allowed_hosts=["gpu01"],
+    allowed_networks=[],
+    allowed_ports=[8000],
+)
 
 
 def _provisioner(
@@ -38,6 +45,7 @@ def _provisioner(
             health_poll_interval=0,
             drain_timeout=0,
         ),
+        endpoint_policy=_ENDPOINT_POLICY,
         registry=registry,
         connection_tracker=MagicMock(get=MagicMock(return_value=0)),
         log_buffer=MagicMock(),

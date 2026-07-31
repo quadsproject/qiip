@@ -43,6 +43,7 @@ from inference_proxy.config.dependencies import (
     get_request_metrics,
     get_settings,
 )
+from inference_proxy.models.endpoint import build_backend_url
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.models.openai import (
     ChatCompletionRequest,
@@ -282,7 +283,7 @@ async def _proxy_non_streaming(
         if starlette_request is not None:
             starlette_request.state.target_node = node.endpoint
 
-        url = f"http://{node.endpoint}{endpoint_path}"
+        url = build_backend_url(node.endpoint, endpoint_path)
         try:
             response = await proxy.forward("POST", url, body)
             # A client error proves reachability but not successful inference.
@@ -500,7 +501,7 @@ async def _stream_completion(
         if starlette_request is not None:
             starlette_request.state.target_node = node.endpoint
 
-        url = f"http://{node.endpoint}{endpoint_path}"
+        url = build_backend_url(node.endpoint, endpoint_path)
         stack = AsyncExitStack()
         try:
             remaining = deadline - asyncio.get_running_loop().time()

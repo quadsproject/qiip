@@ -768,3 +768,67 @@ class TestProvisioningNodeSkipped:
         result_prov = registry.get("prov-1")
         assert result_prov is not None
         assert result_prov.status == NodeStatus.PROVISIONING
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected_url"),
+    [
+        ("10.0.1.100:8000", "http://10.0.1.100:8000/health"),
+        ("http://10.0.1.100:8000", "http://10.0.1.100:8000/health"),
+        ("https://gpu01.example.com:8443", "https://gpu01.example.com:8443/health"),
+        ("http://[::1]:8000", "http://[::1]:8000/health"),
+    ],
+)
+def test_health_probe_endpoint_normalization_matrix(
+    endpoint: str,
+    expected_url: str,
+) -> None:
+    registry = NodeRegistry()
+    registry.add(_make_node(endpoint=endpoint))
+    cb_registry = CircuitBreakerRegistry()
+    failures = _FailureCounts()
+    client = MagicMock(spec=httpx.Client)
+    client.get.return_value = MagicMock(status_code=200)
+
+    _probe_all_nodes(
+        registry,
+        cb_registry,
+        client,
+        failures,
+        failure_threshold=3,
+    )
+
+    client.get.assert_called_once_with(expected_url)
+
+
+def test_half_open_inference_probe_preserves_endpoint_scheme() -> None:
+    registry = NodeRegistry()
+    registry.add(
+        _make_node(
+            endpoint="https://gpu01.example.com:8443",
+            status=NodeStatus.UNHEALTHY,
+        )
+    )
+    cb_registry = CircuitBreakerRegistry(threshold=1)
+    cb_registry.get_or_create("node-1").record_failure()
+    failures = _FailureCounts()
+    client = MagicMock(spec=httpx.Client)
+    client.get.return_value = MagicMock(status_code=200)
+    client.post.return_value = httpx.Response(
+        200,
+        request=httpx.Request("POST", "https://gpu01.example.com:8443/v1/completions"),
+    )
+
+    _probe_all_nodes(
+        registry,
+        cb_registry,
+        client,
+        failures,
+        failure_threshold=3,
+    )
+
+    client.post.assert_called_once_with(
+        "https://gpu01.example.com:8443/v1/completions",
+        json={"model": "llama-3", "prompt": "ping", "max_tokens": 1},
+        timeout=2.0,
+    )

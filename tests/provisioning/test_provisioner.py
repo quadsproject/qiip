@@ -14,7 +14,8 @@ import asyncssh
 import httpx
 import pytest
 
-from inference_proxy.config.settings import ProvisioningSettings
+from inference_proxy.config.settings import ProvisioningSettings, RoutingSettings
+from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
 from inference_proxy.models.node import NodeStatus
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
@@ -28,6 +29,12 @@ from inference_proxy.provisioning.ssh_client import (
 from inference_proxy.redfish.errors import RedfishError
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 
+_TEST_ENDPOINT_POLICY = EndpointPolicy.from_values(
+    allowed_hosts=["host1"],
+    allowed_networks=[],
+    allowed_ports=[8000],
+)
+
 
 def _make_provisioner(
     *,
@@ -38,6 +45,7 @@ def _make_provisioner(
     connection_tracker: MagicMock | None = None,
     circuit_breaker_registry: CircuitBreakerRegistry | MagicMock | None = None,
     redfish_client: MagicMock | None = None,
+    endpoint_policy: EndpointPolicy = _TEST_ENDPOINT_POLICY,
 ) -> NodeProvisioner:
     """Build a NodeProvisioner with mock dependencies."""
     return NodeProvisioner(
@@ -45,6 +53,7 @@ def _make_provisioner(
         etcd_client=etcd_client or MagicMock(),
         settings=settings
         or ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0),
+        endpoint_policy=endpoint_policy,
         registry=registry,
         connection_tracker=connection_tracker,
         circuit_breaker_registry=circuit_breaker_registry,
@@ -112,6 +121,47 @@ class TestProvisionSequence:
         assert "setup" in call_order
         assert "start_vllm" in call_order
         assert call_order.index("setup") < call_order.index("start_vllm")
+
+
+class TestProvisionEndpointPolicy:
+    """Provisioning cannot create a node discovery would reject."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("hostname", "expected_setting"),
+        [
+            ("gpu01", "routing.allowed_endpoint_hosts"),
+            ("10.0.1.100", "routing.allowed_endpoint_networks"),
+        ],
+    )
+    async def test_default_policy_rejects_lab_host_before_remote_work(
+        self,
+        hostname: str,
+        expected_setting: str,
+    ) -> None:
+        ssh = MagicMock()
+        ssh.upload = AsyncMock()
+        etcd = MagicMock()
+        provisioner = _make_provisioner(
+            ssh_client=ssh,
+            etcd_client=etcd,
+            endpoint_policy=RoutingSettings().endpoint_policy(),
+        )
+
+        with patch(
+            "inference_proxy.provisioning.provisioner.asyncio.open_connection",
+            new_callable=AsyncMock,
+        ) as open_connection:
+            with pytest.raises(EndpointValidationError) as caught:
+                await provisioner.provision(hostname)
+
+        message = str(caught.value)
+        assert hostname in message
+        assert expected_setting in message
+        open_connection.assert_not_awaited()
+        ssh.upload.assert_not_awaited()
+        ssh.run_streaming.assert_not_called()
+        etcd.put.assert_not_called()
 
 
 class TestScriptUpload:
@@ -370,7 +420,7 @@ class TestNodeRegistration:
                 assert node.node_id == "host1"
                 assert node.status == NodeStatus.HEALTHY
                 assert node.model == "test-model"
-                assert node.endpoint == "host1:8000"
+                assert node.endpoint == "http://host1:8000"
                 assert node.last_heartbeat is not None
 
                 # Verify etcd.put called via asyncio.to_thread
@@ -590,7 +640,12 @@ def _make_full_provisioner(etcd: MagicMock) -> tuple[NodeProvisioner, MagicMock]
     etcd.put = MagicMock(return_value=True)
 
     settings = ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0)
-    provisioner = NodeProvisioner(ssh_client=ssh, etcd_client=etcd, settings=settings)
+    provisioner = NodeProvisioner(
+        ssh_client=ssh,
+        etcd_client=etcd,
+        settings=settings,
+        endpoint_policy=_TEST_ENDPOINT_POLICY,
+    )
     return provisioner, ssh
 
 
@@ -657,7 +712,10 @@ class TestStateTracking:
 
         settings = ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0)
         provisioner = NodeProvisioner(
-            ssh_client=ssh, etcd_client=etcd, settings=settings
+            ssh_client=ssh,
+            etcd_client=etcd,
+            settings=settings,
+            endpoint_policy=_TEST_ENDPOINT_POLICY,
         )
 
         with patch.object(provisioner, "preflight", new_callable=AsyncMock):

@@ -41,6 +41,7 @@ from inference_proxy.discovery.watcher import EtcdWatcher
 from inference_proxy.huggingface.catalog import ModelCatalogService
 from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.llmfit.runner import LLMFitRunner
+from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.provisioning.ssh_client import SSHClient
@@ -59,7 +60,11 @@ from inference_proxy.routing.request_metrics import RequestMetrics
 logger = structlog.get_logger()
 
 
-def _initial_load(etcd_client: EtcdClient, registry: NodeRegistry) -> None:
+def _initial_load(
+    etcd_client: EtcdClient,
+    registry: NodeRegistry,
+    endpoint_policy: EndpointPolicy,
+) -> None:
     """Fetch all nodes from etcd and populate the registry.
 
     Per D-05: synchronous initial fetch is acceptable during startup.
@@ -77,7 +82,12 @@ def _initial_load(etcd_client: EtcdClient, registry: NodeRegistry) -> None:
         for value_bytes, metadata in results:
             raw_key: bytes | str = metadata["key"]
             key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key
-            node = node_from_etcd(key, value_bytes, etcd_client.prefix)
+            node = node_from_etcd(
+                key,
+                value_bytes,
+                etcd_client.prefix,
+                endpoint_policy=endpoint_policy,
+            )
             if node is not None:
                 registry.add(node)
                 count += 1
@@ -137,11 +147,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         etcd_client = EtcdClient(resolved_settings.etcd)
         registry = NodeRegistry()
+        endpoint_policy = resolved_settings.routing.endpoint_policy()
 
-        _initial_load(etcd_client, registry)
+        allowlist_fields = {
+            "allowed_endpoint_hosts",
+            "allowed_endpoint_networks",
+            "allowed_endpoint_ports",
+        }
+        if not resolved_settings.routing.model_fields_set & allowlist_fields:
+            logger.warning(
+                "backend endpoint allowlist is unset; "
+                "loopback-only secure defaults are active",
+                allowed_hosts=resolved_settings.routing.allowed_endpoint_hosts,
+                allowed_networks=(resolved_settings.routing.allowed_endpoint_networks),
+                allowed_ports=resolved_settings.routing.allowed_endpoint_ports,
+            )
+
+        _initial_load(etcd_client, registry, endpoint_policy)
 
         stop_event = threading.Event()
-        etcd_watcher = EtcdWatcher(etcd_client, registry, stop_event)
+        etcd_watcher = EtcdWatcher(
+            etcd_client,
+            registry,
+            stop_event,
+            endpoint_policy,
+        )
         watch_thread = threading.Thread(
             target=etcd_watcher.run,
             daemon=True,
@@ -239,6 +269,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ssh_client=ssh_client,
             etcd_client=etcd_client,
             settings=resolved_settings.provisioning,
+            endpoint_policy=endpoint_policy,
             registry=registry,
             connection_tracker=connection_tracker,
             circuit_breaker_registry=circuit_breaker_registry,

@@ -41,12 +41,28 @@ class TestDefaultRoutingSettings:
         assert settings.routing.health_check_interval == 30
         assert settings.routing.max_retries == 3
         assert settings.routing.timeout == 30
+        assert settings.routing.allowed_endpoint_hosts == ["localhost"]
+        assert settings.routing.allowed_endpoint_networks == [
+            "127.0.0.0/8",
+            "::1/128",
+        ]
+        assert settings.routing.allowed_endpoint_ports == [8000]
 
     def test_max_retries_rejects_zero(self) -> None:
         with pytest.raises(ValidationError) as caught:
             RoutingSettings(max_retries=0)
 
         assert caught.value.errors()[0]["loc"] == ("max_retries",)
+
+    def test_provisioning_port_must_be_allowed(self) -> None:
+        with pytest.raises(
+            ValidationError,
+            match="provisioning.vllm_port must be included",
+        ):
+            Settings(
+                _env_file=None,
+                provisioning=ProvisioningSettings(vllm_port=9000),
+            )
 
 
 class TestEnvVarOverrideGatewayPort:
@@ -74,6 +90,28 @@ class TestEnvVarOverrideRoutingStrategy:
         monkeypatch.setenv("INFERENCE_PROXY_ROUTING__STRATEGY", "round_robin")
         settings = Settings(_env_file=None)
         assert settings.routing.strategy == "round_robin"
+
+    def test_endpoint_allowlist_env_overrides(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_HOSTS",
+            '["*.lab.example.com"]',
+        )
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_NETWORKS",
+            '["10.0.1.0/24"]',
+        )
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_PORTS",
+            "[8000,8443]",
+        )
+
+        settings = Settings(_env_file=None)
+
+        assert settings.routing.allowed_endpoint_hosts == ["*.lab.example.com"]
+        assert settings.routing.allowed_endpoint_networks == ["10.0.1.0/24"]
+        assert settings.routing.allowed_endpoint_ports == [8000, 8443]
 
 
 class TestDefaultDashboardSettings:

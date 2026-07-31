@@ -140,6 +140,18 @@ All settings are loaded from environment variables with the prefix `INFERENCE_PR
 | `INFERENCE_PROXY_ROUTING__STRATEGY` | `least_connections` | Load balancing strategy |
 | `INFERENCE_PROXY_ROUTING__MAX_RETRIES` | `3` | Max retry attempts on failure |
 | `INFERENCE_PROXY_ROUTING__TIMEOUT` | `30` | General routing timeout (seconds) |
+| `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_HOSTS` | `["localhost"]` | Exact backend DNS names or `*.suffix` rules (JSON array) |
+| `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_NETWORKS` | `["127.0.0.0/8","::1/128"]` | Backend IP CIDR allowlist (JSON array) |
+| `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_PORTS` | `[8000]` | Backend TCP port allowlist (JSON array) |
+
+The endpoint allowlist is intentionally loopback-only by default. Configure the
+GPU host suffixes or IP networks before upgrading an existing deployment;
+otherwise non-loopback etcd node registrations are rejected with warning logs
+and do not appear in `/admin/nodes`. CIDR rules apply to IP-literal endpoints;
+DNS endpoints must match an exact hostname or `*.suffix` rule. The configured
+provisioning vLLM port must also appear in the endpoint port allowlist. Setup
+requests whose generated backend endpoint is not allowed fail before any
+power, SSH, or installation work and name the allowlist setting to update.
 
 ### Proxy (HTTP client)
 

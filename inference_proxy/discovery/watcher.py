@@ -24,6 +24,7 @@ from inference_proxy.discovery.etcd_client import (
 )
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_from_etcd
+from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.node import Node
 
 logger = structlog.get_logger()
@@ -37,11 +38,13 @@ class EtcdWatcher:
         etcd_client: EtcdClient,
         registry: NodeRegistry,
         stop_event: threading.Event,
+        endpoint_policy: EndpointPolicy,
         retry_delay: float = 5.0,
     ) -> None:
         self._etcd_client = etcd_client
         self._registry = registry
         self._stop_event = stop_event
+        self._endpoint_policy = endpoint_policy
         self._retry_delay = retry_delay
         self._stream_lock = threading.Lock()
         self._active_stream: EtcdWatchStream | None = None
@@ -59,6 +62,7 @@ class EtcdWatcher:
                         snapshot,
                         self._registry,
                         self._etcd_client.prefix,
+                        self._endpoint_policy,
                     )
                     resume_revision = snapshot.revision
                     logger.info(
@@ -82,6 +86,7 @@ class EtcdWatcher:
                             self._registry,
                             self._etcd_client.prefix,
                             key_revisions,
+                            self._endpoint_policy,
                         )
                         # Advance only after the whole batch succeeds. Per-key
                         # gates make replay safe if a later event fails.
@@ -152,16 +157,24 @@ def run_watcher(
     etcd_client: EtcdClient,
     registry: NodeRegistry,
     stop_event: threading.Event,
+    endpoint_policy: EndpointPolicy,
     retry_delay: float = 5.0,
 ) -> None:
     """Compatibility entry point for callers that do not need direct stop()."""
-    EtcdWatcher(etcd_client, registry, stop_event, retry_delay).run()
+    EtcdWatcher(
+        etcd_client,
+        registry,
+        stop_event,
+        endpoint_policy,
+        retry_delay,
+    ).run()
 
 
 def _reconcile_snapshot(
     snapshot: EtcdSnapshot,
     registry: NodeRegistry,
     prefix: str,
+    endpoint_policy: EndpointPolicy,
 ) -> dict[str, int]:
     """Apply one prefix snapshot and seed per-key revision gates."""
     nodes: dict[str, Node] = {}
@@ -174,7 +187,12 @@ def _reconcile_snapshot(
             continue
         present_node_ids.add(node_id)
         key_revisions[node_id] = record.mod_revision
-        node = node_from_etcd(record.key, record.value, prefix)
+        node = node_from_etcd(
+            record.key,
+            record.value,
+            prefix,
+            endpoint_policy=endpoint_policy,
+        )
         if node is not None:
             nodes[node_id] = node
 
@@ -193,6 +211,7 @@ def _apply_batch(
     registry: NodeRegistry,
     prefix: str,
     key_revisions: dict[str, int],
+    endpoint_policy: EndpointPolicy,
 ) -> None:
     """Apply every event in a response using independent per-key gates."""
     for event in batch.events:
@@ -208,7 +227,7 @@ def _apply_batch(
                 applied_revision=previous_revision,
             )
             continue
-        _apply_event(event, node_id, registry, prefix)
+        _apply_event(event, node_id, registry, prefix, endpoint_policy)
         key_revisions[node_id] = event.mod_revision
 
 
@@ -217,6 +236,7 @@ def _apply_event(
     node_id: str,
     registry: NodeRegistry,
     prefix: str,
+    endpoint_policy: EndpointPolicy,
 ) -> None:
     if event.is_delete:
         if registry.drain(node_id):
@@ -228,7 +248,12 @@ def _apply_event(
     if event.value is None:
         logger.warning("skipping put event with missing value", node_id=node_id)
         return
-    node = node_from_etcd(event.key, event.value, prefix)
+    node = node_from_etcd(
+        event.key,
+        event.value,
+        prefix,
+        endpoint_policy=endpoint_policy,
+    )
     if node is not None:
         registry.add_discovered(node)
         logger.info(

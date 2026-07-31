@@ -51,6 +51,7 @@ from inference_proxy.models.admin import (
     TaskStatusResponse,
     TeardownResponse,
 )
+from inference_proxy.models.endpoint import EndpointValidationError
 from inference_proxy.models.node import NodeStatus
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.provisioning.ssh_client import (
@@ -175,6 +176,11 @@ async def setup_node(
     Includes dedup guard (D-08) and live QUADS re-validation (D-10/D-11).
     """
     hostname = canonical_hostname(body.hostname)
+
+    try:
+        provisioner.validate_endpoint(hostname)
+    except EndpointValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # D-08: dedup guard
     if hostname in pending_hosts:
