@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 from pathlib import Path
 
@@ -12,6 +13,10 @@ os.environ.setdefault(
     "INFERENCE_PROXY_HUGGINGFACE__CACHE_DIR",
     str(_TEST_HF_CACHE),
 )
+_TEST_ADMIN_USERNAME = "test-admin"
+_TEST_ADMIN_PASSWORD = "test-password"
+os.environ.setdefault("INFERENCE_PROXY_ADMIN__USERNAME", _TEST_ADMIN_USERNAME)
+os.environ.setdefault("INFERENCE_PROXY_ADMIN__PASSWORD", _TEST_ADMIN_PASSWORD)
 
 from collections.abc import AsyncIterator, Generator
 from unittest.mock import AsyncMock, MagicMock
@@ -20,6 +25,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from inference_proxy.config.dependencies import (
     get_catalog_service,
@@ -37,6 +43,7 @@ from inference_proxy.config.dependencies import (
     get_unified_node_service,
 )
 from inference_proxy.config.settings import (
+    AdminSettings,
     EtcdSettings,
     GatewaySettings,
     HuggingFaceSettings,
@@ -63,6 +70,10 @@ def test_settings() -> Settings:
             endpoints=["http://localhost:2379"], node_prefix="/test-nodes/"
         ),
         routing=RoutingSettings(strategy="least_connections", max_retries=3, timeout=5),
+        admin=AdminSettings(
+            username=_TEST_ADMIN_USERNAME,
+            password=SecretStr(_TEST_ADMIN_PASSWORD),
+        ),
         huggingface=HuggingFaceSettings(cache_dir=str(_TEST_HF_CACHE)),
     )
 
@@ -204,6 +215,15 @@ def mock_llmfit_runner(app: FastAPI) -> MagicMock:
 
 
 @pytest.fixture
-def client(app: FastAPI) -> TestClient:
-    """Return a TestClient bound to the test app."""
-    return TestClient(app)
+def admin_auth_headers() -> dict[str, str]:
+    """Return the shared test admin credentials as an HTTP Basic header."""
+    token = base64.b64encode(
+        f"{_TEST_ADMIN_USERNAME}:{_TEST_ADMIN_PASSWORD}".encode()
+    ).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
+@pytest.fixture
+def client(app: FastAPI, admin_auth_headers: dict[str, str]) -> TestClient:
+    """Return an authenticated TestClient bound to the test app."""
+    return TestClient(app, headers=admin_auth_headers)

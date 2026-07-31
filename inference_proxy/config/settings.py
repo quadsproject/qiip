@@ -113,6 +113,27 @@ class LoggingSettings(BaseModel):
     level: str = "INFO"
 
 
+class AdminSettings(BaseModel):
+    """Required shared credentials for the administrative surface."""
+
+    username: str = Field(min_length=1)
+    password: SecretStr
+
+    @field_validator("username")
+    @classmethod
+    def username_has_no_surrounding_whitespace(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("admin.username must not contain surrounding whitespace")
+        return value
+
+    @field_validator("password")
+    @classmethod
+    def password_is_not_empty(cls, value: SecretStr) -> SecretStr:
+        if not value.get_secret_value():
+            raise ValueError("admin.password must not be empty")
+        return value
+
+
 class DashboardSettings(BaseModel):
     """Dashboard UI configuration."""
 
@@ -267,6 +288,7 @@ class Settings(BaseSettings):
     proxy: ProxySettings = ProxySettings()
     resilience: ResilienceSettings = ResilienceSettings()
     logging: LoggingSettings = LoggingSettings()
+    admin: AdminSettings
     dashboard: DashboardSettings = DashboardSettings()
     ssh: SSHSettings = SSHSettings()
     provisioning: ProvisioningSettings = ProvisioningSettings()

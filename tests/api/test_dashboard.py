@@ -118,6 +118,7 @@ class TestDashboardPolling:
         self,
         test_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        admin_auth_headers: dict[str, str],
     ) -> None:
         """The factory's explicit settings own route dependency resolution."""
         monkeypatch.setenv("INFERENCE_PROXY_DASHBOARD__POLL_INTERVAL", "23")
@@ -132,6 +133,7 @@ class TestDashboardPolling:
             async with httpx.AsyncClient(
                 transport=transport,
                 base_url="http://testserver",
+                headers=admin_auth_headers,
             ) as client:
                 response = await asyncio.wait_for(client.get("/dashboard"), timeout=2)
         finally:

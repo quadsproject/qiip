@@ -7,6 +7,7 @@ from pydantic import BaseModel, SecretStr, ValidationError
 from pydantic_settings import BaseSettings
 
 from inference_proxy.config.settings import (
+    AdminSettings,
     DashboardSettings,
     EtcdSettings,
     GatewaySettings,
@@ -18,6 +19,56 @@ from inference_proxy.config.settings import (
     Settings,
     SSHSettings,
 )
+
+
+class TestAdminSettings:
+    def test_admin_credentials_required(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("INFERENCE_PROXY_ADMIN__USERNAME", raising=False)
+        monkeypatch.delenv("INFERENCE_PROXY_ADMIN__PASSWORD", raising=False)
+
+        with pytest.raises(ValidationError, match="admin"):
+            Settings(_env_file=None)
+
+    @pytest.mark.parametrize(
+        ("present", "missing"),
+        [("USERNAME", "password"), ("PASSWORD", "username")],
+    )
+    def test_admin_partial_credentials_rejected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        present: str,
+        missing: str,
+    ) -> None:
+        monkeypatch.delenv("INFERENCE_PROXY_ADMIN__USERNAME", raising=False)
+        monkeypatch.delenv("INFERENCE_PROXY_ADMIN__PASSWORD", raising=False)
+        monkeypatch.setenv(f"INFERENCE_PROXY_ADMIN__{present}", "configured")
+
+        with pytest.raises(ValidationError, match=missing):
+            Settings(_env_file=None)
+
+    def test_admin_password_is_masked(self) -> None:
+        settings = AdminSettings(
+            username="operator",
+            password=SecretStr("admin-secret"),
+        )
+
+        assert "admin-secret" not in repr(settings)
+        assert settings.model_dump()["password"] != "admin-secret"
+
+    def test_admin_credentials_load_from_environment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("INFERENCE_PROXY_ADMIN__USERNAME", "operator")
+        monkeypatch.setenv("INFERENCE_PROXY_ADMIN__PASSWORD", "admin-secret")
+
+        settings = Settings(_env_file=None)
+
+        assert settings.admin.username == "operator"
+        assert settings.admin.password.get_secret_value() == "admin-secret"
 
 
 class TestDefaultGatewaySettings:

@@ -13,8 +13,11 @@ instances.
 """
 
 from functools import lru_cache
+from secrets import compare_digest
+from typing import Annotated
 
-from fastapi import Request
+from fastapi import Depends, HTTPException, Request
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.huggingface.catalog import ModelCatalogService
@@ -32,11 +35,49 @@ from inference_proxy.services.unified_nodes import UnifiedNodeService
 
 from .settings import Settings
 
+_ADMIN_BASIC = HTTPBasic(auto_error=False)
+_JSON_ADMIN_METHODS = frozenset({"POST", "PUT", "PATCH"})
+_ADMIN_AUTH_HEADERS = {
+    "WWW-Authenticate": 'Basic realm="inference-proxy-admin", charset="UTF-8"'
+}
+
 
 @lru_cache
 def get_settings() -> Settings:
     """Return the cached application settings instance."""
     return Settings()
+
+
+def require_admin_auth(
+    request: Request,
+    credentials: Annotated[HTTPBasicCredentials | None, Depends(_ADMIN_BASIC)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> None:
+    """Authenticate admin requests and enforce the JSON-only CSRF boundary."""
+    supplied_username = credentials.username if credentials is not None else ""
+    supplied_password = credentials.password if credentials is not None else ""
+    username_matches = compare_digest(
+        supplied_username.encode("utf-8"),
+        settings.admin.username.encode("utf-8"),
+    )
+    password_matches = compare_digest(
+        supplied_password.encode("utf-8"),
+        settings.admin.password.get_secret_value().encode("utf-8"),
+    )
+    if credentials is None or not (username_matches and password_matches):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid admin credentials",
+            headers=_ADMIN_AUTH_HEADERS,
+        )
+
+    if request.method in _JSON_ADMIN_METHODS:
+        media_type = request.headers.get("content-type", "").partition(";")[0].lower()
+        if media_type != "application/json":
+            raise HTTPException(
+                status_code=415,
+                detail="Admin state-changing requests must use application/json",
+            )
 
 
 def get_registry(request: Request) -> NodeRegistry:

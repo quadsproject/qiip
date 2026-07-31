@@ -55,6 +55,7 @@ def _make_node(
     endpoint: str = "10.0.1.100:8000",
     status: NodeStatus = NodeStatus.HEALTHY,
     model: str = "llama-3",
+    managed: bool = True,
 ) -> Node:
     """Create a test node with sensible defaults."""
     return Node(
@@ -62,6 +63,7 @@ def _make_node(
         endpoint=endpoint,
         status=status,
         model=model,
+        managed=managed,
     )
 
 
@@ -1123,6 +1125,7 @@ class TestGetPowerState:
         app: FastAPI,
         mock_http_client: httpx.AsyncClient,
         httpx_mock: HTTPXMock,
+        admin_auth_headers: dict[str, str],
         content: bytes,
     ) -> None:
         httpx_mock.add_response(
@@ -1133,7 +1136,11 @@ class TestGetPowerState:
             mock_http_client
         )
 
-        bounded_client = TestClient(app, raise_server_exceptions=False)
+        bounded_client = TestClient(
+            app,
+            headers=admin_auth_headers,
+            raise_server_exceptions=False,
+        )
         try:
             response = bounded_client.get("/admin/nodes/gpu01/power")
         finally:
@@ -1148,6 +1155,7 @@ class TestGetPowerState:
         mock_http_client: httpx.AsyncClient,
         httpx_mock: HTTPXMock,
         monkeypatch: pytest.MonkeyPatch,
+        admin_auth_headers: dict[str, str],
     ) -> None:
         httpx_mock.add_response(
             url="https://mgmt-gpu01/redfish/v1/Systems/1",
@@ -1161,7 +1169,11 @@ class TestGetPowerState:
             raise AttributeError("programming defect")
 
         monkeypatch.setattr(httpx.Response, "json", broken_json)
-        bounded_client = TestClient(app, raise_server_exceptions=False)
+        bounded_client = TestClient(
+            app,
+            headers=admin_auth_headers,
+            raise_server_exceptions=False,
+        )
         try:
             response = bounded_client.get("/admin/nodes/gpu01/power")
         finally:
@@ -1299,7 +1311,9 @@ class TestRecommendations:
         app: FastAPI,
         client: TestClient,
         mock_llmfit_runner: MagicMock,
+        test_registry: NodeRegistry,
     ) -> None:
+        test_registry.add(_make_node(node_id="gpu01"))
         mock_llmfit_runner.recommend.return_value = SAMPLE_RESULT
 
         response = client.get("/admin/nodes/gpu01/recommendations")
@@ -1316,7 +1330,9 @@ class TestRecommendations:
         app: FastAPI,
         client: TestClient,
         mock_llmfit_runner: MagicMock,
+        test_registry: NodeRegistry,
     ) -> None:
+        test_registry.add(_make_node(node_id="node42.example.com"))
         mock_llmfit_runner.recommend.return_value = SAMPLE_RESULT
 
         response = client.get("/admin/nodes/node42.example.com/recommendations")
@@ -1328,7 +1344,9 @@ class TestRecommendations:
         app: FastAPI,
         client: TestClient,
         mock_llmfit_runner: MagicMock,
+        test_registry: NodeRegistry,
     ) -> None:
+        test_registry.add(_make_node(node_id="gpu01"))
         mock_llmfit_runner.recommend.return_value = SAMPLE_RESULT
 
         response = client.get("/admin/nodes/gpu01/recommendations")
@@ -1355,7 +1373,9 @@ class TestRecommendationErrors:
         app: FastAPI,
         client: TestClient,
         mock_llmfit_runner: MagicMock,
+        test_registry: NodeRegistry,
     ) -> None:
+        test_registry.add(_make_node(node_id="gpu01"))
         mock_llmfit_runner.recommend.side_effect = LLMFitTimeoutError("gpu01", 60.0)
 
         response = client.get("/admin/nodes/gpu01/recommendations")
@@ -1371,7 +1391,9 @@ class TestRecommendationErrors:
         app: FastAPI,
         client: TestClient,
         mock_llmfit_runner: MagicMock,
+        test_registry: NodeRegistry,
     ) -> None:
+        test_registry.add(_make_node(node_id="gpu01"))
         mock_llmfit_runner.recommend.side_effect = LLMFitParseError(
             "invalid JSON", raw_output="not-json-garbage"
         )
@@ -1388,7 +1410,9 @@ class TestRecommendationErrors:
         app: FastAPI,
         client: TestClient,
         mock_llmfit_runner: MagicMock,
+        test_registry: NodeRegistry,
     ) -> None:
+        test_registry.add(_make_node(node_id="gpu01"))
         mock_llmfit_runner.recommend.side_effect = SSHConnectionError(
             "gpu01", "connection refused"
         )
@@ -1405,7 +1429,9 @@ class TestRecommendationErrors:
         app: FastAPI,
         client: TestClient,
         mock_llmfit_runner: MagicMock,
+        test_registry: NodeRegistry,
     ) -> None:
+        test_registry.add(_make_node(node_id="gpu01"))
         mock_llmfit_runner.recommend.side_effect = RemoteCommandError(
             "gpu01", "llmfit recommend", exit_status=127, stderr="not found"
         )
@@ -1422,8 +1448,10 @@ class TestRecommendationErrors:
         app: FastAPI,
         client: TestClient,
         mock_llmfit_runner: MagicMock,
+        test_registry: NodeRegistry,
     ) -> None:
         """D-01: raw_output must never appear in the API response body."""
+        test_registry.add(_make_node(node_id="gpu01"))
         mock_llmfit_runner.recommend.side_effect = LLMFitParseError(
             "bad json", raw_output="SECRET_RAW_CONTENT_MARKER"
         )
@@ -1432,6 +1460,114 @@ class TestRecommendationErrors:
 
         assert response.status_code == 502
         assert "SECRET_RAW_CONTENT_MARKER" not in response.text
+
+
+class TestRecommendationTargetPolicy:
+    """Recommendations may SSH only to trusted, actionable node targets (S6)."""
+
+    def test_unknown_target_is_rejected_before_runner(
+        self,
+        client: TestClient,
+        mock_llmfit_runner: MagicMock,
+    ) -> None:
+        mock_llmfit_runner.recommend.return_value = SAMPLE_RESULT
+        response = client.get("/admin/nodes/gpu-unknown/recommendations")
+
+        assert response.status_code == 404
+        mock_llmfit_runner.recommend.assert_not_awaited()
+
+    @pytest.mark.parametrize("managed", [True, False])
+    def test_registered_target_is_accepted(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_llmfit_runner: MagicMock,
+        managed: bool,
+    ) -> None:
+        test_registry.add(_make_node(node_id="gpu01", managed=managed))
+        mock_llmfit_runner.recommend.return_value = SAMPLE_RESULT
+
+        response = client.get("/admin/nodes/gpu01/recommendations")
+
+        assert response.status_code == 200
+        mock_llmfit_runner.recommend.assert_awaited_once_with("gpu01")
+
+    def test_currently_available_quads_target_is_accepted(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_llmfit_runner: MagicMock,
+    ) -> None:
+        poller = MagicMock()
+        poller.hosts = [
+            QUADSHost(
+                hostname="GPU01",
+                gpu_vendor="NVIDIA",
+                gpu_model="A100",
+                gpu_count=8,
+            )
+        ]
+        poller.available_hostnames = ["gpu01"]
+        app.dependency_overrides[get_quads_poller] = lambda: poller
+        mock_llmfit_runner.recommend.return_value = SAMPLE_RESULT
+
+        response = client.get("/admin/nodes/gpu01/recommendations")
+
+        assert response.status_code == 200
+        mock_llmfit_runner.recommend.assert_awaited_once_with("gpu01")
+
+    def test_quads_inventory_target_that_is_unavailable_is_rejected(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_llmfit_runner: MagicMock,
+    ) -> None:
+        poller = MagicMock()
+        poller.hosts = [
+            QUADSHost(
+                hostname="gpu01",
+                gpu_vendor="NVIDIA",
+                gpu_model="A100",
+                gpu_count=8,
+            )
+        ]
+        poller.available_hostnames = []
+        app.dependency_overrides[get_quads_poller] = lambda: poller
+        mock_llmfit_runner.recommend.return_value = SAMPLE_RESULT
+
+        response = client.get("/admin/nodes/gpu01/recommendations")
+
+        assert response.status_code == 404
+        mock_llmfit_runner.recommend.assert_not_awaited()
+
+    def test_quads_available_target_outside_allowlist_is_rejected(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+        mock_llmfit_runner: MagicMock,
+    ) -> None:
+        poller = MagicMock()
+        poller.hosts = [
+            QUADSHost(
+                hostname="gpu01",
+                gpu_vendor="NVIDIA",
+                gpu_model="A100",
+                gpu_count=8,
+            )
+        ]
+        poller.available_hostnames = ["gpu01"]
+        app.dependency_overrides[get_quads_poller] = lambda: poller
+        mock_provisioner.validate_endpoint.side_effect = EndpointValidationError(
+            "host is not allowed"
+        )
+        mock_llmfit_runner.recommend.return_value = SAMPLE_RESULT
+
+        response = client.get("/admin/nodes/gpu01/recommendations")
+
+        assert response.status_code == 404
+        mock_provisioner.validate_endpoint.assert_called_once_with("gpu01")
+        mock_llmfit_runner.recommend.assert_not_awaited()
 
 
 # -- Model catalog endpoint tests (CAT-02) --

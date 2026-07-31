@@ -28,6 +28,7 @@ from inference_proxy.config.dependencies import (
     get_registry,
     get_request_metrics,
     get_unified_node_service,
+    require_admin_auth,
 )
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.huggingface.catalog import (
@@ -71,7 +72,11 @@ from inference_proxy.services.unified_nodes import UnifiedNodeService
 
 logger = structlog.get_logger()
 
-admin_router = APIRouter(prefix="/admin", tags=["admin"])
+admin_router = APIRouter(
+    prefix="/admin",
+    tags=["admin"],
+    dependencies=[Depends(require_admin_auth)],
+)
 
 # D-08: module-level set to prevent duplicate setup requests
 # ponytail: single-worker-only dedup guard; move to etcd CAS if workers > 1
@@ -468,9 +473,35 @@ async def execute_power_action(
 async def get_recommendations(
     hostname: str,
     runner: LLMFitRunner = Depends(get_llmfit_runner),
+    registry: NodeRegistry = Depends(get_registry),
+    provisioner: NodeProvisioner = Depends(get_provisioner),
+    poller: QUADSPoller | None = Depends(get_quads_poller),
 ) -> RecommendationResponse | JSONResponse:
     """Return ranked model recommendations for a node's hardware."""
     hostname = _validated_hostname(hostname)
+    try:
+        provisioner.validate_endpoint(hostname)
+    except EndpointValidationError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Node '{hostname}' is not available for recommendations",
+        ) from exc
+
+    registered = registry.get(hostname) is not None
+    quads_available = False
+    if poller is not None:
+        inventory = {canonical_hostname(host.hostname) for host in poller.hosts}
+        available = {
+            canonical_hostname(available_host)
+            for available_host in poller.available_hostnames
+        }
+        quads_available = hostname in inventory and hostname in available
+    if not registered and not quads_available:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Node '{hostname}' is not available for recommendations",
+        )
+
     try:
         result = await runner.recommend(hostname)
     except LLMFitTimeoutError as exc:

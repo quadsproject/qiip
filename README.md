@@ -41,12 +41,18 @@ uv sync
 
 # Copy and edit configuration
 cp .env.example .env
+# Set the required INFERENCE_PROXY_ADMIN__USERNAME and
+# INFERENCE_PROXY_ADMIN__PASSWORD values in .env
 
 # Run the gateway
 uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 8080
 ```
 
 The gateway starts, connects to etcd, discovers available vLLM nodes, and begins accepting requests.
+
+The administrative API and dashboard use HTTP Basic authentication, which sends
+base64-encoded credentials—not encryption—on every request. A trusted work LAN
+may use HTTP; use a TLS terminator whenever that network path is not trusted.
 
 ### Verify it's running
 
@@ -101,7 +107,31 @@ print(response.choices[0].message.content)
 | `POST` | `/v1/chat/completions` | Chat completion (OpenAI-compatible) |
 | `POST` | `/v1/completions` | Text completion (OpenAI-compatible) |
 | `GET` | `/v1/models` | List models available across healthy nodes |
-| `GET` | `/admin/nodes` | Inspect all registered nodes and their status |
+| `GET` | `/admin/nodes` | Inspect all registered nodes and their status (HTTP Basic required) |
+
+### Administrative access
+
+All `/admin/*` API endpoints and `/dashboard*` pages require the shared HTTP
+Basic credentials configured below. The inference API, chat page, and health
+endpoint remain public. For example:
+
+```bash
+curl -u "$INFERENCE_PROXY_ADMIN__USERNAME:$INFERENCE_PROXY_ADMIN__PASSWORD" \
+  http://gateway.example.com/admin/nodes
+```
+
+On a trusted work LAN, the administrative surface may run over HTTP. Anyone able
+to observe that traffic can recover the reusable credential, so deploy a
+TLS-terminating reverse proxy whenever the network path is not trusted. HTTP
+Basic is used deliberately: the browser's `EventSource` API cannot set a Bearer
+header, while browser-cached Basic credentials apply to the provisioning SSE
+stream without exposing a token to JavaScript.
+
+State-changing admin endpoints accept JSON only. This is part of the CSRF
+boundary: cross-origin JSON requests and all DELETE requests require a browser
+preflight. Do not add form-encoded, multipart, or plain-text state-changing
+admin endpoints without adding explicit CSRF protection. Authentication also
+does not protect an already-authenticated browser from same-origin XSS.
 
 ### Error responses
 
@@ -125,6 +155,18 @@ All settings are loaded from environment variables with the prefix `INFERENCE_PR
 | `INFERENCE_PROXY_GATEWAY__HOST` | `0.0.0.0` | Bind address |
 | `INFERENCE_PROXY_GATEWAY__PORT` | `8080` | Bind port |
 | `INFERENCE_PROXY_GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT` | `30` | Seconds to drain requests on shutdown |
+
+### Admin authentication
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INFERENCE_PROXY_ADMIN__USERNAME` | required | Shared username for `/admin/*` and `/dashboard*` |
+| `INFERENCE_PROXY_ADMIN__PASSWORD` | required | Shared password, stored as a masked secret |
+
+Both values are required at startup. Existing deployments must configure them
+before upgrading. Credentials are accepted only through HTTP Basic and must be
+protected by TLS whenever clients do not reach the gateway over a trusted
+network.
 
 ### etcd
 
