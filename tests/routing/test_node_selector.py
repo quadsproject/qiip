@@ -7,6 +7,8 @@ and the has_model helper method.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.routing.connection_tracker import ConnectionTracker
@@ -80,7 +82,7 @@ class TestSelectLeastConnections:
 class TestSelectTieBreaking:
     """select() breaks ties randomly among nodes with equal connection counts (D-03)."""
 
-    def test_tie_break_returns_one_of_tied_nodes(self) -> None:
+    def test_tie_break_uses_random_choice_for_all_tied_nodes(self) -> None:
         nodes = [
             _make_node("node-a", "http://10.0.1.100:8000"),
             _make_node("node-b", "http://10.0.1.200:8000"),
@@ -88,10 +90,15 @@ class TestSelectTieBreaking:
         ]
         selector, _, _ = _make_selector(nodes)
 
-        result = selector.select()
+        with patch(
+            "inference_proxy.routing.node_selector.random.choice",
+            return_value=nodes[1],
+        ) as choose:
+            result = selector.select()
 
-        assert result is not None
-        assert result.node_id in {"node-a", "node-b", "node-c"}
+        tied = choose.call_args.args[0]
+        assert [node.node_id for node in tied] == ["node-a", "node-b", "node-c"]
+        assert result is nodes[1]
 
 
 class TestSelectModelFiltering:

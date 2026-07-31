@@ -14,6 +14,7 @@ Per D-09: ``model=None`` selects among all healthy nodes.
 from __future__ import annotations
 
 import random
+import threading
 
 import structlog
 
@@ -24,13 +25,31 @@ from inference_proxy.routing.connection_tracker import ConnectionTracker
 logger = structlog.get_logger()
 
 
+class NodeReservation:
+    """A selected node with exactly one active-connection reservation."""
+
+    def __init__(self, selector: NodeSelector, node: Node) -> None:
+        self.node = node
+        self._selector = selector
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        """Release the reservation once, even from competing finalizers."""
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._selector._release(self.node.node_id)
+
+
 class NodeSelector:
     """Least-connections node selector with model-aware filtering.
 
     Constructor takes ``registry`` and ``tracker`` via dependency
-    injection (D-07).  The ``tracker`` property is exposed so that
-    route handlers can access it for increment/decrement around
-    proxy calls (D-02).
+    injection (D-07).  Reservations own counter changes for request
+    routing; the ``tracker`` property remains available for status
+    reporting and drain coordination.
     """
 
     def __init__(
@@ -43,7 +62,7 @@ class NodeSelector:
 
     @property
     def tracker(self) -> ConnectionTracker:
-        """Return the connection tracker for use by route handlers."""
+        """Return the connection tracker for status and drain consumers."""
         return self._tracker
 
     def select(
@@ -65,6 +84,34 @@ class NodeSelector:
             The healthy ``Node`` with the fewest active connections,
             or ``None`` if no suitable nodes are available.
         """
+        with self._registry.locked():
+            return self._select_locked(model, exclude_node_ids)
+
+    def select_and_reserve(
+        self,
+        model: str | None = None,
+        exclude_node_ids: set[str] | None = None,
+    ) -> NodeReservation | None:
+        """Atomically select a healthy node and reserve one connection.
+
+        Selection and the counter increment share the registry lock with
+        status transitions such as ``drain()``.  A drain therefore either
+        wins before selection, excluding the node, or observes the completed
+        reservation and waits for it.
+        """
+        with self._registry.locked():
+            node = self._select_locked(model, exclude_node_ids)
+            if node is None:
+                return None
+            self._tracker.increment(node.node_id)
+            return NodeReservation(self, node)
+
+    def _select_locked(
+        self,
+        model: str | None,
+        exclude_node_ids: set[str] | None,
+    ) -> Node | None:
+        """Select a node while the caller holds the registry lock."""
         nodes = self._registry.get_all()
 
         # Filter to HEALTHY nodes only -- skip DRAINING, UNHEALTHY, UNKNOWN
@@ -115,6 +162,23 @@ class NodeSelector:
             tied_count=len(tied),
         )
         return selected
+
+    def _release(self, node_id: str) -> None:
+        """Release a connection and atomically remove fully drained nodes."""
+        removed: list[str] = []
+        with self._registry.locked():
+            self._tracker.decrement(node_id)
+            for node in self._registry.get_all():
+                if (
+                    node.status == NodeStatus.DRAINING
+                    and self._tracker.get(node.node_id) == 0
+                ):
+                    self._registry.remove(node.node_id)
+                    self._tracker.remove(node.node_id)
+                    removed.append(node.node_id)
+
+        for removed_node_id in removed:
+            logger.info("drained node removed", node_id=removed_node_id)
 
     def has_model(self, model: str) -> bool:
         """Check whether any registered node serves the given model.

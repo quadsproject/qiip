@@ -1,18 +1,19 @@
 """Thread-safe in-memory registry of discovered vLLM nodes.
 
 Provides add/remove/get/get_all operations protected by a
-``threading.Lock``.  The lock is required because the watch thread
+``threading.RLock``.  The lock is required because the watch thread
 (an OS thread, not a coroutine) mutates the registry while async
 handlers read from it.
 
-Per D-06: Nodes held in a ``dict[str, Node]`` protected by
-``threading.Lock``.
+Per D-06: Nodes held in a ``dict[str, Node]`` protected by a lock.
 Per D-08: Thread-safe methods ``add``, ``remove``, ``get``, ``get_all``.
 """
 
 from __future__ import annotations
 
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from inference_proxy.models.node import Node, NodeStatus
 
@@ -22,12 +23,25 @@ class NodeRegistry:
 
     All public methods acquire ``self._lock`` before accessing the
     internal dictionary.  ``get_all`` returns a shallow copy so that
-    callers cannot mutate internal state.
+    callers cannot mutate internal state.  Coordinated operations may
+    hold ``locked()`` while calling other registry methods, so the lock
+    is re-entrant.
     """
 
     def __init__(self) -> None:
         self._nodes: dict[str, Node] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        """Hold the registry coordination lock across related operations.
+
+        Callers use this when an operation must remain atomic with registry
+        mutations such as ``drain()``.  The lock is re-entrant, so ordinary
+        registry methods remain safe to call inside this context.
+        """
+        with self._lock:
+            yield
 
     def add(self, node: Node) -> None:
         """Store or replace a node by its ``node_id``."""

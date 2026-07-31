@@ -17,10 +17,7 @@ import httpx
 from fastapi.testclient import TestClient
 from pytest_httpx import HTTPXMock, IteratorStream
 
-from inference_proxy.api.routes import (
-    _maybe_remove_drained,
-    _record_failure_and_trip,
-)
+from inference_proxy.api.routes import _record_failure_and_trip
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
@@ -1018,9 +1015,11 @@ class TestCircuitBreakerStatusTransition:
         registry = NodeRegistry()
         node = _make_node()
         registry.add(node)
-        registry.drain(node.node_id)
         selector = NodeSelector(registry, ConnectionTracker())
         cb_registry = CircuitBreakerRegistry(threshold=1)
+        reservation = selector.select_and_reserve()
+        assert reservation is not None
+        registry.drain(node.node_id)
 
         _record_failure_and_trip(node, cb_registry, selector)
 
@@ -1028,7 +1027,7 @@ class TestCircuitBreakerStatusTransition:
         assert draining is not None
         assert draining.status == NodeStatus.DRAINING
 
-        _maybe_remove_drained(node, selector)
+        reservation.release()
         assert registry.get(node.node_id) is None
 
 

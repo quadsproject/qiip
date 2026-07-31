@@ -26,6 +26,7 @@ from fastapi import Request as StarletteRequest
 from fastapi.responses import JSONResponse
 from fastapi.sse import EventSourceResponse, format_sse_event
 from httpx_sse import aconnect_sse
+from starlette.background import BackgroundTask
 
 from inference_proxy.api.errors import (
     map_proxy_error,
@@ -71,45 +72,6 @@ def _select_error(
     if model and node_selector.has_model(model):
         return model_unavailable_error(model)
     return no_nodes_error()
-
-
-def _maybe_remove_drained(node: Node, node_selector: NodeSelector) -> None:
-    """Auto-remove a draining node when its connection count reaches 0.
-
-    Implements D-11: after decrementing the connection counter for a node,
-    check if the node is DRAINING with 0 active connections.  If so, remove
-    it from both the registry and the tracker.  This completes LBAL-02 by
-    ensuring that nodes marked DRAINING stay in the registry until their
-    in-flight requests finish.
-    """
-    current = node_selector._registry.get(node.node_id)
-    if (
-        current is not None
-        and current.status == NodeStatus.DRAINING
-        and node_selector.tracker.get(node.node_id) == 0
-    ):
-        node_selector._registry.remove(node.node_id)
-        node_selector.tracker.remove(node.node_id)
-        logger.info("drained node removed", node_id=node.node_id)
-
-
-def _scan_drained_nodes(node_selector: NodeSelector) -> None:
-    """Scan all nodes and remove any DRAINING nodes with 0 connections.
-
-    Called after a proxy call completes to clean up draining nodes that
-    have no remaining in-flight requests.  This handles the case where
-    the proxied node was not itself draining, but other nodes in the
-    registry may be.
-    """
-    for n in node_selector._registry.get_all():
-        is_drained = (
-            n.status == NodeStatus.DRAINING
-            and node_selector.tracker.get(n.node_id) == 0
-        )
-        if is_drained:
-            node_selector._registry.remove(n.node_id)
-            node_selector.tracker.remove(n.node_id)
-            logger.info("drained node removed", node_id=n.node_id)
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -171,19 +133,19 @@ async def _proxy_non_streaming(
     model = body.get("model")
     excluded: set[str] = set()
     last_error_response: JSONResponse | None = None
-    tracker = node_selector.tracker
     first_attempt = True
 
     for attempt in range(1, max_retries + 1):
-        node = node_selector.select(
+        reservation = node_selector.select_and_reserve(
             model=model,
             exclude_node_ids=excluded or None,
         )
-        if node is None:
+        if reservation is None:
             if last_error_response is not None:
                 return last_error_response
             status, error_resp = _select_error(model, node_selector)
             return JSONResponse(content=error_resp.model_dump(), status_code=status)
+        node = reservation.node
 
         if first_attempt:
             request_metrics.record_request(node.node_id, model)
@@ -195,7 +157,6 @@ async def _proxy_non_streaming(
             starlette_request.state.target_node = node.endpoint
 
         url = f"http://{node.endpoint}{endpoint_path}"
-        tracker.increment(node.node_id)
         try:
             response = await proxy.forward("POST", url, body)
             circuit_breaker_registry.get_or_create(node.node_id).record_success()
@@ -223,9 +184,7 @@ async def _proxy_non_streaming(
                 continue
             return last_error_response
         finally:
-            tracker.decrement(node.node_id)
-            _maybe_remove_drained(node, node_selector)
-            _scan_drained_nodes(node_selector)
+            reservation.release()
 
     # All retries exhausted
     assert last_error_response is not None
@@ -366,18 +325,17 @@ async def _stream_completion(
     do not retry once the SSE connection has started.
     """
     model = body.get("model")
-    node = node_selector.select(model=model)
-    if node is None:
+    reservation = node_selector.select_and_reserve(model=model)
+    if reservation is None:
         status, error_resp = _select_error(model, node_selector)
         return JSONResponse(content=error_resp.model_dump(), status_code=status)
+    node = reservation.node
 
     if starlette_request is not None:
         starlette_request.state.target_node = node.endpoint
 
     url = f"http://{node.endpoint}{endpoint_path}"
-    tracker = node_selector.tracker
 
-    tracker.increment(node.node_id)
     request_metrics.record_request(node.node_id, model)
 
     async def event_generator() -> AsyncGenerator[bytes, None]:
@@ -406,8 +364,9 @@ async def _stream_completion(
             yield format_sse_event(data_str=error_json)
             yield format_sse_event(data_str="[DONE]")
         finally:
-            tracker.decrement(node.node_id)
-            _maybe_remove_drained(node, node_selector)
-            _scan_drained_nodes(node_selector)
+            reservation.release()
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(
+        event_generator(),
+        background=BackgroundTask(reservation.release),
+    )
