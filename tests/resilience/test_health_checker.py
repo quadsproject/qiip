@@ -14,20 +14,183 @@ import threading
 from unittest.mock import MagicMock, patch
 
 import httpx
+import pytest
 
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
-from inference_proxy.resilience.health_checker import run_health_checker
+from inference_proxy.resilience.health_checker import (
+    _probe_all_nodes,
+    run_health_checker,
+)
 
 
 def _make_node(
     node_id: str = "node-1",
     endpoint: str = "10.0.1.100:8000",
     status: NodeStatus = NodeStatus.HEALTHY,
+    model: str = "llama-3",
 ) -> Node:
     """Create a Node fixture with the given parameters."""
-    return Node(node_id=node_id, endpoint=endpoint, status=status)
+    return Node(node_id=node_id, endpoint=endpoint, status=status, model=model)
+
+
+@pytest.mark.parametrize("status", list(NodeStatus))
+@pytest.mark.parametrize(
+    ("probe_succeeded", "expected_by_status", "reset_statuses"),
+    [
+        (
+            True,
+            {
+                NodeStatus.HEALTHY: NodeStatus.HEALTHY,
+                NodeStatus.UNHEALTHY: NodeStatus.HEALTHY,
+                NodeStatus.DRAINING: NodeStatus.DRAINING,
+                NodeStatus.PROVISIONING: NodeStatus.PROVISIONING,
+                NodeStatus.FAILED: NodeStatus.FAILED,
+                NodeStatus.UNKNOWN: NodeStatus.HEALTHY,
+            },
+            {NodeStatus.UNHEALTHY, NodeStatus.UNKNOWN},
+        ),
+        (
+            False,
+            {
+                NodeStatus.HEALTHY: NodeStatus.UNHEALTHY,
+                NodeStatus.UNHEALTHY: NodeStatus.UNHEALTHY,
+                NodeStatus.DRAINING: NodeStatus.DRAINING,
+                NodeStatus.PROVISIONING: NodeStatus.PROVISIONING,
+                NodeStatus.FAILED: NodeStatus.FAILED,
+                NodeStatus.UNKNOWN: NodeStatus.UNHEALTHY,
+            },
+            set(),
+        ),
+    ],
+    ids=["success", "failure-past-threshold"],
+)
+def test_probe_transition_matrix(
+    status: NodeStatus,
+    probe_succeeded: bool,
+    expected_by_status: dict[NodeStatus, NodeStatus],
+    reset_statuses: set[NodeStatus],
+) -> None:
+    """Every status has an explicit probe transition and breaker-reset policy."""
+    registry = NodeRegistry()
+    registry.add(_make_node(status=status))
+    cb_registry = CircuitBreakerRegistry(threshold=1)
+    breaker = cb_registry.get_or_create("node-1")
+    breaker.record_failure()
+    assert breaker.is_open
+    failures = {"node-1": 2}
+    client = MagicMock(spec=httpx.Client)
+    client.get.return_value = MagicMock(status_code=200 if probe_succeeded else 500)
+
+    _probe_all_nodes(
+        registry,
+        cb_registry,
+        client,
+        failures,
+        failure_threshold=3,
+    )
+
+    if status == NodeStatus.PROVISIONING:
+        client.get.assert_not_called()
+    else:
+        client.get.assert_called_once_with("http://10.0.1.100:8000/health")
+
+    result = registry.get("node-1")
+    assert result is not None
+    assert result.status == expected_by_status[status]
+    if status in reset_statuses:
+        assert not breaker.is_open
+    else:
+        assert breaker.is_open
+
+
+@pytest.mark.parametrize(
+    ("concurrent_update", "expected_status", "expected_endpoint", "expected_model"),
+    [
+        (
+            {"status": NodeStatus.PROVISIONING},
+            NodeStatus.PROVISIONING,
+            "10.0.1.100:8000",
+            "llama-3",
+        ),
+        (
+            {"endpoint": "10.0.1.200:8000"},
+            NodeStatus.HEALTHY,
+            "10.0.1.200:8000",
+            "llama-3",
+        ),
+        (
+            {"model": "qwen-3"},
+            NodeStatus.HEALTHY,
+            "10.0.1.100:8000",
+            "qwen-3",
+        ),
+    ],
+    ids=["status-provisioning", "endpoint", "model"],
+)
+def test_probe_result_preserves_concurrent_registry_update(
+    concurrent_update: dict[str, object],
+    expected_status: NodeStatus,
+    expected_endpoint: str,
+    expected_model: str,
+) -> None:
+    """A probe result updates the current node, never its stale cycle snapshot."""
+    registry = NodeRegistry()
+    stale_node = _make_node(status=NodeStatus.UNHEALTHY)
+    registry.add(stale_node)
+    cb_registry = MagicMock(spec=CircuitBreakerRegistry)
+    failures: dict[str, int] = {}
+    mock_response = MagicMock(status_code=200)
+    client = MagicMock(spec=httpx.Client)
+
+    def update_during_probe(_url: str) -> MagicMock:
+        current = registry.get("node-1")
+        assert current is not None
+        registry.add(current.model_copy(update=concurrent_update))
+        return mock_response
+
+    client.get.side_effect = update_during_probe
+
+    _probe_all_nodes(
+        registry,
+        cb_registry,
+        client,
+        failures,
+        failure_threshold=3,
+    )
+
+    result = registry.get("node-1")
+    assert result is not None
+    assert result.status == expected_status
+    assert result.endpoint == expected_endpoint
+    assert result.model == expected_model
+
+
+def test_probe_failure_does_not_resurrect_removed_node() -> None:
+    """A node removed while its probe is in flight remains absent."""
+    registry = NodeRegistry()
+    node = _make_node()
+    registry.add(node)
+    cb_registry = CircuitBreakerRegistry()
+    failures = {"node-1": 2}
+    client = MagicMock(spec=httpx.Client)
+
+    def remove_during_probe(_url: str) -> MagicMock:
+        registry.remove("node-1")
+        return MagicMock(status_code=500)
+
+    client.get.side_effect = remove_during_probe
+
+    _probe_all_nodes(
+        registry,
+        cb_registry,
+        client,
+        failures,
+        failure_threshold=3,
+    )
+
+    assert registry.get("node-1") is None
 
 
 class TestHealthyNodeStaysHealthy:

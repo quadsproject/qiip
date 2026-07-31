@@ -17,9 +17,14 @@ import httpx
 from fastapi.testclient import TestClient
 from pytest_httpx import HTTPXMock, IteratorStream
 
+from inference_proxy.api.routes import (
+    _maybe_remove_drained,
+    _record_failure_and_trip,
+)
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
+from inference_proxy.routing.connection_tracker import ConnectionTracker
 from inference_proxy.routing.node_selector import NodeSelector
 
 
@@ -992,6 +997,39 @@ class TestNonStreamingRetry:
         assert response.status_code == 502
         data = response.json()
         assert data["error"]["code"] == "backend_unavailable"
+
+
+class TestCircuitBreakerStatusTransition:
+    """A stale request snapshot cannot resurrect or undrain a node."""
+
+    def test_request_failure_does_not_resurrect_removed_node(self) -> None:
+        registry = NodeRegistry()
+        node = _make_node()
+        registry.add(node)
+        registry.remove(node.node_id)
+        selector = NodeSelector(registry, ConnectionTracker())
+        cb_registry = CircuitBreakerRegistry(threshold=1)
+
+        _record_failure_and_trip(node, cb_registry, selector)
+
+        assert registry.get(node.node_id) is None
+
+    def test_request_failure_does_not_clobber_draining_node(self) -> None:
+        registry = NodeRegistry()
+        node = _make_node()
+        registry.add(node)
+        registry.drain(node.node_id)
+        selector = NodeSelector(registry, ConnectionTracker())
+        cb_registry = CircuitBreakerRegistry(threshold=1)
+
+        _record_failure_and_trip(node, cb_registry, selector)
+
+        draining = registry.get(node.node_id)
+        assert draining is not None
+        assert draining.status == NodeStatus.DRAINING
+
+        _maybe_remove_drained(node, selector)
+        assert registry.get(node.node_id) is None
 
 
 class TestCircuitBreakerRecording:

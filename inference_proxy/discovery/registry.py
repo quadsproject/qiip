@@ -44,6 +44,28 @@ class NodeRegistry:
         with self._lock:
             return self._nodes.get(node_id)
 
+    def update_status(
+        self,
+        node_id: str,
+        new: NodeStatus,
+        allowed_from: set[NodeStatus],
+    ) -> bool:
+        """Conditionally update a registered node's status.
+
+        The current node is read and replaced while holding the same lock,
+        so a stale caller cannot resurrect a removed node, overwrite a
+        concurrent status transition, or revert other node fields.
+
+        Returns ``True`` when the current status was allowed and the update
+        was applied, otherwise ``False``.
+        """
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if node is None or node.status not in allowed_from:
+                return False
+            self._nodes[node_id] = node.model_copy(update={"status": new})
+            return True
+
     def drain(self, node_id: str) -> bool:
         """Mark a node as DRAINING.
 

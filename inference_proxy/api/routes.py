@@ -138,9 +138,11 @@ def _record_failure_and_trip(
     """
     breaker = circuit_breaker_registry.get_or_create(node.node_id)
     breaker.record_failure()
-    if breaker.is_open:
-        updated = node.model_copy(update={"status": NodeStatus.UNHEALTHY})
-        node_selector._registry.add(updated)
+    if breaker.is_open and node_selector._registry.update_status(
+        node.node_id,
+        NodeStatus.UNHEALTHY,
+        allowed_from={NodeStatus.HEALTHY},
+    ):
         logger.info(
             "circuit breaker tripped, node marked unhealthy",
             node_id=node.node_id,

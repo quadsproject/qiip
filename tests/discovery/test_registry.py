@@ -6,7 +6,9 @@ semantics, and concurrent thread safety.
 
 from __future__ import annotations
 
+import ast
 import threading
+from pathlib import Path
 
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
@@ -170,6 +172,120 @@ class TestDrain:
         assert node is not None
         assert node.endpoint == "http://10.0.1.100:8000"
         assert node.model == "llama-3"
+
+
+class TestUpdateStatus:
+    """update_status() applies conditional transitions under the registry lock."""
+
+    def test_missing_node_returns_false(self) -> None:
+        registry = NodeRegistry()
+
+        updated = registry.update_status(
+            "missing",
+            NodeStatus.UNHEALTHY,
+            allowed_from={NodeStatus.HEALTHY},
+        )
+
+        assert updated is False
+
+    def test_disallowed_source_status_returns_false(self) -> None:
+        registry = NodeRegistry()
+        registry.add(
+            Node(
+                node_id="node-1",
+                endpoint="http://10.0.1.100:8000",
+                status=NodeStatus.DRAINING,
+            )
+        )
+
+        updated = registry.update_status(
+            "node-1",
+            NodeStatus.UNHEALTHY,
+            allowed_from={NodeStatus.HEALTHY},
+        )
+
+        assert updated is False
+        node = registry.get("node-1")
+        assert node is not None
+        assert node.status == NodeStatus.DRAINING
+
+    def test_permitted_transition_returns_true(self) -> None:
+        registry = NodeRegistry()
+        registry.add(
+            Node(
+                node_id="node-1",
+                endpoint="http://10.0.1.100:8000",
+                status=NodeStatus.UNKNOWN,
+            )
+        )
+
+        updated = registry.update_status(
+            "node-1",
+            NodeStatus.HEALTHY,
+            allowed_from={NodeStatus.UNKNOWN},
+        )
+
+        assert updated is True
+        node = registry.get("node-1")
+        assert node is not None
+        assert node.status == NodeStatus.HEALTHY
+
+    def test_transition_preserves_non_status_fields(self) -> None:
+        registry = NodeRegistry()
+        registry.add(
+            Node(
+                node_id="node-1",
+                endpoint="http://10.0.1.100:8000",
+                status=NodeStatus.UNHEALTHY,
+                model="llama-3",
+                managed=False,
+            )
+        )
+
+        registry.update_status(
+            "node-1",
+            NodeStatus.HEALTHY,
+            allowed_from={NodeStatus.UNHEALTHY},
+        )
+
+        node = registry.get("node-1")
+        assert node is not None
+        assert node.endpoint == "http://10.0.1.100:8000"
+        assert node.model == "llama-3"
+        assert node.managed is False
+
+
+def test_status_transitions_use_registry_primitive() -> None:
+    """No production caller may copy a status and write it back with add()."""
+    source_root = Path(__file__).parents[2] / "inference_proxy"
+    registry_path = source_root / "discovery" / "registry.py"
+    offenders: list[str] = []
+
+    # This deliberately detects literal model_copy(update={"status": ...})
+    # transitions. Direct Node(...) construction followed by add() is outside
+    # this AST pattern and remains a code-review responsibility.
+    for path in source_root.rglob("*.py"):
+        if path == registry_path:
+            continue
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+            if not (
+                isinstance(call.func, ast.Attribute) and call.func.attr == "model_copy"
+            ):
+                continue
+            for keyword in call.keywords:
+                if keyword.arg != "update" or not isinstance(keyword.value, ast.Dict):
+                    continue
+                keys = {
+                    key.value
+                    for key in keyword.value.keys
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                }
+                if "status" in keys:
+                    relative = path.relative_to(source_root.parent)
+                    offenders.append(f"{relative}:{call.lineno}")
+
+    assert offenders == []
 
 
 class TestRegistryConcurrentAccess:

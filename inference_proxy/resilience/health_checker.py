@@ -39,12 +39,14 @@ import httpx
 import structlog
 
 from inference_proxy.discovery.registry import NodeRegistry
-from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.models.node import NodeStatus
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 
 logger = structlog.get_logger()
 
 _PROBE_TIMEOUT: float = 5.0
+_RECOVERABLE_STATUSES = {NodeStatus.UNHEALTHY, NodeStatus.UNKNOWN}
+_DEMOTABLE_STATUSES = {NodeStatus.HEALTHY, NodeStatus.UNKNOWN}
 
 
 def run_health_checker(
@@ -106,13 +108,11 @@ def _probe_all_nodes(
         _probe_node(
             node_id=node.node_id,
             endpoint=node.endpoint,
-            current_status=node.status,
             registry=registry,
             circuit_breaker_registry=circuit_breaker_registry,
             client=client,
             consecutive_failures=consecutive_failures,
             failure_threshold=failure_threshold,
-            node=node,
         )
 
 
@@ -120,26 +120,22 @@ def _probe_node(
     *,
     node_id: str,
     endpoint: str,
-    current_status: NodeStatus,
     registry: NodeRegistry,
     circuit_breaker_registry: CircuitBreakerRegistry,
     client: httpx.Client,
     consecutive_failures: dict[str, int],
     failure_threshold: int,
-    node: Node,
 ) -> None:
     """Probe a single node and update its status if needed.
 
     Args:
         node_id: The node's unique identifier.
         endpoint: The node's HTTP endpoint (host:port).
-        current_status: The node's current status in the registry.
         registry: The node registry to update on status changes.
         circuit_breaker_registry: Circuit breaker registry for resets.
         client: The synchronous HTTP client for probing.
         consecutive_failures: Mutable dict tracking per-node failure counts.
         failure_threshold: Consecutive failures before marking UNHEALTHY.
-        node: The original Node object (used for model_copy).
     """
     try:
         url = f"http://{endpoint}/health"
@@ -147,31 +143,25 @@ def _probe_node(
         if response.status_code == 200:
             _handle_probe_success(
                 node_id=node_id,
-                current_status=current_status,
                 registry=registry,
                 circuit_breaker_registry=circuit_breaker_registry,
                 consecutive_failures=consecutive_failures,
-                node=node,
             )
         else:
             _handle_probe_failure(
                 node_id=node_id,
-                current_status=current_status,
                 registry=registry,
                 consecutive_failures=consecutive_failures,
                 failure_threshold=failure_threshold,
                 reason=f"non-200 status: {response.status_code}",
-                node=node,
             )
     except Exception:
         _handle_probe_failure(
             node_id=node_id,
-            current_status=current_status,
             registry=registry,
             consecutive_failures=consecutive_failures,
             failure_threshold=failure_threshold,
             reason="probe exception",
-            node=node,
         )
         logger.debug(
             "health probe failed with exception",
@@ -183,23 +173,20 @@ def _probe_node(
 def _handle_probe_success(
     *,
     node_id: str,
-    current_status: NodeStatus,
     registry: NodeRegistry,
     circuit_breaker_registry: CircuitBreakerRegistry,
     consecutive_failures: dict[str, int],
-    node: Node,
 ) -> None:
     """Handle a successful health probe for a node."""
     consecutive_failures[node_id] = 0
-    if current_status != NodeStatus.HEALTHY:
-        updated_node = node.model_copy(update={"status": NodeStatus.HEALTHY})
-        registry.add(updated_node)
+    transitioned = registry.update_status(
+        node_id,
+        NodeStatus.HEALTHY,
+        allowed_from=_RECOVERABLE_STATUSES,
+    )
+    if transitioned:
         circuit_breaker_registry.reset(node_id)
-        logger.info(
-            "node recovered to healthy",
-            node_id=node_id,
-            previous_status=str(current_status),
-        )
+        logger.info("node recovered to healthy", node_id=node_id)
     else:
         logger.debug("health probe succeeded", node_id=node_id)
 
@@ -207,12 +194,10 @@ def _handle_probe_success(
 def _handle_probe_failure(
     *,
     node_id: str,
-    current_status: NodeStatus,
     registry: NodeRegistry,
     consecutive_failures: dict[str, int],
     failure_threshold: int,
     reason: str,
-    node: Node,
 ) -> None:
     """Handle a failed health probe for a node."""
     count = consecutive_failures.get(node_id, 0) + 1
@@ -223,9 +208,11 @@ def _handle_probe_failure(
         consecutive_failures=count,
         reason=reason,
     )
-    if count >= failure_threshold and current_status == NodeStatus.HEALTHY:
-        updated_node = node.model_copy(update={"status": NodeStatus.UNHEALTHY})
-        registry.add(updated_node)
+    if count >= failure_threshold and registry.update_status(
+        node_id,
+        NodeStatus.UNHEALTHY,
+        allowed_from=_DEMOTABLE_STATUSES,
+    ):
         logger.info(
             "node marked unhealthy",
             node_id=node_id,
