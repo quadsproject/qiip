@@ -8,6 +8,7 @@ Only the root Settings class inherits from BaseSettings.
 from pathlib import Path
 from string import Formatter
 from typing import Self
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -180,11 +181,29 @@ class QUADSSettings(BaseModel):
     """
 
     base_url: str | None = None
+    server_timezone: str | None = None
     timeout: float = 10.0
     poll_interval: int = 300
     verify_ssl: bool = True
     schedule_check_interval: int = 300
     schedule_lookahead_hours: int = 24
+
+    @model_validator(mode="after")
+    def server_timezone_matches_quads_clock(self) -> Self:
+        """Require the IANA timezone used by QUADS' naive date parser."""
+        if self.base_url is not None and self.server_timezone is None:
+            raise ValueError(
+                "quads.server_timezone is required when quads.base_url is set"
+            )
+        if self.server_timezone is not None:
+            try:
+                ZoneInfo(self.server_timezone)
+            except (ValueError, ZoneInfoNotFoundError) as exc:
+                raise ValueError(
+                    f"quads.server_timezone is not a known IANA timezone: "
+                    f"{self.server_timezone!r}"
+                ) from exc
+        return self
 
 
 class LLMFitSettings(BaseModel):

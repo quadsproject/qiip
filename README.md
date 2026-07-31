@@ -148,6 +148,31 @@ All errors follow the OpenAI error format:
 
 All settings are loaded from environment variables with the prefix `INFERENCE_PROXY_` and double-underscore nesting for nested groups. A `.env` file is also supported.
 
+### Upgrade requirements
+
+Deployments upgrading from releases before the reliability campaign must apply
+these changes together:
+
+- Launch with `uvicorn inference_proxy.main:create_app --factory`; the old
+  `inference_proxy.main:app` target no longer exists.
+- Configure `ROUTING__ALLOWED_ENDPOINT_HOSTS`,
+  `ROUTING__ALLOWED_ENDPOINT_NETWORKS`, and
+  `ROUTING__ALLOWED_ENDPOINT_PORTS` for every backend the gateway may contact.
+- Configure `ADMIN__USERNAME` and `ADMIN__PASSWORD`. HTTP is permitted on a
+  trusted work LAN; use TLS when the network path is not trusted.
+- Add `"managed": true` to externally written etcd node records only when the
+  proxy should own and enforce their lifecycle. Missing values now default to
+  unmanaged.
+- When QUADS is enabled, configure `QUADS__SERVER_TIMEZONE` to the IANA timezone
+  used by the QUADS server's local clock.
+
+Enabling QUADS requires both `INFERENCE_PROXY_QUADS__BASE_URL` and
+`INFERENCE_PROXY_QUADS__SERVER_TIMEZONE`. Set the latter to the IANA timezone
+used by the QUADS server's local clock, for example `America/New_York`. The
+QUADS availability endpoint accepts timezone-naive `YYYY-MM-DDTHH:MM` values,
+so the proxy converts its UTC scheduling deadline into that configured server
+timezone before querying availability.
+
 ### Gateway
 
 | Variable | Default | Description |

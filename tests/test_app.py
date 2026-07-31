@@ -13,7 +13,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from inference_proxy.config.settings import RedfishSettings, RoutingSettings, Settings
+from inference_proxy.config.settings import (
+    QUADSSettings,
+    RedfishSettings,
+    RoutingSettings,
+    Settings,
+)
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.main import _initial_load
 from inference_proxy.models.node import Node, NodeStatus
@@ -333,6 +338,40 @@ class TestLifespanRegistryIntegration:
             auth=ANY,
             poll_timeout=60.0,
             poll_interval=5.0,
+        )
+
+    def test_lifespan_passes_configured_quads_server_timezone(
+        self,
+        test_settings: Settings,
+    ) -> None:
+        mock_etcd = MagicMock()
+        mock_etcd.get_prefix.return_value = []
+        mock_etcd.prefix = "/nodes/"
+        quads = QUADSSettings(
+            base_url="http://quads.example.com",
+            server_timezone="America/New_York",
+        )
+        settings = _lifespan_settings(test_settings.model_copy(update={"quads": quads}))
+
+        from inference_proxy.main import create_app
+
+        with (
+            patch("inference_proxy.main.EtcdClient", return_value=mock_etcd),
+            patch("inference_proxy.main.EtcdWatcher"),
+            patch("inference_proxy.main.QUADSPoller") as quads_poller_cls,
+            patch("inference_proxy.main.ScheduleEnforcer") as enforcer_cls,
+            patch("inference_proxy.main.QUADSClient") as quads_client_cls,
+        ):
+            quads_poller_cls.return_value.stop = AsyncMock()
+            enforcer_cls.return_value.stop = AsyncMock()
+            app = create_app(settings=settings)
+            with TestClient(app):
+                pass
+
+        quads_client_cls.assert_called_once_with(
+            ANY,
+            "http://quads.example.com",
+            server_timezone="America/New_York",
         )
 
 

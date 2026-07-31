@@ -11,8 +11,9 @@ Per D-09: all API errors surface as QUADSConnectionError.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
@@ -36,17 +37,37 @@ def canonical_hostname(raw: str) -> str:
     return raw.strip().lower().rstrip(".")
 
 
+def availability_window_end(
+    lookahead_hours: int,
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    """Return an absolute UTC deadline for a QUADS availability window."""
+    current = datetime.now(tz=UTC) if now is None else now
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("availability window start must be timezone-aware")
+    return current.astimezone(UTC) + timedelta(hours=lookahead_hours)
+
+
 class QUADSClient:
     """Async client for the QUADS REST API.
 
     Args:
         http_client: A pre-built httpx.AsyncClient (lifecycle managed externally).
         base_url: QUADS server base URL (e.g. ``https://quads.example.com``).
+        server_timezone: IANA timezone used by the QUADS server's local clock.
     """
 
-    def __init__(self, http_client: httpx.AsyncClient, base_url: str) -> None:
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient,
+        base_url: str,
+        *,
+        server_timezone: str = "UTC",
+    ) -> None:
         self._client = http_client
         self._base_url = base_url.rstrip("/")
+        self._server_timezone = ZoneInfo(server_timezone)
 
     async def get_hosts(self) -> list[QUADSHost]:
         """Fetch GPU hosts from QUADS, filtering out broken/retired (D-06).
@@ -119,7 +140,16 @@ class QUADSClient:
         """
         params: dict[str, str] = {}
         if end is not None:
-            params["end"] = end.strftime("%Y-%m-%dT%H:%M")
+            if end.tzinfo is None or end.utcoffset() is None:
+                raise ValueError("QUADS availability end must be timezone-aware")
+            # QUADS commit bbada78 parses this with a strict, timezone-naive
+            # strptime. Convert the absolute deadline into the server's local
+            # timezone before intentionally omitting the offset. The protocol
+            # cannot disambiguate the repeated hour during a DST fall-back, so
+            # deadlines in that hour may differ from the intended instant by
+            # one hour until QUADS accepts offset-aware timestamps.
+            server_end = end.astimezone(self._server_timezone)
+            params["end"] = server_end.strftime("%Y-%m-%dT%H:%M")
         path = "/api/v3/available"
         data = await self._get(path, params=params)
         try:

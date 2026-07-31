@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from structlog.testing import capture_logs
 
 from inference_proxy.config.settings import ProvisioningSettings
 from inference_proxy.discovery.registry import NodeRegistry
@@ -102,14 +103,30 @@ class TestEnforceOnce:
 
         provisioner.fire_background.assert_not_called()
 
-    async def test_skips_draining_node(self) -> None:
+    async def test_active_draining_node_is_not_duplicated(self) -> None:
         enforcer, _, provisioner = _enforcer(
             available=[],
             nodes=[_node("gpu01", NodeStatus.DRAINING)],
         )
+        provisioner.try_reserve_host.side_effect = None
+        provisioner.try_reserve_host.return_value = None
+
         await enforcer._enforce_once()
 
+        provisioner.try_reserve_host.assert_awaited_once_with("gpu01")
         provisioner.fire_background.assert_not_called()
+
+    async def test_reconciled_draining_managed_node_is_torn_down(self) -> None:
+        enforcer, registry, provisioner = _enforcer(
+            available=[],
+            nodes=[_node("gpu01")],
+        )
+        registry.drain("gpu01")
+
+        await enforcer._enforce_once()
+
+        provisioner.try_reserve_host.assert_awaited_once_with("gpu01")
+        provisioner.fire_background.assert_called_once()
 
     async def test_tears_down_unhealthy_node(self) -> None:
         enforcer, _, provisioner = _enforcer(
@@ -180,6 +197,190 @@ class TestEnforceOnce:
         await enforcer._enforce_once()
 
         assert provisioner.fire_background.call_count == 2
+
+    @pytest.mark.parametrize(
+        ("node_id", "available"),
+        [("GPU01", "gpu01"), ("gpu01.", "GPU01")],
+    )
+    async def test_enforcer_matches_canonical_node_ids(
+        self,
+        node_id: str,
+        available: str,
+    ) -> None:
+        enforcer, _, provisioner = _enforcer(
+            available=[available],
+            nodes=[_node(node_id)],
+        )
+
+        await enforcer._enforce_once()
+
+        provisioner.try_reserve_host.assert_not_awaited()
+        provisioner.fire_background.assert_not_called()
+
+    async def test_enforcer_requests_exact_configured_lookahead_window(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        expected_end = datetime(2026, 8, 1, 16, 45, tzinfo=UTC)
+
+        def fixed_window(lookahead_hours: int) -> datetime:
+            assert lookahead_hours == 24
+            return expected_end
+
+        monkeypatch.setattr(
+            "inference_proxy.quads.schedule_enforcer.availability_window_end",
+            fixed_window,
+        )
+        enforcer, _, _ = _enforcer(available=["gpu01"])
+
+        await enforcer._enforce_once()
+
+        enforcer._client.get_available.assert_awaited_once_with(end=expected_end)
+
+
+class TestTeardownRetry:
+    async def test_failed_teardown_is_observed_and_retried_after_backoff(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        now = [100.0]
+        monkeypatch.setattr(
+            "inference_proxy.quads.schedule_enforcer.monotonic",
+            lambda: now[0],
+        )
+        enforcer, registry, provisioner = _enforcer(
+            available=[],
+            nodes=[_node("gpu01")],
+        )
+        enforcer._interval = 10
+        tasks: list[asyncio.Task[None]] = []
+        attempts = 0
+
+        def fire_background(coro):
+            task = asyncio.create_task(coro)
+            tasks.append(task)
+            return task
+
+        async def teardown(hostname: str, *, lifecycle_lease) -> None:
+            nonlocal attempts
+            attempts += 1
+            registry.drain(hostname)
+            if attempts == 1:
+                raise RuntimeError("ssh unavailable")
+            registry.remove(hostname)
+
+        provisioner.fire_background.side_effect = fire_background
+        provisioner.teardown.side_effect = teardown
+
+        with capture_logs() as logs:
+            await enforcer._enforce_once()
+            await asyncio.wait_for(tasks[-1], timeout=1)
+
+        node = registry.get("gpu01")
+        assert node is not None
+        assert node.status == NodeStatus.DRAINING
+        assert "gpu01" not in enforcer.teardown_initiated
+        assert enforcer.teardown_retry_attempts == {"gpu01": 1}
+        assert any(
+            log.get("event") == "schedule_enforcer_teardown_retry_scheduled"
+            and log.get("attempt") == 1
+            and log.get("retry_delay_seconds") == 10.0
+            for log in logs
+        )
+
+        enforcer._client.get_available.return_value = ["gpu01"]
+        await enforcer._enforce_once()
+        assert len(tasks) == 1
+
+        now[0] = 110.0
+        await enforcer._enforce_once()
+        await asyncio.wait_for(tasks[-1], timeout=1)
+
+        assert len(tasks) == 2
+        assert registry.get("gpu01") is None
+        assert enforcer.teardown_retry_attempts == {}
+
+    async def test_repeated_failures_back_off_and_escalate(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        now = [0.0]
+        monkeypatch.setattr(
+            "inference_proxy.quads.schedule_enforcer.monotonic",
+            lambda: now[0],
+        )
+        enforcer, registry, provisioner = _enforcer(
+            available=[],
+            nodes=[_node("gpu01")],
+        )
+        tasks: list[asyncio.Task[None]] = []
+
+        def fire_background(coro):
+            task = asyncio.create_task(coro)
+            tasks.append(task)
+            return task
+
+        async def teardown(hostname: str, *, lifecycle_lease) -> None:
+            registry.drain(hostname)
+            raise RuntimeError("host unreachable")
+
+        provisioner.fire_background.side_effect = fire_background
+        provisioner.teardown.side_effect = teardown
+        expected_delays = [300.0, 600.0, 1200.0, 2400.0, 3600.0]
+
+        with capture_logs() as logs:
+            for expected_attempt, expected_delay in enumerate(
+                expected_delays,
+                start=1,
+            ):
+                await enforcer._enforce_once()
+                await asyncio.wait_for(tasks[-1], timeout=1)
+                assert enforcer.teardown_retry_attempts == {"gpu01": expected_attempt}
+                now[0] += expected_delay
+
+        retry_events = [
+            log
+            for log in logs
+            if log.get("event")
+            in {
+                "schedule_enforcer_teardown_retry_scheduled",
+                "schedule_enforcer_teardown_requires_operator",
+            }
+        ]
+        assert [log["retry_delay_seconds"] for log in retry_events] == expected_delays
+        escalation = [
+            log
+            for log in logs
+            if log.get("event") == "schedule_enforcer_teardown_requires_operator"
+        ]
+        assert len(escalation) == 1
+        assert escalation[0]["attempt"] == 5
+        assert escalation[0]["retry_delay_seconds"] == 3600.0
+
+    async def test_teardown_schedule_failure_backs_off_and_continues(
+        self,
+    ) -> None:
+        enforcer, _, provisioner = _enforcer(
+            available=[],
+            nodes=[_node("gpu01"), _node("gpu02")],
+        )
+        scheduled = 0
+
+        def fire_background(coro):
+            nonlocal scheduled
+            scheduled += 1
+            if scheduled == 1:
+                raise RuntimeError("scheduler unavailable")
+            coro.close()
+            return MagicMock()
+
+        provisioner.fire_background.side_effect = fire_background
+
+        await enforcer._enforce_once()
+
+        assert scheduled == 2
+        assert enforcer.teardown_retry_attempts == {"gpu01": 1}
+        assert "gpu02" in enforcer.teardown_initiated
 
 
 class TestDedup:

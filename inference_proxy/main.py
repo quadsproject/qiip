@@ -284,11 +284,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.provisioner = provisioner
 
         if resolved_settings.quads.base_url is not None:
+            quads_server_timezone = resolved_settings.quads.server_timezone
+            if quads_server_timezone is None:
+                raise RuntimeError(
+                    "QUADS server timezone missing after settings validation"
+                )
             quads_http = httpx.AsyncClient(
                 timeout=httpx.Timeout(resolved_settings.quads.timeout),
                 verify=resolved_settings.quads.verify_ssl,
             )
-            quads_client = QUADSClient(quads_http, resolved_settings.quads.base_url)
+            quads_client = QUADSClient(
+                quads_http,
+                resolved_settings.quads.base_url,
+                server_timezone=quads_server_timezone,
+            )
             app.state.quads_client = quads_client
             quads_poller = QUADSPoller(
                 quads_client, resolved_settings.quads.poll_interval

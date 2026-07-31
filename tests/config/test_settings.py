@@ -273,6 +273,10 @@ class TestDefaultQUADSSettings:
         settings = Settings(_env_file=None)
         assert settings.quads.timeout == 10.0
 
+    def test_server_timezone_is_none_while_disabled(self) -> None:
+        settings = Settings(_env_file=None)
+        assert settings.quads.server_timezone is None
+
 
 class TestEnvVarOverrideQUADSBaseUrl:
     def test_env_var_override_quads_base_url(
@@ -281,8 +285,29 @@ class TestEnvVarOverrideQUADSBaseUrl:
         monkeypatch.setenv(
             "INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com"
         )
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SERVER_TIMEZONE", "America/New_York")
         settings = Settings(_env_file=None)
         assert settings.quads.base_url == "http://quads.example.com"
+        assert settings.quads.server_timezone == "America/New_York"
+
+    def test_enabled_quads_requires_server_timezone(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com"
+        )
+        monkeypatch.delenv("INFERENCE_PROXY_QUADS__SERVER_TIMEZONE", raising=False)
+
+        with pytest.raises(ValidationError, match="server_timezone is required"):
+            Settings(_env_file=None)
+
+    def test_unknown_quads_server_timezone_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="known IANA timezone"):
+            QUADSSettings(
+                base_url="http://quads.example.com",
+                server_timezone="Mars/Olympus_Mons",
+            )
 
 
 class TestEnvVarOverrideQUADSTimeout:

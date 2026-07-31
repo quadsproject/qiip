@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import ANY, AsyncMock, MagicMock
 
 import httpx
@@ -30,8 +30,10 @@ from inference_proxy.config.dependencies import (
     get_quads_client,
     get_quads_poller,
     get_redfish_client,
+    get_settings,
     get_unified_node_service,
 )
+from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.llmfit.errors import LLMFitParseError, LLMFitTimeoutError
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
@@ -963,6 +965,45 @@ class TestSetupQuadsRevalidation:
 
         response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
         assert response.status_code == 400
+
+    def test_setup_checks_full_configured_availability_window(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+        test_settings: Settings,
+    ) -> None:
+        lookahead_hours = 20
+        configured = test_settings.model_copy(
+            update={
+                "quads": test_settings.quads.model_copy(
+                    update={"schedule_lookahead_hours": lookahead_hours}
+                )
+            }
+        )
+        app.dependency_overrides[get_settings] = lambda: configured
+        mock_quads = AsyncMock()
+
+        async def availability(*, end: datetime | None = None) -> list[str]:
+            return ["gpu01"] if end is None else []
+
+        mock_quads.get_available.side_effect = availability
+        app.dependency_overrides[get_quads_client] = lambda: mock_quads
+        before = datetime.now(tz=UTC)
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        after = datetime.now(tz=UTC)
+        assert response.status_code == 400
+        assert response.json()["detail"] == (
+            "Host 'gpu01' is currently assigned or has an upcoming QUADS "
+            "assignment within the configured 20-hour scheduling window"
+        )
+        called_end = mock_quads.get_available.await_args.kwargs["end"]
+        assert before + timedelta(hours=lookahead_hours) <= called_end
+        assert called_end <= after + timedelta(hours=lookahead_hours)
+        mock_provisioner.fire_background.assert_not_called()
+        mock_provisioner.provision.assert_not_awaited()
 
     def test_succeeds_for_available_host(
         self,

@@ -27,9 +27,11 @@ from inference_proxy.config.dependencies import (
     get_redfish_client,
     get_registry,
     get_request_metrics,
+    get_settings,
     get_unified_node_service,
     require_admin_auth,
 )
+from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.huggingface.catalog import (
     ModelCatalogResponse,
@@ -62,6 +64,7 @@ from inference_proxy.provisioning.ssh_client import (
 from inference_proxy.quads.client import (
     QUADSClient,
     QUADSConnectionError,
+    availability_window_end,
     canonical_hostname,
 )
 from inference_proxy.quads.poller import QUADSPoller
@@ -184,6 +187,7 @@ async def setup_node(
     registry: NodeRegistry = Depends(get_registry),
     provisioner: NodeProvisioner = Depends(get_provisioner),
     quads_client: QUADSClient | None = Depends(get_quads_client),
+    settings: Settings = Depends(get_settings),
 ) -> SetupResponse:
     """Trigger provisioning of a new node (runs in background).
 
@@ -262,8 +266,10 @@ async def setup_node(
 
         # D-10/D-11: live QUADS re-validation (skip for unmanaged nodes).
         if body.managed and quads_client is not None:
+            lookahead_hours = settings.quads.schedule_lookahead_hours
+            window_end = availability_window_end(lookahead_hours)
             try:
-                available = await quads_client.get_available()
+                available = await quads_client.get_available(end=window_end)
             except QUADSConnectionError as exc:
                 raise HTTPException(
                     status_code=503, detail="QUADS unavailable"
@@ -271,7 +277,11 @@ async def setup_node(
             if hostname not in available:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Host '{hostname}' is not available in QUADS",
+                    detail=(
+                        f"Host '{hostname}' is currently assigned or has an "
+                        f"upcoming QUADS assignment within the configured "
+                        f"{lookahead_hours}-hour scheduling window"
+                    ),
                 )
 
         # The lease already closes the async TOCTOU window. Keep the legacy

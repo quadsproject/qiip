@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import httpx
 import pytest
 from pytest_httpx import HTTPXMock
@@ -9,6 +11,7 @@ from pytest_httpx import HTTPXMock
 from inference_proxy.quads.client import (
     QUADSClient,
     QUADSConnectionError,
+    availability_window_end,
     canonical_hostname,
 )
 
@@ -27,6 +30,19 @@ class TestCanonicalHostname:
 
     def test_combined(self) -> None:
         assert canonical_hostname("  Host01. ") == "host01"
+
+
+class TestAvailabilityWindow:
+    def test_uses_configured_hours(self) -> None:
+        now = datetime(2026, 7, 31, 16, 45, tzinfo=UTC)
+
+        end = availability_window_end(24, now=now)
+
+        assert end == datetime(2026, 8, 1, 16, 45, tzinfo=UTC)
+
+    def test_rejects_naive_start(self) -> None:
+        with pytest.raises(ValueError, match="timezone-aware"):
+            availability_window_end(24, now=datetime(2026, 7, 31, 16, 45))
 
 
 def _gpu_host(
@@ -179,6 +195,55 @@ class TestGetAvailable:
             available = await quads.get_available()
 
         assert available == ["host01", "host02", "host03"]
+
+    async def test_normalizes_end_to_server_timezone(
+        self,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        expected_end = "2026-08-01T12:34"
+        httpx_mock.add_response(
+            url=f"{QUADS_URL}/api/v3/available?end={expected_end}",
+            json=["gpu01"],
+        )
+        end = datetime(2026, 8, 1, 16, 34, tzinfo=UTC)
+
+        async with httpx.AsyncClient() as client:
+            quads = QUADSClient(
+                client,
+                QUADS_URL,
+                server_timezone="America/New_York",
+            )
+            available = await quads.get_available(end=end)
+
+        request = httpx_mock.get_request()
+        assert available == ["gpu01"]
+        assert request is not None
+        assert request.url.params["end"] == expected_end
+
+    async def test_sends_exact_end_query_parameter(
+        self,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        expected_end = "2026-08-01T16:34"
+        httpx_mock.add_response(
+            url=f"{QUADS_URL}/api/v3/available?end={expected_end}",
+            json=[],
+        )
+
+        async with httpx.AsyncClient() as client:
+            quads = QUADSClient(client, QUADS_URL, server_timezone="UTC")
+            await quads.get_available(end=datetime(2026, 8, 1, 16, 34, 56, tzinfo=UTC))
+
+        request = httpx_mock.get_request()
+        assert request is not None
+        assert set(request.url.params) == {"end"}
+        assert request.url.params["end"] == expected_end
+
+    async def test_rejects_naive_end(self) -> None:
+        async with httpx.AsyncClient() as client:
+            quads = QUADSClient(client, QUADS_URL)
+            with pytest.raises(ValueError, match="timezone-aware"):
+                await quads.get_available(end=datetime(2026, 8, 1, 16, 34))
 
 
 class TestConnectionError:
