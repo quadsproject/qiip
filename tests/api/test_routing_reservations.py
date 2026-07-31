@@ -110,11 +110,15 @@ class _BlockingSSEStream(httpx.AsyncByteStream):
 class _PausingAfterFirstSSEStream(httpx.AsyncByteStream):
     def __init__(self, waiting_for_next_chunk: asyncio.Event) -> None:
         self._waiting_for_next_chunk = waiting_for_next_chunk
+        self.close_calls = 0
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
         yield _sse_chunks()[0]
         self._waiting_for_next_chunk.set()
         await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
@@ -447,14 +451,22 @@ async def _drive_disconnect(
 
 
 @pytest.mark.asyncio
-async def test_stream_disconnect_before_first_event_releases_reservation(
+async def test_stream_disconnect_before_first_event_closes_upstream_and_reservation(
     app: FastAPI,
     test_registry: NodeRegistry,
     node_selector: NodeSelector,
+    httpx_mock: HTTPXMock,
 ) -> None:
-    """A pre-iteration disconnect cannot leak its route reservation."""
+    """A pre-iteration disconnect closes the pre-opened stream and reservation."""
     node = _make_node("node-1", "10.0.1.100:8000")
     test_registry.add(node)
+    stream = _PausingAfterFirstSSEStream(asyncio.Event())
+    httpx_mock.add_response(
+        url="http://10.0.1.100:8000/v1/chat/completions",
+        headers={"content-type": "text/event-stream"},
+        stream=stream,
+        is_optional=True,
+    )
 
     messages = await asyncio.wait_for(
         _drive_disconnect(app, after_first_event=False),
@@ -463,6 +475,7 @@ async def test_stream_disconnect_before_first_event_releases_reservation(
 
     assert any(message["type"] == "http.response.start" for message in messages)
     assert node_selector.tracker.get(node.node_id) == 0
+    assert stream.close_calls == 1
 
 
 @pytest.mark.asyncio
@@ -477,10 +490,11 @@ async def test_stream_disconnect_after_first_event_balances_reservation_once(
     node = _make_node("node-1", "10.0.1.100:8000")
     test_registry.add(node)
     generator_waiting = asyncio.Event()
+    stream = _PausingAfterFirstSSEStream(generator_waiting)
     httpx_mock.add_response(
         url="http://10.0.1.100:8000/v1/chat/completions",
         headers={"content-type": "text/event-stream"},
-        stream=_PausingAfterFirstSSEStream(generator_waiting),
+        stream=stream,
     )
 
     decrement_calls = 0
@@ -511,6 +525,7 @@ async def test_stream_disconnect_after_first_event_balances_reservation_once(
     await asyncio.wait_for(decremented.wait(), timeout=_WAIT_TIMEOUT)
     assert decrement_calls == 1
     assert node_selector.tracker.get(node.node_id) == 0
+    assert stream.close_calls == 1
 
 
 def test_non_streaming_route_updates_metrics(

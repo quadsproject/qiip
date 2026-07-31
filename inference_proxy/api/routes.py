@@ -15,8 +15,10 @@ FastAPI's EventSourceResponse for downstream re-emission.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator
+from contextlib import AsyncExitStack
 from typing import Any
 
 import httpx
@@ -25,7 +27,7 @@ from fastapi import APIRouter, Depends
 from fastapi import Request as StarletteRequest
 from fastapi.responses import JSONResponse
 from fastapi.sse import EventSourceResponse, format_sse_event
-from httpx_sse import aconnect_sse
+from httpx_sse import EventSource, aconnect_sse
 from starlette.background import BackgroundTask
 
 from inference_proxy.api.errors import (
@@ -49,7 +51,7 @@ from inference_proxy.models.openai import (
 )
 from inference_proxy.proxy.client import ProxyClient
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
-from inference_proxy.routing.node_selector import NodeSelector
+from inference_proxy.routing.node_selector import NodeReservation, NodeSelector
 from inference_proxy.routing.request_metrics import RequestMetrics
 
 logger = structlog.get_logger()
@@ -137,6 +139,95 @@ def _proxy_error_response(
     return JSONResponse(content=content, status_code=status, headers=headers)
 
 
+def _response_content(response: httpx.Response) -> Any:
+    """Decode an upstream response without changing its JSON shape."""
+    try:
+        return response.json()
+    except (json.JSONDecodeError, ValueError):
+        return {"raw": response.text}
+
+
+async def _close_streaming_attempt(
+    stack: AsyncExitStack,
+    reservation: NodeReservation,
+    *,
+    node_id: str,
+) -> None:
+    """Close one upstream context and always release its node reservation."""
+    try:
+        await stack.aclose()
+    except Exception:
+        logger.warning(
+            "failed to close upstream streaming context",
+            node_id=node_id,
+            exc_info=True,
+        )
+    finally:
+        reservation.release()
+
+
+class _StreamingSession:
+    """Own the successful upstream stream and its reservation."""
+
+    def __init__(
+        self,
+        event_source: EventSource,
+        stack: AsyncExitStack,
+        reservation: NodeReservation,
+    ) -> None:
+        self.event_source = event_source
+        self._stack = stack
+        self._reservation = reservation
+        self._close_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
+
+    async def close(self) -> None:
+        """Close the upstream and release its reservation exactly once."""
+        async with self._close_lock:
+            if self._close_task is None:
+                self._close_task = asyncio.create_task(
+                    _close_streaming_attempt(
+                        self._stack,
+                        self._reservation,
+                        node_id=self._reservation.node.node_id,
+                    )
+                )
+            close_task = self._close_task
+        await asyncio.shield(close_task)
+
+
+async def _stream_events(
+    session: _StreamingSession,
+    node: Node,
+    url: str,
+    circuit_breaker_registry: CircuitBreakerRegistry,
+    node_selector: NodeSelector,
+) -> AsyncGenerator[bytes, None]:
+    """Relay one established upstream stream without attempting failover."""
+    try:
+        async for sse in session.event_source.aiter_sse():
+            if sse.data == "[DONE]":
+                yield format_sse_event(data_str="[DONE]")
+                circuit_breaker_registry.get_or_create(
+                    node.node_id,
+                ).record_success()
+                return
+            yield format_sse_event(data_str=sse.data)
+    except Exception as exc:
+        logger.error("streaming proxy error", error=str(exc), url=url)
+        _record_failure_and_trip(
+            node,
+            circuit_breaker_registry,
+            node_selector,
+        )
+        _, error_resp = map_proxy_error(exc)
+        error_json = json.dumps(error_resp.model_dump())
+        yield format_sse_event(data_str=error_json)
+        yield format_sse_event(data_str="[DONE]")
+    finally:
+        await session.close()
+
+
 async def _proxy_non_streaming(
     endpoint_path: str,
     body: dict[str, Any],
@@ -195,10 +286,7 @@ async def _proxy_non_streaming(
         try:
             response = await proxy.forward("POST", url, body)
             circuit_breaker_registry.get_or_create(node.node_id).record_success()
-            try:
-                content = response.json()
-            except (json.JSONDecodeError, ValueError):
-                content = {"raw": response.text}
+            content = _response_content(response)
             return JSONResponse(content=content, status_code=response.status_code)
         except Exception as exc:
             retryable = _is_retryable(exc)
@@ -261,6 +349,8 @@ async def chat_completions(
             circuit_breaker_registry=circuit_breaker_registry,
             request_metrics=request_metrics,
             starlette_request=starlette_request,
+            max_retries=settings.routing.max_retries,
+            handshake_timeout=settings.routing.timeout,
         )
     return await _proxy_non_streaming(
         "/v1/chat/completions",
@@ -301,6 +391,8 @@ async def text_completions(
             circuit_breaker_registry=circuit_breaker_registry,
             request_metrics=request_metrics,
             starlette_request=starlette_request,
+            max_retries=settings.routing.max_retries,
+            handshake_timeout=settings.routing.timeout,
         )
     return await _proxy_non_streaming(
         "/v1/completions",
@@ -354,62 +446,142 @@ async def _stream_completion(
     circuit_breaker_registry: CircuitBreakerRegistry,
     request_metrics: RequestMetrics,
     starlette_request: StarletteRequest | None = None,
+    max_retries: int = 3,
+    handshake_timeout: float = 30,
 ) -> JSONResponse | EventSourceResponse:
-    """Stream SSE events from a vLLM backend to the client.
+    """Establish a backend SSE stream, then expose it to the client.
 
-    Consumes upstream SSE events via ``httpx-sse`` and re-emits them
-    using FastAPI's ``EventSourceResponse``.
+    Retryable failures before upstream response headers fail over to a
+    different node. The downstream 200 is committed only after a backend
+    returns a successful response. The complete pre-stream retry phase is
+    bounded by ``handshake_timeout``.
 
-    Uses ``format_sse_event(data_str=...)`` to avoid double JSON encoding
-    (upstream data is already JSON-serialised by vLLM).
-
-    Records success/failure in the circuit breaker but does NOT retry
-    mid-stream.  Per plan: streaming requests may record failures but
-    do not retry once the SSE connection has started.
+    Once streaming begins, events are re-emitted with their existing JSON
+    payloads and failures are reported in-band without retrying.
     """
     model = body.get("model")
-    reservation = node_selector.select_and_reserve(model=model)
-    if reservation is None:
-        status, error_resp = _select_error(model, node_selector)
-        return JSONResponse(content=error_resp.model_dump(), status_code=status)
-    node = reservation.node
+    excluded: set[str] = set()
+    last_error: tuple[int, ErrorResponse] | None = None
+    attempts = 0
+    first_attempt = True
+    deadline = asyncio.get_running_loop().time() + handshake_timeout
 
-    if starlette_request is not None:
-        starlette_request.state.target_node = node.endpoint
+    for _ in range(max_retries):
+        if asyncio.get_running_loop().time() >= deadline:
+            break
 
-    url = f"http://{node.endpoint}{endpoint_path}"
+        reservation = node_selector.select_and_reserve(
+            model=model,
+            exclude_node_ids=excluded or None,
+        )
+        if reservation is None:
+            if last_error is not None:
+                status, error = last_error
+                return _proxy_error_response(
+                    status,
+                    error,
+                    failover_exhausted=True,
+                    attempts=attempts,
+                )
+            status, error_resp = _select_error(model, node_selector)
+            return JSONResponse(content=error_resp.model_dump(), status_code=status)
 
-    request_metrics.record_request(node.node_id, model)
+        node = reservation.node
+        attempts += 1
+        if first_attempt:
+            request_metrics.record_request(node.node_id, model)
+            first_attempt = False
+        else:
+            request_metrics.record_node_attempt(node.node_id)
 
-    async def event_generator() -> AsyncGenerator[bytes, None]:
+        if starlette_request is not None:
+            starlette_request.state.target_node = node.endpoint
+
+        url = f"http://{node.endpoint}{endpoint_path}"
+        stack = AsyncExitStack()
         try:
-            async with aconnect_sse(
-                proxy.client, "POST", url, json=body
-            ) as event_source:
-                event_source.response.raise_for_status()
-                async for sse in event_source.aiter_sse():
-                    if sse.data == "[DONE]":
-                        yield format_sse_event(data_str="[DONE]")
-                        circuit_breaker_registry.get_or_create(
-                            node.node_id,
-                        ).record_success()
-                        return
-                    yield format_sse_event(data_str=sse.data)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise httpx.ReadTimeout(
+                    "Streaming upstream handshake exceeded routing timeout"
+                )
+            try:
+                async with asyncio.timeout(remaining):
+                    event_source = await stack.enter_async_context(
+                        aconnect_sse(proxy.client, "POST", url, json=body)
+                    )
+                    response = event_source.response
+                    if not response.is_success:
+                        await response.aread()
+            except TimeoutError as exc:
+                raise httpx.ReadTimeout(
+                    "Streaming upstream handshake exceeded routing timeout"
+                ) from exc
+
+            if response.status_code >= 500:
+                # D3: the streamed body was read above, so error mapping can
+                # safely inspect response.text after this context is closed.
+                response.raise_for_status()
+
+            if not response.is_success:
+                circuit_breaker_registry.get_or_create(node.node_id).record_success()
+                content = _response_content(response)
+                await _close_streaming_attempt(
+                    stack,
+                    reservation,
+                    node_id=node.node_id,
+                )
+                return JSONResponse(
+                    content=content,
+                    status_code=response.status_code,
+                )
         except Exception as exc:
-            logger.error("streaming proxy error", error=str(exc), url=url)
+            await _close_streaming_attempt(
+                stack,
+                reservation,
+                node_id=node.node_id,
+            )
+            retryable = _is_retryable(exc)
             _record_failure_and_trip(
                 node,
                 circuit_breaker_registry,
                 node_selector,
             )
-            _, error_resp = map_proxy_error(exc)
-            error_json = json.dumps(error_resp.model_dump())
-            yield format_sse_event(data_str=error_json)
-            yield format_sse_event(data_str="[DONE]")
-        finally:
-            reservation.release()
+            status, error_resp = map_proxy_error(exc)
+            last_error = (status, error_resp)
+            if retryable:
+                excluded.add(node.node_id)
+                logger.warning(
+                    "retrying streaming handshake on different node",
+                    failed_node=node.node_id,
+                    attempt=attempts,
+                    max_attempts=max_retries,
+                    error=str(exc),
+                )
+                continue
+            return _proxy_error_response(status, error_resp)
 
-    return EventSourceResponse(
-        event_generator(),
-        background=BackgroundTask(reservation.release),
+        # Only the successful context crosses the handler/generator boundary.
+        # Every failed context was closed before the next selection attempt.
+        session = _StreamingSession(event_source, stack, reservation)
+
+        return EventSourceResponse(
+            _stream_events(
+                session,
+                node,
+                url,
+                circuit_breaker_registry,
+                node_selector,
+            ),
+            background=BackgroundTask(session.close),
+        )
+
+    if last_error is None:
+        raise RuntimeError("attempt budget exhausted without a backend failure")
+    status, error = last_error
+    return _proxy_error_response(
+        status,
+        error,
+        failover_exhausted=True,
+        attempts=attempts,
     )

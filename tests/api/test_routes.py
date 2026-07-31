@@ -13,6 +13,9 @@ Tests cover all phase 3 requirements:
 
 from __future__ import annotations
 
+import json
+from collections.abc import Iterator
+
 import httpx
 from fastapi.testclient import TestClient
 from pytest_httpx import HTTPXMock, IteratorStream
@@ -38,6 +41,22 @@ def _make_node(
         status=status,
         model=model,
     )
+
+
+def _assert_sse_frames(
+    response_body: bytes,
+    expected_payloads: list[dict[str, object]],
+) -> None:
+    """Assert wire framing separately from decoded SSE payloads."""
+    assert response_body.endswith(b"\n\n")
+    frames = response_body[:-2].split(b"\n\n")
+    assert len(frames) == len(expected_payloads) + 1
+    assert all(frame.startswith(b"data: ") for frame in frames)
+    assert all(b"\n" not in frame for frame in frames)
+
+    data = [frame.removeprefix(b"data: ") for frame in frames]
+    assert [json.loads(item) for item in data[:-1]] == expected_payloads
+    assert data[-1] == b"[DONE]"
 
 
 # ---------------------------------------------------------------------------
@@ -201,11 +220,39 @@ class TestChatCompletionStreaming:
         """Streaming chat completion returns SSE data lines from vLLM."""
         test_registry.add(_make_node())
 
-        sse_chunks = [
-            b'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1234,"model":"llama-3","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}\n\n',
-            b'data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1234,"model":"llama-3","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":"stop"}]}\n\n',
-            b"data: [DONE]\n\n",
+        payloads = [
+            {
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "created": 1234,
+                "model": "llama-3",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": "Hello"},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl-1",
+                "object": "chat.completion.chunk",
+                "created": 1234,
+                "model": "llama-3",
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": " world"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
         ]
+        sse_chunks = [
+            b"data: " + json.dumps(payload, separators=(",", ":")).encode() + b"\n\n"
+            for payload in payloads
+        ]
+        sse_chunks.append(b"data: [DONE]\n\n")
         httpx_mock.add_response(
             url="http://10.0.1.100:8000/v1/chat/completions",
             headers={"content-type": "text/event-stream"},
@@ -222,9 +269,7 @@ class TestChatCompletionStreaming:
         )
 
         assert response.status_code == 200
-        body = response.text
-        assert "Hello" in body
-        assert " world" in body
+        _assert_sse_frames(response.content, payloads)
 
     def test_chat_streaming_done_signal(
         self,
@@ -293,11 +338,39 @@ class TestTextCompletionStreaming:
         """Streaming text completion returns SSE data lines from vLLM."""
         test_registry.add(_make_node())
 
-        sse_chunks = [
-            b'data: {"id":"cmpl-1","object":"text_completion.chunk","created":1234,"model":"llama-3","choices":[{"index":0,"text":"The answer","finish_reason":null}]}\n\n',
-            b'data: {"id":"cmpl-1","object":"text_completion.chunk","created":1234,"model":"llama-3","choices":[{"index":0,"text":" is 42","finish_reason":"stop"}]}\n\n',
-            b"data: [DONE]\n\n",
+        payloads = [
+            {
+                "id": "cmpl-1",
+                "object": "text_completion.chunk",
+                "created": 1234,
+                "model": "llama-3",
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": "The answer",
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "cmpl-1",
+                "object": "text_completion.chunk",
+                "created": 1234,
+                "model": "llama-3",
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": " is 42",
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
         ]
+        sse_chunks = [
+            b"data: " + json.dumps(payload, separators=(",", ":")).encode() + b"\n\n"
+            for payload in payloads
+        ]
+        sse_chunks.append(b"data: [DONE]\n\n")
         httpx_mock.add_response(
             url="http://10.0.1.100:8000/v1/completions",
             headers={"content-type": "text/event-stream"},
@@ -314,10 +387,7 @@ class TestTextCompletionStreaming:
         )
 
         assert response.status_code == 200
-        body = response.text
-        assert "The answer" in body
-        assert " is 42" in body
-        assert "[DONE]" in body
+        _assert_sse_frames(response.content, payloads)
 
 
 # ---------------------------------------------------------------------------
@@ -1170,14 +1240,14 @@ class TestCircuitBreakerRecording:
 class TestStreamingCircuitBreaker:
     """Streaming requests record in circuit breaker but do not retry mid-stream."""
 
-    def test_streaming_records_failure_no_retry(
+    def test_streaming_records_failure_no_retry_after_connection(
         self,
         test_registry: NodeRegistry,
         node_selector: NodeSelector,
         app: object,
         httpx_mock: HTTPXMock,
     ) -> None:
-        """Streaming error records failure but does not retry on another node."""
+        """A failure after upstream 200 records failure without retrying."""
         from fastapi import FastAPI
 
         from inference_proxy.config.dependencies import get_circuit_breaker_registry
@@ -1195,10 +1265,14 @@ class TestStreamingCircuitBreaker:
         # Ensure node-1 is selected first (fewer connections)
         node_selector.tracker.increment("node-2")
 
-        # Simulate streaming error -- connection fails
-        httpx_mock.add_exception(
-            httpx.ConnectError("connection refused"),
+        def broken_stream() -> Iterator[bytes]:
+            yield b'data: {"id":"partial"}\n\n'
+            raise httpx.ReadError("stream ended early")
+
+        httpx_mock.add_response(
             url="http://10.0.1.100:8000/v1/chat/completions",
+            headers={"content-type": "text/event-stream"},
+            stream=IteratorStream(broken_stream()),
         )
 
         test_client = TestClient(app)
@@ -1214,7 +1288,9 @@ class TestStreamingCircuitBreaker:
         # Should NOT have retried on node-2; response contains an error
         assert response.status_code == 200  # SSE response is always 200
         body = response.text
-        assert "backend_unavailable" in body or "upstream_error" in body
+        assert '"id":"partial"' in body
+        assert "backend_transport_error" in body
+        assert "[DONE]" in body
 
         # Circuit breaker should have recorded the failure
         breaker = cb_registry.get_or_create("node-1")

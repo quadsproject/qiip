@@ -6,7 +6,7 @@ import httpx
 import pytest
 import structlog
 from fastapi.testclient import TestClient
-from pytest_httpx import HTTPXMock, IteratorStream
+from pytest_httpx import HTTPXMock
 
 import inference_proxy.api.routes as routes_module
 from inference_proxy.config.settings import Settings
@@ -371,25 +371,3 @@ def test_retry_budget_counts_total_attempts(
     assert [str(request.url) for request in httpx_mock.get_requests()] == [
         _backend_url(nodes[0])
     ]
-
-
-def test_streaming_5xx_mapping_remains_pr3_scope(
-    client: TestClient,
-    test_registry: NodeRegistry,
-    httpx_mock: HTTPXMock,
-) -> None:
-    """Characterize D3 so PR 2 cannot partially change its shared mapping path."""
-    node = _make_node("node-1", "10.0.1.100:8000")
-    test_registry.add(node)
-    httpx_mock.add_response(
-        url=_backend_url(node),
-        status_code=500,
-        headers={"content-type": "text/event-stream"},
-        stream=IteratorStream([b'data: {"error":"failed"}\n\n']),
-    )
-
-    with pytest.raises(httpx.ResponseNotRead):
-        client.post(
-            _CHAT_URL,
-            json={**_REQUEST_BODY, "stream": True},
-        )
