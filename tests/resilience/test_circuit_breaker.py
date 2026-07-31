@@ -1,15 +1,16 @@
 """Unit tests for CircuitBreaker and CircuitBreakerRegistry.
 
-Tests cover record_failure, record_success, is_open, reset for
-CircuitBreaker, and get_or_create, reset, remove for
-CircuitBreakerRegistry.
+Tests cover CLOSED, OPEN and HALF_OPEN transitions plus registry lifecycle.
 """
 
 from __future__ import annotations
 
+import threading
+
 from inference_proxy.resilience.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerRegistry,
+    CircuitBreakerState,
 )
 
 # -- CircuitBreaker tests --
@@ -95,6 +96,58 @@ class TestIsOpen:
         breaker.record_failure()
 
         assert breaker.is_open
+
+
+class TestHalfOpen:
+    """OPEN breakers admit exactly one thread-safe recovery probe."""
+
+    def test_only_one_half_open_probe_is_admitted(self) -> None:
+        breaker = CircuitBreaker(threshold=1)
+        breaker.record_failure()
+        start = threading.Event()
+        results: list[bool] = []
+        results_lock = threading.Lock()
+
+        def attempt_probe() -> None:
+            assert start.wait(timeout=1)
+            admitted = breaker.try_half_open()
+            with results_lock:
+                results.append(admitted)
+
+        threads = [
+            threading.Thread(target=attempt_probe, daemon=True) for _ in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        start.set()
+        for thread in threads:
+            thread.join(timeout=1)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert results.count(True) == 1
+        assert results.count(False) == 7
+        assert breaker.state == CircuitBreakerState.HALF_OPEN
+        assert breaker.is_open
+
+    def test_half_open_failure_reopens_breaker(self) -> None:
+        breaker = CircuitBreaker(threshold=1)
+        breaker.record_failure()
+        assert breaker.try_half_open()
+
+        breaker.record_failure()
+
+        assert breaker.state == CircuitBreakerState.OPEN
+        assert breaker.is_open
+
+    def test_half_open_success_closes_breaker(self) -> None:
+        breaker = CircuitBreaker(threshold=1)
+        breaker.record_failure()
+        assert breaker.try_half_open()
+
+        breaker.record_success()
+
+        assert breaker.state == CircuitBreakerState.CLOSED
+        assert not breaker.is_open
 
 
 class TestReset:
@@ -196,13 +249,20 @@ class TestRegistryRemove:
     """remove() removes the breaker for a node_id."""
 
     def test_remove_clears_breaker(self) -> None:
-        registry = CircuitBreakerRegistry()
-        registry.get_or_create("node-1")
+        registry = CircuitBreakerRegistry(threshold=3)
+        original = registry.get_or_create("node-1")
+        for _ in range(3):
+            original.record_failure()
+        assert original.is_open
 
         registry.remove("node-1")
 
-        # get_or_create should return a new instance
+        assert registry.get("node-1") is None
         new_breaker = registry.get_or_create("node-1")
+        assert new_breaker is not original
+        assert not new_breaker.is_open
+        new_breaker.record_failure()
+        new_breaker.record_failure()
         assert not new_breaker.is_open
 
     def test_remove_nonexistent_is_silent(self) -> None:

@@ -3,7 +3,7 @@
 Tests cover:
 - Healthy node stays healthy after successful probe
 - Node marked UNHEALTHY after 3 consecutive probe failures (D-03)
-- Node restored to HEALTHY after 1 successful probe with circuit breaker reset (D-04, D-08)
+- Health-demoted nodes recover from liveness while open breakers require inference
 - Pre-set stop_event exits immediately without probing (D-11)
 - HTTP exception during probing counts as failure, does not crash thread
 """
@@ -18,7 +18,10 @@ import pytest
 
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
-from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
+from inference_proxy.resilience.circuit_breaker import (
+    CircuitBreakerRegistry,
+    CircuitBreakerState,
+)
 from inference_proxy.resilience.health_checker import (
     _probe_all_nodes,
     run_health_checker,
@@ -33,6 +36,21 @@ def _make_node(
 ) -> Node:
     """Create a Node fixture with the given parameters."""
     return Node(node_id=node_id, endpoint=endpoint, status=status, model=model)
+
+
+class _FailureCounts(dict[str, int]):
+    """Counter interface accepted by both pre- and post-fix probe code."""
+
+    def reset(self, node_id: str) -> None:
+        self[node_id] = 0
+
+    def increment(self, node_id: str) -> int:
+        count = self.get(node_id, 0) + 1
+        self[node_id] = count
+        return count
+
+    def close(self) -> None:
+        pass
 
 
 @pytest.mark.parametrize("status", list(NodeStatus))
@@ -79,17 +97,24 @@ def test_probe_transition_matrix(
     breaker = cb_registry.get_or_create("node-1")
     breaker.record_failure()
     assert breaker.is_open
-    failures = {"node-1": 2}
+    failures = _FailureCounts({"node-1": 2})
     client = MagicMock(spec=httpx.Client)
     client.get.return_value = MagicMock(status_code=200 if probe_succeeded else 500)
-
-    _probe_all_nodes(
-        registry,
-        cb_registry,
-        client,
-        failures,
-        failure_threshold=3,
+    client.post.return_value = httpx.Response(
+        200,
+        request=httpx.Request("POST", "http://10.0.1.100:8000/v1/completions"),
     )
+
+    try:
+        _probe_all_nodes(
+            registry,
+            cb_registry,
+            client,
+            failures,
+            failure_threshold=3,
+        )
+    finally:
+        failures.close()
 
     if status == NodeStatus.PROVISIONING:
         client.get.assert_not_called()
@@ -101,8 +126,14 @@ def test_probe_transition_matrix(
     assert result.status == expected_by_status[status]
     if status in reset_statuses:
         assert not breaker.is_open
+        client.post.assert_called_once_with(
+            "http://10.0.1.100:8000/v1/completions",
+            json={"model": "llama-3", "prompt": "ping", "max_tokens": 1},
+            timeout=2.0,
+        )
     else:
         assert breaker.is_open
+        client.post.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -139,8 +170,8 @@ def test_probe_result_preserves_concurrent_registry_update(
     registry = NodeRegistry()
     stale_node = _make_node(status=NodeStatus.UNHEALTHY)
     registry.add(stale_node)
-    cb_registry = MagicMock(spec=CircuitBreakerRegistry)
-    failures: dict[str, int] = {}
+    cb_registry = CircuitBreakerRegistry()
+    failures = _FailureCounts()
     mock_response = MagicMock(status_code=200)
     client = MagicMock(spec=httpx.Client)
 
@@ -152,13 +183,16 @@ def test_probe_result_preserves_concurrent_registry_update(
 
     client.get.side_effect = update_during_probe
 
-    _probe_all_nodes(
-        registry,
-        cb_registry,
-        client,
-        failures,
-        failure_threshold=3,
-    )
+    try:
+        _probe_all_nodes(
+            registry,
+            cb_registry,
+            client,
+            failures,
+            failure_threshold=3,
+        )
+    finally:
+        failures.close()
 
     result = registry.get("node-1")
     assert result is not None
@@ -173,7 +207,7 @@ def test_probe_failure_does_not_resurrect_removed_node() -> None:
     node = _make_node()
     registry.add(node)
     cb_registry = CircuitBreakerRegistry()
-    failures = {"node-1": 2}
+    failures = _FailureCounts({"node-1": 2})
     client = MagicMock(spec=httpx.Client)
 
     def remove_during_probe(_url: str) -> MagicMock:
@@ -182,13 +216,16 @@ def test_probe_failure_does_not_resurrect_removed_node() -> None:
 
     client.get.side_effect = remove_during_probe
 
-    _probe_all_nodes(
-        registry,
-        cb_registry,
-        client,
-        failures,
-        failure_threshold=3,
-    )
+    try:
+        _probe_all_nodes(
+            registry,
+            cb_registry,
+            client,
+            failures,
+            failure_threshold=3,
+        )
+    finally:
+        failures.close()
 
     assert registry.get("node-1") is None
 
@@ -320,52 +357,288 @@ class TestUnhealthyAfterThreeFailures:
 
 
 class TestRecoveryAfterOneSuccess:
-    """UNHEALTHY node recovers to HEALTHY after 1 successful probe (D-04, D-08)."""
+    """Recovery distinguishes liveness success from inference success."""
 
-    def test_recovery_restores_healthy_and_resets_circuit_breaker(self) -> None:
+    def test_open_breaker_recovers_only_after_successful_inference_probe(
+        self,
+    ) -> None:
         registry = NodeRegistry()
-        # Start with an unhealthy node
-        node = _make_node(status=NodeStatus.UNHEALTHY)
-        registry.add(node)
+        registry.add(_make_node(status=NodeStatus.UNHEALTHY))
         cb_registry = CircuitBreakerRegistry()
-        # Trip the circuit breaker for this node
         breaker = cb_registry.get_or_create("node-1")
-        breaker.record_failure()
-        breaker.record_failure()
-        breaker.record_failure()
-        assert breaker.is_open
+        for _ in range(3):
+            breaker.record_failure()
+        assert breaker.state == CircuitBreakerState.OPEN
 
-        stop_event = threading.Event()
+        failures = _FailureCounts()
+        client = MagicMock(spec=httpx.Client)
+        client.get.return_value = MagicMock(status_code=200)
 
-        mock_response = MagicMock()
-        mock_response.status_code = 200
+        def successful_inference(*_args: object, **_kwargs: object) -> httpx.Response:
+            current = registry.get("node-1")
+            assert current is not None
+            assert current.status == NodeStatus.UNHEALTHY
+            assert breaker.state == CircuitBreakerState.HALF_OPEN
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", "http://10.0.1.100:8000/v1/completions"),
+            )
 
-        mock_client = MagicMock(spec=httpx.Client)
-        mock_client.get.return_value = mock_response
-        mock_client.__enter__ = MagicMock(return_value=mock_client)
-        mock_client.__exit__ = MagicMock(return_value=False)
-
-        iteration_count = 0
-
-        def stop_after_one_iteration(timeout: float | None = None) -> bool:
-            nonlocal iteration_count
-            iteration_count += 1
-            if iteration_count >= 1:
-                stop_event.set()
-                return True
-            return False
-
-        with patch(
-            "inference_proxy.resilience.health_checker.httpx.Client",
-            return_value=mock_client,
-        ):
-            stop_event.wait = stop_after_one_iteration  # type: ignore[assignment]
-            run_health_checker(registry, cb_registry, stop_event, interval=0.01)
+        client.post.side_effect = successful_inference
+        try:
+            _probe_all_nodes(
+                registry,
+                cb_registry,
+                client,
+                failures,
+                failure_threshold=3,
+            )
+        finally:
+            failures.close()
 
         result_node = registry.get("node-1")
         assert result_node is not None
         assert result_node.status == NodeStatus.HEALTHY
-        assert not breaker.is_open
+        assert breaker.state == CircuitBreakerState.CLOSED
+        client.post.assert_called_once_with(
+            "http://10.0.1.100:8000/v1/completions",
+            json={"model": "llama-3", "prompt": "ping", "max_tokens": 1},
+            timeout=2.0,
+        )
+
+    @pytest.mark.parametrize(
+        "probe_result",
+        [
+            httpx.Response(
+                503,
+                request=httpx.Request("POST", "http://10.0.1.100:8000/v1/completions"),
+            ),
+            httpx.ConnectError("connection refused"),
+            httpx.ReadTimeout("inference timed out"),
+        ],
+        ids=["server_error", "transport_error", "timeout"],
+    )
+    def test_failed_half_open_inference_probe_keeps_node_unhealthy(
+        self,
+        probe_result: httpx.Response | Exception,
+    ) -> None:
+        registry = NodeRegistry()
+        registry.add(_make_node(status=NodeStatus.UNHEALTHY))
+        cb_registry = CircuitBreakerRegistry(threshold=1)
+        breaker = cb_registry.get_or_create("node-1")
+        breaker.record_failure()
+        failures = _FailureCounts()
+        client = MagicMock(spec=httpx.Client)
+        client.get.return_value = MagicMock(status_code=200)
+        if isinstance(probe_result, Exception):
+            client.post.side_effect = probe_result
+        else:
+            client.post.return_value = probe_result
+
+        try:
+            _probe_all_nodes(
+                registry,
+                cb_registry,
+                client,
+                failures,
+                failure_threshold=3,
+            )
+        finally:
+            failures.close()
+
+        current = registry.get("node-1")
+        assert current is not None
+        assert current.status == NodeStatus.UNHEALTHY
+        assert breaker.state == CircuitBreakerState.OPEN
+
+    def test_half_open_success_does_not_recover_concurrent_draining_node(
+        self,
+    ) -> None:
+        registry = NodeRegistry()
+        registry.add(_make_node(status=NodeStatus.UNHEALTHY))
+        cb_registry = CircuitBreakerRegistry(threshold=1)
+        breaker = cb_registry.get_or_create("node-1")
+        breaker.record_failure()
+        failures = _FailureCounts()
+        client = MagicMock(spec=httpx.Client)
+        client.get.return_value = MagicMock(status_code=200)
+
+        def drain_during_inference(
+            *_args: object,
+            **_kwargs: object,
+        ) -> httpx.Response:
+            assert registry.drain("node-1")
+            return httpx.Response(
+                200,
+                request=httpx.Request("POST", "http://10.0.1.100:8000/v1/completions"),
+            )
+
+        client.post.side_effect = drain_during_inference
+        try:
+            _probe_all_nodes(
+                registry,
+                cb_registry,
+                client,
+                failures,
+                failure_threshold=3,
+            )
+        finally:
+            failures.close()
+
+        current = registry.get("node-1")
+        assert current is not None
+        assert current.status == NodeStatus.DRAINING
+        assert breaker.state == CircuitBreakerState.OPEN
+
+    def test_health_demoted_node_recovers_without_inference_probe(self) -> None:
+        registry = NodeRegistry()
+        registry.add(_make_node(status=NodeStatus.UNHEALTHY))
+        cb_registry = CircuitBreakerRegistry()
+        breaker = cb_registry.get_or_create("node-1")
+        breaker.record_failure()
+        breaker.record_failure()
+        failures = _FailureCounts()
+        client = MagicMock(spec=httpx.Client)
+        client.get.return_value = MagicMock(status_code=200)
+
+        try:
+            _probe_all_nodes(
+                registry,
+                cb_registry,
+                client,
+                failures,
+                failure_threshold=3,
+            )
+        finally:
+            failures.close()
+
+        current = registry.get("node-1")
+        assert current is not None
+        assert current.status == NodeStatus.HEALTHY
+        assert breaker.state == CircuitBreakerState.CLOSED
+        client.post.assert_not_called()
+
+        breaker.record_failure()
+        assert breaker.state == CircuitBreakerState.OPEN
+
+    def test_half_open_timeout_does_not_block_remaining_probe_cycle(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        registry = NodeRegistry()
+        registry.add(
+            _make_node(
+                node_id="node-1",
+                endpoint="10.0.1.100:8000",
+                status=NodeStatus.UNHEALTHY,
+            )
+        )
+        registry.add(
+            _make_node(
+                node_id="node-2",
+                endpoint="10.0.1.101:8000",
+                status=NodeStatus.HEALTHY,
+            )
+        )
+        cb_registry = CircuitBreakerRegistry(threshold=1)
+        cb_registry.get_or_create("node-1").record_failure()
+        failures = _FailureCounts()
+        client = MagicMock(spec=httpx.Client)
+        client.get.return_value = MagicMock(status_code=200)
+        never_complete = threading.Event()
+
+        def hanging_inference(
+            *_args: object,
+            timeout: float | None = None,
+            **_kwargs: object,
+        ) -> None:
+            if timeout is None:
+                never_complete.wait()
+            else:
+                never_complete.wait(timeout)
+            raise httpx.ReadTimeout("inference timed out")
+
+        client.post.side_effect = hanging_inference
+        monkeypatch.setattr(
+            "inference_proxy.resilience.health_checker._HALF_OPEN_PROBE_TIMEOUT",
+            0.01,
+            raising=False,
+        )
+        completed = threading.Event()
+        errors: list[BaseException] = []
+
+        def run_cycle() -> None:
+            try:
+                _probe_all_nodes(
+                    registry,
+                    cb_registry,
+                    client,
+                    failures,
+                    failure_threshold=3,
+                )
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        thread = threading.Thread(target=run_cycle, daemon=True)
+        thread.start()
+
+        assert completed.wait(timeout=0.5)
+        thread.join(timeout=0.1)
+        failures.close()
+        assert not thread.is_alive()
+        assert errors == []
+        assert [call.args[0] for call in client.get.call_args_list] == [
+            "http://10.0.1.100:8000/health",
+            "http://10.0.1.101:8000/health",
+        ]
+        client.post.assert_called_once_with(
+            "http://10.0.1.100:8000/v1/completions",
+            json={"model": "llama-3", "prompt": "ping", "max_tokens": 1},
+            timeout=0.01,
+        )
+
+    def test_removed_node_does_not_inherit_probe_failure_count(self) -> None:
+        registry = NodeRegistry()
+        registry.add(_make_node())
+        cb_registry = CircuitBreakerRegistry()
+        stop_event = threading.Event()
+        client = MagicMock(spec=httpx.Client)
+        client.get.return_value = MagicMock(status_code=500)
+        iteration = 0
+
+        def replace_after_two_failures(timeout: float | None = None) -> bool:
+            nonlocal iteration
+            iteration += 1
+            if iteration == 2:
+                before_removal = registry.get("node-1")
+                assert before_removal is not None
+                assert before_removal.status == NodeStatus.HEALTHY
+                registry.remove("node-1")
+                registry.add(_make_node())
+                return False
+            if iteration == 3:
+                stop_event.set()
+                return True
+            return False
+
+        stop_event.wait = replace_after_two_failures  # type: ignore[assignment]
+        with patch(
+            "inference_proxy.resilience.health_checker.httpx.Client",
+            return_value=client,
+        ):
+            run_health_checker(
+                registry,
+                cb_registry,
+                stop_event,
+                interval=0.01,
+                failure_threshold=3,
+            )
+
+        replacement = registry.get("node-1")
+        assert replacement is not None
+        assert replacement.status == NodeStatus.HEALTHY
 
 
 class TestStopEventExitsImmediately:

@@ -153,6 +153,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         circuit_breaker_registry = CircuitBreakerRegistry(
             threshold=resolved_settings.resilience.circuit_breaker_threshold,
         )
+        registry.register_remove_listener(circuit_breaker_registry.remove)
         app.state.circuit_breaker_registry = circuit_breaker_registry
 
         health_thread = threading.Thread(

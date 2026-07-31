@@ -285,7 +285,10 @@ async def _proxy_non_streaming(
         url = f"http://{node.endpoint}{endpoint_path}"
         try:
             response = await proxy.forward("POST", url, body)
-            circuit_breaker_registry.get_or_create(node.node_id).record_success()
+            # A client error proves reachability but not successful inference.
+            # Keep it neutral so it cannot erase earlier backend failures.
+            if response.is_success:
+                circuit_breaker_registry.get_or_create(node.node_id).record_success()
             content = _response_content(response)
             return JSONResponse(content=content, status_code=response.status_code)
         except Exception as exc:
@@ -524,7 +527,8 @@ async def _stream_completion(
                 response.raise_for_status()
 
             if not response.is_success:
-                circuit_breaker_registry.get_or_create(node.node_id).record_success()
+                # Preserve 4xx responses verbatim without treating malformed
+                # client traffic as positive circuit-breaker evidence.
                 content = _response_content(response)
                 await _close_streaming_attempt(
                     stack,

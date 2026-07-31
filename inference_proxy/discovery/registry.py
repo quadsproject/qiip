@@ -12,16 +12,22 @@ Per D-08: Thread-safe methods ``add``, ``remove``, ``get``, ``get_all``.
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
+
+import structlog
 
 from inference_proxy.models.node import Node, NodeStatus
+
+logger = structlog.get_logger()
 
 _LIVENESS_STATUSES = {
     NodeStatus.HEALTHY,
     NodeStatus.UNHEALTHY,
     NodeStatus.UNKNOWN,
 }
+
+RemoveListener = Callable[[str], None]
 
 
 class NodeRegistry:
@@ -36,6 +42,7 @@ class NodeRegistry:
 
     def __init__(self) -> None:
         self._nodes: dict[str, Node] = {}
+        self._remove_listeners: list[RemoveListener] = []
         self._lock = threading.RLock()
 
     @contextmanager
@@ -53,6 +60,30 @@ class NodeRegistry:
         """Store or replace a node by its ``node_id``."""
         with self._lock:
             self._nodes[node.node_id] = node
+
+    def register_remove_listener(
+        self,
+        listener: RemoveListener,
+    ) -> Callable[[], None]:
+        """Run *listener* whenever a registered node is removed.
+
+        Listeners run synchronously while the registry coordination lock is
+        held. This orders per-node cleanup before another thread can register
+        the same node ID. The resulting global lock order is registry lock,
+        then each listener's own state lock; listeners must be non-blocking and
+        must not acquire unrelated locks, mutate the registry, or raise.
+
+        Returns a callback that unregisters the listener. Calling it more than
+        once is harmless.
+        """
+        with self._lock:
+            self._remove_listeners.append(listener)
+
+        def unregister() -> None:
+            with self._lock, suppress(ValueError):
+                self._remove_listeners.remove(listener)
+
+        return unregister
 
     def add_discovered(self, node: Node) -> None:
         """Merge an etcd node without overwriting a local liveness decision.
@@ -98,7 +129,19 @@ class NodeRegistry:
     def remove(self, node_id: str) -> None:
         """Remove a node by its ``node_id``.  No-op if absent."""
         with self._lock:
-            self._nodes.pop(node_id, None)
+            removed = self._nodes.pop(node_id, None)
+            if removed is None:
+                return
+            for listener in tuple(self._remove_listeners):
+                try:
+                    listener(node_id)
+                except Exception:
+                    logger.warning(
+                        "node removal listener failed",
+                        node_id=node_id,
+                        listener=repr(listener),
+                        exc_info=True,
+                    )
 
     def get(self, node_id: str) -> Node | None:
         """Return the node with the given ``node_id``, or ``None``."""

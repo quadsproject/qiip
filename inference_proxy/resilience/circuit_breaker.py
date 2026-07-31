@@ -1,9 +1,8 @@
 """Thread-safe per-node circuit breaker and registry.
 
-Tracks consecutive failures per node.  When failures reach the
-configured threshold, the breaker trips to OPEN and ``is_open``
-returns ``True``.  A single success (``record_success``) or explicit
-``reset`` clears the failure count and returns the breaker to CLOSED.
+Tracks consecutive failures per node. When failures reach the configured
+threshold, the breaker trips to OPEN. One recovery probe may transition it
+to HALF_OPEN; only successful inference returns it to CLOSED.
 
 Uses ``threading.Lock`` following the same concurrency pattern as
 ``ConnectionTracker`` (D-05).
@@ -11,16 +10,25 @@ Uses ``threading.Lock`` following the same concurrency pattern as
 Per D-06: CircuitBreaker trips to OPEN after 3 consecutive failures.
 Per D-05: CircuitBreaker and CircuitBreakerRegistry live in
 ``inference_proxy/resilience/``, separate from the node registry.
-Per D-08: Health checker calls ``reset()`` on recovery.
+Health-only recovery never resets inference failure evidence.
 """
 
 from __future__ import annotations
 
 import threading
+from enum import StrEnum
 
 import structlog
 
 logger = structlog.get_logger()
+
+
+class CircuitBreakerState(StrEnum):
+    """Traffic-admission state for a node circuit breaker."""
+
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
 
 
 class CircuitBreaker:
@@ -37,7 +45,7 @@ class CircuitBreaker:
     def __init__(self, threshold: int = 3) -> None:
         self._threshold = threshold
         self._failure_count: int = 0
-        self._state: str = "closed"
+        self._state = CircuitBreakerState.CLOSED
         self._lock = threading.Lock()
 
     def record_failure(self) -> None:
@@ -46,40 +54,64 @@ class CircuitBreaker:
         Increments the failure counter.  When the counter reaches
         ``threshold``, the breaker transitions to OPEN.
         """
+        transitioned = False
         with self._lock:
             self._failure_count += 1
-            if self._failure_count >= self._threshold and self._state != "open":
-                self._state = "open"
-                logger.info(
-                    "circuit breaker tripped",
-                    failure_count=self._failure_count,
-                    threshold=self._threshold,
-                )
+            should_open = (
+                self._failure_count >= self._threshold
+                or self._state == CircuitBreakerState.HALF_OPEN
+            )
+            if should_open:
+                transitioned = self._state != CircuitBreakerState.OPEN
+                self._state = CircuitBreakerState.OPEN
+            failure_count = self._failure_count
+        if transitioned:
+            logger.info(
+                "circuit breaker tripped",
+                failure_count=failure_count,
+                threshold=self._threshold,
+            )
 
     def record_success(self) -> None:
         """Record a successful request.
 
         Resets the failure counter to 0 and transitions the breaker
-        back to CLOSED.
+        back to CLOSED. A request that was already in flight when the
+        breaker opened may close it directly because completed inference is
+        sufficient recovery evidence; it need not repeat the half-open probe.
         """
         with self._lock:
-            was_open = self._state == "open"
+            was_open = self._state != CircuitBreakerState.CLOSED
             self._failure_count = 0
-            self._state = "closed"
+            self._state = CircuitBreakerState.CLOSED
         if was_open:
             logger.info("circuit breaker closed after success")
 
     @property
     def is_open(self) -> bool:
-        """Return ``True`` when the breaker is in the OPEN state."""
+        """Return ``True`` while ordinary traffic must remain excluded."""
         with self._lock:
-            return self._state == "open"
+            return self._state != CircuitBreakerState.CLOSED
 
     @property
-    def state(self) -> str:
-        """Return the current state as a string (``'closed'`` or ``'open'``)."""
+    def state(self) -> CircuitBreakerState:
+        """Return the current CLOSED, OPEN, or HALF_OPEN state."""
         with self._lock:
             return self._state
+
+    def try_half_open(self) -> bool:
+        """Admit one recovery probe by transitioning OPEN to HALF_OPEN."""
+        with self._lock:
+            if self._state != CircuitBreakerState.OPEN:
+                return False
+            self._state = CircuitBreakerState.HALF_OPEN
+            return True
+
+    def reopen(self) -> None:
+        """Return a HALF_OPEN breaker to OPEN without recording a failure."""
+        with self._lock:
+            if self._state == CircuitBreakerState.HALF_OPEN:
+                self._state = CircuitBreakerState.OPEN
 
     def reset(self) -> None:
         """Reset the breaker to CLOSED and clear the failure count.
@@ -137,4 +169,3 @@ class CircuitBreakerRegistry:
         """
         with self._lock:
             self._breakers.pop(node_id, None)
-        logger.debug("circuit breaker removed", node_id=node_id)

@@ -94,9 +94,15 @@ def connection_tracker() -> ConnectionTracker:
 
 
 @pytest.fixture
-def circuit_breaker_registry() -> CircuitBreakerRegistry:
+def circuit_breaker_registry(
+    test_registry: NodeRegistry,
+) -> CircuitBreakerRegistry:
     """Return a fresh CircuitBreakerRegistry for testing."""
-    return CircuitBreakerRegistry()
+    registry = CircuitBreakerRegistry()
+    register_listener = getattr(test_registry, "register_remove_listener", None)
+    if register_listener is not None:
+        register_listener(registry.remove)
+    return registry
 
 
 @pytest.fixture

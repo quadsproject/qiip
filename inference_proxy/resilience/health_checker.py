@@ -9,11 +9,12 @@ endpoint using synchronous HTTP calls (per D-02) and updates the
 ``failure_threshold`` consecutive probe failures.
 
 **Recovery** (per D-04): A node is restored to HEALTHY after 1
-successful probe.  On recovery, the circuit breaker for that node
-is reset (per D-08).
+successful liveness probe when its circuit breaker is closed. An OPEN
+breaker requires a successful minimal inference probe before recovery.
 
-**Timeout** (per T-05-02): Health probes use a short 5-second timeout
-so a slow node cannot block the checker from probing others.
+**Timeout** (per T-05-02): Health probes use a 5-second timeout. The
+inference recovery probe has its own 2-second timeout so a wedged engine
+cannot stall the serial probe cycle for the ordinary liveness budget.
 
 Usage::
 
@@ -45,8 +46,39 @@ from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 logger = structlog.get_logger()
 
 _PROBE_TIMEOUT: float = 5.0
+_HALF_OPEN_PROBE_TIMEOUT: float = 2.0
 _RECOVERABLE_STATUSES = {NodeStatus.UNHEALTHY, NodeStatus.UNKNOWN}
 _DEMOTABLE_STATUSES = {NodeStatus.HEALTHY, NodeStatus.UNKNOWN}
+
+
+class _ConsecutiveFailures:
+    """Thread-safe health-probe counters bound to registry removal."""
+
+    def __init__(self, registry: NodeRegistry) -> None:
+        self._counts: dict[str, int] = {}
+        self._lock = threading.Lock()
+        self._unregister = registry.register_remove_listener(self.remove)
+
+    def reset(self, node_id: str) -> None:
+        """Reset the probe-failure count for *node_id*."""
+        with self._lock:
+            self._counts[node_id] = 0
+
+    def increment(self, node_id: str) -> int:
+        """Increment and return the probe-failure count for *node_id*."""
+        with self._lock:
+            count = self._counts.get(node_id, 0) + 1
+            self._counts[node_id] = count
+            return count
+
+    def remove(self, node_id: str) -> None:
+        """Discard the probe-failure count for a removed node."""
+        with self._lock:
+            self._counts.pop(node_id, None)
+
+    def close(self) -> None:
+        """Detach the counter cleanup listener from its registry."""
+        self._unregister()
 
 
 def run_health_checker(
@@ -69,7 +101,7 @@ def run_health_checker(
         failure_threshold: Consecutive failures before marking a node
             UNHEALTHY (default 3, per D-03).
     """
-    consecutive_failures: dict[str, int] = {}
+    consecutive_failures = _ConsecutiveFailures(registry)
 
     client = httpx.Client(timeout=_PROBE_TIMEOUT)
     try:
@@ -84,6 +116,7 @@ def run_health_checker(
             if stop_event.wait(timeout=interval):
                 break
     finally:
+        consecutive_failures.close()
         client.close()
 
 
@@ -91,7 +124,7 @@ def _probe_all_nodes(
     registry: NodeRegistry,
     circuit_breaker_registry: CircuitBreakerRegistry,
     client: httpx.Client,
-    consecutive_failures: dict[str, int],
+    consecutive_failures: _ConsecutiveFailures,
     failure_threshold: int,
 ) -> None:
     """Probe every node in the registry once.
@@ -123,7 +156,7 @@ def _probe_node(
     registry: NodeRegistry,
     circuit_breaker_registry: CircuitBreakerRegistry,
     client: httpx.Client,
-    consecutive_failures: dict[str, int],
+    consecutive_failures: _ConsecutiveFailures,
     failure_threshold: int,
 ) -> None:
     """Probe a single node and update its status if needed.
@@ -145,6 +178,7 @@ def _probe_node(
                 node_id=node_id,
                 registry=registry,
                 circuit_breaker_registry=circuit_breaker_registry,
+                client=client,
                 consecutive_failures=consecutive_failures,
             )
         else:
@@ -175,17 +209,77 @@ def _handle_probe_success(
     node_id: str,
     registry: NodeRegistry,
     circuit_breaker_registry: CircuitBreakerRegistry,
-    consecutive_failures: dict[str, int],
+    client: httpx.Client,
+    consecutive_failures: _ConsecutiveFailures,
 ) -> None:
     """Handle a successful health probe for a node."""
-    consecutive_failures[node_id] = 0
+    consecutive_failures.reset(node_id)
+    current = registry.get(node_id)
+    if current is None or current.status not in _RECOVERABLE_STATUSES:
+        logger.debug("health probe succeeded", node_id=node_id)
+        return
+
+    breaker = circuit_breaker_registry.get(node_id)
+    if breaker is not None and breaker.is_open:
+        if not breaker.try_half_open():
+            logger.debug("half-open probe already active", node_id=node_id)
+            return
+        if not current.model:
+            breaker.reopen()
+            logger.warning(
+                "cannot probe inference recovery without a registered model",
+                node_id=node_id,
+            )
+            return
+        try:
+            response = client.post(
+                f"http://{current.endpoint}/v1/completions",
+                json={
+                    "model": current.model,
+                    "prompt": "ping",
+                    "max_tokens": 1,
+                },
+                timeout=_HALF_OPEN_PROBE_TIMEOUT,
+            )
+            # Client-originated 4xx responses are neutral breaker evidence,
+            # but this proxy-owned request is known-valid for the registered
+            # model. Any non-success means the node failed its recovery trial.
+            response.raise_for_status()
+        except Exception:
+            breaker.record_failure()
+            logger.info(
+                "half-open inference probe failed",
+                node_id=node_id,
+                exc_info=True,
+            )
+            return
+
+        try:
+            transitioned = registry.update_status(
+                node_id,
+                NodeStatus.HEALTHY,
+                allowed_from=_RECOVERABLE_STATUSES,
+            )
+        except Exception:
+            breaker.reopen()
+            raise
+        if transitioned:
+            breaker.record_success()
+            logger.info("node recovered after inference probe", node_id=node_id)
+        else:
+            breaker.reopen()
+            logger.debug(
+                "half-open inference succeeded after node state changed",
+                node_id=node_id,
+            )
+        return
+
     transitioned = registry.update_status(
         node_id,
         NodeStatus.HEALTHY,
         allowed_from=_RECOVERABLE_STATUSES,
     )
     if transitioned:
-        circuit_breaker_registry.reset(node_id)
         logger.info("node recovered to healthy", node_id=node_id)
     else:
         logger.debug("health probe succeeded", node_id=node_id)
@@ -195,13 +289,12 @@ def _handle_probe_failure(
     *,
     node_id: str,
     registry: NodeRegistry,
-    consecutive_failures: dict[str, int],
+    consecutive_failures: _ConsecutiveFailures,
     failure_threshold: int,
     reason: str,
 ) -> None:
     """Handle a failed health probe for a node."""
-    count = consecutive_failures.get(node_id, 0) + 1
-    consecutive_failures[node_id] = count
+    count = consecutive_failures.increment(node_id)
     logger.debug(
         "health probe failed",
         node_id=node_id,

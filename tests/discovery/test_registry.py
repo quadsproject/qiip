@@ -10,6 +10,8 @@ import ast
 import threading
 from pathlib import Path
 
+import structlog
+
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
 
@@ -60,6 +62,55 @@ class TestRegistryRemove:
         registry.remove("node-1")
 
         assert registry.get("node-1") is None
+
+    def test_remove_notifies_listener_only_for_existing_node(self) -> None:
+        registry = NodeRegistry()
+        removed: list[str] = []
+        registry.register_remove_listener(removed.append)
+        registry.add(_make_node())
+
+        registry.remove("missing")
+        registry.remove("node-1")
+
+        assert removed == ["node-1"]
+
+    def test_remove_listener_can_be_unregistered(self) -> None:
+        registry = NodeRegistry()
+        removed: list[str] = []
+        unregister = registry.register_remove_listener(removed.append)
+        unregister()
+        unregister()
+        registry.add(_make_node())
+
+        registry.remove("node-1")
+
+        assert removed == []
+
+    def test_listener_failure_does_not_escape_or_skip_later_listeners(
+        self,
+    ) -> None:
+        registry = NodeRegistry()
+        notified: list[str] = []
+
+        def broken_listener(_node_id: str) -> None:
+            raise RuntimeError("cleanup failed")
+
+        registry.register_remove_listener(broken_listener)
+        registry.register_remove_listener(notified.append)
+        registry.add(_make_node())
+
+        with structlog.testing.capture_logs() as captured:
+            registry.remove("node-1")
+
+        assert registry.get("node-1") is None
+        assert notified == ["node-1"]
+        failure = next(
+            event
+            for event in captured
+            if event.get("event") == "node removal listener failed"
+        )
+        assert failure["node_id"] == "node-1"
+        assert failure["log_level"] == "warning"
 
 
 class TestRegistryRemoveNonExistent:

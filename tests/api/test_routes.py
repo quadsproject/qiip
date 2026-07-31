@@ -866,14 +866,15 @@ class TestStreamingConnectionTracking:
 class TestDrainAutoRemoval:
     """Draining node with 0 connections is auto-removed from registry (D-11, LBAL-02)."""
 
-    def test_draining_node_removed_after_proxy_call(
+    def test_drained_request_finalization_discards_open_breaker(
         self,
         client: TestClient,
         test_registry: NodeRegistry,
         node_selector: NodeSelector,
+        circuit_breaker_registry: CircuitBreakerRegistry,
         httpx_mock: HTTPXMock,
     ) -> None:
-        """DRAINING node with 0 connections is removed after proxy call completes."""
+        """Finalization removes a drained node and all of its breaker state."""
         # Add a healthy node and a draining node both serving same model
         test_registry.add(
             _make_node(
@@ -883,6 +884,10 @@ class TestDrainAutoRemoval:
                 status=NodeStatus.HEALTHY,
             )
         )
+        stale_breaker = circuit_breaker_registry.get_or_create("node-2")
+        for _ in range(3):
+            stale_breaker.record_failure()
+        assert stale_breaker.is_open
         test_registry.add(
             _make_node(
                 node_id="node-2",
@@ -921,8 +926,19 @@ class TestDrainAutoRemoval:
         )
 
         assert response.status_code == 200
-        # The draining node-2 with 0 connections should be auto-removed
         assert test_registry.get("node-2") is None
+        assert circuit_breaker_registry.get("node-2") is None
+
+        test_registry.add(
+            _make_node(
+                node_id="node-2",
+                endpoint="10.0.1.101:8000",
+                model="llama-3",
+            )
+        )
+        replacement_breaker = circuit_breaker_registry.get_or_create("node-2")
+        assert replacement_breaker is not stale_breaker
+        assert not replacement_breaker.is_open
 
 
 # ---------------------------------------------------------------------------

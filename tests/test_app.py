@@ -125,6 +125,43 @@ class TestLifespanRegistryIntegration:
             assert isinstance(registry, NodeRegistry)
             assert registry.get_all() == []
 
+    @patch("inference_proxy.main.EtcdWatcher")
+    @patch("inference_proxy.main.EtcdClient")
+    def test_lifespan_wires_breaker_cleanup_to_node_registry(
+        self,
+        mock_etcd_cls: MagicMock,
+        _mock_watcher_cls: MagicMock,
+        test_settings: Settings,
+    ) -> None:
+        """Production registry removal discards the node's breaker state."""
+        mock_client = MagicMock()
+        mock_client.get_prefix.return_value = []
+        mock_client.prefix = "/nodes/"
+        mock_etcd_cls.return_value = mock_client
+
+        from inference_proxy.main import create_app
+
+        app = create_app(settings=_lifespan_settings(test_settings))
+        with TestClient(app):
+            registry = app.state.registry
+            breaker_registry = app.state.circuit_breaker_registry
+            registry.add(
+                Node(
+                    node_id="node-1",
+                    endpoint="10.0.1.100:8000",
+                    status=NodeStatus.HEALTHY,
+                    model="llama-3",
+                )
+            )
+            stale_breaker = breaker_registry.get_or_create("node-1")
+            for _ in range(3):
+                stale_breaker.record_failure()
+            assert stale_breaker.is_open
+
+            registry.remove("node-1")
+
+            assert breaker_registry.get("node-1") is None
+
 
 class TestGetRegistryDependency:
     """get_registry dependency returns the registry from app.state."""

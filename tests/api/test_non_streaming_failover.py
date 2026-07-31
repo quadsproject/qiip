@@ -218,6 +218,44 @@ def test_non_retryable_error_carries_no_marker(
     assert not breaker.is_open
 
 
+def test_non_streaming_4xx_does_not_clear_prior_failures(
+    client: TestClient,
+    test_registry: NodeRegistry,
+    circuit_breaker_registry: CircuitBreakerRegistry,
+    httpx_mock: HTTPXMock,
+) -> None:
+    node = _make_node("node-1", "10.0.1.100:8000")
+    test_registry.add(node)
+    breaker = circuit_breaker_registry.get_or_create(node.node_id)
+    breaker.record_failure()
+    breaker.record_failure()
+    httpx_mock.add_response(
+        url=_backend_url(node),
+        status_code=400,
+        json={"error": {"code": "context_length_exceeded"}},
+    )
+    httpx_mock.add_response(
+        url=_backend_url(node),
+        status_code=500,
+        json={"error": "backend failed"},
+        is_optional=True,
+    )
+
+    client_error = client.post(_CHAT_URL, json=_REQUEST_BODY)
+
+    assert client_error.status_code == 400
+    assert not breaker.is_open
+
+    backend_error = client.post(_CHAT_URL, json=_REQUEST_BODY)
+
+    assert backend_error.status_code == 500
+    assert backend_error.json()["error"]["code"] == "failover_exhausted"
+    assert breaker.is_open
+    current = test_registry.get(node.node_id)
+    assert current is not None
+    assert current.status == NodeStatus.UNHEALTHY
+
+
 def test_mixed_statuses_returns_last_attempt(
     client: TestClient,
     test_registry: NodeRegistry,

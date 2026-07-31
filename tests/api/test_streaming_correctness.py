@@ -176,8 +176,7 @@ def test_streaming_4xx_preserves_upstream_error_verbatim(
     breaker = circuit_breaker_registry.get_or_create(node.node_id)
     breaker.record_failure()
     breaker.record_failure()
-    breaker.record_failure()
-    assert breaker.is_open
+    assert not breaker.is_open
     upstream_error = {
         "error": {
             "message": "Requested tokens exceed the model context window",
@@ -204,6 +203,54 @@ def test_streaming_4xx_preserves_upstream_error_verbatim(
     assert len(httpx_mock.get_requests()) == 1
     assert node_selector.tracker.get(node.node_id) == 0
     assert upstream.close_calls == 1
+
+
+def test_streaming_4xx_does_not_clear_prior_failures(
+    client: TestClient,
+    test_registry: NodeRegistry,
+    node_selector: NodeSelector,
+    circuit_breaker_registry: CircuitBreakerRegistry,
+    httpx_mock: HTTPXMock,
+) -> None:
+    node = _make_node("node-1", "10.0.1.100:8000")
+    test_registry.add(node)
+    breaker = circuit_breaker_registry.get_or_create(node.node_id)
+    breaker.record_failure()
+    breaker.record_failure()
+    client_error_stream = _TrackedStream(
+        [b'{"error":{"code":"context_length_exceeded"}}']
+    )
+    backend_error_stream = _TrackedStream([b'{"error":"backend failed"}'])
+    httpx_mock.add_response(
+        url=_backend_url(node),
+        status_code=400,
+        headers={"content-type": "application/json"},
+        stream=client_error_stream,
+    )
+    httpx_mock.add_response(
+        url=_backend_url(node),
+        status_code=500,
+        headers={"content-type": "application/json"},
+        stream=backend_error_stream,
+        is_optional=True,
+    )
+
+    client_error = client.post(_CHAT_PATH, json=_REQUEST_BODY)
+
+    assert client_error.status_code == 400
+    assert not breaker.is_open
+
+    backend_error = client.post(_CHAT_PATH, json=_REQUEST_BODY)
+
+    assert backend_error.status_code == 500
+    assert backend_error.json()["error"]["code"] == "failover_exhausted"
+    assert breaker.is_open
+    current = test_registry.get(node.node_id)
+    assert current is not None
+    assert current.status == NodeStatus.UNHEALTHY
+    assert node_selector.tracker.get(node.node_id) == 0
+    assert client_error_stream.close_calls == 1
+    assert backend_error_stream.close_calls == 1
 
 
 @pytest.mark.parametrize(
