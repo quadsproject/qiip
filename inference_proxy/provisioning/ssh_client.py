@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -21,6 +22,12 @@ from inference_proxy.config.settings import SSHSettings
 
 logger = structlog.get_logger()
 
+# KeyImportError is a ValueError in asyncssh 2.24 rather than part of the
+# asyncssh.Error hierarchy. Keep it beside the hierarchy so malformed key
+# material is normalized consistently with connection and channel failures.
+_ASYNCSSH_CONNECTION_ERRORS = (asyncssh.Error, asyncssh.KeyImportError)
+_STREAM_QUEUE_MAXSIZE = 1024
+
 
 class SSHConnectionError(Exception):
     """Raised when SSH connection to a host fails."""
@@ -29,6 +36,26 @@ class SSHConnectionError(Exception):
         self.host = host
         self.reason = reason
         super().__init__(f"SSH connection to {host} failed: {reason}")
+
+
+class SSHCommandTimeoutError(TimeoutError):
+    """Raised when a streaming SSH command exceeds a bounded deadline."""
+
+    def __init__(
+        self,
+        host: str,
+        command: str,
+        timeout: float,
+        *,
+        deadline: str,
+    ) -> None:
+        self.host = host
+        self.command = command
+        self.timeout = timeout
+        self.deadline = deadline
+        super().__init__(
+            f"Streaming command on {host} exceeded the {deadline} timeout of {timeout}s"
+        )
 
 
 class RemoteCommandError(Exception):
@@ -55,6 +82,25 @@ def _stderr_tail(stderr: str, max_lines: int = 50) -> str:
     return stderr
 
 
+@dataclass(frozen=True)
+class _StreamLine:
+    stream: str
+    value: str
+
+
+@dataclass(frozen=True)
+class _StreamError:
+    error: Exception
+
+
+@dataclass(frozen=True)
+class _StreamDone:
+    pass
+
+
+_StreamEvent = _StreamLine | _StreamError | _StreamDone
+
+
 class SSHClient:
     """Sole consumer of asyncssh in the codebase (DIP).
 
@@ -67,22 +113,40 @@ class SSHClient:
         self._username = settings.username
         self._key_path = settings.key_path
         self._connect_timeout = settings.connect_timeout
+        self._streaming_command_timeout = settings.streaming_command_timeout
+        self._streaming_inactivity_timeout = settings.streaming_inactivity_timeout
 
     async def run_streaming(
         self, host: str, command: str
     ) -> AsyncIterator[tuple[str, str]]:
         """Run *command* on *host*, yielding ``(stream, line)`` tuples.
 
-        *stream* is ``"stdout"`` or ``"stderr"``.  Stdout lines are
-        yielded in real-time as they arrive (D-05).  After stdout is
-        exhausted, any stderr output is read in bulk and yielded
-        line-by-line (D-07).
+        *stream* is ``"stdout"`` or ``"stderr"``. Both streams are drained
+        concurrently so either remote pipe can exceed asyncssh's receive
+        window without deadlocking the other. The total command and
+        no-output intervals are bounded independently.
 
         Raises:
             SSHConnectionError: On auth failure, disconnect, or OS error.
+            SSHCommandTimeoutError: On total or inactivity deadline expiry.
             RemoteCommandError: When the remote process exits non-zero.
         """
-        try:
+        # Bound buffering without returning to the old one-stream-at-a-time
+        # deadlock: both pumps share the same queue and receive backpressure
+        # symmetrically when a consumer falls behind.
+        queue: asyncio.Queue[_StreamEvent] = asyncio.Queue(
+            maxsize=_STREAM_QUEUE_MAXSIZE
+        )
+
+        async def run_remote() -> None:
+            stderr_chunks: list[str] = []
+
+            async def pump(stream: str, reader: AsyncIterator[str]) -> None:
+                async for line in reader:
+                    if stream == "stderr":
+                        stderr_chunks.append(line)
+                    await queue.put(_StreamLine(stream, line))
+
             async with (
                 asyncssh.connect(
                     host,
@@ -93,27 +157,103 @@ class SSHClient:
                 ) as conn,
                 conn.create_process(command) as process,
             ):
-                async for line in process.stdout:
-                    yield ("stdout", line.rstrip("\n"))
+                pumps = [
+                    asyncio.create_task(
+                        pump("stdout", cast(AsyncIterator[str], process.stdout))
+                    ),
+                    asyncio.create_task(
+                        pump("stderr", cast(AsyncIterator[str], process.stderr))
+                    ),
+                ]
+                try:
+                    done, pending = await asyncio.wait(
+                        pumps,
+                        return_when=asyncio.FIRST_EXCEPTION,
+                    )
+                    failure: BaseException | None = None
+                    for task in done:
+                        if not task.cancelled():
+                            failure = task.exception()
+                            if failure is not None:
+                                break
+                    if failure is not None:
+                        for task in pending:
+                            task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        raise failure
+                    await asyncio.gather(*pending)
+                finally:
+                    for task in pumps:
+                        task.cancel()
+                    await asyncio.gather(*pumps, return_exceptions=True)
 
-                # D-07: read stderr after stdout exhausted
-                stderr_output = await process.stderr.read()
-                if stderr_output:
-                    for err_line in stderr_output.splitlines():
-                        if err_line:
-                            yield ("stderr", err_line)
-
+                stderr_output = "".join(stderr_chunks)
                 if process.exit_status is not None and process.exit_status != 0:
                     raise RemoteCommandError(
                         host,
                         command,
                         process.exit_status,
-                        stderr=stderr_output or "",
+                        stderr=stderr_output,
                     )
+
+        async def supervise() -> None:
+            total_timeout = asyncio.timeout(self._streaming_command_timeout)
+            try:
+                async with total_timeout:
+                    await run_remote()
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError as timeout_error:
+                error: Exception = timeout_error
+                if total_timeout.expired():
+                    error = SSHCommandTimeoutError(
+                        host,
+                        command,
+                        self._streaming_command_timeout,
+                        deadline="total",
+                    )
+                await queue.put(_StreamError(error))
+            except Exception as exc:
+                await queue.put(_StreamError(exc))
+            # Deliberately skipped on external cancellation: the consumer is
+            # already unwinding and may have left a full queue behind.
+            await queue.put(_StreamDone())
+
+        try:
+            supervisor = asyncio.create_task(supervise())
+            try:
+                while True:
+                    try:
+                        event = await asyncio.wait_for(
+                            queue.get(),
+                            timeout=self._streaming_inactivity_timeout,
+                        )
+                    except TimeoutError as exc:
+                        raise SSHCommandTimeoutError(
+                            host,
+                            command,
+                            self._streaming_inactivity_timeout,
+                            deadline="inactivity",
+                        ) from exc
+
+                    if isinstance(event, _StreamDone):
+                        break
+                    if isinstance(event, _StreamError):
+                        raise event.error
+                    yield (event.stream, event.value.rstrip("\n"))
+            finally:
+                supervisor.cancel()
+                await asyncio.gather(supervisor, return_exceptions=True)
         except asyncssh.PermissionDenied as exc:
             raise SSHConnectionError(host, f"authentication failed: {exc}") from exc
         except asyncssh.DisconnectError as exc:
             raise SSHConnectionError(host, f"disconnected: {exc.reason}") from exc
+        except TimeoutError:
+            # TimeoutError is an OSError subclass. Preserve both SSH command
+            # deadlines and any caller-visible asyncio timeout unchanged.
+            raise
+        except _ASYNCSSH_CONNECTION_ERRORS as exc:
+            raise SSHConnectionError(host, str(exc)) from exc
         except OSError as exc:
             raise SSHConnectionError(host, str(exc)) from exc
 
@@ -166,6 +306,8 @@ class SSHClient:
             raise SSHConnectionError(host, f"disconnected: {exc.reason}") from exc
         except TimeoutError:
             raise  # asyncio.TimeoutError is TimeoutError is OSError in 3.11+
+        except _ASYNCSSH_CONNECTION_ERRORS as exc:
+            raise SSHConnectionError(host, str(exc)) from exc
         except OSError as exc:
             raise SSHConnectionError(host, str(exc)) from exc
 
@@ -196,5 +338,7 @@ class SSHClient:
             raise SSHConnectionError(host, f"authentication failed: {exc}") from exc
         except asyncssh.DisconnectError as exc:
             raise SSHConnectionError(host, f"disconnected: {exc.reason}") from exc
+        except _ASYNCSSH_CONNECTION_ERRORS as exc:
+            raise SSHConnectionError(host, str(exc)) from exc
         except OSError as exc:
             raise SSHConnectionError(host, str(exc)) from exc

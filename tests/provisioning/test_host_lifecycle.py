@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from inference_proxy.config.settings import ProvisioningSettings
+from inference_proxy.config.settings import LLMFitSettings, ProvisioningSettings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.node import Node, NodeStatus
@@ -36,6 +36,7 @@ def _provisioner(
         ssh_client=MagicMock(),
         etcd_client=etcd,
         settings=ProvisioningSettings(),
+        llmfit_settings=LLMFitSettings(),
         endpoint_policy=_ENDPOINT_POLICY,
         registry=registry,
         connection_tracker=tracker,

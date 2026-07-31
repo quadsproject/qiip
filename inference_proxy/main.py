@@ -273,6 +273,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ssh_client=ssh_client,
             etcd_client=etcd_client,
             settings=resolved_settings.provisioning,
+            llmfit_settings=resolved_settings.llmfit,
             endpoint_policy=endpoint_policy,
             registry=registry,
             connection_tracker=connection_tracker,

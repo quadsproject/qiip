@@ -25,17 +25,23 @@ from fastapi.testclient import TestClient
 from pytest_httpx import HTTPXMock
 from structlog.testing import capture_logs
 
+from inference_proxy.api.admin import admin_router
 from inference_proxy.config.dependencies import (
     get_catalog_service,
+    get_llmfit_runner,
+    get_provisioner,
     get_quads_client,
     get_quads_poller,
     get_redfish_client,
+    get_registry,
     get_settings,
     get_unified_node_service,
+    require_admin_auth,
 )
-from inference_proxy.config.settings import Settings
+from inference_proxy.config.settings import LLMFitSettings, Settings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.llmfit.errors import LLMFitParseError, LLMFitTimeoutError
+from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
 from inference_proxy.models.llmfit import LLMFitResult, ModelRecommendation, SystemInfo
 from inference_proxy.models.node import Node, NodeStatus
@@ -1469,6 +1475,64 @@ class TestRecommendationErrors:
         assert data["error_type"] == "timeout"
         assert isinstance(data["detail"], str)
         assert len(data["detail"]) > 0
+
+    async def test_install_timeout_returns_structured_502(
+        self,
+        test_registry: NodeRegistry,
+    ) -> None:
+        test_registry.add(_make_node(node_id="gpu01"))
+        ssh = MagicMock()
+        ssh.run = AsyncMock(
+            side_effect=[
+                RemoteCommandError("gpu01", "llmfit recommend", 127),
+                TimeoutError(),
+            ]
+        )
+        runner = LLMFitRunner(
+            ssh_client=ssh,
+            settings=LLMFitSettings(timeout=0.01),
+        )
+        provisioner = MagicMock()
+        provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+        application = FastAPI()
+        application.include_router(admin_router)
+
+        async def no_auth() -> None:
+            return None
+
+        async def use_runner() -> LLMFitRunner:
+            return runner
+
+        async def use_registry() -> NodeRegistry:
+            return test_registry
+
+        async def use_provisioner() -> MagicMock:
+            return provisioner
+
+        async def no_poller() -> None:
+            return None
+
+        application.dependency_overrides[require_admin_auth] = no_auth
+        application.dependency_overrides[get_llmfit_runner] = use_runner
+        application.dependency_overrides[get_registry] = use_registry
+        application.dependency_overrides[get_provisioner] = use_provisioner
+        application.dependency_overrides[get_quads_poller] = no_poller
+
+        transport = httpx.ASGITransport(
+            app=application,
+            raise_app_exceptions=False,
+        )
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as bounded_client:
+            response = await asyncio.wait_for(
+                bounded_client.get("/admin/nodes/gpu01/recommendations"),
+                timeout=2,
+            )
+
+        assert response.status_code == 502
+        assert response.json()["error_type"] == "timeout"
 
     def test_parse_error_returns_502(
         self,

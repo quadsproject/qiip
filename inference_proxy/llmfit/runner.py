@@ -68,7 +68,10 @@ class LLMFitRunner:
             stdout, _stderr, _exit = await self._run_recommend(hostname)
         except RemoteCommandError:
             log.info("llmfit_not_found_installing", host=hostname)
-            await self._install(hostname)
+            try:
+                await self._install(hostname)
+            except TimeoutError as exc:
+                raise LLMFitTimeoutError(hostname, self._settings.timeout) from exc
             try:
                 stdout, _stderr, _exit = await self._run_recommend(hostname)
             except TimeoutError as exc:

@@ -12,7 +12,7 @@ import asyncio
 import json
 import re
 import shlex
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 import httpx
 import structlog
 
-from inference_proxy.config.settings import ProvisioningSettings
+from inference_proxy.config.settings import LLMFitSettings, ProvisioningSettings
 from inference_proxy.discovery.etcd_client import EtcdClient
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_to_etcd
@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger()
 
-STEP_PATTERN = re.compile(r"\[STEP:(\w+):(START|OK|FAIL)\]")
+STEP_PATTERN = re.compile(r"\[STEP:(\w+):(START|OK|FAIL|WARN)\]")
 MODEL_PATTERN = re.compile(r"#\s*Model:\s+(.+)")
 
 
@@ -88,6 +88,7 @@ class NodeProvisioner:
         ssh_client: SSHClient,
         etcd_client: EtcdClient,
         settings: ProvisioningSettings,
+        llmfit_settings: LLMFitSettings,
         endpoint_policy: EndpointPolicy,
         registry: NodeRegistry | None = None,
         connection_tracker: ConnectionTracker | None = None,
@@ -100,6 +101,7 @@ class NodeProvisioner:
         self._ssh_client = ssh_client
         self._etcd_client = etcd_client
         self._settings = settings
+        self._llmfit_version = llmfit_settings.version
         self._endpoint_policy = endpoint_policy
         self._registry = registry
         self._tracker = connection_tracker
@@ -146,7 +148,7 @@ class NodeProvisioner:
             f"NFS_MOUNT_POINT={shlex.quote(s.nfs_mount_point)} "
             f"NVIDIA_DRIVER_VERSION={shlex.quote(s.nvidia_driver_version)} "
             f"VLLM_PORT={s.vllm_port} "
-            f"LLMFIT_VERSION={shlex.quote(s.llmfit_version)} "
+            f"LLMFIT_VERSION={shlex.quote(self._llmfit_version)} "
         )
         if self._hf_token:
             prefix += f"HF_TOKEN={shlex.quote(self._hf_token)} "
@@ -397,23 +399,23 @@ class NodeProvisioner:
             self._log_buffer.mark_complete(hostname)
             raise
 
-        # D-09: Register node as PROVISIONING before setup
-        node = Node(
-            node_id=hostname,
-            endpoint=self.validate_endpoint(hostname),
-            status=NodeStatus.PROVISIONING,
-            model="",
-            last_heartbeat=datetime.now(UTC),
-            managed=managed,
-        )
-        key, value = node_to_etcd(node, self._etcd_client.prefix)
+        current_step = "registering_node"
+        value: bytes | None = None
         try:
+            # D-09: Register node as PROVISIONING before setup. Failure is
+            # terminal: remote mutation must not start without an ownership
+            # record in discovery.
+            node = Node(
+                node_id=hostname,
+                endpoint=self.validate_endpoint(hostname),
+                status=NodeStatus.PROVISIONING,
+                model="",
+                last_heartbeat=datetime.now(UTC),
+                managed=managed,
+            )
+            key, value = node_to_etcd(node, self._etcd_client.prefix)
             await asyncio.to_thread(self._etcd_client.put, key, value)
-        except Exception:
-            logger.warning("provisioning_registration_failed", hostname=hostname)
-
-        current_step = "uploading_scripts"
-        try:
+            current_step = "uploading_scripts"
             await self._update_state(
                 hostname,
                 ProvisioningStep.UPLOADING_SCRIPTS,
@@ -422,7 +424,16 @@ class NodeProvisioner:
             self._log(hostname, "info", "Uploading provisioning scripts")
             await self._upload_scripts(hostname)
             self._log(hostname, "info", "Running setup.sh")
-            await self._run_setup(hostname)
+
+            def set_current_step(step: str) -> None:
+                nonlocal current_step
+                current_step = step
+
+            await self._run_setup(
+                hostname,
+                started_at=provision_started_at,
+                on_step=set_current_step,
+            )
             current_step = "gpu_verify"
             await self._verify_gpu(hostname)
             current_step = "starting_vllm"
@@ -449,7 +460,7 @@ class NodeProvisioner:
                 hostname, ProvisioningStep.COMPLETE, started_at=provision_started_at
             )
             self._log(hostname, "info", "Provisioning complete")
-        except (RemoteCommandError, SSHConnectionError, ProvisioningError) as exc:
+        except Exception as exc:
             self._log(hostname, "error", f"Failed at step '{current_step}': {exc}")
             await self._update_state(
                 hostname,
@@ -459,31 +470,32 @@ class NodeProvisioner:
                 started_at=provision_started_at,
             )
             # Update node entry to FAILED so it doesn't stay stuck as PROVISIONING
-            failed_node = Node(
-                node_id=hostname,
-                endpoint=self.validate_endpoint(hostname),
-                status=NodeStatus.FAILED,
-                model="",
-                last_heartbeat=datetime.now(UTC),
-                managed=managed,
-            )
-            f_key, f_value = node_to_etcd(failed_node, self._etcd_client.prefix)
             try:
-                replaced = await asyncio.to_thread(
-                    self._etcd_client.replace,
-                    f_key,
-                    value,
-                    f_value,
+                failed_node = Node(
+                    node_id=hostname,
+                    endpoint=self.validate_endpoint(hostname),
+                    status=NodeStatus.FAILED,
+                    model="",
+                    last_heartbeat=datetime.now(UTC),
+                    managed=managed,
                 )
-                if not replaced:
-                    logger.info(
-                        "failed_node_update_skipped",
-                        hostname=hostname,
-                        reason="node changed or removed",
+                f_key, f_value = node_to_etcd(failed_node, self._etcd_client.prefix)
+                if value is not None:
+                    replaced = await asyncio.to_thread(
+                        self._etcd_client.replace,
+                        f_key,
+                        value,
+                        f_value,
                     )
+                    if not replaced:
+                        logger.info(
+                            "failed_node_update_skipped",
+                            hostname=hostname,
+                            reason="node changed or removed",
+                        )
             except Exception:
                 logger.warning("failed_node_update_failed", hostname=hostname)
-            raise ProvisioningError(str(exc)) from exc
+            raise
         finally:
             self._log_buffer.mark_complete(hostname)
 
@@ -493,7 +505,13 @@ class NodeProvisioner:
         """Copy provisioning scripts to the remote host via SCP."""
         await self._ssh_client.upload(hostname, self._settings.scripts_dir)
 
-    async def _run_setup(self, hostname: str) -> None:
+    async def _run_setup(
+        self,
+        hostname: str,
+        *,
+        started_at: datetime,
+        on_step: Callable[[str], None],
+    ) -> None:
         """Run setup.sh and parse step markers from stdout (D-05, D-06)."""
         async for stream, line in self._ssh_client.run_streaming(
             hostname, f"{self._script_env_prefix()}bash auto-vllm/setup.sh"
@@ -502,14 +520,22 @@ class NodeProvisioner:
                 match = STEP_PATTERN.search(line)
                 if match:
                     step_name, status = match.group(1), match.group(2)
-                    if status == "START":
+                    on_step(step_name)
+                    if status in {"START", "WARN"}:
                         with suppress(ValueError):
                             await self._update_state(
-                                hostname, ProvisioningStep(step_name)
+                                hostname,
+                                ProvisioningStep(step_name),
+                                started_at=started_at,
                             )
                     if status == "FAIL":
                         logger.error("step_failed", step=step_name, hostname=hostname)
                         self._log(hostname, "error", f"[STEP:{step_name}:FAIL]")
+                    elif status == "WARN":
+                        logger.warning(
+                            "step_warning", step=step_name, hostname=hostname
+                        )
+                        self._log(hostname, "warning", f"[STEP:{step_name}:WARN]")
                     else:
                         logger.info(
                             "step_marker",
@@ -811,7 +837,7 @@ class NodeProvisioner:
                 started_at=teardown_started_at,
             )
             self._log(hostname, "info", "Teardown complete")
-        except (RemoteCommandError, SSHConnectionError) as exc:
+        except Exception as exc:
             self._log(hostname, "error", f"Teardown failed: {exc}")
             await self._update_state(
                 hostname,
@@ -820,7 +846,13 @@ class NodeProvisioner:
                 error=str(exc),
                 started_at=teardown_started_at,
             )
-            raise ProvisioningError(str(exc)) from exc
+            if self._registry is not None:
+                self._registry.update_status(
+                    hostname,
+                    NodeStatus.FAILED,
+                    allowed_from=set(NodeStatus),
+                )
+            raise
         finally:
             self._log_buffer.mark_complete(hostname)
 

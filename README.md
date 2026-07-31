@@ -220,6 +220,21 @@ provisioning vLLM port must also appear in the endpoint port allowlist. Setup
 requests whose generated backend endpoint is not allowed fail before any
 power, SSH, or installation work and name the allowlist setting to update.
 
+### SSH and provisioning commands
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INFERENCE_PROXY_SSH__KEY_PATH` | `~/.ssh/id_rsa` | Private key used for node access; `~` is expanded after environment loading |
+| `INFERENCE_PROXY_SSH__USERNAME` | `root` | Remote provisioning user |
+| `INFERENCE_PROXY_SSH__CONNECT_TIMEOUT` | `10` | SSH connection timeout (seconds) |
+| `INFERENCE_PROXY_SSH__STREAMING_COMMAND_TIMEOUT` | `3600` | Total wall-clock deadline for a streaming remote command (seconds) |
+| `INFERENCE_PROXY_SSH__STREAMING_INACTIVITY_TIMEOUT` | `900` | Maximum interval without stdout or stderr from a streaming command (seconds) |
+
+LLMFit has one version setting: `INFERENCE_PROXY_LLMFIT__VERSION`. The retired
+`INFERENCE_PROXY_PROVISIONING__LLMFIT_VERSION` variable is ignored and emits a
+startup warning so an existing pin cannot disappear silently. Remove the old
+variable and move its value to the LLMFit setting when upgrading.
+
 ### Proxy (HTTP client)
 
 | Variable | Default | Description |

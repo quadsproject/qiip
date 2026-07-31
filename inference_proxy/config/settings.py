@@ -5,6 +5,7 @@ nested env var resolution works correctly through the root Settings class.
 Only the root Settings class inherits from BaseSettings.
 """
 
+import warnings
 from pathlib import Path
 from string import Formatter
 from typing import Self
@@ -150,6 +151,14 @@ class SSHSettings(BaseModel):
     key_path: Path = Path("~/.ssh/id_rsa").expanduser()  # D-01
     username: str = "root"  # D-02
     connect_timeout: int = 10  # D-04
+    streaming_command_timeout: float = Field(default=3600.0, gt=0)
+    streaming_inactivity_timeout: float = Field(default=900.0, gt=0)
+
+    @field_validator("key_path", mode="before")
+    @classmethod
+    def expand_key_path(cls, value: str | Path) -> Path:
+        """Expand user-relative paths after environment settings are loaded."""
+        return Path(value).expanduser()
 
 
 class ProvisioningSettings(BaseModel):
@@ -169,7 +178,24 @@ class ProvisioningSettings(BaseModel):
     nfs_server: str = "storage.example.com:/mnt/SATA/scratch/grafuls/hf-cache"
     nfs_mount_point: str = "/srv/hf-cache"
     nvidia_driver_version: str = "580.126.09"
-    llmfit_version: str = "1.1.6"
+    retired_llmfit_version: str | None = Field(
+        default=None,
+        validation_alias="llmfit_version",
+        exclude=True,
+        repr=False,
+    )
+
+    @model_validator(mode="after")
+    def warn_about_retired_llmfit_version(self) -> Self:
+        """Make the retired provisioning-scoped LLMFit knob fail visibly."""
+        if self.retired_llmfit_version is not None:
+            warnings.warn(
+                "INFERENCE_PROXY_PROVISIONING__LLMFIT_VERSION is ignored; "
+                "configure INFERENCE_PROXY_LLMFIT__VERSION instead",
+                UserWarning,
+                stacklevel=2,
+            )
+        return self
 
 
 class QUADSSettings(BaseModel):

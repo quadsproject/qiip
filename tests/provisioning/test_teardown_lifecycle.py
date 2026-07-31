@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from inference_proxy.api.admin import setup_node, teardown_node
-from inference_proxy.config.settings import ProvisioningSettings
+from inference_proxy.config.settings import LLMFitSettings, ProvisioningSettings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.admin import SetupRequest
 from inference_proxy.models.endpoint import EndpointPolicy
@@ -45,6 +45,7 @@ def _provisioner(
             health_poll_interval=0,
             drain_timeout=0,
         ),
+        llmfit_settings=LLMFitSettings(),
         endpoint_policy=_ENDPOINT_POLICY,
         registry=registry,
         connection_tracker=MagicMock(get=MagicMock(return_value=0)),

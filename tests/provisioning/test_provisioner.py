@@ -6,7 +6,9 @@ provisioning sequence: setup.sh -> start-vllm.sh -> health poll -> register.
 
 from __future__ import annotations
 
+import inspect
 import json
+from collections.abc import Callable
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,9 +16,15 @@ import asyncssh
 import httpx
 import pytest
 
-from inference_proxy.config.settings import ProvisioningSettings, RoutingSettings
+from inference_proxy.config.settings import (
+    LLMFitSettings,
+    ProvisioningSettings,
+    RoutingSettings,
+)
+from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
-from inference_proxy.models.node import NodeStatus
+from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     PreflightError,
@@ -41,30 +49,81 @@ def _make_provisioner(
     ssh_client: MagicMock | None = None,
     etcd_client: MagicMock | None = None,
     settings: ProvisioningSettings | None = None,
-    registry: MagicMock | None = None,
+    llmfit_settings: LLMFitSettings | None = None,
+    registry: NodeRegistry | MagicMock | None = None,
     connection_tracker: MagicMock | None = None,
     circuit_breaker_registry: CircuitBreakerRegistry | MagicMock | None = None,
     redfish_client: MagicMock | None = None,
     endpoint_policy: EndpointPolicy = _TEST_ENDPOINT_POLICY,
 ) -> NodeProvisioner:
     """Build a NodeProvisioner with mock dependencies."""
-    return NodeProvisioner(
-        ssh_client=ssh_client or MagicMock(),
-        etcd_client=etcd_client or MagicMock(),
-        settings=settings
+    constructor_args: dict[str, object] = {
+        "ssh_client": ssh_client or MagicMock(),
+        "etcd_client": etcd_client or MagicMock(),
+        "settings": settings
         or ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0),
-        endpoint_policy=endpoint_policy,
-        registry=registry,
-        connection_tracker=connection_tracker,
-        circuit_breaker_registry=circuit_breaker_registry,
-        redfish_client=redfish_client,
-    )
+        "endpoint_policy": endpoint_policy,
+        "registry": registry,
+        "connection_tracker": connection_tracker,
+        "circuit_breaker_registry": circuit_breaker_registry,
+        "redfish_client": redfish_client,
+    }
+    # Baseline comparisons run these tests against the pre-PR constructor so
+    # failures reach behavioral assertions rather than stopping at TypeError.
+    if "llmfit_settings" in inspect.signature(NodeProvisioner).parameters:
+        constructor_args["llmfit_settings"] = llmfit_settings or LLMFitSettings()
+    return NodeProvisioner(**constructor_args)
+
+
+@pytest.mark.asyncio
+async def test_llmfit_version_single_source() -> None:
+    """E5: provisioning and repair install consume one LLMFit setting."""
+    settings = LLMFitSettings(version="8.7.6")
+    provisioner = _make_provisioner(llmfit_settings=settings)
+    ssh = MagicMock()
+    ssh.run = AsyncMock(return_value=("", "", 0))
+    runner = LLMFitRunner(ssh_client=ssh, settings=settings)
+
+    await runner._install("host1")
+
+    assert "LLMFIT_VERSION=8.7.6" in provisioner._script_env_prefix()
+    install_command = ssh.run.await_args.args[1]
+    assert "/v8.7.6/llmfit-v8.7.6-" in install_command
+    assert "llmfit_version" not in ProvisioningSettings.model_fields
 
 
 async def _async_iter(items: list[tuple[str, str]]):
     """Helper: async generator yielding items."""
     for item in items:
         yield item
+
+
+def _recording_etcd() -> tuple[MagicMock, dict[str, bytes], list[dict[str, object]]]:
+    """Return an etcd double which implements put/replace/delete semantics."""
+    etcd = MagicMock()
+    etcd.prefix = "/nodes/"
+    values: dict[str, bytes] = {}
+    state_payloads: list[dict[str, object]] = []
+
+    def put(key: str, value: bytes) -> bool:
+        values[key] = value
+        if key.startswith("/provisioning/"):
+            state_payloads.append(json.loads(value))
+        return True
+
+    def replace(key: str, expected: bytes, value: bytes) -> bool:
+        if values.get(key) != expected:
+            return False
+        values[key] = value
+        return True
+
+    def delete(key: str) -> bool:
+        return values.pop(key, None) is not None
+
+    etcd.put = MagicMock(side_effect=put)
+    etcd.replace = MagicMock(side_effect=replace)
+    etcd.delete = MagicMock(side_effect=delete)
+    return etcd, values, state_payloads
 
 
 class TestProvisionSequence:
@@ -234,7 +293,7 @@ class TestScriptUpload:
                 new_callable=AsyncMock,
             ) as mock_tt:
                 mock_tt.return_value = True
-                with pytest.raises(ProvisioningError):
+                with pytest.raises(SSHConnectionError):
                     await provisioner.provision("host1")
 
 
@@ -261,7 +320,11 @@ class TestStepMarkerParsing:
 
         # _run_setup should not raise on FAIL markers -- that's a logging concern.
         # RemoteCommandError from SSHClient is what signals actual failure.
-        await provisioner._run_setup("host1")
+        await provisioner._run_setup(
+            "host1",
+            started_at=datetime.now(UTC),
+            on_step=lambda _step: None,
+        )
 
 
 class TestModelExtraction:
@@ -430,7 +493,7 @@ class TestNodeRegistration:
 
 
 class TestSetupFailure:
-    """D-08: Setup failure raises ProvisioningError, no cleanup."""
+    """D-08: setup failures retain their original typed exception."""
 
     @pytest.mark.asyncio
     async def test_remote_command_error_wraps(self) -> None:
@@ -453,7 +516,7 @@ class TestSetupFailure:
                 new_callable=AsyncMock,
             ) as mock_to_thread:
                 mock_to_thread.return_value = True
-                with pytest.raises(ProvisioningError):
+                with pytest.raises(RemoteCommandError):
                     await provisioner.provision("host1")
 
     @pytest.mark.asyncio
@@ -478,8 +541,168 @@ class TestSetupFailure:
                 new_callable=AsyncMock,
             ) as mock_to_thread:
                 mock_to_thread.return_value = True
-                with pytest.raises(ProvisioningError):
+                with pytest.raises(SSHConnectionError):
                     await provisioner.provision("host1")
+
+
+class TestProvisioningFailureAccuracy:
+    """P3/P7/P8/E14: failures are terminal, accurate, and diagnosable."""
+
+    @pytest.mark.asyncio
+    async def test_initial_registration_failure_aborts_before_ssh(self) -> None:
+        etcd, _values, state_payloads = _recording_etcd()
+        registration_error = RuntimeError("etcd registration unavailable")
+        normal_put = etcd.put.side_effect
+
+        def fail_node_registration(key: str, value: bytes) -> bool:
+            if key == "/nodes/host1":
+                raise registration_error
+            return normal_put(key, value)
+
+        etcd.put.side_effect = fail_node_registration
+        ssh = MagicMock()
+        ssh.upload = AsyncMock(
+            side_effect=RuntimeError("remote work started after registration failure")
+        )
+        provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
+
+        with patch.object(provisioner, "preflight", new_callable=AsyncMock):
+            with pytest.raises(RuntimeError) as caught:
+                await provisioner.provision("host1")
+
+        assert caught.value is registration_error
+        ssh.upload.assert_not_awaited()
+        assert state_payloads[-1]["current_step"] == "failed"
+        assert state_payloads[-1]["failed_step"] == "registering_node"
+
+    @pytest.mark.asyncio
+    async def test_unexpected_provision_error_records_terminal_state(self) -> None:
+        etcd, values, state_payloads = _recording_etcd()
+        upload_error = RuntimeError("unexpected upload failure")
+        ssh = MagicMock()
+        ssh.upload = AsyncMock(side_effect=upload_error)
+        provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
+
+        with patch.object(provisioner, "preflight", new_callable=AsyncMock):
+            with pytest.raises(RuntimeError) as caught:
+                await provisioner.provision("host1")
+
+        assert caught.value is upload_error
+        assert state_payloads[-1]["current_step"] == "failed"
+        assert state_payloads[-1]["failed_step"] == "uploading_scripts"
+        assert json.loads(values["/nodes/host1"])["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_setup_failure_records_emitted_step(self) -> None:
+        etcd, _values, state_payloads = _recording_etcd()
+        command_error = RemoteCommandError("host1", "setup", 1)
+        ssh = MagicMock()
+        ssh.upload = AsyncMock()
+
+        async def setup_failure(host: str, command: str):
+            assert host == "host1"
+            assert "setup.sh" in command
+            yield ("stdout", "[STEP:nvidia_driver:START]")
+            raise command_error
+
+        ssh.run_streaming = setup_failure
+        provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
+
+        with patch.object(provisioner, "preflight", new_callable=AsyncMock):
+            with pytest.raises((RemoteCommandError, ProvisioningError)):
+                await provisioner.provision("host1")
+
+        assert state_payloads[-1]["failed_step"] == "nvidia_driver"
+
+    @pytest.mark.asyncio
+    async def test_setup_markers_preserve_original_started_at(self) -> None:
+        etcd, _values, state_payloads = _recording_etcd()
+        ssh = MagicMock()
+        ssh.upload = AsyncMock()
+
+        async def setup_failure(host: str, command: str):
+            yield ("stdout", "[STEP:system_update:START]")
+            raise RuntimeError("setup interrupted")
+
+        ssh.run_streaming = setup_failure
+        provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
+
+        with patch.object(provisioner, "preflight", new_callable=AsyncMock):
+            with pytest.raises(RuntimeError):
+                await provisioner.provision("host1")
+
+        starts = {payload["started_at"] for payload in state_payloads}
+        assert len(starts) == 1
+        assert any(
+            payload["current_step"] == "system_update" for payload in state_payloads
+        )
+
+    @pytest.mark.asyncio
+    async def test_warn_marker_parsed(self) -> None:
+        etcd, _values, state_payloads = _recording_etcd()
+        ssh = MagicMock()
+        ssh.upload = AsyncMock()
+
+        async def setup_warning(host: str, command: str):
+            yield ("stdout", "[STEP:llmfit_install:WARN]")
+            raise RuntimeError("later setup failure")
+
+        ssh.run_streaming = setup_warning
+        provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
+
+        with patch.object(provisioner, "preflight", new_callable=AsyncMock):
+            with pytest.raises(RuntimeError):
+                await provisioner.provision("host1")
+
+        assert any(
+            payload["current_step"] == "llmfit_install" for payload in state_payloads
+        )
+        assert state_payloads[-1]["failed_step"] == "llmfit_install"
+        assert any(
+            entry["level"] == "warning" and entry["msg"] == "[STEP:llmfit_install:WARN]"
+            for entry in provisioner.log_buffer.get_entries("host1")
+        )
+
+    @pytest.mark.asyncio
+    async def test_unexpected_teardown_error_marks_node_failed_and_not_routable(
+        self,
+    ) -> None:
+        etcd, _values, state_payloads = _recording_etcd()
+        delete_error = RuntimeError("etcd delete failed")
+        etcd.delete.side_effect = delete_error
+        registry = NodeRegistry()
+        registry.add(
+            Node(
+                node_id="host1",
+                endpoint="host1:8000",
+                status=NodeStatus.HEALTHY,
+                model="model-a",
+                managed=True,
+            )
+        )
+        ssh = MagicMock()
+        ssh.upload = AsyncMock()
+
+        async def stopped(_host: str, _command: str):
+            if False:  # pragma: no cover - defines an empty async generator
+                yield ("stdout", "")
+
+        ssh.run_streaming = stopped
+        provisioner = _make_provisioner(
+            ssh_client=ssh,
+            etcd_client=etcd,
+            registry=registry,
+        )
+
+        with pytest.raises(RuntimeError) as caught:
+            await provisioner.teardown("host1", force=True)
+
+        assert caught.value is delete_error
+        failed_node = registry.get("host1")
+        assert failed_node is not None
+        assert failed_node.status == NodeStatus.FAILED
+        assert state_payloads[-1]["current_step"] == "failed"
+        assert state_payloads[-1]["failed_step"] == "teardown"
 
 
 class TestPreflight:
@@ -644,6 +867,7 @@ def _make_full_provisioner(etcd: MagicMock) -> tuple[NodeProvisioner, MagicMock]
         ssh_client=ssh,
         etcd_client=etcd,
         settings=settings,
+        llmfit_settings=LLMFitSettings(),
         endpoint_policy=_TEST_ENDPOINT_POLICY,
     )
     return provisioner, ssh
@@ -715,6 +939,7 @@ class TestStateTracking:
             ssh_client=ssh,
             etcd_client=etcd,
             settings=settings,
+            llmfit_settings=LLMFitSettings(),
             endpoint_policy=_TEST_ENDPOINT_POLICY,
         )
 
@@ -724,7 +949,7 @@ class TestStateTracking:
                 new_callable=AsyncMock,
             ) as mock_to_thread:
                 mock_to_thread.return_value = True
-                with pytest.raises(ProvisioningError):
+                with pytest.raises(RemoteCommandError):
                     await provisioner.provision("host1")
 
         # Find the last /provisioning/ state write
@@ -861,10 +1086,19 @@ class TestStateTracking:
         setup_called = False
         original_run_setup = provisioner._run_setup
 
-        async def tracking_setup(hostname: str) -> None:
+        async def tracking_setup(
+            hostname: str,
+            *,
+            started_at: datetime,
+            on_step: Callable[[str], None],
+        ) -> None:
             nonlocal setup_called
             setup_called = True
-            await original_run_setup(hostname)
+            await original_run_setup(
+                hostname,
+                started_at=started_at,
+                on_step=on_step,
+            )
 
         provisioner._run_setup = tracking_setup
 
@@ -1200,7 +1434,7 @@ class TestTeardownSSHFailure:
             "inference_proxy.provisioning.provisioner.asyncio.to_thread",
             side_effect=capture_to_thread,
         ):
-            with pytest.raises(ProvisioningError):
+            with pytest.raises(SSHConnectionError):
                 await provisioner.teardown("host1", force=True)
 
         assert "failed" in state_steps
@@ -1217,7 +1451,7 @@ class TestTeardownSSHFailure:
 
         ssh.run_streaming = failing_streaming
 
-        with pytest.raises(ProvisioningError, match="exited with status 1"):
+        with pytest.raises(RemoteCommandError, match="exited with status 1"):
             await provisioner.teardown("host1", force=True)
 
         etcd.delete.assert_not_called()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import BaseModel, SecretStr, ValidationError
 from pydantic_settings import BaseSettings
@@ -206,8 +208,6 @@ class TestDefaultSSHSettings:
     """D-01, D-02, D-04: SSHSettings defaults."""
 
     def test_default_key_path(self) -> None:
-        from pathlib import Path
-
         settings = Settings(_env_file=None)
         assert settings.ssh.key_path == Path("~/.ssh/id_rsa").expanduser()
 
@@ -218,6 +218,26 @@ class TestDefaultSSHSettings:
     def test_default_connect_timeout(self) -> None:
         settings = Settings(_env_file=None)
         assert settings.ssh.connect_timeout == 10
+
+    def test_default_streaming_deadlines(self) -> None:
+        settings = Settings(_env_file=None)
+        assert settings.ssh.streaming_command_timeout == 3600.0
+        assert settings.ssh.streaming_inactivity_timeout == 900.0
+
+    def test_ssh_key_path_from_environment_is_expanded(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_SSH__KEY_PATH",
+            "~/.ssh/provisioning-key",
+        )
+
+        settings = Settings(_env_file=None)
+
+        assert settings.ssh.key_path == tmp_path / ".ssh/provisioning-key"
 
 
 class TestDefaultProvisioningSettings:
@@ -252,6 +272,25 @@ class TestEnvVarOverrideProvisioningTimeout:
         monkeypatch.setenv("INFERENCE_PROXY_PROVISIONING__HEALTH_POLL_TIMEOUT", "300")
         settings = Settings(_env_file=None)
         assert settings.provisioning.health_poll_timeout == 300
+
+    def test_retired_provisioning_llmfit_version_warns(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_PROVISIONING__LLMFIT_VERSION",
+            "9.9.9",
+        )
+        monkeypatch.setenv("INFERENCE_PROXY_LLMFIT__VERSION", "2.0.0")
+
+        with pytest.warns(
+            UserWarning,
+            match="INFERENCE_PROXY_LLMFIT__VERSION",
+        ):
+            settings = Settings(_env_file=None)
+
+        assert settings.llmfit.version == "2.0.0"
+        assert "llmfit_version" not in ProvisioningSettings.model_fields
 
 
 class TestSSHAndProvisioningAreNotBaseSettings:

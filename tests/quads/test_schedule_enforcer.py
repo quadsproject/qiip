@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from structlog.testing import capture_logs
 
-from inference_proxy.config.settings import ProvisioningSettings
+from inference_proxy.config.settings import LLMFitSettings, ProvisioningSettings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_from_etcd
 from inference_proxy.models.endpoint import EndpointPolicy
@@ -447,6 +447,7 @@ async def test_schedule_enforcer_uses_same_host_lifecycle_lock(
         ssh_client=MagicMock(),
         etcd_client=etcd,
         settings=ProvisioningSettings(),
+        llmfit_settings=LLMFitSettings(),
         endpoint_policy=_ENDPOINT_POLICY,
         registry=registry,
     )

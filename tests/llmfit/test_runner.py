@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -12,7 +12,11 @@ from inference_proxy.llmfit.errors import (
     LLMFitTimeoutError,
 )
 from inference_proxy.llmfit.runner import LLMFitRunner
-from inference_proxy.provisioning.ssh_client import SSHClient, SSHConnectionError
+from inference_proxy.provisioning.ssh_client import (
+    RemoteCommandError,
+    SSHClient,
+    SSHConnectionError,
+)
 
 FIXTURE_JSON = json.dumps(
     {
@@ -112,6 +116,63 @@ class TestRecommendTimeout:
             await runner.recommend("gpu-host-01")
         assert exc_info.value.host == "gpu-host-01"
         assert exc_info.value.timeout == 60.0
+
+    @pytest.mark.asyncio
+    async def test_install_timeout_raises_typed_error(
+        self, runner: LLMFitRunner, mock_ssh_client: MagicMock
+    ) -> None:
+        mock_ssh_client.run.side_effect = [
+            RemoteCommandError("gpu-host-01", "llmfit recommend", 127),
+            TimeoutError(),
+        ]
+
+        with pytest.raises(LLMFitTimeoutError) as caught:
+            await runner.recommend("gpu-host-01")
+
+        assert caught.value.host == "gpu-host-01"
+        assert caught.value.timeout == 60.0
+        assert mock_ssh_client.run.await_count == 2
+
+
+class TestFirstRecommendationInstall:
+    """T23: first use installs the requested binary and retries exactly once."""
+
+    @pytest.mark.asyncio
+    async def test_first_recommendation_installs_then_retries_exactly_once(
+        self, mock_ssh_client: MagicMock
+    ) -> None:
+        from inference_proxy.config.settings import LLMFitSettings
+
+        settings = LLMFitSettings(
+            version="2.3.4",
+            binary_path="/opt/llmfit",
+            timeout=17.0,
+            install_url="https://downloads.example/llmfit-{version}.tar.gz",
+        )
+        runner = LLMFitRunner(mock_ssh_client, settings)
+        recommend_command = "/opt/llmfit recommend --json --runtime vllm -n 30"
+        install_command = (
+            "wget -q 'https://downloads.example/llmfit-2.3.4.tar.gz' "
+            "-O /tmp/llmfit.tar.gz"
+            " && tar -xzf /tmp/llmfit.tar.gz -C /tmp/"
+            ' && sudo install -m 755 "$(find /tmp/ -name llmfit -type f '
+            '-print -quit)" /opt/llmfit'
+            " && rm -rf /tmp/llmfit.tar.gz /tmp/llmfit-*"
+        )
+        mock_ssh_client.run.side_effect = [
+            RemoteCommandError("gpu-host-01", recommend_command, 127),
+            ("", "", 0),
+            (FIXTURE_JSON, "", 0),
+        ]
+
+        result = await runner.recommend("gpu-host-01")
+
+        assert len(result.models) == 2
+        assert mock_ssh_client.run.await_args_list == [
+            call("gpu-host-01", recommend_command, timeout=17.0),
+            call("gpu-host-01", install_command, timeout=17.0),
+            call("gpu-host-01", recommend_command, timeout=17.0),
+        ]
 
 
 class TestRecommendEmptyOutput:
