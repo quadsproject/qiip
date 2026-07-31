@@ -240,6 +240,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             settings=resolved_settings.provisioning,
             registry=registry,
             connection_tracker=connection_tracker,
+            circuit_breaker_registry=circuit_breaker_registry,
             redfish_client=app.state.redfish_client,
             log_buffer=log_buffer,
         )

@@ -12,9 +12,10 @@ Tests cover:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 from fastapi import FastAPI
@@ -302,11 +303,12 @@ class TestSetupModelPassthrough:
         assert response.status_code == 202
         # fire_background receives a coroutine; await it to trigger provision
         coro = mock_provisioner.fire_background.call_args[0][0]
-        import asyncio
-
         asyncio.get_event_loop().run_until_complete(coro)
         mock_provisioner.provision.assert_awaited_once_with(
-            "gpu01", managed=True, model="org/model"
+            "gpu01",
+            managed=True,
+            model="org/model",
+            lifecycle_lease=ANY,
         )
 
     def test_setup_without_model_defaults_none(
@@ -318,11 +320,12 @@ class TestSetupModelPassthrough:
         response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
         assert response.status_code == 202
         coro = mock_provisioner.fire_background.call_args[0][0]
-        import asyncio
-
         asyncio.get_event_loop().run_until_complete(coro)
         mock_provisioner.provision.assert_awaited_once_with(
-            "gpu01", managed=True, model=None
+            "gpu01",
+            managed=True,
+            model=None,
+            lifecycle_lease=ANY,
         )
 
 
@@ -516,13 +519,276 @@ class TestSetupDedupGuard:
         client: TestClient,
         mock_provisioner: MagicMock,
     ) -> None:
-        """Pending host is removed after provisioning task fires."""
+        """The real background wrapper clears pending state after success."""
 
         response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
         assert response.status_code == 202
-        # The background task wrapper should eventually discard from pending_hosts.
-        # Since fire_background is mocked, we check it was called with a coroutine.
-        mock_provisioner.fire_background.assert_called_once()
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+
+        import inference_proxy.api.admin as admin_mod
+
+        assert "gpu01" not in admin_mod.pending_hosts
+
+    @pytest.mark.parametrize("outcome", ["failure", "cancellation"])
+    def test_releases_pending_and_host_lease_after_unsuccessful_background_task(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+        outcome: str,
+    ) -> None:
+        """Failure and cancellation cannot leave setup permanently locked."""
+        error: BaseException
+        if outcome == "failure":
+            error = RuntimeError("provision failed")
+        else:
+            error = asyncio.CancelledError()
+        mock_provisioner.provision.side_effect = error
+        lease = MagicMock(hostname="gpu01")
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = lease
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args.args[0]
+
+        with pytest.raises(type(error)):
+            asyncio.run(asyncio.wait_for(coro, timeout=1))
+
+        import inference_proxy.api.admin as admin_mod
+
+        assert "gpu01" not in admin_mod.pending_hosts
+        lease.release.assert_called()
+
+        mock_provisioner.reset_mock()
+        mock_provisioner.provision.side_effect = None
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host = AsyncMock(
+            return_value=MagicMock(hostname="gpu01")
+        )
+        retry = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+        assert retry.status_code == 202
+
+    def test_schedule_failure_releases_pending_and_host_lease(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """Failure to create the task cannot leak either setup guard."""
+        lease = MagicMock(hostname="gpu01")
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = lease
+        mock_provisioner.fire_background.side_effect = RuntimeError("no task")
+
+        with pytest.raises(RuntimeError, match="no task"):
+            client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        import inference_proxy.api.admin as admin_mod
+
+        assert "gpu01" not in admin_mod.pending_hosts
+        lease.release.assert_called_once()
+
+    def test_task_cancelled_before_start_releases_pending_and_host_lease(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """The task callback covers cancellation before coroutine entry."""
+        lease = MagicMock(hostname="gpu01")
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = lease
+
+        class NeverStartedTask:
+            def __init__(self) -> None:
+                self.background = None
+                self.callback = None
+
+            def add_done_callback(self, callback) -> None:
+                self.callback = callback
+
+            def cancel_before_start(self) -> None:
+                assert self.background is not None
+                assert self.callback is not None
+                self.background.close()
+                self.callback(self)
+
+        task = NeverStartedTask()
+
+        def hold_background(background):
+            task.background = background
+            return task
+
+        mock_provisioner.fire_background.side_effect = hold_background
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+        assert response.status_code == 202
+
+        import inference_proxy.api.admin as admin_mod
+
+        assert "gpu01" in admin_mod.pending_hosts
+        task.cancel_before_start()
+        assert "gpu01" not in admin_mod.pending_hosts
+        lease.release.assert_called_once()
+
+
+class TestSetupEligibility:
+    """Setup eligibility follows node state for managed and standalone hosts."""
+
+    @pytest.mark.parametrize("managed", [True, False])
+    @pytest.mark.parametrize(
+        ("status", "expected_status"),
+        [
+            (NodeStatus.HEALTHY, 409),
+            (NodeStatus.UNHEALTHY, 409),
+            # Acquiring the host lease proves no provision is still running,
+            # so this is a persisted record left by an interrupted process.
+            (NodeStatus.PROVISIONING, 202),
+            # A DRAINING node without a live host operation or connections is
+            # a PR 6 reconciliation ghost and is safe to clean.
+            (NodeStatus.DRAINING, 202),
+            (NodeStatus.FAILED, 202),
+            (NodeStatus.UNKNOWN, 202),
+        ],
+    )
+    def test_setup_eligibility_by_status(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+        status: NodeStatus,
+        expected_status: int,
+        managed: bool,
+    ) -> None:
+        test_registry.add(_make_node(node_id="gpu01", status=status))
+
+        response = client.post(
+            "/admin/nodes/setup",
+            json={"hostname": "gpu01", "managed": managed},
+        )
+
+        assert response.status_code == expected_status
+        if expected_status == 409:
+            mock_provisioner.fire_background.assert_not_called()
+            mock_provisioner.cleanup_stale_node.assert_not_awaited()
+            return
+
+        mock_provisioner.cleanup_stale_node.assert_awaited_once_with("gpu01")
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+        mock_provisioner.provision.assert_awaited_once_with(
+            "gpu01",
+            managed=managed,
+            model=None,
+            lifecycle_lease=ANY,
+        )
+
+    def test_draining_node_with_connections_is_rejected_actionably(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(_make_node(node_id="gpu01", status=NodeStatus.DRAINING))
+        mock_provisioner.connection_count.return_value = 2
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 409
+        assert "2 active request" in response.json()["detail"]
+        assert "wait" in response.json()["detail"].lower()
+        mock_provisioner.cleanup_stale_node.assert_not_awaited()
+
+    def test_setup_returns_409_while_host_operation_is_reserved(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(_make_node(node_id="gpu01", status=NodeStatus.DRAINING))
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = None
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 409
+        assert "operation" in response.json()["detail"].lower()
+        mock_provisioner.cleanup_stale_node.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            NodeStatus.PROVISIONING,
+            NodeStatus.FAILED,
+            NodeStatus.UNKNOWN,
+        ],
+    )
+    def test_retry_clears_stale_state_before_provision(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        connection_tracker: ConnectionTracker,
+        circuit_breaker_registry: CircuitBreakerRegistry,
+        mock_provisioner: MagicMock,
+        status: NodeStatus,
+    ) -> None:
+        test_registry.add(_make_node(node_id="gpu01", status=status))
+        connection_tracker.increment("gpu01")
+        breaker = circuit_breaker_registry.get_or_create("gpu01")
+        for _ in range(3):
+            breaker.record_failure()
+
+        cleanup_complete = False
+
+        async def cleanup(hostname: str) -> None:
+            nonlocal cleanup_complete
+            assert hostname == "gpu01"
+            test_registry.remove(hostname)
+            connection_tracker.remove(hostname)
+            circuit_breaker_registry.remove(hostname)
+            cleanup_complete = True
+
+        async def provision(
+            hostname: str,
+            *,
+            managed: bool,
+            model: str | None,
+            lifecycle_lease: object,
+        ) -> None:
+            assert hostname == "gpu01"
+            assert managed is True
+            assert model is None
+            assert lifecycle_lease is not None
+            assert cleanup_complete
+            assert test_registry.get(hostname) is None
+            assert connection_tracker.get(hostname) == 0
+            assert circuit_breaker_registry.get(hostname) is None
+
+        mock_provisioner.cleanup_stale_node.side_effect = cleanup
+        mock_provisioner.provision.side_effect = provision
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+
+    def test_retry_cleanup_failure_does_not_start_provisioning(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(_make_node(node_id="gpu01", status=NodeStatus.FAILED))
+        lease = MagicMock(hostname="gpu01")
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = lease
+        mock_provisioner.cleanup_stale_node.side_effect = RuntimeError("etcd down")
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 503
+        mock_provisioner.fire_background.assert_not_called()
+        mock_provisioner.provision.assert_not_awaited()
+        lease.release.assert_called_once()
 
 
 # -- QUADS re-validation tests (NODES-05) --

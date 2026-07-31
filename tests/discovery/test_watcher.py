@@ -540,6 +540,47 @@ def test_event_between_snapshot_and_watch_is_applied() -> None:
     assert client.start_revisions[:2] == [11, 12]
 
 
+def test_late_cleanup_delete_does_not_drain_new_registration() -> None:
+    """A retry's delayed cleanup DELETE cannot drain its newer HEALTHY PUT."""
+    failed = _node("gpu01", status=NodeStatus.FAILED)
+    healthy = _node("gpu01", "gpu01:8000", status=NodeStatus.HEALTHY)
+    registration_then_late_delete = _Batch(
+        (
+            _put(healthy, 3),
+            _delete("gpu01", 2),
+        ),
+        revision=3,
+    )
+    events = _FakeStream((registration_then_late_delete,))
+    settled = _FakeStream(block_after=True)
+    legacy_events = _LegacyStream(
+        tuple(_legacy_event(event) for event in registration_then_late_delete.events)
+    )
+    legacy_settled = _LegacyStream(block_after=True)
+    client = _FakeEtcdClient(
+        (_snapshot(1, (failed, 1)),),
+        (events, settled),
+        legacy_watches=(legacy_events, legacy_settled),
+    )
+    registry = NodeRegistry()
+    watcher, thread = _start_watcher(client, registry)
+
+    assert _wait_for_stream(settled, legacy_settled)
+    _stop_watcher(
+        watcher,
+        thread,
+        events,
+        settled,
+        legacy_events,
+        legacy_settled,
+    )
+
+    current = registry.get("gpu01")
+    assert current is not None
+    assert current.status == NodeStatus.HEALTHY
+    assert current.endpoint == "gpu01:8000"
+
+
 def test_reconcile_preserves_local_liveness_status() -> None:
     """Snapshot data refresh does not resurrect a locally unhealthy node."""
     registry = NodeRegistry()

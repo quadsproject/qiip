@@ -25,6 +25,10 @@ from inference_proxy.discovery.etcd_client import EtcdClient
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_to_etcd
 from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.provisioning.host_lifecycle import (
+    HostLifecycleCoordinator,
+    HostLifecycleLease,
+)
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -34,6 +38,7 @@ from inference_proxy.provisioning.ssh_client import (
 from inference_proxy.provisioning.state import ProvisioningState, ProvisioningStep
 from inference_proxy.redfish.client import RedfishClient
 from inference_proxy.redfish.errors import RedfishError
+from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 from inference_proxy.routing.connection_tracker import ConnectionTracker
 
 if TYPE_CHECKING:
@@ -76,16 +81,20 @@ class NodeProvisioner:
         settings: ProvisioningSettings,
         registry: NodeRegistry | None = None,
         connection_tracker: ConnectionTracker | None = None,
+        circuit_breaker_registry: CircuitBreakerRegistry | None = None,
         redfish_client: RedfishClient | None = None,
         log_buffer: ProvisioningLogBuffer | None = None,
+        lifecycle_coordinator: HostLifecycleCoordinator | None = None,
     ) -> None:
         self._ssh_client = ssh_client
         self._etcd_client = etcd_client
         self._settings = settings
         self._registry = registry
         self._tracker = connection_tracker
+        self._cb_registry = circuit_breaker_registry
         self._redfish_client = redfish_client
         self._log_buffer = log_buffer or ProvisioningLogBuffer()
+        self._lifecycle = lifecycle_coordinator or HostLifecycleCoordinator()
         self._background_tasks: set[asyncio.Task[None]] = set()
 
     @property
@@ -243,7 +252,60 @@ class NodeProvisioner:
         if failures:
             raise PreflightError(hostname, failures)
 
+    async def try_reserve_host(self, hostname: str) -> HostLifecycleLease | None:
+        """Reserve *hostname* without waiting for another lifecycle operation."""
+        return await self._lifecycle.try_acquire(hostname)
+
+    def host_operation_in_progress(self, hostname: str) -> bool:
+        """Return whether provisioning or teardown owns or awaits *hostname*."""
+        return self._lifecycle.is_busy(hostname)
+
+    def connection_count(self, hostname: str) -> int:
+        """Return active requests for *hostname*, or zero without a tracker."""
+        if self._tracker is None:
+            return 0
+        return self._tracker.get(hostname)
+
+    async def cleanup_stale_node(self, hostname: str) -> None:
+        """Delete stale discovery and local routing state before a retry.
+
+        The etcd delete completes before local state is removed and before the
+        caller starts provisioning. A replacement registration therefore has
+        a newer mod revision, allowing the revision-aware watcher to reject a
+        delayed cleanup DELETE.
+        """
+        await asyncio.to_thread(
+            self._etcd_client.delete,
+            f"{self._etcd_client.prefix}{hostname}",
+        )
+        if self._registry is not None:
+            self._registry.remove(hostname)
+        if self._tracker is not None:
+            self._tracker.remove(hostname)
+        if self._cb_registry is not None:
+            self._cb_registry.remove(hostname)
+
     async def provision(
+        self,
+        hostname: str,
+        *,
+        managed: bool = True,
+        model: str | None = None,
+        lifecycle_lease: HostLifecycleLease | None = None,
+    ) -> None:
+        """Provision *hostname* under the shared host lifecycle coordinator."""
+        lease = lifecycle_lease
+        if lease is None:
+            lease = await self._lifecycle.acquire(hostname)
+        elif not lease.belongs_to(self._lifecycle, hostname):
+            raise ValueError("lifecycle lease does not own this host")
+
+        try:
+            await self._provision(hostname, managed=managed, model=model)
+        finally:
+            lease.release()
+
+    async def _provision(
         self, hostname: str, *, managed: bool = True, model: str | None = None
     ) -> None:
         """Run full provisioning sequence on *hostname*.
@@ -525,7 +587,26 @@ class NodeProvisioner:
                 return
             await asyncio.sleep(1)
 
-    async def teardown(self, hostname: str, *, force: bool = False) -> None:
+    async def teardown(
+        self,
+        hostname: str,
+        *,
+        force: bool = False,
+        lifecycle_lease: HostLifecycleLease | None = None,
+    ) -> None:
+        """Teardown *hostname* under the shared host lifecycle coordinator."""
+        lease = lifecycle_lease
+        if lease is None:
+            lease = await self._lifecycle.acquire(hostname)
+        elif not lease.belongs_to(self._lifecycle, hostname):
+            raise ValueError("lifecycle lease does not own this host")
+
+        try:
+            await self._teardown(hostname, force=force)
+        finally:
+            lease.release()
+
+    async def _teardown(self, hostname: str, *, force: bool = False) -> None:
         """Teardown a provisioned node.
 
         Graceful: drain -> kill vllm -> deregister.

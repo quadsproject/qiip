@@ -25,6 +25,7 @@ from inference_proxy.provisioning.ssh_client import (
     SSHConnectionError,
 )
 from inference_proxy.redfish.errors import RedfishError
+from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 
 
 def _make_provisioner(
@@ -34,6 +35,7 @@ def _make_provisioner(
     settings: ProvisioningSettings | None = None,
     registry: MagicMock | None = None,
     connection_tracker: MagicMock | None = None,
+    circuit_breaker_registry: CircuitBreakerRegistry | MagicMock | None = None,
     redfish_client: MagicMock | None = None,
 ) -> NodeProvisioner:
     """Build a NodeProvisioner with mock dependencies."""
@@ -44,6 +46,7 @@ def _make_provisioner(
         or ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0),
         registry=registry,
         connection_tracker=connection_tracker,
+        circuit_breaker_registry=circuit_breaker_registry,
         redfish_client=redfish_client,
     )
 

@@ -155,6 +155,13 @@ def app(
     mock_provisioner = MagicMock()
     mock_provisioner._etcd_client = MagicMock()
     mock_provisioner.list_tasks_raw = AsyncMock(return_value=[])
+    mock_provisioner.try_reserve_host = AsyncMock(
+        side_effect=lambda hostname: MagicMock(hostname=hostname)
+    )
+    mock_provisioner.connection_count = MagicMock(return_value=0)
+    mock_provisioner.cleanup_stale_node = AsyncMock()
+    mock_provisioner.provision = AsyncMock()
+    mock_provisioner.teardown = AsyncMock()
     application.state.provisioner = mock_provisioner
     application.dependency_overrides[get_provisioner] = lambda: mock_provisioner
     mock_runner = MagicMock(spec=LLMFitRunner)

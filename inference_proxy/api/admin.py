@@ -51,6 +51,7 @@ from inference_proxy.models.admin import (
     TaskStatusResponse,
     TeardownResponse,
 )
+from inference_proxy.models.node import NodeStatus
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -74,6 +75,21 @@ admin_router = APIRouter(prefix="/admin", tags=["admin"])
 # D-08: module-level set to prevent duplicate setup requests
 # ponytail: single-worker-only dedup guard; move to etcd CAS if workers > 1
 pending_hosts: set[str] = set()
+
+_SETUP_REJECTED_STATUSES = frozenset(
+    {
+        NodeStatus.HEALTHY,
+        NodeStatus.UNHEALTHY,
+    }
+)
+_SETUP_RETRYABLE_STATUSES = frozenset(
+    {
+        NodeStatus.PROVISIONING,
+        NodeStatus.FAILED,
+        NodeStatus.UNKNOWN,
+        NodeStatus.DRAINING,
+    }
+)
 
 # Regex from SetupRequest.validate_hostname — reused for path-parameter validation
 _HOSTNAME_RE = re.compile(r"[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?")
@@ -150,6 +166,7 @@ async def list_downloads(
 @admin_router.post("/nodes/setup", status_code=202)
 async def setup_node(
     body: SetupRequest,
+    registry: NodeRegistry = Depends(get_registry),
     provisioner: NodeProvisioner = Depends(get_provisioner),
     quads_client: QUADSClient | None = Depends(get_quads_client),
 ) -> SetupResponse:
@@ -166,11 +183,64 @@ async def setup_node(
             detail=f"Setup already in progress for '{hostname}'",
         )
 
-    # Add before any await to close TOCTOU window (CR-01)
-    pending_hosts.add(hostname)
+    lease = await provisioner.try_reserve_host(hostname)
+    if lease is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Host lifecycle operation already in progress for '{hostname}'; "
+                "wait for it to finish before retrying setup"
+            ),
+        )
 
-    # D-10/D-11: live QUADS re-validation (skip for unmanaged nodes)
+    transferred = False
     try:
+        # A setup could have passed the first check before waiting on the host
+        # reservation. Re-check under exclusive lifecycle ownership.
+        if hostname in pending_hosts:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Setup already in progress for '{hostname}'",
+            )
+
+        node = registry.get(hostname)
+        if node is not None and node.status in _SETUP_REJECTED_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Host '{hostname}' is {node.status.value}; tear it down "
+                    "before starting setup"
+                ),
+            )
+
+        if node is not None and node.status == NodeStatus.DRAINING:
+            active_connections = provisioner.connection_count(hostname)
+            if active_connections:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Host '{hostname}' is draining with "
+                        f"{active_connections} active request(s); wait for "
+                        "requests to finish or complete teardown"
+                    ),
+                )
+
+        if node is not None and node.status in _SETUP_RETRYABLE_STATUSES:
+            try:
+                await provisioner.cleanup_stale_node(hostname)
+            except Exception as exc:
+                logger.warning(
+                    "setup_stale_cleanup_failed",
+                    hostname=hostname,
+                    status=node.status.value,
+                    exc_info=True,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Could not clean stale state for '{hostname}'",
+                ) from exc
+
+        # D-10/D-11: live QUADS re-validation (skip for unmanaged nodes).
         if body.managed and quads_client is not None:
             try:
                 available = await quads_client.get_available()
@@ -183,24 +253,46 @@ async def setup_node(
                     status_code=400,
                     detail=f"Host '{hostname}' is not available in QUADS",
                 )
-    except Exception:
-        pending_hosts.discard(hostname)
-        raise
 
-    async def _provision_and_cleanup() -> None:
+        # The lease already closes the async TOCTOU window. Keep the legacy
+        # single-worker guard for clear duplicate-setup responses.
+        pending_hosts.add(hostname)
+
+        async def _provision_and_cleanup() -> None:
+            try:
+                await provisioner.provision(
+                    hostname,
+                    managed=body.managed,
+                    model=body.model,
+                    lifecycle_lease=lease,
+                )
+            finally:
+                pending_hosts.discard(hostname)
+                # NodeProvisioner owns the lease after transfer. This
+                # idempotent release also covers test doubles and cancellation
+                # during wrapper cleanup.
+                lease.release()
+
+        background = _provision_and_cleanup()
         try:
-            await provisioner.provision(
-                hostname, managed=body.managed, model=body.model
-            )
-        finally:
+            task = provisioner.fire_background(background)
+        except Exception:
+            background.close()
             pending_hosts.discard(hostname)
+            raise
 
-    try:
-        provisioner.fire_background(_provision_and_cleanup())
-    except Exception:
-        pending_hosts.discard(hostname)
-        raise
-    return SetupResponse(task_id=hostname)
+        def _setup_done(_task: object) -> None:
+            # A task cancelled before its coroutine starts never reaches the
+            # wrapper's finally block.
+            pending_hosts.discard(hostname)
+            lease.release()
+
+        task.add_done_callback(_setup_done)
+        transferred = True
+        return SetupResponse(task_id=hostname)
+    finally:
+        if not transferred:
+            lease.release()
 
 
 @admin_router.get("/provisioning/tasks")
@@ -255,10 +347,40 @@ async def teardown_node(
 ) -> TeardownResponse:
     """Trigger teardown of a node (runs in background)."""
     node_id = canonical_hostname(node_id)
-    if registry.get(node_id) is None:
-        raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
-    provisioner.fire_background(provisioner.teardown(node_id, force=force))
-    return TeardownResponse(task_id=node_id)
+    lease = await provisioner.try_reserve_host(node_id)
+    if lease is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Host lifecycle operation already in progress for '{node_id}'",
+        )
+
+    transferred = False
+    try:
+        if registry.get(node_id) is None:
+            raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+        async def _teardown_and_cleanup() -> None:
+            try:
+                await provisioner.teardown(
+                    node_id,
+                    force=force,
+                    lifecycle_lease=lease,
+                )
+            finally:
+                lease.release()
+
+        background = _teardown_and_cleanup()
+        try:
+            task = provisioner.fire_background(background)
+        except Exception:
+            background.close()
+            raise
+        task.add_done_callback(lambda _task: lease.release())
+        transferred = True
+        return TeardownResponse(task_id=node_id)
+    finally:
+        if not transferred:
+            lease.release()
 
 
 @admin_router.get("/quads/status")

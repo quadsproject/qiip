@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
+from inference_proxy.config.settings import ProvisioningSettings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.provisioning.provisioner import NodeProvisioner
@@ -34,8 +38,16 @@ def _enforcer(
         registry.add(n)
 
     provisioner = MagicMock(spec=NodeProvisioner)
-    provisioner.teardown = MagicMock(return_value=AsyncMock()())
-    provisioner.fire_background = MagicMock()
+    provisioner.try_reserve_host = AsyncMock(
+        side_effect=lambda hostname: MagicMock(hostname=hostname)
+    )
+    provisioner.teardown = AsyncMock()
+
+    def close_background(coro):
+        coro.close()
+        return MagicMock()
+
+    provisioner.fire_background = MagicMock(side_effect=close_background)
 
     enforcer = ScheduleEnforcer(
         client=client,
@@ -92,6 +104,19 @@ class TestEnforceOnce:
         await enforcer._enforce_once()
 
         provisioner.fire_background.assert_called_once()
+
+    async def test_skips_host_with_lifecycle_operation_in_progress(self) -> None:
+        enforcer, _, provisioner = _enforcer(
+            available=[],
+            nodes=[_node("gpu01")],
+        )
+        provisioner.try_reserve_host.side_effect = None
+        provisioner.try_reserve_host.return_value = None
+
+        await enforcer._enforce_once()
+
+        provisioner.fire_background.assert_not_called()
+        assert "gpu01" not in enforcer.teardown_initiated
 
     async def test_multiple_nodes_mixed(self) -> None:
         enforcer, _, provisioner = _enforcer(
@@ -151,3 +176,65 @@ class TestPollerFailure:
         await enforcer._enforce_once()
 
         provisioner.fire_background.assert_not_called()
+
+
+async def test_schedule_enforcer_uses_same_host_lifecycle_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enforcement cannot enter teardown while provisioning owns the host."""
+    registry = NodeRegistry()
+    registry.add(_node("gpu01"))
+    client = AsyncMock(spec=QUADSClient)
+    client.get_available.return_value = []
+    etcd = MagicMock()
+    etcd.prefix = "/nodes/"
+    provisioner = NodeProvisioner(
+        ssh_client=MagicMock(),
+        etcd_client=etcd,
+        settings=ProvisioningSettings(),
+        registry=registry,
+    )
+    provision_entered = asyncio.Event()
+    release_provision = asyncio.Event()
+    teardown_entered = asyncio.Event()
+
+    async def provision_body(
+        hostname: str,
+        *,
+        managed: bool = True,
+        model: str | None = None,
+    ) -> None:
+        assert hostname == "gpu01"
+        provision_entered.set()
+        await release_provision.wait()
+
+    async def teardown_body(hostname: str, *, force: bool = False) -> None:
+        assert hostname == "gpu01"
+        teardown_entered.set()
+
+    monkeypatch.setattr(provisioner, "_provision", provision_body)
+    monkeypatch.setattr(provisioner, "_teardown", teardown_body)
+    fire_background = MagicMock()
+    monkeypatch.setattr(provisioner, "fire_background", fire_background)
+    enforcer = ScheduleEnforcer(
+        client=client,
+        registry=registry,
+        provisioner=provisioner,
+    )
+
+    provision_task = asyncio.create_task(provisioner.provision("gpu01"))
+    assert await asyncio.wait_for(provision_entered.wait(), timeout=1)
+
+    await enforcer._enforce_once()
+    fire_background.assert_not_called()
+    assert not teardown_entered.is_set()
+    assert "gpu01" not in enforcer.teardown_initiated
+
+    release_provision.set()
+    await asyncio.wait_for(provision_task, timeout=1)
+    await enforcer._enforce_once()
+    teardown_coro = fire_background.call_args.args[0]
+    await asyncio.wait_for(teardown_coro, timeout=1)
+
+    assert teardown_entered.is_set()
+    assert "gpu01" in enforcer.teardown_initiated

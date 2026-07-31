@@ -16,6 +16,7 @@ import structlog
 
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import NodeStatus
+from inference_proxy.provisioning.host_lifecycle import HostLifecycleLease
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.quads.client import QUADSClient
 
@@ -93,6 +94,13 @@ class ScheduleEnforcer:
                 continue
             if node.node_id in self._teardown_initiated:
                 continue
+            lease = await self._provisioner.try_reserve_host(node.node_id)
+            if lease is None:
+                logger.debug(
+                    "schedule_enforcer_host_busy",
+                    hostname=node.node_id,
+                )
+                continue
             logger.info(
                 "schedule_enforcer_teardown",
                 hostname=node.node_id,
@@ -100,7 +108,35 @@ class ScheduleEnforcer:
                 lookahead_hours=self._lookahead_hours,
             )
             self._teardown_initiated.add(node.node_id)
-            self._provisioner.fire_background(self._provisioner.teardown(node.node_id))
+
+            async def _teardown(
+                hostname: str = node.node_id,
+                lifecycle_lease: HostLifecycleLease = lease,
+            ) -> None:
+                try:
+                    await self._provisioner.teardown(
+                        hostname,
+                        lifecycle_lease=lifecycle_lease,
+                    )
+                finally:
+                    lifecycle_lease.release()
+
+            background = _teardown()
+            try:
+                task = self._provisioner.fire_background(background)
+
+                def _release_lease(
+                    _task: asyncio.Task[None],
+                    lifecycle_lease: HostLifecycleLease = lease,
+                ) -> None:
+                    lifecycle_lease.release()
+
+                task.add_done_callback(_release_lease)
+            except Exception:
+                background.close()
+                self._teardown_initiated.discard(node.node_id)
+                lease.release()
+                raise
 
     def _prune_completed(self) -> None:
         """Remove hostnames from tracking once they leave the registry."""
