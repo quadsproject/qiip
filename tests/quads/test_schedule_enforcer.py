@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,6 +11,7 @@ import pytest
 
 from inference_proxy.config.settings import ProvisioningSettings
 from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.discovery.serializer import node_from_etcd
 from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.provisioning.provisioner import NodeProvisioner
@@ -23,13 +25,19 @@ _ENDPOINT_POLICY = EndpointPolicy.from_values(
 )
 
 
-def _node(hostname: str, status: NodeStatus = NodeStatus.HEALTHY) -> Node:
+def _node(
+    hostname: str,
+    status: NodeStatus = NodeStatus.HEALTHY,
+    *,
+    managed: bool = True,
+) -> Node:
     return Node(
         node_id=hostname,
         endpoint=f"{hostname}:8000",
         status=status,
         model="meta-llama/Llama-3",
         last_heartbeat=datetime.now(tz=UTC),
+        managed=managed,
     )
 
 
@@ -111,6 +119,45 @@ class TestEnforceOnce:
         await enforcer._enforce_once()
 
         provisioner.fire_background.assert_called_once()
+
+    async def test_schedule_enforcer_skips_explicitly_unmanaged_node(self) -> None:
+        enforcer, _, provisioner = _enforcer(
+            available=[],
+            nodes=[_node("gpu01", managed=False)],
+        )
+
+        await enforcer._enforce_once()
+
+        provisioner.try_reserve_host.assert_not_awaited()
+        provisioner.fire_background.assert_not_called()
+        provisioner.teardown.assert_not_awaited()
+
+    async def test_etcd_node_without_managed_is_never_enforced(self) -> None:
+        payload = json.dumps(
+            {
+                "endpoint": "gpu01:8000",
+                "status": "healthy",
+                "model": "meta-llama/Llama-3",
+            }
+        ).encode()
+        node = node_from_etcd(
+            "/nodes/gpu01",
+            payload,
+            "/nodes/",
+            endpoint_policy=_ENDPOINT_POLICY,
+        )
+        assert node is not None
+
+        enforcer, registry, provisioner = _enforcer(available=[])
+        registry.add(node)
+
+        await enforcer._enforce_once()
+
+        assert registry.get("gpu01") is node
+        assert node.managed is False
+        provisioner.try_reserve_host.assert_not_awaited()
+        provisioner.fire_background.assert_not_called()
+        provisioner.teardown.assert_not_awaited()
 
     async def test_skips_host_with_lifecycle_operation_in_progress(self) -> None:
         enforcer, _, provisioner = _enforcer(

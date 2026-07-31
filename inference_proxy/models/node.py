@@ -52,6 +52,8 @@ class Node(BaseModel):
         last_heartbeat: Timestamp of the last health check response.
         capabilities: Hardware and serving capabilities.
         active_connections: Number of active inference requests.
+        managed: Whether the proxy owns the node lifecycle. Externally
+            registered nodes must opt in explicitly.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -63,4 +65,4 @@ class Node(BaseModel):
     last_heartbeat: datetime | None = None
     capabilities: NodeCapabilities = Field(default_factory=NodeCapabilities)
     active_connections: int = 0
-    managed: bool = True
+    managed: bool = False

@@ -23,6 +23,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pytest_httpx import HTTPXMock
+from structlog.testing import capture_logs
 
 from inference_proxy.config.dependencies import (
     get_catalog_service,
@@ -175,6 +176,48 @@ class TestAdminNodesPopulated:
         assert len(data) == 3
         statuses = {node["status"] for node in data}
         assert statuses == {"healthy", "unhealthy", "draining"}
+
+    def test_admin_nodes_falls_back_when_task_etcd_unavailable(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(
+            _make_node(node_id="gpu01", status=NodeStatus.FAILED, managed=True)
+        )
+        mock_provisioner.list_tasks_raw.side_effect = RuntimeError("etcd unavailable")
+
+        with capture_logs() as logs:
+            response = client.get("/admin/nodes")
+
+        assert response.status_code == 200
+        assert response.headers["X-Inference-Proxy-Data-Degraded"] == (
+            "provisioning-tasks"
+        )
+        assert response.json() == [
+            {
+                "node_id": "gpu01",
+                "endpoint": "10.0.1.100:8000",
+                "model": "llama-3",
+                "status": "failed",
+                "active_connections": 0,
+                "circuit_breaker_state": "closed",
+                "state": "failed",
+                "actions": ["setup", "teardown"],
+                "gpu_vendor": None,
+                "gpu_model": None,
+                "gpu_count": None,
+                "managed": True,
+                "failed_step": None,
+                "error": None,
+            }
+        ]
+        assert any(
+            log.get("event") == "provisioning_task_list_unavailable"
+            and log.get("log_level") == "warning"
+            for log in logs
+        )
 
 
 class TestAdminNodesEmpty:

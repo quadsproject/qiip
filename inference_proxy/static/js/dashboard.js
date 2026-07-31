@@ -156,8 +156,7 @@ async function refreshDashboard() {
       renderQuadsStatus(await quadsResp.json());
     }
 
-    warningEl.textContent = "";
-    warningEl.className = "";
+    renderTaskDataWarning(nodesResp, warningEl);
 
     if (nodes.length === 0) {
       countEl.textContent = "0 nodes";
@@ -311,6 +310,18 @@ async function refreshDashboard() {
     warningEl.textContent = "Update failed — retrying...";
     warningEl.className = "poll-warning";
   }
+}
+
+function renderTaskDataWarning(nodesResponse, warningEl) {
+  const degraded = nodesResponse.headers.get("X-Inference-Proxy-Data-Degraded");
+  if (degraded === "provisioning-tasks") {
+    warningEl.textContent =
+      "Provisioning task details are unavailable; failed step and error data may be incomplete.";
+    warningEl.className = "poll-warning";
+    return;
+  }
+  warningEl.textContent = "";
+  warningEl.className = "";
 }
 
 document.addEventListener("DOMContentLoaded", function () {

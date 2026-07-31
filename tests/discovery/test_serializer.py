@@ -72,6 +72,43 @@ class TestNodeFromEtcdMinimalJson:
         assert node.capabilities.max_tokens == 4096
         assert node.capabilities.gpu_memory == ""
         assert node.active_connections == 0
+        assert node.managed is False
+
+
+class TestNodeFromEtcdOwnership:
+    """Ownership is opt-in for external etcd registrations."""
+
+    def test_etcd_node_without_managed_defaults_unmanaged(self) -> None:
+        value = json.dumps({"endpoint": "10.0.1.100:8000"}).encode()
+
+        node = node_from_etcd(
+            "/nodes/external",
+            value,
+            "/nodes/",
+            endpoint_policy=_ENDPOINT_POLICY,
+        )
+
+        assert node is not None
+        assert node.managed is False
+
+    def test_etcd_explicit_managed_value_is_preserved(self) -> None:
+        for managed in (True, False):
+            original = Node(
+                node_id=f"managed-{managed}",
+                endpoint="10.0.1.100:8000",
+                managed=managed,
+            )
+
+            key, value = node_to_etcd(original, "/nodes/")
+            restored = node_from_etcd(
+                key,
+                value,
+                "/nodes/",
+                endpoint_policy=_ENDPOINT_POLICY,
+            )
+
+            assert restored is not None
+            assert restored.managed is managed
 
 
 def test_node_from_etcd_normalizes_schemeless_endpoint() -> None:

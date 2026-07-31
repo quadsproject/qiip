@@ -29,7 +29,7 @@ var ACTION_CONFIG = {
   },
   retry: {
     method: "POST", url: function () { return "/admin/nodes/setup"; },
-    body: function (id) { var b = { hostname: id }; var m = getSelectedModel(); if (m) b.model = m; return b; }, confirm: false,
+    body: function (id, node) { var b = { hostname: id, managed: node ? node.managed !== false : true }; var m = getSelectedModel(); if (m) b.model = m; return b; }, confirm: false,
     label: "Retry", css: "btn-retry",
     successMsg: function (id) { return "Retry started for " + id; },
   },
@@ -49,14 +49,14 @@ var ACTION_CONFIG = {
   },
 };
 
-async function handleAction(action, nodeId) {
+async function handleAction(action, nodeId, node) {
   var config = ACTION_CONFIG[action];
   if (!config) return;
   if (config.confirm && !window.confirm(config.confirmMsg(nodeId))) return;
   var options = { method: config.method };
   if (config.body) {
     options.headers = { "Content-Type": "application/json" };
-    options.body = JSON.stringify(config.body(nodeId));
+    options.body = JSON.stringify(config.body(nodeId, node));
   }
   try {
     var resp = await fetch(config.url(nodeId), options);
@@ -75,7 +75,7 @@ async function handleAction(action, nodeId) {
 
 var ALL_ACTIONS = ["setup", "teardown", "retry", "cancel", "force_teardown"];
 
-function createActionsDropdown(nodeId, enabledActions) {
+function createActionsDropdown(nodeId, enabledActions, node) {
   var group = document.createElement("div");
   group.className = "action-group";
 
@@ -101,7 +101,7 @@ function createActionsDropdown(nodeId, enabledActions) {
         btn.addEventListener("click", async function () {
           btn.disabled = true;
           menu.classList.remove("open");
-          try { await handleAction(action, nodeId); } finally { btn.disabled = false; }
+          try { await handleAction(action, nodeId, node); } finally { btn.disabled = false; }
         });
       }
       menu.appendChild(btn);
@@ -182,7 +182,7 @@ async function refreshDetail() {
       if (catalogModels.length === 0) {
         enabledActions = enabledActions.filter(function (a) { return a !== "setup"; });
       }
-      tdAc.appendChild(createActionsDropdown(node.node_id, enabledActions));
+      tdAc.appendChild(createActionsDropdown(node.node_id, enabledActions, node));
       tr.appendChild(tdAc);
 
       infoBody.appendChild(tr);
@@ -225,7 +225,15 @@ async function refreshDetail() {
       }
     }
 
-    lastUpdatedEl.textContent = "Updated " + new Date().toLocaleTimeString();
+    var degraded = nodesResp.headers.get("X-Inference-Proxy-Data-Degraded");
+    if (degraded === "provisioning-tasks") {
+      lastUpdatedEl.textContent = "Updated " + new Date().toLocaleTimeString() +
+        " — task/error details unavailable";
+      lastUpdatedEl.className = "poll-warning";
+    } else {
+      lastUpdatedEl.textContent = "Updated " + new Date().toLocaleTimeString();
+      lastUpdatedEl.className = "last-updated";
+    }
   } catch (err) {
     lastUpdatedEl.textContent = "Update failed — retrying...";
   }

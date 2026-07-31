@@ -205,3 +205,83 @@ class TestConnectionError:
             quads = QUADSClient(client, QUADS_URL)
             with pytest.raises(QUADSConnectionError):
                 await quads.get_available()
+
+
+class TestResponseErrors:
+    async def test_non_json_success_raises_connection_error(
+        self,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        httpx_mock.add_response(
+            url=f"{QUADS_URL}/api/v3/hosts",
+            text="<html>login required</html>",
+            status_code=200,
+        )
+
+        async with httpx.AsyncClient() as client:
+            quads = QUADSClient(client, QUADS_URL)
+            with pytest.raises(QUADSConnectionError) as caught:
+                await quads.get_hosts()
+
+        assert caught.value.__cause__ is not None
+
+    @pytest.mark.parametrize(
+        ("path", "payload", "method_name"),
+        [
+            ("/api/v3/hosts", {"name": "gpu01"}, "get_hosts"),
+            (
+                "/api/v3/hosts",
+                [
+                    {
+                        "processors": [
+                            {
+                                "processor_type": "GPU",
+                                "vendor": "NVIDIA",
+                                "product": "A100",
+                            }
+                        ]
+                    }
+                ],
+                "get_hosts",
+            ),
+            ("/api/v3/available", [42], "get_available"),
+        ],
+    )
+    async def test_invalid_success_shape_raises_connection_error(
+        self,
+        httpx_mock: HTTPXMock,
+        path: str,
+        payload: object,
+        method_name: str,
+    ) -> None:
+        httpx_mock.add_response(url=f"{QUADS_URL}{path}", json=payload)
+
+        async with httpx.AsyncClient() as client:
+            quads = QUADSClient(client, QUADS_URL)
+            method = getattr(quads, method_name)
+            with pytest.raises(QUADSConnectionError, match="invalid QUADS response"):
+                await method()
+
+    @pytest.mark.parametrize("error_type", [RuntimeError, TypeError, ValueError])
+    async def test_programming_error_is_not_wrapped(
+        self,
+        httpx_mock: HTTPXMock,
+        monkeypatch: pytest.MonkeyPatch,
+        error_type: type[Exception],
+    ) -> None:
+        httpx_mock.add_response(
+            url=f"{QUADS_URL}/api/v3/available",
+            json=["gpu01"],
+        )
+
+        def broken_normalizer(_hostname: str) -> str:
+            raise error_type("programming defect")
+
+        monkeypatch.setattr(
+            "inference_proxy.quads.client.canonical_hostname",
+            broken_normalizer,
+        )
+        async with httpx.AsyncClient() as client:
+            quads = QUADSClient(client, QUADS_URL)
+            with pytest.raises(error_type, match="programming defect"):
+                await quads.get_available()

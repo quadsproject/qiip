@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
+import pytest
+
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.admin import TaskStatusResponse
 from inference_proxy.models.node import Node, NodeStatus
@@ -33,8 +35,16 @@ def _node(
     endpoint: str = "10.0.1.100:8000",
     status: NodeStatus = NodeStatus.HEALTHY,
     model: str = "llama-3",
+    *,
+    managed: bool = True,
 ) -> Node:
-    return Node(node_id=node_id, endpoint=endpoint, status=status, model=model)
+    return Node(
+        node_id=node_id,
+        endpoint=endpoint,
+        status=status,
+        model=model,
+        managed=managed,
+    )
 
 
 def _poller(
@@ -146,16 +156,34 @@ class TestEtcdNodeStates:
 class TestFiltering:
     """Exclusion rules for the unified list."""
 
-    def test_etcd_node_not_in_quads_excluded(self) -> None:
-        """D-03: etcd node without matching QUADS host is excluded."""
+    @pytest.mark.parametrize("managed", [True, False])
+    def test_registered_node_missing_from_quads_inventory_remains_visible(
+        self,
+        managed: bool,
+    ) -> None:
+        """QUADS enriches registry nodes but never controls their visibility."""
         registry = NodeRegistry()
-        registry.add(_node("orphan-node"))
+        registry.add(_node("orphan-node", managed=managed))
         poller = _poller(hosts=[_host("gpu01")], available=["gpu01"])
         svc = _service(registry=registry, poller=poller)
 
         nodes = svc.get_unified_nodes()
-        ids = [n.node_id for n in nodes]
-        assert "orphan-node" not in ids
+        by_id = {node.node_id: node for node in nodes}
+        assert by_id["orphan-node"].managed is managed
+
+    def test_registered_nodes_visible_when_quads_cache_empty(self) -> None:
+        registry = NodeRegistry()
+        registry.add(_node("managed-node", managed=True))
+        registry.add(_node("external-node", managed=False))
+        svc = _service(registry=registry, poller=_poller())
+
+        nodes = svc.get_unified_nodes()
+
+        assert {node.node_id: node.managed for node in nodes} == {
+            "external-node": False,
+            "managed-node": True,
+        }
+        assert all(node.gpu_vendor is None for node in nodes)
 
     def test_quads_host_not_available_not_in_etcd_excluded(self) -> None:
         """QUADS host that is neither available nor in etcd is skipped."""

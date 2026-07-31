@@ -13,7 +13,7 @@ import re
 from collections.abc import AsyncIterator
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
@@ -72,6 +72,9 @@ from inference_proxy.services.unified_nodes import UnifiedNodeService
 
 logger = structlog.get_logger()
 
+_DEGRADED_DATA_HEADER = "X-Inference-Proxy-Data-Degraded"
+_PROVISIONING_TASKS_DEGRADED = "provisioning-tasks"
+
 admin_router = APIRouter(
     prefix="/admin",
     tags=["admin"],
@@ -111,11 +114,17 @@ def _validated_hostname(hostname: str) -> str:
 
 @admin_router.get("/nodes")
 async def list_nodes(
+    response: Response,
     service: UnifiedNodeService = Depends(get_unified_node_service),
     provisioner: NodeProvisioner = Depends(get_provisioner),
 ) -> list[AdminNodeResponse]:
     """Return unified node list merging QUADS hosts with etcd nodes."""
-    results = await provisioner.list_tasks_raw()
+    try:
+        results = await provisioner.list_tasks_raw()
+    except Exception:
+        logger.warning("provisioning_task_list_unavailable", exc_info=True)
+        response.headers[_DEGRADED_DATA_HEADER] = _PROVISIONING_TASKS_DEGRADED
+        results = []
     task_map: dict[str, TaskStatusResponse] = {}
     for value_bytes, _metadata in results:
         try:

@@ -38,6 +38,7 @@ class TestNodeMinimalCreation:
         assert node.model == ""
         assert node.last_heartbeat is None
         assert node.active_connections == 0
+        assert node.managed is False
 
 
 class TestNodeFullCreation:

@@ -10,11 +10,13 @@ Per D-09: all API errors surface as QUADSConnectionError.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any
 
 import httpx
 import structlog
+from pydantic import ValidationError
 
 from inference_proxy.models.quads import QUADSHost
 
@@ -23,6 +25,10 @@ logger = structlog.get_logger()
 
 class QUADSConnectionError(Exception):
     """Raised when the QUADS API is unreachable or returns an error."""
+
+
+class _InvalidQUADSResponseError(ValueError):
+    """Raised only for response-shape faults detected at the API boundary."""
 
 
 def canonical_hostname(raw: str) -> str:
@@ -49,25 +55,59 @@ class QUADSClient:
         are returned (QUADS-03).  GPU vendor and model are taken from
         the first GPU processor entry.
         """
-        data = await self._get("/api/v3/hosts")
+        path = "/api/v3/hosts"
+        data = await self._get(path)
 
-        hosts: list[QUADSHost] = []
-        for raw in data:
-            if raw.get("broken") or raw.get("retired"):
-                continue
-            gpus = [
-                p for p in raw.get("processors", []) if p.get("processor_type") == "GPU"
-            ]
-            if not gpus:
-                continue
-            hosts.append(
-                QUADSHost(
-                    hostname=canonical_hostname(raw["name"]),
-                    gpu_vendor=gpus[0].get("vendor", ""),
-                    gpu_model=gpus[0].get("product", ""),
-                    gpu_count=len(gpus),
+        try:
+            if not isinstance(data, list):
+                raise _InvalidQUADSResponseError("host inventory must be a list")
+
+            hosts: list[QUADSHost] = []
+            for raw in data:
+                if not isinstance(raw, dict):
+                    raise _InvalidQUADSResponseError(
+                        "host inventory entries must be objects"
+                    )
+                if raw.get("broken") or raw.get("retired"):
+                    continue
+
+                processors = raw.get("processors", [])
+                if not isinstance(processors, list) or not all(
+                    isinstance(processor, dict) for processor in processors
+                ):
+                    raise _InvalidQUADSResponseError(
+                        "host processors must be a list of objects"
+                    )
+                gpus = [
+                    processor
+                    for processor in processors
+                    if processor.get("processor_type") == "GPU"
+                ]
+                if not gpus:
+                    continue
+
+                name = raw.get("name")
+                if not isinstance(name, str):
+                    raise _InvalidQUADSResponseError("GPU host name must be a string")
+                vendor = gpus[0].get("vendor", "")
+                product = gpus[0].get("product", "")
+                if not isinstance(vendor, str) or not isinstance(product, str):
+                    raise _InvalidQUADSResponseError(
+                        "GPU vendor and product must be strings"
+                    )
+                hosts.append(
+                    QUADSHost(
+                        hostname=canonical_hostname(name),
+                        gpu_vendor=vendor,
+                        gpu_model=product,
+                        gpu_count=len(gpus),
+                    )
                 )
-            )
+        except (_InvalidQUADSResponseError, ValidationError) as exc:
+            raise QUADSConnectionError(
+                f"invalid QUADS response from {path}: {exc}"
+            ) from exc
+
         logger.debug("fetched QUADS hosts", count=len(hosts))
         return hosts
 
@@ -80,8 +120,20 @@ class QUADSClient:
         params: dict[str, str] = {}
         if end is not None:
             params["end"] = end.strftime("%Y-%m-%dT%H:%M")
-        data = await self._get("/api/v3/available", params=params)
-        return [canonical_hostname(h) for h in data]
+        path = "/api/v3/available"
+        data = await self._get(path, params=params)
+        try:
+            if not isinstance(data, list) or not all(
+                isinstance(hostname, str) for hostname in data
+            ):
+                raise _InvalidQUADSResponseError(
+                    "available hosts must be a list of strings"
+                )
+            return [canonical_hostname(hostname) for hostname in data]
+        except _InvalidQUADSResponseError as exc:
+            raise QUADSConnectionError(
+                f"invalid QUADS response from {path}: {exc}"
+            ) from exc
 
     async def _get(self, path: str, params: dict[str, str] | None = None) -> Any:
         """GET a JSON endpoint, wrapping errors in QUADSConnectionError."""
@@ -89,6 +141,6 @@ class QUADSClient:
         try:
             resp = await self._client.get(url, params=params)
             resp.raise_for_status()
-        except httpx.HTTPError as exc:
+            return resp.json()
+        except (httpx.HTTPError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise QUADSConnectionError(str(exc)) from exc
-        return resp.json()

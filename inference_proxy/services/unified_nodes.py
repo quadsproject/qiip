@@ -3,7 +3,8 @@
 Produces a single list of AdminNodeResponse with computed state and
 actions by joining QUADS GPU inventory with etcd-registered nodes by
 hostname.  Etcd status wins when a host appears in both sources (D-05).
-Nodes in etcd but absent from QUADS are excluded (D-03).
+Every registered node remains visible; QUADS enriches matching nodes and
+adds unregistered hosts that are currently available.
 """
 
 from __future__ import annotations
@@ -70,10 +71,11 @@ class UnifiedNodeService:
                 result.append(self._from_available(host))
             # else: not available and not in etcd -> skip
 
-        # Unmanaged nodes live in etcd but not in QUADS
+        # Registry membership is authoritative for operational visibility.
+        # QUADS may be empty, stale, or omit broken/retired hosts, but none of
+        # those conditions should hide a node the proxy is still routing to.
         for node in etcd_map.values():
-            if not node.managed:
-                result.append(self._from_etcd(node, task_map=task_map))
+            result.append(self._from_etcd(node, task_map=task_map))
 
         return sorted(result, key=lambda r: r.node_id)
 
