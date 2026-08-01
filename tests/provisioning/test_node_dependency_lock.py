@@ -117,6 +117,11 @@ def test_ci_installs_uv_from_the_node_version_pin() -> None:
 
 def test_pinned_uv_reads_and_resolves_node_lock(tmp_path: Path) -> None:
     uv_binary = os.environ.get("AUTOVLLM_PINNED_UV_BIN", "uv")
+    node_environment = {
+        **os.environ,
+        "UV_CACHE_DIR": str(tmp_path / "cache"),
+        "UV_PYTHON": "3.12",
+    }
     version = subprocess.run(
         [uv_binary, "--version"],
         text=True,
@@ -132,7 +137,7 @@ def test_pinned_uv_reads_and_resolves_node_lock(tmp_path: Path) -> None:
         capture_output=True,
         timeout=15,
         check=True,
-        env={**os.environ, "UV_CACHE_DIR": str(tmp_path / "cache")},
+        env=node_environment,
     )
     sync = subprocess.run(
         [
@@ -155,8 +160,7 @@ def test_pinned_uv_reads_and_resolves_node_lock(tmp_path: Path) -> None:
         timeout=30,
         check=True,
         env={
-            **os.environ,
-            "UV_CACHE_DIR": str(tmp_path / "cache"),
+            **node_environment,
             "UV_PROJECT_ENVIRONMENT": str(tmp_path / "node-venv"),
         },
     )
