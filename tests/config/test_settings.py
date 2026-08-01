@@ -15,6 +15,7 @@ from inference_proxy.config.settings import (
     GatewaySettings,
     HuggingFaceSettings,
     LLMFitSettings,
+    LoggingSettings,
     ProvisioningSettings,
     QUADSSettings,
     RedfishSettings,
@@ -79,6 +80,48 @@ class TestDefaultGatewaySettings:
         settings = Settings(_env_file=None)
         assert settings.gateway.host == "0.0.0.0"
         assert settings.gateway.port == 8080
+
+    def test_retired_graceful_shutdown_timeout_warns_with_replacement(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT",
+            "60",
+        )
+
+        with pytest.warns(
+            UserWarning,
+            match="uvicorn --timeout-graceful-shutdown",
+        ):
+            settings = Settings(_env_file=None)
+
+        assert settings.gateway.retired_graceful_shutdown_timeout == 60
+        assert "graceful_shutdown_timeout" not in GatewaySettings.model_fields
+
+
+class TestLoggingSettings:
+    @pytest.mark.parametrize(
+        ("configured", "canonical"),
+        [
+            ("debug", "DEBUG"),
+            ("INFO", "INFO"),
+            ("Warning", "WARNING"),
+            ("ERROR", "ERROR"),
+            ("critical", "CRITICAL"),
+        ],
+    )
+    def test_log_level_validation_matrix(
+        self,
+        configured: str,
+        canonical: str,
+    ) -> None:
+        assert LoggingSettings(level=configured).level == canonical
+
+    @pytest.mark.parametrize("configured", ["TRACE", "VERBOSE", "inf", "", 10])
+    def test_unknown_log_level_is_rejected(self, configured: object) -> None:
+        with pytest.raises(ValidationError, match="logging.level"):
+            LoggingSettings(level=configured)  # type: ignore[arg-type]
 
 
 class TestDefaultEtcdSettings:

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 
 import structlog
 from huggingface_hub import snapshot_download
@@ -23,6 +25,28 @@ from huggingface_hub.errors import (
 from inference_proxy.models.admin import DownloadState, DownloadStatusResponse
 
 logger = structlog.get_logger()
+
+
+async def _run_in_daemon_thread[T](function: Callable[[], T], *, name: str) -> T:
+    """Run blocking work without registering a process-blocking executor thread."""
+    finished = threading.Event()
+    values: list[T] = []
+    errors: list[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            values.append(function())
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            finished.set()
+
+    threading.Thread(target=_worker, name=name, daemon=True).start()
+    while not finished.is_set():
+        await asyncio.sleep(0.01)
+    if errors:
+        raise errors[0]
+    return values[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +73,7 @@ class DownloadService:
         # ponytail: lazy semaphore -- must be created inside a running event loop
         self._semaphore: asyncio.Semaphore | None = None
         self._tasks: set[asyncio.Task[None]] = set()
+        self._closed = False
 
     def _ensure_semaphore(self) -> asyncio.Semaphore:
         if self._semaphore is None:
@@ -73,6 +98,8 @@ class DownloadService:
         previous attempt completed or failed (D-11).
         """
         with self._lock:
+            if self._closed:
+                raise RuntimeError("download service is shutting down")
             existing = self._statuses.get(repo_id)
             if existing is not None and existing.status == DownloadState.DOWNLOADING:
                 return DownloadTriggerResult(status=existing, started=False)
@@ -95,11 +122,14 @@ class DownloadService:
             log = logger.bind(repo_id=repo_id)
             log.info("download started")
             try:
-                await asyncio.to_thread(
-                    snapshot_download,
-                    repo_id,
-                    cache_dir=self._cache_dir,
-                    token=self._token,
+                await _run_in_daemon_thread(
+                    partial(
+                        snapshot_download,
+                        repo_id,
+                        cache_dir=self._cache_dir,
+                        token=self._token,
+                    ),
+                    name=f"huggingface-download:{repo_id}",
                 )
             except GatedRepoError:
                 self._set_failed(
@@ -126,6 +156,21 @@ class DownloadService:
                     completed_at=now,
                 )
             log.info("download complete")
+
+    async def shutdown(self) -> None:
+        """Cancel download wrappers without joining their daemon workers.
+
+        A blocking ``snapshot_download`` cannot be interrupted safely. Its raw
+        worker thread is therefore allowed to end with the process, while the
+        asyncio tasks are cancelled and awaited so loop shutdown stays bounded.
+        """
+        with self._lock:
+            self._closed = True
+        tasks = tuple(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _set_failed(self, repo_id: str, error: str) -> None:
         now = datetime.now(UTC)

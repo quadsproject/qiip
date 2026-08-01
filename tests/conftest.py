@@ -151,7 +151,6 @@ def app(
     application.state.quads_poller = None
     application.state.quads_client = None
     application.state.redfish_client = None
-    application.state.shutting_down = False
     application.dependency_overrides[get_proxy_client] = lambda: proxy_client
     application.dependency_overrides[get_quads_client] = lambda: None
     application.dependency_overrides[get_quads_poller] = lambda: None

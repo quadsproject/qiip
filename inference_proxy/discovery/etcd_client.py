@@ -399,6 +399,10 @@ class EtcdClient:
         """
         return self._client.delete(key)
 
+    def close(self) -> None:
+        """Release the underlying requests session owned by etcd3gw."""
+        self._client.session.close()
+
     def watch_prefix(self, *, start_revision: int) -> EtcdWatchStream:
         """Open a raw prefix watch beginning at *start_revision*.
 

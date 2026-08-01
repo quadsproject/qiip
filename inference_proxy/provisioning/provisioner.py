@@ -753,6 +753,19 @@ class NodeProvisioner:
         task.add_done_callback(_task_done)
         return task
 
+    async def shutdown(self) -> None:
+        """Cancel and await every lifecycle task still owned by this process.
+
+        This method owns shutdown lifecycle only. Per-task exception observation
+        remains the responsibility of ``fire_background``'s done callback so a
+        future generic observer cannot double-log failures during shutdown.
+        """
+        tasks = tuple(self._background_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def cancel_active_provision(self, hostname: str) -> asyncio.Task[None] | None:
         """Cancel and await the active provisioning task for *hostname*."""
         record = self._provisioning_tasks.get(hostname)

@@ -84,6 +84,40 @@ def _make_provisioner(
 
 
 @pytest.mark.asyncio
+async def test_shutdown_cancels_and_awaits_owned_tasks() -> None:
+    """C2: shutdown awaits cancellation and releases host task ownership."""
+    provisioner = _make_provisioner()
+    started = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def owned_task() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    task: asyncio.Task[None] | None = None
+    try:
+        task = provisioner.fire_background(
+            owned_task(),
+            provisioning_hostname="host1",
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.wait_for(provisioner.shutdown(), timeout=1)
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    assert task is not None
+    assert task.cancelled() is True
+    assert cleaned.is_set()
+    assert provisioner._background_tasks == set()
+    assert provisioner._provisioning_tasks == {}
+
+
+@pytest.mark.asyncio
 async def test_llmfit_version_single_source() -> None:
     """E5: provisioning and repair install consume one LLMFit setting."""
     settings = LLMFitSettings(version="8.7.6", sha256="a" * 64)

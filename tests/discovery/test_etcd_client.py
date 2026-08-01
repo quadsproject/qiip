@@ -117,6 +117,16 @@ class TestEtcdClientInit:
             ignored=["http://etcd2:2379"],
         )
 
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_close_releases_underlying_http_session(
+        self, mock_etcd3_cls: MagicMock
+    ) -> None:
+        client = EtcdClient(_settings())
+
+        client.close()
+
+        mock_etcd3_cls.return_value.session.close.assert_called_once_with()
+
 
 class TestEtcdSnapshot:
     @patch("inference_proxy.discovery.etcd_client.Etcd3Client")

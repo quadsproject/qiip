@@ -45,7 +45,24 @@ class GatewaySettings(BaseModel):
 
     host: str = "0.0.0.0"
     port: int = 8080
-    graceful_shutdown_timeout: int = 30
+    retired_graceful_shutdown_timeout: int | None = Field(
+        default=None,
+        validation_alias="graceful_shutdown_timeout",
+        exclude=True,
+        repr=False,
+    )
+
+    @model_validator(mode="after")
+    def warn_about_retired_graceful_shutdown_timeout(self) -> Self:
+        """Direct operators to the server-owned graceful-drain setting."""
+        if self.retired_graceful_shutdown_timeout is not None:
+            warnings.warn(
+                "INFERENCE_PROXY_GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT is ignored; "
+                "configure uvicorn --timeout-graceful-shutdown instead",
+                UserWarning,
+                stacklevel=2,
+            )
+        return self
 
 
 class EtcdSettings(BaseModel):
@@ -132,6 +149,19 @@ class LoggingSettings(BaseModel):
 
     json_output: bool = False
     level: str = "INFO"
+
+    @field_validator("level", mode="before")
+    @classmethod
+    def level_is_supported(cls, value: object) -> str:
+        """Reject unknown levels instead of silently falling back to INFO."""
+        if not isinstance(value, str):
+            raise ValueError("logging.level must be a string")
+        normalized = value.upper()
+        if normalized not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError(
+                "logging.level must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL"
+            )
+        return normalized
 
 
 class AdminSettings(BaseModel):

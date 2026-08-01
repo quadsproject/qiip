@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
+import textwrap
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -12,6 +16,14 @@ from huggingface_hub.errors import GatedRepoError
 
 from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.models.admin import DownloadState
+
+
+async def _wait_for_thread_event(event: threading.Event, timeout: float) -> bool:
+    """Poll a thread event without creating a process-blocking default worker."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not event.is_set() and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.001)
+    return event.is_set()
 
 
 class TestTriggerDownload:
@@ -81,7 +93,7 @@ class TestTriggerDownload:
 
         svc = DownloadService(cache_dir="/tmp/test", token="test-token")
         first = await svc.trigger_download("org/model")
-        assert await asyncio.to_thread(started.wait, 1)
+        assert await _wait_for_thread_event(started, 1)
         duplicate = await svc.trigger_download("org/model")
 
         tasks = tuple(svc._tasks)
@@ -142,8 +154,8 @@ class TestTriggerDownload:
 
         tasks = tuple(svc._tasks)
         try:
-            assert await asyncio.to_thread(two_started.wait, 1)
-            assert not await asyncio.to_thread(third_started.wait, 0.1)
+            assert await _wait_for_thread_event(two_started, 1)
+            assert not await _wait_for_thread_event(third_started, 0.1)
         finally:
             release.set()
             await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
@@ -151,6 +163,79 @@ class TestTriggerDownload:
         assert {status.status for status in svc.get_all_statuses()} == {
             DownloadState.COMPLETE
         }
+
+
+class TestDownloadShutdown:
+    @pytest.mark.asyncio
+    async def test_shutdown_cancels_wrappers_without_waiting_for_worker(
+        self,
+    ) -> None:
+        started = asyncio.Event()
+
+        async def block_download(*_args: object, **_kwargs: object) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        service = DownloadService(cache_dir="/tmp/test", token=None)
+        with patch(
+            "inference_proxy.huggingface.downloader._run_in_daemon_thread",
+            side_effect=block_download,
+        ):
+            await service.trigger_download("org/model")
+            await asyncio.wait_for(started.wait(), timeout=1)
+            await asyncio.wait_for(service.shutdown(), timeout=0.5)
+
+        assert service._tasks == set()
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await service.trigger_download("org/other")
+
+    def test_process_exits_with_blocked_snapshot_download(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        script = textwrap.dedent(
+            """
+            import asyncio
+            import threading
+            from unittest.mock import patch
+
+            from inference_proxy.huggingface.downloader import DownloadService
+
+            started = threading.Event()
+            blocked_forever = threading.Event()
+
+            def block_download(*_args, **_kwargs):
+                started.set()
+                blocked_forever.wait()
+
+            async def main():
+                with patch(
+                    "inference_proxy.huggingface.downloader.snapshot_download",
+                    side_effect=block_download,
+                ):
+                    service = DownloadService(cache_dir="/tmp/test", token=None)
+                    await service.trigger_download("org/model")
+                    deadline = asyncio.get_running_loop().time() + 1
+                    while not started.is_set():
+                        if asyncio.get_running_loop().time() >= deadline:
+                            raise RuntimeError("download worker did not start")
+                        await asyncio.sleep(0.001)
+                    await service.shutdown()
+
+            asyncio.run(main())
+            """
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
 
 
 class TestGetAllStatuses:

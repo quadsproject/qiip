@@ -203,6 +203,9 @@ these changes together:
 
 - Launch with `uvicorn inference_proxy.main:create_app --factory`; the old
   `inference_proxy.main:app` target no longer exists.
+- Move any `GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT` setting to Uvicorn's
+  `--timeout-graceful-shutdown` launcher option. Uvicorn owns request draining;
+  the retired gateway setting is ignored with a startup warning.
 - Configure `ROUTING__ALLOWED_ENDPOINT_HOSTS`,
   `ROUTING__ALLOWED_ENDPOINT_NETWORKS`, and
   `ROUTING__ALLOWED_ENDPOINT_PORTS` for every backend the gateway may contact.
@@ -227,7 +230,12 @@ timezone before querying availability.
 |----------|---------|-------------|
 | `INFERENCE_PROXY_GATEWAY__HOST` | `0.0.0.0` | Bind address |
 | `INFERENCE_PROXY_GATEWAY__PORT` | `8080` | Bind port |
-| `INFERENCE_PROXY_GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT` | `30` | Seconds to drain requests on shutdown |
+
+Uvicorn owns graceful request draining. Configure its
+`--timeout-graceful-shutdown <seconds>` launcher option when the default does
+not fit the deployment. The retired
+`INFERENCE_PROXY_GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT` setting is ignored and
+emits a migration warning.
 
 ### Admin authentication
 

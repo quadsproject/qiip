@@ -24,12 +24,6 @@ from inference_proxy.main import _initial_load
 from inference_proxy.models.node import Node, NodeStatus
 
 
-def _lifespan_settings(settings: Settings) -> Settings:
-    """Disable the production drain delay only for lifespan smoke tests."""
-    gateway = settings.gateway.model_copy(update={"graceful_shutdown_timeout": 0})
-    return settings.model_copy(update={"gateway": gateway})
-
-
 def test_health_endpoint(client: TestClient) -> None:
     """GET /health returns 200 with status and nodes_registered count."""
     response = client.get("/health")
@@ -83,6 +77,47 @@ def test_importing_main_does_not_resolve_settings(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_hf_xet_disabled_before_huggingface_import(tmp_path: Path) -> None:
+    """The module-level guard must run before Hugging Face freezes its value."""
+    env = os.environ.copy()
+    env.pop("HF_HUB_DISABLE_XET", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import inference_proxy.main; "
+                "from huggingface_hub import constants; "
+                "assert constants.HF_HUB_DISABLE_XET is True"
+            ),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_lifespan_has_no_artificial_shutdown_gate(test_settings: Settings) -> None:
+    """Uvicorn owns connection draining; the app adds no dead second gate."""
+    from inference_proxy.main import create_app
+
+    app = create_app(settings=test_settings)
+
+    assert all(
+        middleware.cls.__name__ != "ShutdownMiddleware"
+        for middleware in app.user_middleware
+    )
+    assert not (
+        Path(__file__).parents[1] / "inference_proxy/resilience/shutdown.py"
+    ).exists()
+    assert "graceful_shutdown_timeout" not in type(test_settings.gateway).model_fields
 
 
 def test_default_allowlist_rejects_lab_endpoint_from_admin_nodes(
@@ -170,7 +205,7 @@ class TestLifespanRegistryIntegration:
 
         from inference_proxy.main import create_app
 
-        app = create_app(settings=_lifespan_settings(test_settings))
+        app = create_app(settings=test_settings)
         with TestClient(app):
             assert hasattr(app.state, "registry")
             assert isinstance(app.state.registry, NodeRegistry)
@@ -193,9 +228,7 @@ class TestLifespanRegistryIntegration:
         huggingface = test_settings.huggingface.model_copy(
             update={"nfs_export": "storage.example:/exports/huggingface"}
         )
-        settings = _lifespan_settings(
-            test_settings.model_copy(update={"huggingface": huggingface})
-        )
+        settings = test_settings.model_copy(update={"huggingface": huggingface})
 
         from inference_proxy.main import create_app
 
@@ -223,7 +256,7 @@ class TestLifespanRegistryIntegration:
 
         from inference_proxy.main import create_app
 
-        app = create_app(settings=_lifespan_settings(test_settings))
+        app = create_app(settings=test_settings)
         with TestClient(app):
             pass
 
@@ -256,7 +289,7 @@ class TestLifespanRegistryIntegration:
 
         from inference_proxy.main import create_app
 
-        app = create_app(settings=_lifespan_settings(test_settings))
+        app = create_app(settings=test_settings)
         with TestClient(app):
             registry = app.state.registry
             assert isinstance(registry, NodeRegistry)
@@ -278,7 +311,7 @@ class TestLifespanRegistryIntegration:
 
         from inference_proxy.main import create_app
 
-        app = create_app(settings=_lifespan_settings(test_settings))
+        app = create_app(settings=test_settings)
         with TestClient(app):
             registry = app.state.registry
             breaker_registry = app.state.circuit_breaker_registry
@@ -316,7 +349,7 @@ class TestLifespanRegistryIntegration:
 
         from inference_proxy.main import create_app
 
-        app = create_app(settings=_lifespan_settings(test_settings))
+        app = create_app(settings=test_settings)
         with TestClient(app):
             assert app.state.redfish_client is None
         mock_redfish_cls.assert_not_called()
@@ -334,9 +367,7 @@ class TestLifespanRegistryIntegration:
             bmc_username="operator",
             bmc_password=SecretStr("redfish-secret"),
         )
-        settings = _lifespan_settings(
-            test_settings.model_copy(update={"redfish": redfish})
-        )
+        settings = test_settings.model_copy(update={"redfish": redfish})
 
         from inference_proxy.main import create_app
 
@@ -378,7 +409,7 @@ class TestLifespanRegistryIntegration:
             base_url="http://quads.example.com",
             server_timezone="America/New_York",
         )
-        settings = _lifespan_settings(test_settings.model_copy(update={"quads": quads}))
+        settings = test_settings.model_copy(update={"quads": quads})
 
         from inference_proxy.main import create_app
 
