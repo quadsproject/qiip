@@ -175,9 +175,14 @@ class ProvisioningSettings(BaseModel):
     scripts_dir: Path = Path("auto-vllm")
     boot_wait_timeout: int = 300  # D-05: 5 minutes for cold boot
     boot_wait_interval: int = 10
-    nfs_server: str = "storage.example.com:/mnt/SATA/scratch/grafuls/hf-cache"
     nfs_mount_point: str = "/srv/hf-cache"
     nvidia_driver_version: str = "580.126.09"
+    retired_nfs_server: str | None = Field(
+        default=None,
+        validation_alias="nfs_server",
+        exclude=True,
+        repr=False,
+    )
     retired_llmfit_version: str | None = Field(
         default=None,
         validation_alias="llmfit_version",
@@ -192,6 +197,18 @@ class ProvisioningSettings(BaseModel):
             warnings.warn(
                 "INFERENCE_PROXY_PROVISIONING__LLMFIT_VERSION is ignored; "
                 "configure INFERENCE_PROXY_LLMFIT__VERSION instead",
+                UserWarning,
+                stacklevel=2,
+            )
+        return self
+
+    @model_validator(mode="after")
+    def warn_about_retired_nfs_server(self) -> Self:
+        """Make migration from the duplicate NFS export knob visible."""
+        if self.retired_nfs_server is not None:
+            warnings.warn(
+                "INFERENCE_PROXY_PROVISIONING__NFS_SERVER is ignored; "
+                "configure INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT instead",
                 UserWarning,
                 stacklevel=2,
             )
@@ -246,7 +263,19 @@ class HuggingFaceSettings(BaseModel):
     """HuggingFace cache and authentication configuration."""
 
     cache_dir: str  # Required -- gateway won't start without it
+    nfs_export: str | None = None
     api_token: SecretStr | None = None
+
+    @field_validator("nfs_export")
+    @classmethod
+    def nfs_export_is_not_empty(cls, value: str | None) -> str | None:
+        """Reject an explicitly configured empty export."""
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("huggingface.nfs_export must not be empty")
+        return normalized
 
 
 class RedfishSettings(BaseModel):

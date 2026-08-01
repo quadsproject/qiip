@@ -56,7 +56,7 @@ from inference_proxy.models.admin import (
 )
 from inference_proxy.models.endpoint import EndpointValidationError
 from inference_proxy.models.node import NodeStatus
-from inference_proxy.provisioning.provisioner import NodeProvisioner
+from inference_proxy.provisioning.provisioner import NodeProvisioner, ProvisioningError
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
     SSHConnectionError,
@@ -204,7 +204,8 @@ async def setup_node(
 
     try:
         provisioner.validate_endpoint(hostname)
-    except EndpointValidationError as exc:
+        provisioner.validate_setup_configuration()
+    except (EndpointValidationError, ProvisioningError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # D-08: dedup guard

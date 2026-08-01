@@ -526,6 +526,51 @@ class TestHuggingFaceSettings:
         settings = Settings(_env_file=None)
         assert settings.huggingface.api_token is None
 
+    def test_nfs_export_optional_for_proxy_only_deployment(self) -> None:
+        settings = HuggingFaceSettings(cache_dir="/data/huggingface")
+
+        assert settings.nfs_export is None
+
+    def test_cache_paths_resolve_to_same_export(self) -> None:
+        settings = Settings(
+            admin=AdminSettings(
+                username="operator", password=SecretStr("admin-secret")
+            ),
+            huggingface=HuggingFaceSettings(
+                cache_dir="/data/huggingface",
+                nfs_export="storage.example:/exports/huggingface",
+            ),
+            provisioning=ProvisioningSettings(nfs_mount_point="/srv/hf-cache"),
+        )
+
+        assert settings.huggingface.cache_dir == "/data/huggingface"
+        assert settings.provisioning.nfs_mount_point == "/srv/hf-cache"
+        assert settings.huggingface.nfs_export == (
+            "storage.example:/exports/huggingface"
+        )
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_explicit_empty_nfs_export_rejected(self, value: str) -> None:
+        with pytest.raises(ValidationError, match="nfs_export must not be empty"):
+            HuggingFaceSettings(cache_dir="/data/huggingface", nfs_export=value)
+
+    def test_retired_provisioning_nfs_server_warns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_PROVISIONING__NFS_SERVER",
+            "legacy.example:/old/export",
+        )
+
+        with pytest.warns(
+            UserWarning,
+            match="INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT",
+        ):
+            settings = Settings(_env_file=None)
+
+        assert settings.huggingface.nfs_export is None
+        assert "nfs_server" not in settings.provisioning.model_dump()
+
     def test_api_token_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("INFERENCE_PROXY_HUGGINGFACE__CACHE_DIR", "/data/hf")
         monkeypatch.setenv("INFERENCE_PROXY_HUGGINGFACE__API_TOKEN", "hf_test123")

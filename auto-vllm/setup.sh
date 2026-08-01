@@ -2,17 +2,23 @@
 set -euo pipefail
 
 # --- Configurable defaults ---
-NFS_SERVER="${NFS_SERVER:-storage.example.com:/mnt/SATA/scratch/grafuls/hf-cache}"
-NFS_MOUNT_POINT="${NFS_MOUNT_POINT:-/srv/hf-cache}"
-NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-580.126.09}"
-NVIDIA_DRIVER_URL="${NVIDIA_DRIVER_URL:-https://us.download.nvidia.com/tesla/${NVIDIA_DRIVER_VERSION}/NVIDIA-Linux-x86_64-${NVIDIA_DRIVER_VERSION}.run}"
-VLLM_PORT="${VLLM_PORT:-8000}"
-LLMFIT_VERSION="${LLMFIT_VERSION:-1.1.6}"
-LLMFIT_URL="${LLMFIT_URL:-https://github.com/AlexsJones/llmfit/releases/download/v${LLMFIT_VERSION}/llmfit-v${LLMFIT_VERSION}-x86_64-unknown-linux-musl.tar.gz}"
+NFS_EXPORT="${AUTOVLLM_NFS_EXPORT:-}"
+NFS_MOUNT_POINT="${AUTOVLLM_NFS_MOUNT_POINT:-/srv/hf-cache}"
+DRIVER_VERSION="${AUTOVLLM_NVIDIA_DRIVER_VERSION:-580.126.09}"
+NVIDIA_DRIVER_URL="${NVIDIA_DRIVER_URL:-https://us.download.nvidia.com/tesla/${DRIVER_VERSION}/NVIDIA-Linux-x86_64-${DRIVER_VERSION}.run}"
+API_PORT="${AUTOVLLM_API_PORT:-8000}"
+LLMFIT_RELEASE="${AUTOVLLM_LLMFIT_VERSION:-1.1.6}"
+LLMFIT_URL="${LLMFIT_URL:-https://github.com/AlexsJones/llmfit/releases/download/v${LLMFIT_RELEASE}/llmfit-v${LLMFIT_RELEASE}-x86_64-unknown-linux-musl.tar.gz}"
 VLLM_VENV="${AUTOVLLM_VENV:-/opt/vllm-venv}"
 LLMFIT_BIN="${AUTOVLLM_LLMFIT_BIN:-/usr/local/bin/llmfit}"
 INSTALL_TMP_DIR="${AUTOVLLM_TMP_DIR:-/tmp}"
 FLASHINFER_INDEX_URL="${FLASHINFER_INDEX_URL:-https://flashinfer.ai/whl}"
+
+# Script configuration is captured above. Do not leak this namespace into
+# installers or other child processes spawned by setup.sh.
+unset AUTOVLLM_NFS_EXPORT AUTOVLLM_NFS_MOUNT_POINT
+unset AUTOVLLM_NVIDIA_DRIVER_VERSION AUTOVLLM_API_PORT
+unset AUTOVLLM_LLMFIT_VERSION AUTOVLLM_VENV AUTOVLLM_LLMFIT_BIN AUTOVLLM_TMP_DIR
 
 run_with_errexit() {
     # A function invoked directly as an if-condition inherits Bash's ignored
@@ -71,12 +77,12 @@ install_nvidia_driver() {
             nvidia-smi --query-gpu=driver_version --format=csv,noheader \
                 | sed '/^[[:space:]]*$/d' | sort -u
         )
-        if [ "$installed_versions" = "$NVIDIA_DRIVER_VERSION" ]; then
-            echo "NVIDIA driver ${NVIDIA_DRIVER_VERSION} already installed, skipping"
+        if [ "$installed_versions" = "$DRIVER_VERSION" ]; then
+            echo "NVIDIA driver ${DRIVER_VERSION} already installed, skipping"
             return 0
         fi
         installed_versions=${installed_versions//$'\n'/, }
-        echo "FATAL: installed NVIDIA driver ${installed_versions:-unknown} does not match requested ${NVIDIA_DRIVER_VERSION}; upgrade the driver explicitly before provisioning" >&2
+        echo "FATAL: installed NVIDIA driver ${installed_versions:-unknown} does not match requested ${DRIVER_VERSION}; upgrade the driver explicitly before provisioning" >&2
         return 1
     fi
     if modinfo nvidia &>/dev/null; then
@@ -155,25 +161,25 @@ mount_nfs_cache() {
     fi
     sudo mkdir -p "${NFS_MOUNT_POINT}"
     sudo timeout --kill-after=5 30 \
-        mount -t nfs -o vers=3,soft,timeo=100,retrans=2 "${NFS_SERVER}" "${NFS_MOUNT_POINT}"
+        mount -t nfs -o vers=3,soft,timeo=100,retrans=2 "${NFS_EXPORT}" "${NFS_MOUNT_POINT}"
 }
 
 configure_firewall() {
     if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld; then
-        if sudo firewall-cmd --query-port="${VLLM_PORT}/tcp" &>/dev/null; then
-            echo "Firewall rule already exists for port ${VLLM_PORT}, skipping"
+        if sudo firewall-cmd --query-port="${API_PORT}/tcp" &>/dev/null; then
+            echo "Firewall rule already exists for port ${API_PORT}, skipping"
             return 0
         fi
-        sudo firewall-cmd --add-port="${VLLM_PORT}/tcp" --permanent
+        sudo firewall-cmd --add-port="${API_PORT}/tcp" --permanent
         sudo firewall-cmd --reload
     elif command -v iptables &>/dev/null \
         && systemctl list-unit-files --type=service --no-legend iptables.service 2>/dev/null \
             | grep -q '^iptables\.service'; then
-        if sudo iptables -C INPUT -p tcp --dport "${VLLM_PORT}" -j ACCEPT 2>/dev/null; then
-            echo "Firewall rule already exists for port ${VLLM_PORT}, skipping"
+        if sudo iptables -C INPUT -p tcp --dport "${API_PORT}" -j ACCEPT 2>/dev/null; then
+            echo "Firewall rule already exists for port ${API_PORT}, skipping"
             return 0
         fi
-        sudo iptables -I INPUT -p tcp --dport "${VLLM_PORT}" -j ACCEPT
+        sudo iptables -I INPUT -p tcp --dport "${API_PORT}" -j ACCEPT
         sudo iptables-save | sudo tee /etc/sysconfig/iptables > /dev/null
         sudo systemctl restart iptables
     else
@@ -188,11 +194,11 @@ install_llmfit() {
             "$LLMFIT_BIN" --version 2>/dev/null \
                 | grep -Eo '[0-9]+([.][0-9]+)+' | head -n 1
         ) || true
-        if [ "$installed_version" = "$LLMFIT_VERSION" ]; then
-            echo "llmfit ${LLMFIT_VERSION} already installed, skipping"
+        if [ "$installed_version" = "$LLMFIT_RELEASE" ]; then
+            echo "llmfit ${LLMFIT_RELEASE} already installed, skipping"
             return 0
         fi
-        echo "Replacing llmfit ${installed_version:-unknown} with requested ${LLMFIT_VERSION}"
+        echo "Replacing llmfit ${installed_version:-unknown} with requested ${LLMFIT_RELEASE}"
     fi
     local archive="${INSTALL_TMP_DIR}/llmfit.tar.gz"
     wget -q "${LLMFIT_URL}" -O "$archive"
@@ -205,6 +211,10 @@ install_llmfit() {
 
 # --- Main ---
 main() {
+    if [ -z "$NFS_EXPORT" ]; then
+        echo "FATAL: AUTOVLLM_NFS_EXPORT is required for node provisioning" >&2
+        return 2
+    fi
     step system_update run_system_update
     step nvidia_driver install_nvidia_driver
     step cuda_toolkit install_cuda_toolkit

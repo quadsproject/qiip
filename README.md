@@ -235,6 +235,19 @@ LLMFit has one version setting: `INFERENCE_PROXY_LLMFIT__VERSION`. The retired
 startup warning so an existing pin cannot disappear silently. Remove the old
 variable and move its value to the LLMFit setting when upgrading.
 
+The gateway cache path and node cache mount may differ, but provisioning uses
+one declared backing export: `INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT`. It is
+optional for proxy-only deployments and required before a node setup operation
+can acquire a host lease or start SSH work. The retired
+`INFERENCE_PROXY_PROVISIONING__NFS_SERVER` variable is ignored with a startup
+warning; move its value to the HuggingFace setting when upgrading.
+
+Node-side launch tuning uses the `AUTOVLLM_*` namespace. The retired
+`VLLM_TENSOR_PARALLEL`, `VLLM_GPU_MEM_UTIL`, `VLLM_MAX_MODEL_LEN`,
+`VLLM_MAX_BATCHED_TOKENS`, and `VLLM_EXTRA_ARGS` names are ignored by
+`start-vllm.sh` and produce a warning naming their replacements. This keeps
+script inputs out of the environment namespace reserved by vLLM itself.
+
 ### Proxy (HTTP client)
 
 | Variable | Default | Description |

@@ -50,6 +50,7 @@ def _provisioner(
         registry=registry,
         connection_tracker=MagicMock(get=MagicMock(return_value=0)),
         log_buffer=MagicMock(),
+        nfs_export="nfs.example:/exports/huggingface",
     )
 
 

@@ -17,6 +17,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from ipaddress import ip_address
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 
 import httpx
@@ -97,6 +98,7 @@ class NodeProvisioner:
         log_buffer: ProvisioningLogBuffer | None = None,
         lifecycle_coordinator: HostLifecycleCoordinator | None = None,
         hf_token: str | None = None,
+        nfs_export: str | None = None,
     ) -> None:
         self._ssh_client = ssh_client
         self._etcd_client = etcd_client
@@ -110,6 +112,7 @@ class NodeProvisioner:
         self._log_buffer = log_buffer or ProvisioningLogBuffer()
         self._lifecycle = lifecycle_coordinator or HostLifecycleCoordinator()
         self._hf_token = hf_token
+        self._nfs_export = nfs_export
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._provisioning_tasks: dict[str, _ProvisioningTask] = {}
 
@@ -140,19 +143,58 @@ class NodeProvisioner:
                 f"endpoint {candidate!r}: {exc}; {allowlist_hint}"
             ) from exc
 
-    def _script_env_prefix(self) -> str:
-        """Build env var prefix for remote script invocation."""
-        s = self._settings
-        prefix = (
-            f"NFS_SERVER={shlex.quote(s.nfs_server)} "
-            f"NFS_MOUNT_POINT={shlex.quote(s.nfs_mount_point)} "
-            f"NVIDIA_DRIVER_VERSION={shlex.quote(s.nvidia_driver_version)} "
-            f"VLLM_PORT={s.vllm_port} "
-            f"LLMFIT_VERSION={shlex.quote(self._llmfit_version)} "
-        )
+    def validate_setup_configuration(self) -> None:
+        """Require settings used only by the node-provisioning workflow."""
+        self._required_nfs_export()
+
+    def _required_nfs_export(self) -> str:
+        """Return the canonical NFS export or reject node provisioning."""
+        if self._nfs_export is None:
+            raise ProvisioningError(
+                "Node provisioning requires "
+                "INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT; proxy-only "
+                "deployments may leave it unset"
+            )
+        return self._nfs_export
+
+    def _setup_script_env(self) -> dict[str, str]:
+        """Return the exact environment accepted by setup.sh."""
+        return {
+            "AUTOVLLM_NFS_EXPORT": self._required_nfs_export(),
+            "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
+            "AUTOVLLM_NVIDIA_DRIVER_VERSION": self._settings.nvidia_driver_version,
+            "AUTOVLLM_API_PORT": str(self._settings.vllm_port),
+            "AUTOVLLM_LLMFIT_VERSION": self._llmfit_version,
+        }
+
+    def _start_script_env(self, model: str | None) -> dict[str, str]:
+        """Return the exact environment accepted by start-vllm.sh."""
+        env = {
+            "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
+            "AUTOVLLM_API_PORT": str(self._settings.vllm_port),
+        }
+        if model is not None:
+            env["AUTOVLLM_MODEL"] = model
         if self._hf_token:
-            prefix += f"HF_TOKEN={shlex.quote(self._hf_token)} "
-        return prefix
+            env["HF_TOKEN"] = self._hf_token
+        return env
+
+    def _script_command(
+        self,
+        script_name: str,
+        *,
+        env: dict[str, str] | None = None,
+        args: tuple[str, ...] = (),
+    ) -> str:
+        """Build one uniformly quoted remote script command."""
+        script_path = str(PurePosixPath(self._settings.scripts_dir.name, script_name))
+        command = shlex.join(("bash", script_path, *args))
+        if not env:
+            return command
+        assignments = " ".join(
+            f"{name}={shlex.quote(value)}" for name, value in env.items()
+        )
+        return f"{assignments} {command}"
 
     def _log(
         self,
@@ -339,6 +381,7 @@ class NodeProvisioner:
         # Validate before acquiring the lifecycle lease or touching the host.
         # The API also calls this synchronously so configuration errors become
         # immediate 400 responses instead of failed background operations.
+        self.validate_setup_configuration()
         self.validate_endpoint(hostname)
         lease = lifecycle_lease
         if lease is None:
@@ -514,7 +557,8 @@ class NodeProvisioner:
     ) -> None:
         """Run setup.sh and parse step markers from stdout (D-05, D-06)."""
         async for stream, line in self._ssh_client.run_streaming(
-            hostname, f"{self._script_env_prefix()}bash auto-vllm/setup.sh"
+            hostname,
+            self._script_command("setup.sh", env=self._setup_script_env()),
         ):
             if stream == "stdout":
                 match = STEP_PATTERN.search(line)
@@ -563,10 +607,9 @@ class NodeProvisioner:
 
     async def _run_start_vllm(self, hostname: str, *, model: str | None = None) -> str:
         """Run start-vllm.sh and extract model name from stdout."""
-        prefix = self._script_env_prefix()
-        if model:
-            prefix = f"VLLM_MODEL={shlex.quote(model)} {prefix}"
-        command = f"{prefix}bash auto-vllm/start-vllm.sh"
+        command = self._script_command(
+            "start-vllm.sh", env=self._start_script_env(model)
+        )
         model_name: str | None = None
         async for stream, line in self._ssh_client.run_streaming(hostname, command):
             logger.debug(
@@ -816,9 +859,9 @@ class NodeProvisioner:
                     "Could not refresh teardown scripts; attempting the "
                     "existing remote stop script",
                 )
-            stop_command = "bash auto-vllm/stop-vllm.sh"
-            if force:
-                stop_command += " --force"
+            stop_command = self._script_command(
+                "stop-vllm.sh", args=("--force",) if force else ()
+            )
             await self._ssh_run_command(hostname, stop_command)
 
             await self._update_state(

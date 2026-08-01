@@ -1,8 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-VLLM_PORT="${VLLM_PORT:-8000}"
-NFS_MOUNT_POINT="${NFS_MOUNT_POINT:-/srv/hf-cache}"
+API_PORT="${AUTOVLLM_API_PORT:-8000}"
+NFS_MOUNT_POINT="${AUTOVLLM_NFS_MOUNT_POINT:-/srv/hf-cache}"
+MODEL_OVERRIDE="${AUTOVLLM_MODEL:-}"
+TENSOR_PARALLEL_OVERRIDE="${AUTOVLLM_TENSOR_PARALLEL:-}"
+GPU_MEM_UTIL_OVERRIDE="${AUTOVLLM_GPU_MEM_UTIL:-}"
+MAX_MODEL_LEN_OVERRIDE="${AUTOVLLM_MAX_MODEL_LEN:-}"
+MAX_BATCHED_TOKENS_OVERRIDE="${AUTOVLLM_MAX_BATCHED_TOKENS:-}"
+EXTRA_ARGS_OVERRIDE="${AUTOVLLM_EXTRA_ARGS:-}"
 SCRIPT_DIR="${AUTOVLLM_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 VLLM_BIN="${AUTOVLLM_BIN:-/opt/vllm-venv/bin/vllm}"
 PID_FILE="${AUTOVLLM_PID_FILE:-/var/run/vllm.pid}"
@@ -13,6 +19,28 @@ PROC_ROOT="${AUTOVLLM_PROC_ROOT:-/proc}"
 COMMAND_PATTERN="${AUTOVLLM_COMMAND_PATTERN:-${VLLM_BIN} serve}"
 STARTUP_GRACE_PERIOD="${AUTOVLLM_STARTUP_GRACE_PERIOD:-2}"
 STARTUP_LOG_LINES="${AUTOVLLM_STARTUP_LOG_LINES:-40}"
+
+warn_retired_override() {
+    local legacy_name="$1"
+    local replacement="$2"
+    if [[ -v $legacy_name ]]; then
+        echo "WARNING: ${legacy_name} is ignored; use ${replacement} instead" >&2
+    fi
+}
+
+# These five names were previously script-level tuning overrides. Warn only
+# for that retired set: vLLM legitimately owns other VLLM_* environment names.
+warn_retired_override VLLM_TENSOR_PARALLEL AUTOVLLM_TENSOR_PARALLEL
+warn_retired_override VLLM_GPU_MEM_UTIL AUTOVLLM_GPU_MEM_UTIL
+warn_retired_override VLLM_MAX_MODEL_LEN AUTOVLLM_MAX_MODEL_LEN
+warn_retired_override VLLM_MAX_BATCHED_TOKENS AUTOVLLM_MAX_BATCHED_TOKENS
+warn_retired_override VLLM_EXTRA_ARGS AUTOVLLM_EXTRA_ARGS
+
+# Ignore legacy script inputs instead of leaking them into vLLM's reserved
+# environment namespace. VLLM_MODEL was an internal gateway handoff;
+# VLLM_PORT is the upstream collision that motivated the namespace change.
+unset VLLM_MODEL VLLM_PORT VLLM_TENSOR_PARALLEL VLLM_GPU_MEM_UTIL
+unset VLLM_MAX_MODEL_LEN VLLM_MAX_BATCHED_TOKENS VLLM_EXTRA_ARGS
 
 # shellcheck source=auto-vllm/vllm-process.sh
 source "${SCRIPT_DIR}/vllm-process.sh"
@@ -114,12 +142,26 @@ configure_vllm_params() {
             ;;
     esac
 
-    MODEL="${VLLM_MODEL:-$MODEL}"
-    TENSOR_PARALLEL="${VLLM_TENSOR_PARALLEL:-$TENSOR_PARALLEL}"
-    GPU_MEM_UTIL="${VLLM_GPU_MEM_UTIL:-$GPU_MEM_UTIL}"
-    MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$MAX_MODEL_LEN}"
-    MAX_BATCHED_TOKENS="${VLLM_MAX_BATCHED_TOKENS:-$MAX_BATCHED_TOKENS}"
-    EXTRA_ARGS="${VLLM_EXTRA_ARGS:-$EXTRA_ARGS}"
+    MODEL="${MODEL_OVERRIDE:-$MODEL}"
+    TENSOR_PARALLEL="${TENSOR_PARALLEL_OVERRIDE:-$TENSOR_PARALLEL}"
+    GPU_MEM_UTIL="${GPU_MEM_UTIL_OVERRIDE:-$GPU_MEM_UTIL}"
+    MAX_MODEL_LEN="${MAX_MODEL_LEN_OVERRIDE:-$MAX_MODEL_LEN}"
+    MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS_OVERRIDE:-$MAX_BATCHED_TOKENS}"
+    EXTRA_ARGS="${EXTRA_ARGS_OVERRIDE:-$EXTRA_ARGS}"
+}
+
+clear_script_environment() {
+    # stop-vllm.sh consumes the shared process-control inputs first. Clear all
+    # start/stop script parameters only after that child exits, immediately
+    # before the long-lived vLLM process is launched.
+    unset AUTOVLLM_API_PORT AUTOVLLM_NFS_MOUNT_POINT AUTOVLLM_MODEL
+    unset AUTOVLLM_TENSOR_PARALLEL AUTOVLLM_GPU_MEM_UTIL
+    unset AUTOVLLM_MAX_MODEL_LEN AUTOVLLM_MAX_BATCHED_TOKENS AUTOVLLM_EXTRA_ARGS
+    unset AUTOVLLM_SCRIPT_DIR AUTOVLLM_BIN AUTOVLLM_PID_FILE
+    unset AUTOVLLM_HF_CACHE_LINK AUTOVLLM_LOG_FILE AUTOVLLM_PYTHON
+    unset AUTOVLLM_PROC_ROOT AUTOVLLM_COMMAND_PATTERN
+    unset AUTOVLLM_STARTUP_GRACE_PERIOD AUTOVLLM_STARTUP_LOG_LINES
+    unset AUTOVLLM_STOP_TIMEOUT AUTOVLLM_STOP_INTERVAL
 }
 
 verify_flashinfer_aot() {
@@ -166,6 +208,7 @@ run_vllm() {
     # Never launch over an older or orphaned server. A failed verified stop
     # aborts this script under set -e rather than registering the wrong model.
     bash "${SCRIPT_DIR}/stop-vllm.sh"
+    clear_script_environment
 
     cat <<EOF
 
@@ -186,7 +229,7 @@ EOF
     # shellcheck disable=SC2086
     "$VLLM_BIN" serve "$MODEL" \
         --host 0.0.0.0 \
-        --port "${VLLM_PORT}" \
+        --port "${API_PORT}" \
         --tensor-parallel-size "$TENSOR_PARALLEL" \
         --gpu-memory-utilization "$GPU_MEM_UTIL" \
         --max-model-len "$MAX_MODEL_LEN" \

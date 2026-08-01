@@ -6,10 +6,13 @@ provisioning sequence: setup.sh -> start-vllm.sh -> health poll -> register.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import shlex
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncssh
@@ -55,6 +58,8 @@ def _make_provisioner(
     circuit_breaker_registry: CircuitBreakerRegistry | MagicMock | None = None,
     redfish_client: MagicMock | None = None,
     endpoint_policy: EndpointPolicy = _TEST_ENDPOINT_POLICY,
+    nfs_export: str | None = "nfs.example:/exports/huggingface",
+    hf_token: str | None = None,
 ) -> NodeProvisioner:
     """Build a NodeProvisioner with mock dependencies."""
     constructor_args: dict[str, object] = {
@@ -67,11 +72,14 @@ def _make_provisioner(
         "connection_tracker": connection_tracker,
         "circuit_breaker_registry": circuit_breaker_registry,
         "redfish_client": redfish_client,
+        "hf_token": hf_token,
     }
     # Baseline comparisons run these tests against the pre-PR constructor so
     # failures reach behavioral assertions rather than stopping at TypeError.
     if "llmfit_settings" in inspect.signature(NodeProvisioner).parameters:
         constructor_args["llmfit_settings"] = llmfit_settings or LLMFitSettings()
+    if "nfs_export" in inspect.signature(NodeProvisioner).parameters:
+        constructor_args["nfs_export"] = nfs_export
     return NodeProvisioner(**constructor_args)
 
 
@@ -86,10 +94,110 @@ async def test_llmfit_version_single_source() -> None:
 
     await runner._install("host1")
 
-    assert "LLMFIT_VERSION=8.7.6" in provisioner._script_env_prefix()
+    assert provisioner._setup_script_env()["AUTOVLLM_LLMFIT_VERSION"] == "8.7.6"
     install_command = ssh.run.await_args.args[1]
     assert "/v8.7.6/llmfit-v8.7.6-" in install_command
     assert "llmfit_version" not in ProvisioningSettings.model_fields
+
+
+def test_script_env_prefix_exact() -> None:
+    """E7/E9: each remote script receives only its ordered allowlist."""
+    provisioner = _make_provisioner(
+        settings=ProvisioningSettings(
+            vllm_port=8123,
+            nfs_mount_point="/srv/hf cache",
+            nvidia_driver_version="999.1",
+        ),
+        llmfit_settings=LLMFitSettings(version="8.7.6"),
+        nfs_export="nfs.example:/exports/hf cache",
+        hf_token="hf secret",
+    )
+
+    assert provisioner._setup_script_env() == {
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
+        "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_NVIDIA_DRIVER_VERSION": "999.1",
+        "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_LLMFIT_VERSION": "8.7.6",
+    }
+    assert provisioner._start_script_env("org/model") == {
+        "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MODEL": "org/model",
+        "HF_TOKEN": "hf secret",
+    }
+    assert shlex.split(
+        provisioner._script_command("setup.sh", env=provisioner._setup_script_env())
+    ) == [
+        "AUTOVLLM_NFS_EXPORT=nfs.example:/exports/hf cache",
+        "AUTOVLLM_NFS_MOUNT_POINT=/srv/hf cache",
+        "AUTOVLLM_NVIDIA_DRIVER_VERSION=999.1",
+        "AUTOVLLM_API_PORT=8123",
+        "AUTOVLLM_LLMFIT_VERSION=8.7.6",
+        "bash",
+        "auto-vllm/setup.sh",
+    ]
+
+
+def test_env_prefix_quoting() -> None:
+    """E10: hostile values round-trip through one command assembly path."""
+    provisioner = _make_provisioner(
+        settings=ProvisioningSettings(scripts_dir=Path("bundles/provision scripts")),
+        hf_token="token '$(touch nope)'",
+    )
+    model = "org/model; printf 'unsafe'"
+
+    command = provisioner._script_command(
+        "start-vllm.sh", env=provisioner._start_script_env(model)
+    )
+    words = shlex.split(command)
+
+    assert words == [
+        "AUTOVLLM_NFS_MOUNT_POINT=/srv/hf-cache",
+        "AUTOVLLM_API_PORT=8000",
+        f"AUTOVLLM_MODEL={model}",
+        "HF_TOKEN=token '$(touch nope)'",
+        "bash",
+        "provision scripts/start-vllm.sh",
+    ]
+    assert not command.endswith(" ")
+
+
+def test_cache_paths_resolve_to_same_export() -> None:
+    """E8: distinct mount paths share one declared backing export."""
+    provisioner = _make_provisioner(
+        settings=ProvisioningSettings(nfs_mount_point="/srv/hf-cache"),
+        nfs_export="storage.example:/exports/huggingface",
+    )
+
+    assert provisioner._setup_script_env()["AUTOVLLM_NFS_EXPORT"] == (
+        "storage.example:/exports/huggingface"
+    )
+    assert provisioner._setup_script_env()["AUTOVLLM_NFS_MOUNT_POINT"] == (
+        "/srv/hf-cache"
+    )
+    assert "nfs_server" not in ProvisioningSettings.model_fields
+
+
+@pytest.mark.asyncio
+async def test_missing_nfs_export_fails_before_remote_work() -> None:
+    """E3: proxy-only startup is valid, but setup fails before side effects."""
+    ssh = MagicMock()
+    etcd = MagicMock()
+    provisioner = _make_provisioner(
+        ssh_client=ssh,
+        etcd_client=etcd,
+        nfs_export=None,
+    )
+
+    with patch.object(provisioner, "_provision", new_callable=AsyncMock) as body:
+        with pytest.raises(ProvisioningError, match="HUGGINGFACE__NFS_EXPORT"):
+            await provisioner.provision("host1")
+        body.assert_not_awaited()
+
+    ssh.upload.assert_not_called()
+    ssh.run_streaming.assert_not_called()
+    etcd.put.assert_not_called()
 
 
 async def _async_iter(items: list[tuple[str, str]]):
@@ -363,8 +471,8 @@ class TestModelExtraction:
             await provisioner._run_start_vllm("host1")
 
     @pytest.mark.asyncio
-    async def test_prepends_vllm_model_env_var(self) -> None:
-        """When model is provided, VLLM_MODEL=<quoted> is prepended to the command."""
+    async def test_includes_model_in_start_environment(self) -> None:
+        """The model uses the same ordered start environment as other inputs."""
         ssh = MagicMock()
         captured_commands: list[str] = []
 
@@ -378,7 +486,7 @@ class TestModelExtraction:
 
         await provisioner._run_start_vllm("host1", model="org/model")
         assert len(captured_commands) == 1
-        assert "VLLM_MODEL=" in captured_commands[0]
+        assert "AUTOVLLM_MODEL=" in captured_commands[0]
         assert "org/model" in captured_commands[0]
         assert captured_commands[0].endswith("bash auto-vllm/start-vllm.sh")
 
@@ -416,7 +524,7 @@ class TestModelExtraction:
         await provisioner._run_start_vllm("host1", model="model; rm -rf /")
         cmd = captured_commands[0]
         # shlex.quote wraps in single quotes so the shell treats it as one token
-        assert "VLLM_MODEL='model; rm -rf /'" in cmd
+        assert "AUTOVLLM_MODEL='model; rm -rf /'" in cmd
         assert "bash auto-vllm/start-vllm.sh" in cmd
 
 
@@ -869,6 +977,7 @@ def _make_full_provisioner(etcd: MagicMock) -> tuple[NodeProvisioner, MagicMock]
         settings=settings,
         llmfit_settings=LLMFitSettings(),
         endpoint_policy=_TEST_ENDPOINT_POLICY,
+        nfs_export="nfs.example:/exports/huggingface",
     )
     return provisioner, ssh
 
@@ -941,6 +1050,7 @@ class TestStateTracking:
             settings=settings,
             llmfit_settings=LLMFitSettings(),
             endpoint_policy=_TEST_ENDPOINT_POLICY,
+            nfs_export="nfs.example:/exports/huggingface",
         )
 
         with patch.object(provisioner, "preflight", new_callable=AsyncMock):
@@ -1120,6 +1230,7 @@ def _make_teardown_provisioner(
     model: str = "Qwen/Qwen2.5-72B-Instruct",
     tracker_get_returns: int | list[int] = 0,
     force: bool = False,
+    scripts_dir: Path = Path("auto-vllm"),
 ) -> tuple[NodeProvisioner, MagicMock, MagicMock, MagicMock, list[str]]:
     """Build a provisioner wired for teardown testing.
 
@@ -1164,7 +1275,10 @@ def _make_teardown_provisioner(
         registry=registry,
         connection_tracker=tracker,
         settings=ProvisioningSettings(
-            health_poll_timeout=2, health_poll_interval=0, drain_timeout=2
+            health_poll_timeout=2,
+            health_poll_interval=0,
+            drain_timeout=2,
+            scripts_dir=scripts_dir,
         ),
     )
     return provisioner, ssh, etcd, registry, tracker
@@ -1230,6 +1344,49 @@ class TestTeardownGraceful:
 
         assert commands == ["bash auto-vllm/stop-vllm.sh"]
         assert operation_order == ["upload", "stop"]
+
+    @pytest.mark.asyncio
+    async def test_scripts_dir_respected_in_commands(self) -> None:
+        """E12: upload, setup, start, and stop share the configured bundle."""
+        scripts_dir = Path("bundles/provision scripts")
+        provisioner, ssh, _etcd, _registry, _tracker = _make_teardown_provisioner(
+            scripts_dir=scripts_dir
+        )
+        commands: list[str] = []
+
+        async def capture_streaming(host: str, command: str):
+            assert host == "host1"
+            commands.append(command)
+            if "start-vllm.sh" in command:
+                yield ("stdout", "# Model:              org/model")
+            else:
+                yield ("stdout", "ok")
+
+        ssh.run_streaming = capture_streaming
+
+        await provisioner._upload_scripts("host1")
+        await provisioner._run_setup(
+            "host1",
+            started_at=datetime.now(UTC),
+            on_step=lambda _step: None,
+        )
+        await provisioner._run_start_vllm("host1", model="org/model")
+
+        assert ssh.upload.await_args_list[0].args == ("host1", scripts_dir)
+        assert [shlex.split(command)[-1] for command in commands[:2]] == [
+            "provision scripts/setup.sh",
+            "provision scripts/start-vllm.sh",
+        ]
+        assert all("auto-vllm/" not in command for command in commands)
+
+        await asyncio.wait_for(provisioner.teardown("host1", force=True), timeout=1)
+
+        assert shlex.split(commands[2]) == [
+            "bash",
+            "provision scripts/stop-vllm.sh",
+            "--force",
+        ]
+        assert all("auto-vllm/" not in command for command in commands)
 
     @pytest.mark.asyncio
     async def test_etcd_node_key_deleted(self) -> None:

@@ -51,6 +51,36 @@ def _source_and(
     return f"source <(sed {sed_args} {script})\n{command}"
 
 
+def test_setup_requires_nfs_export_before_steps(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("AUTOVLLM_NFS_EXPORT", raising=False)
+    attempted_remote_work = tmp_path / "attempted-remote-work"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "sudo",
+        f"#!/bin/bash\ntouch {shlex.quote(str(attempted_remote_work))}\nexit 99\n",
+    )
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = subprocess.run(
+        ["bash", str(SETUP_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "AUTOVLLM_NFS_EXPORT is required" in result.stderr
+    assert "[STEP:" not in result.stdout
+    assert not attempted_remote_work.exists()
+
+
 def test_hard_step_stops_at_first_failed_command(tmp_path: Path) -> None:
     reached_later_command = tmp_path / "reached-later-command"
 
@@ -186,7 +216,7 @@ exit 0
         {
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "AUTOVLLM_INSTALLED_DRIVER": installed_version,
-            "NVIDIA_DRIVER_VERSION": "580.126.09",
+            "AUTOVLLM_NVIDIA_DRIVER_VERSION": "580.126.09",
         }
     )
 
@@ -257,7 +287,7 @@ exit 2
             "AUTOVLLM_LLMFIT_BIN": str(llmfit_bin),
             "AUTOVLLM_TMP_DIR": str(tmp_path),
             "AUTOVLLM_TEST_LOG": str(operation_log),
-            "LLMFIT_VERSION": "1.1.6",
+            "AUTOVLLM_LLMFIT_VERSION": "1.1.6",
         }
     )
 

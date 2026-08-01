@@ -74,7 +74,7 @@ esac
             "AUTOVLLM_STOP_TIMEOUT": "2",
             "AUTOVLLM_STOP_INTERVAL": "0.01",
             "AUTOVLLM_TEST_LOG": str(process_log),
-            "NFS_MOUNT_POINT": str(cache_dir),
+            "AUTOVLLM_NFS_MOUNT_POINT": str(cache_dir),
         }
     )
     return env
@@ -95,6 +95,12 @@ def _configured_profile(
         "VLLM_MAX_MODEL_LEN",
         "VLLM_MAX_BATCHED_TOKENS",
         "VLLM_EXTRA_ARGS",
+        "AUTOVLLM_MODEL",
+        "AUTOVLLM_TENSOR_PARALLEL",
+        "AUTOVLLM_GPU_MEM_UTIL",
+        "AUTOVLLM_MAX_MODEL_LEN",
+        "AUTOVLLM_MAX_BATCHED_TOKENS",
+        "AUTOVLLM_EXTRA_ARGS",
     ):
         env.pop(name, None)
     env["AUTOVLLM_SCRIPT_DIR"] = str(SCRIPT_ROOT / "auto-vllm")
@@ -165,7 +171,7 @@ while true; do sleep 1; done
         # Simulate PID reuse: the file names a live but unrelated process,
         # while the real old vLLM must be discovered from its command line.
         pid_file.write_text(str(unrelated.pid))
-        env["VLLM_MODEL"] = "new-model"
+        env["AUTOVLLM_MODEL"] = "new-model"
 
         result = subprocess.run(
             ["bash", str(START_SCRIPT)],
@@ -226,7 +232,7 @@ while true; do sleep 1; done
     try:
         _wait_for_line(process_log, "start:old-model")
         pid_file.write_text(str(old_vllm.pid))
-        env["VLLM_MODEL"] = "new-model"
+        env["AUTOVLLM_MODEL"] = "new-model"
         env["AUTOVLLM_STOP_TIMEOUT"] = "1"
 
         result = subprocess.run(
@@ -433,7 +439,7 @@ echo launched >> "$AUTOVLLM_TEST_LOG"
     assert cache_target.is_dir()
     assert not cache_target.is_symlink()
     assert sentinel.read_text() == "keep"
-    assert not (cache_target / Path(env["NFS_MOUNT_POINT"]).name).exists()
+    assert not (cache_target / Path(env["AUTOVLLM_NFS_MOUNT_POINT"]).name).exists()
     assert not process_log.exists()
 
 
@@ -468,7 +474,7 @@ while true; do sleep 1; done
 
         assert result.returncode == 0, result.stderr
         assert cache_target.is_symlink()
-        assert os.readlink(cache_target) == env["NFS_MOUNT_POINT"]
+        assert os.readlink(cache_target) == env["AUTOVLLM_NFS_MOUNT_POINT"]
     finally:
         subprocess.run(
             ["bash", str(STOP_SCRIPT), "--force"],
@@ -577,12 +583,12 @@ def test_explicit_vllm_overrides_still_win() -> None:
         gpu_count=2,
         gpu_vram_gb=80,
         overrides={
-            "VLLM_MODEL": "example/custom-model",
-            "VLLM_TENSOR_PARALLEL": "1",
-            "VLLM_GPU_MEM_UTIL": "0.73",
-            "VLLM_MAX_MODEL_LEN": "1234",
-            "VLLM_MAX_BATCHED_TOKENS": "5678",
-            "VLLM_EXTRA_ARGS": "--dtype float16",
+            "AUTOVLLM_MODEL": "example/custom-model",
+            "AUTOVLLM_TENSOR_PARALLEL": "1",
+            "AUTOVLLM_GPU_MEM_UTIL": "0.73",
+            "AUTOVLLM_MAX_MODEL_LEN": "1234",
+            "AUTOVLLM_MAX_BATCHED_TOKENS": "5678",
+            "AUTOVLLM_EXTRA_ARGS": "--dtype float16",
         },
     ) == [
         "example/custom-model",
@@ -592,6 +598,159 @@ def test_explicit_vllm_overrides_still_win() -> None:
         "5678",
         "--dtype float16",
     ]
+
+
+def test_retired_vllm_overrides_warn_and_are_ignored() -> None:
+    env = os.environ.copy()
+    retired = {
+        "VLLM_TENSOR_PARALLEL": "1",
+        "VLLM_GPU_MEM_UTIL": "0.11",
+        "VLLM_MAX_MODEL_LEN": "123",
+        "VLLM_MAX_BATCHED_TOKENS": "456",
+        "VLLM_EXTRA_ARGS": "--dtype float16",
+    }
+    for name in (
+        *retired,
+        "AUTOVLLM_TENSOR_PARALLEL",
+        "AUTOVLLM_GPU_MEM_UTIL",
+        "AUTOVLLM_MAX_MODEL_LEN",
+        "AUTOVLLM_MAX_BATCHED_TOKENS",
+        "AUTOVLLM_EXTRA_ARGS",
+    ):
+        env.pop(name, None)
+    env.update(retired)
+    env["AUTOVLLM_SCRIPT_DIR"] = str(SCRIPT_ROOT / "auto-vllm")
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+GPU_MODEL='NVIDIA A100'
+GPU_COUNT=2
+GPU_VRAM_GB=80
+configure_vllm_params
+printf '%s|%s|%s|%s|%s\n' \
+    "$TENSOR_PARALLEL" "$GPU_MEM_UTIL" "$MAX_MODEL_LEN" \
+    "$MAX_BATCHED_TOKENS" "$EXTRA_ARGS"
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == "2|0.90|32768|32768|"
+    for legacy, replacement in zip(
+        retired,
+        (
+            "AUTOVLLM_TENSOR_PARALLEL",
+            "AUTOVLLM_GPU_MEM_UTIL",
+            "AUTOVLLM_MAX_MODEL_LEN",
+            "AUTOVLLM_MAX_BATCHED_TOKENS",
+            "AUTOVLLM_EXTRA_ARGS",
+        ),
+        strict=True,
+    ):
+        assert f"{legacy} is ignored; use {replacement} instead" in result.stderr
+
+
+def test_vllm_env_does_not_leak_script_params(tmp_path: Path) -> None:
+    captured_env = tmp_path / "vllm.env"
+    process_log = tmp_path / "process.log"
+    vllm_bin = tmp_path / "environment-capturing-vllm"
+    _write_executable(
+        vllm_bin,
+        """#!/bin/bash
+env | sort > "$AUTOVLLM_CAPTURE_ENV"
+trap 'exit 0' TERM
+while true; do sleep 1; done
+""",
+    )
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=vllm_bin,
+        process_log=process_log,
+    )
+    env.update(
+        {
+            "AUTOVLLM_CAPTURE_ENV": str(captured_env),
+            "AUTOVLLM_API_PORT": "8123",
+            "AUTOVLLM_MODEL": "example/model",
+            "AUTOVLLM_TENSOR_PARALLEL": "1",
+            "AUTOVLLM_GPU_MEM_UTIL": "0.73",
+            "AUTOVLLM_MAX_MODEL_LEN": "1234",
+            "AUTOVLLM_MAX_BATCHED_TOKENS": "5678",
+            "AUTOVLLM_EXTRA_ARGS": "--dtype float16",
+            "VLLM_PORT": "8123",
+            "VLLM_TENSOR_PARALLEL": "99",
+            "VLLM_GPU_MEM_UTIL": "0.01",
+            "VLLM_MAX_MODEL_LEN": "1",
+            "VLLM_MAX_BATCHED_TOKENS": "1",
+            "VLLM_EXTRA_ARGS": "--should-not-leak",
+            "HF_TOKEN": "hf_secret",
+        }
+    )
+
+    try:
+        result = subprocess.run(
+            ["bash", str(START_SCRIPT)],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        captured = {
+            line.partition("=")[0]: line.partition("=")[2]
+            for line in captured_env.read_text().splitlines()
+        }
+        forbidden = {
+            "AUTOVLLM_API_PORT",
+            "AUTOVLLM_NFS_MOUNT_POINT",
+            "AUTOVLLM_MODEL",
+            "AUTOVLLM_TENSOR_PARALLEL",
+            "AUTOVLLM_GPU_MEM_UTIL",
+            "AUTOVLLM_MAX_MODEL_LEN",
+            "AUTOVLLM_MAX_BATCHED_TOKENS",
+            "AUTOVLLM_EXTRA_ARGS",
+            "AUTOVLLM_SCRIPT_DIR",
+            "AUTOVLLM_BIN",
+            "AUTOVLLM_PID_FILE",
+            "AUTOVLLM_HF_CACHE_LINK",
+            "AUTOVLLM_LOG_FILE",
+            "AUTOVLLM_PYTHON",
+            "AUTOVLLM_PROC_ROOT",
+            "AUTOVLLM_COMMAND_PATTERN",
+            "AUTOVLLM_STARTUP_GRACE_PERIOD",
+            "AUTOVLLM_STARTUP_LOG_LINES",
+            "AUTOVLLM_STOP_TIMEOUT",
+            "AUTOVLLM_STOP_INTERVAL",
+            "VLLM_PORT",
+            "VLLM_TENSOR_PARALLEL",
+            "VLLM_GPU_MEM_UTIL",
+            "VLLM_MAX_MODEL_LEN",
+            "VLLM_MAX_BATCHED_TOKENS",
+            "VLLM_EXTRA_ARGS",
+        }
+        assert forbidden.isdisjoint(captured)
+        assert captured["HF_TOKEN"] == "hf_secret"
+        assert captured["FLASHINFER_DISABLE_JIT"] == "1"
+    finally:
+        subprocess.run(
+            ["bash", str(STOP_SCRIPT), "--force"],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
 
 
 def test_start_failure_returns_log_tail_immediately(tmp_path: Path) -> None:

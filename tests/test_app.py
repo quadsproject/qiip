@@ -178,6 +178,33 @@ class TestLifespanRegistryIntegration:
         watcher.run.assert_called_once()
         watcher.stop.assert_called_once()
 
+    @patch("inference_proxy.main.EtcdWatcher")
+    @patch("inference_proxy.main.EtcdClient")
+    def test_lifespan_passes_canonical_nfs_export_to_provisioner(
+        self,
+        mock_etcd_cls: MagicMock,
+        _mock_watcher_cls: MagicMock,
+        test_settings: Settings,
+    ) -> None:
+        mock_client = MagicMock()
+        mock_client.get_prefix.return_value = []
+        mock_client.prefix = "/nodes/"
+        mock_etcd_cls.return_value = mock_client
+        huggingface = test_settings.huggingface.model_copy(
+            update={"nfs_export": "storage.example:/exports/huggingface"}
+        )
+        settings = _lifespan_settings(
+            test_settings.model_copy(update={"huggingface": huggingface})
+        )
+
+        from inference_proxy.main import create_app
+
+        app = create_app(settings=settings)
+        with TestClient(app):
+            assert app.state.provisioner._nfs_export == (
+                "storage.example:/exports/huggingface"
+            )
+
     @patch("inference_proxy.main.logger")
     @patch("inference_proxy.main.EtcdWatcher")
     @patch("inference_proxy.main.EtcdClient")

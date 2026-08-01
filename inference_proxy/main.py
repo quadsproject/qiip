@@ -281,6 +281,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             redfish_client=app.state.redfish_client,
             log_buffer=log_buffer,
             hf_token=hf_token.get_secret_value() if hf_token else None,
+            nfs_export=resolved_settings.huggingface.nfs_export,
         )
         app.state.provisioner = provisioner
 

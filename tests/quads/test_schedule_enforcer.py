@@ -450,6 +450,7 @@ async def test_schedule_enforcer_uses_same_host_lifecycle_lock(
         llmfit_settings=LLMFitSettings(),
         endpoint_policy=_ENDPOINT_POLICY,
         registry=registry,
+        nfs_export="nfs.example:/exports/huggingface",
     )
     provision_entered = asyncio.Event()
     release_provision = asyncio.Event()

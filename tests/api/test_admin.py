@@ -46,6 +46,7 @@ from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationEr
 from inference_proxy.models.llmfit import LLMFitResult, ModelRecommendation, SystemInfo
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.models.quads import QUADSHost
+from inference_proxy.provisioning.provisioner import ProvisioningError
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
     SSHConnectionError,
@@ -379,6 +380,22 @@ class TestSetupEndpoint:
         assert response.json()["detail"] == (
             "add 'gpu01' to routing.allowed_endpoint_hosts"
         )
+        mock_provisioner.try_reserve_host.assert_not_awaited()
+        mock_provisioner.fire_background.assert_not_called()
+
+    def test_missing_nfs_export_rejected_before_reserving_host(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.validate_setup_configuration.side_effect = ProvisioningError(
+            "Node provisioning requires INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT"
+        )
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 400
+        assert "HUGGINGFACE__NFS_EXPORT" in response.json()["detail"]
         mock_provisioner.try_reserve_host.assert_not_awaited()
         mock_provisioner.fire_background.assert_not_called()
 

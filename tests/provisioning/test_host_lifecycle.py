@@ -41,6 +41,7 @@ def _provisioner(
         registry=registry,
         connection_tracker=tracker,
         circuit_breaker_registry=breakers,
+        nfs_export="nfs.example:/exports/huggingface",
     )
 
 
