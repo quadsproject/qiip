@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import subprocess
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -145,20 +149,13 @@ class TestFirstRecommendationInstall:
 
         settings = LLMFitSettings(
             version="2.3.4",
+            sha256="a" * 64,
             binary_path="/opt/llmfit",
             timeout=17.0,
             install_url="https://downloads.example/llmfit-{version}.tar.gz",
         )
         runner = LLMFitRunner(mock_ssh_client, settings)
         recommend_command = "/opt/llmfit recommend --json --runtime vllm -n 30"
-        install_command = (
-            "wget -q 'https://downloads.example/llmfit-2.3.4.tar.gz' "
-            "-O /tmp/llmfit.tar.gz"
-            " && tar -xzf /tmp/llmfit.tar.gz -C /tmp/"
-            ' && sudo install -m 755 "$(find /tmp/ -name llmfit -type f '
-            '-print -quit)" /opt/llmfit'
-            " && rm -rf /tmp/llmfit.tar.gz /tmp/llmfit-*"
-        )
         mock_ssh_client.run.side_effect = [
             RemoteCommandError("gpu-host-01", recommend_command, 127),
             ("", "", 0),
@@ -168,11 +165,93 @@ class TestFirstRecommendationInstall:
         result = await runner.recommend("gpu-host-01")
 
         assert len(result.models) == 2
-        assert mock_ssh_client.run.await_args_list == [
-            call("gpu-host-01", recommend_command, timeout=17.0),
-            call("gpu-host-01", install_command, timeout=17.0),
-            call("gpu-host-01", recommend_command, timeout=17.0),
-        ]
+        assert mock_ssh_client.run.await_args_list[0] == call(
+            "gpu-host-01", recommend_command, timeout=17.0
+        )
+        install_call = mock_ssh_client.run.await_args_list[1]
+        assert install_call.args[0] == "gpu-host-01"
+        assert install_call.kwargs == {"timeout": 17.0}
+        shell_command = shlex.split(install_call.args[1])
+        assert shell_command[:2] == ["bash", "-c"]
+        assert "https://downloads.example/llmfit-2.3.4.tar.gz" in shell_command[2]
+        assert "a" * 64 in shell_command[2]
+        assert "sha256sum -c -" in shell_command[2]
+        assert mock_ssh_client.run.await_args_list[2] == call(
+            "gpu-host-01", recommend_command, timeout=17.0
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("exit_status", [1, 2, 126])
+    async def test_non_command_not_found_failure_does_not_install(
+        self,
+        mock_ssh_client: MagicMock,
+        exit_status: int,
+    ) -> None:
+        error = RemoteCommandError(
+            "gpu-host-01", "llmfit recommend", exit_status, "recommend failed"
+        )
+        mock_ssh_client.run.side_effect = error
+        runner = LLMFitRunner(mock_ssh_client)
+
+        with pytest.raises(RemoteCommandError) as caught:
+            await runner.recommend("gpu-host-01")
+
+        assert caught.value is error
+        mock_ssh_client.run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_install_checksum_mismatch_never_reaches_root_install(
+    mock_ssh_client: MagicMock,
+    tmp_path: Path,
+) -> None:
+    from inference_proxy.config.settings import LLMFitSettings
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    operation_log = tmp_path / "operations.log"
+    wget = fake_bin / "wget"
+    wget.write_text(
+        "#!/bin/bash\n"
+        'echo wget >> "$LLMFIT_TEST_LOG"\n'
+        'while [[ "$#" -gt 0 ]]; do\n'
+        '  if [[ "$1" == "-O" ]]; then printf bad > "$2"; exit 0; fi\n'
+        "  shift\n"
+        "done\n"
+        "exit 2\n"
+    )
+    wget.chmod(0o755)
+    for command in ("tar", "sudo"):
+        executable = fake_bin / command
+        executable.write_text(
+            f'#!/bin/bash\necho {command} >> "$LLMFIT_TEST_LOG"\nexit 99\n'
+        )
+        executable.chmod(0o755)
+
+    settings = LLMFitSettings(
+        binary_path=str(tmp_path / "llmfit"),
+        sha256="a" * 64,
+        install_url="https://downloads.example/llmfit-{version}.tar.gz",
+    )
+    runner = LLMFitRunner(mock_ssh_client, settings)
+    await runner._install("gpu-host-01")
+    command = mock_ssh_client.run.await_args.args[1]
+
+    result = subprocess.run(
+        ["bash", "-c", command],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "LLMFIT_TEST_LOG": str(operation_log),
+        },
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert operation_log.read_text().splitlines() == ["wget"]
 
 
 class TestRecommendEmptyOutput:

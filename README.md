@@ -235,6 +235,12 @@ LLMFit has one version setting: `INFERENCE_PROXY_LLMFIT__VERSION`. The retired
 startup warning so an existing pin cannot disappear silently. Remove the old
 variable and move its value to the LLMFit setting when upgrading.
 
+The default NVIDIA driver and LLMFit versions each ship with a verified
+SHA-256. Changing either version requires configuring its matching digest via
+`INFERENCE_PROXY_PROVISIONING__NVIDIA_DRIVER_SHA256` or
+`INFERENCE_PROXY_LLMFIT__SHA256`; provisioning fails before SSH or installation
+when a custom version has no explicit digest.
+
 The gateway cache path and node cache mount may differ, but provisioning uses
 one declared backing export: `INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT`. It is
 optional for proxy-only deployments and required before a node setup operation

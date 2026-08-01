@@ -2,23 +2,81 @@
 set -euo pipefail
 
 # --- Configurable defaults ---
+SCRIPT_DIR="${AUTOVLLM_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 NFS_EXPORT="${AUTOVLLM_NFS_EXPORT:-}"
 NFS_MOUNT_POINT="${AUTOVLLM_NFS_MOUNT_POINT:-/srv/hf-cache}"
-DRIVER_VERSION="${AUTOVLLM_NVIDIA_DRIVER_VERSION:-580.126.09}"
+DEFAULT_DRIVER_VERSION="580.126.09"
+DEFAULT_DRIVER_SHA256="4cac53e48f8adff661d47c8788ed24059a248c9fd8098ceafd088a498986ec26"
+DRIVER_VERSION="${AUTOVLLM_NVIDIA_DRIVER_VERSION-$DEFAULT_DRIVER_VERSION}"
+if [[ -v AUTOVLLM_NVIDIA_DRIVER_SHA256 ]]; then
+    DRIVER_SHA256="$AUTOVLLM_NVIDIA_DRIVER_SHA256"
+elif [ "$DRIVER_VERSION" = "$DEFAULT_DRIVER_VERSION" ]; then
+    DRIVER_SHA256="$DEFAULT_DRIVER_SHA256"
+else
+    DRIVER_SHA256=""
+fi
 NVIDIA_DRIVER_URL="${NVIDIA_DRIVER_URL:-https://us.download.nvidia.com/tesla/${DRIVER_VERSION}/NVIDIA-Linux-x86_64-${DRIVER_VERSION}.run}"
 API_PORT="${AUTOVLLM_API_PORT:-8000}"
-LLMFIT_RELEASE="${AUTOVLLM_LLMFIT_VERSION:-1.1.6}"
+DEFAULT_LLMFIT_RELEASE="1.1.6"
+DEFAULT_LLMFIT_SHA256="1e09232a128455596a2d348ab5893741d04b94aa6d924f1253462dc13304f7c6"
+LLMFIT_RELEASE="${AUTOVLLM_LLMFIT_VERSION-$DEFAULT_LLMFIT_RELEASE}"
+if [[ -v AUTOVLLM_LLMFIT_SHA256 ]]; then
+    LLMFIT_SHA256="$AUTOVLLM_LLMFIT_SHA256"
+elif [ "$LLMFIT_RELEASE" = "$DEFAULT_LLMFIT_RELEASE" ]; then
+    LLMFIT_SHA256="$DEFAULT_LLMFIT_SHA256"
+else
+    LLMFIT_SHA256=""
+fi
 LLMFIT_URL="${LLMFIT_URL:-https://github.com/AlexsJones/llmfit/releases/download/v${LLMFIT_RELEASE}/llmfit-v${LLMFIT_RELEASE}-x86_64-unknown-linux-musl.tar.gz}"
 VLLM_VENV="${AUTOVLLM_VENV:-/opt/vllm-venv}"
 LLMFIT_BIN="${AUTOVLLM_LLMFIT_BIN:-/usr/local/bin/llmfit}"
 INSTALL_TMP_DIR="${AUTOVLLM_TMP_DIR:-/tmp}"
-FLASHINFER_INDEX_URL="${FLASHINFER_INDEX_URL:-https://flashinfer.ai/whl}"
+UV_BIN="${AUTOVLLM_UV_BIN:-/usr/local/bin/uv}"
+UV_PROJECT="${AUTOVLLM_UV_PROJECT:-$SCRIPT_DIR}"
+UV_TARGET="x86_64-unknown-linux-gnu"
+UV_PYTHON_PLATFORM="x86_64-manylinux_2_34"
+UV_VERSION="$(<"${SCRIPT_DIR}/.uv-version")"
+UV_ARCHIVE="uv-${UV_TARGET}.tar.gz"
+UV_CHECKSUM_FILE="${SCRIPT_DIR}/${UV_ARCHIVE}.sha256"
+FLASHINFER_INDEX_OVERRIDE_SET=0
+if [[ -v FLASHINFER_INDEX_URL ]]; then
+    FLASHINFER_INDEX_OVERRIDE_SET=1
+fi
 
 # Script configuration is captured above. Do not leak this namespace into
 # installers or other child processes spawned by setup.sh.
 unset AUTOVLLM_NFS_EXPORT AUTOVLLM_NFS_MOUNT_POINT
-unset AUTOVLLM_NVIDIA_DRIVER_VERSION AUTOVLLM_API_PORT
-unset AUTOVLLM_LLMFIT_VERSION AUTOVLLM_VENV AUTOVLLM_LLMFIT_BIN AUTOVLLM_TMP_DIR
+unset AUTOVLLM_NVIDIA_DRIVER_VERSION AUTOVLLM_NVIDIA_DRIVER_SHA256 AUTOVLLM_API_PORT
+unset AUTOVLLM_LLMFIT_VERSION AUTOVLLM_LLMFIT_SHA256
+unset AUTOVLLM_VENV AUTOVLLM_LLMFIT_BIN AUTOVLLM_TMP_DIR
+unset AUTOVLLM_UV_BIN AUTOVLLM_UV_PROJECT AUTOVLLM_SCRIPT_DIR FLASHINFER_INDEX_URL
+
+require_sha256() {
+    local label="$1"
+    local digest="$2"
+    local setting="$3"
+    if [[ ! "$digest" =~ ^[[:xdigit:]]{64}$ ]]; then
+        echo "FATAL: ${label} requires a 64-character SHA-256 in ${setting}" >&2
+        return 2
+    fi
+}
+
+verify_sha256() {
+    local file="$1"
+    local digest="$2"
+    local label="$3"
+    if ! printf '%s  %s\n' "$digest" "$file" | sha256sum -c - >/dev/null; then
+        echo "FATAL: ${label} SHA-256 verification failed" >&2
+        return 1
+    fi
+}
+
+reject_retired_flashinfer_index() {
+    if [ "$FLASHINFER_INDEX_OVERRIDE_SET" -eq 1 ]; then
+        echo "FATAL: FLASHINFER_INDEX_URL is retired; the frozen auto-vllm/uv.lock owns package sources. Ship a regenerated auto-vllm bundle for a custom mirror." >&2
+        return 2
+    fi
+}
 
 run_with_errexit() {
     # A function invoked directly as an if-condition inherits Bash's ignored
@@ -71,6 +129,8 @@ run_system_update() {
 }
 
 install_nvidia_driver() {
+    require_sha256 "NVIDIA driver ${DRIVER_VERSION}" "$DRIVER_SHA256" \
+        "AUTOVLLM_NVIDIA_DRIVER_SHA256"
     if nvidia-smi &>/dev/null; then
         local installed_versions
         installed_versions=$(
@@ -101,13 +161,32 @@ install_nvidia_driver() {
         sudo dnf -y remove '*nvidia*driver*' 2>/dev/null || true
         sudo rm -f /etc/modprobe.d/blacklist-nouveau.conf
     fi
+    local work_dir installer status
+    work_dir=$(mktemp -d "${INSTALL_TMP_DIR%/}/auto-vllm-driver.XXXXXX")
+    installer="${work_dir}/NVIDIA-driver.run"
+    if wget -q "${NVIDIA_DRIVER_URL}" -O "$installer"; then
+        :
+    else
+        status=$?
+        rm -rf "$work_dir"
+        return "$status"
+    fi
+    if ! verify_sha256 "$installer" "$DRIVER_SHA256" \
+        "NVIDIA driver ${DRIVER_VERSION}"; then
+        rm -rf "$work_dir"
+        return 1
+    fi
+    chmod +x "$installer"
     echo 'blacklist nouveau' | sudo tee /etc/modprobe.d/blacklist-nouveau.conf
     sudo dracut --force
     sudo modprobe -r nouveau 2>/dev/null || true
-    wget -q "${NVIDIA_DRIVER_URL}" -O /tmp/NVIDIA-driver.run
-    chmod +x /tmp/NVIDIA-driver.run
-    sudo sh /tmp/NVIDIA-driver.run --dkms --no-x-check --no-nouveau-check --ui=none --no-questions
-    rm -f /tmp/NVIDIA-driver.run
+    if sudo sh "$installer" --dkms --no-x-check --no-nouveau-check --ui=none --no-questions; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -rf "$work_dir"
+    return "$status"
 }
 
 install_cuda_toolkit() {
@@ -121,35 +200,62 @@ install_cuda_toolkit() {
     ln -sfn /usr/bin/ninja-build /usr/local/bin/ninja
 }
 
-install_vllm() {
-    if [ -x "${VLLM_VENV}/bin/vllm" ]; then
-        echo "vLLM already installed in ${VLLM_VENV}, skipping core install"
-    else
-        python3.12 -m venv "${VLLM_VENV}"
-        "${VLLM_VENV}/bin/pip" install --upgrade pip
-        "${VLLM_VENV}/bin/pip" install vllm
+install_uv() {
+    local installed_version=""
+    if [ -x "$UV_BIN" ]; then
+        installed_version=$("$UV_BIN" --version 2>/dev/null | awk '{print $2}') || true
     fi
-
-    install_flashinfer_aot
-}
-
-install_flashinfer_aot() {
-    local flashinfer_version
-    flashinfer_version=$(
-        "${VLLM_VENV}/bin/python" -c \
-            'from importlib.metadata import version; from packaging.version import Version; print(Version(version("flashinfer-python")).public)'
-    )
-
-    if "${VLLM_VENV}/bin/python" -c \
-        'from importlib.metadata import version; from packaging.version import Version; import flashinfer_cubin; assert Version(version("flashinfer-cubin")).public == Version(version("flashinfer-python")).public' \
-        &>/dev/null; then
-        echo "FlashInfer AOT kernels ${flashinfer_version} already installed, skipping"
+    if [ "$installed_version" = "$UV_VERSION" ]; then
+        echo "uv ${UV_VERSION} already installed, skipping bootstrap"
         return 0
     fi
 
-    "${VLLM_VENV}/bin/pip" install --no-deps \
-        --index-url "$FLASHINFER_INDEX_URL" \
-        "flashinfer-cubin==${flashinfer_version}"
+    if [ ! -s "$UV_CHECKSUM_FILE" ]; then
+        echo "FATAL: pinned uv checksum file is missing or empty: ${UV_CHECKSUM_FILE}" >&2
+        return 2
+    fi
+
+    local work_dir archive extracted status
+    work_dir=$(mktemp -d "${INSTALL_TMP_DIR%/}/auto-vllm-uv.XXXXXX")
+    archive="${work_dir}/${UV_ARCHIVE}"
+    extracted="${work_dir}/uv-${UV_TARGET}/uv"
+    if wget -q \
+        "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ARCHIVE}" \
+        -O "$archive"; then
+        :
+    else
+        status=$?
+        rm -rf "$work_dir"
+        return "$status"
+    fi
+    if ! (cd "$work_dir" && sha256sum -c "$UV_CHECKSUM_FILE" >/dev/null); then
+        echo "FATAL: uv ${UV_VERSION} SHA-256 verification failed" >&2
+        rm -rf "$work_dir"
+        return 1
+    fi
+    tar -xzf "$archive" -C "$work_dir"
+    if sudo install -m 755 "$extracted" "$UV_BIN"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -rf "$work_dir"
+    return "$status"
+}
+
+install_vllm() {
+    reject_retired_flashinfer_index
+    install_uv
+
+    UV_PROJECT_ENVIRONMENT="$VLLM_VENV" "$UV_BIN" sync \
+        --project "$UV_PROJECT" \
+        --frozen \
+        --no-dev \
+        --no-install-project \
+        --no-build \
+        --python /usr/bin/python3.12 \
+        --python-platform "$UV_PYTHON_PLATFORM"
+
     "${VLLM_VENV}/bin/python" -c \
         'from importlib.metadata import version; from packaging.version import Version; import flashinfer_cubin; assert Version(version("flashinfer-cubin")).public == Version(version("flashinfer-python")).public'
 }
@@ -188,6 +294,8 @@ configure_firewall() {
 }
 
 install_llmfit() {
+    require_sha256 "llmfit ${LLMFIT_RELEASE}" "$LLMFIT_SHA256" \
+        "AUTOVLLM_LLMFIT_SHA256"
     if [ -x "$LLMFIT_BIN" ]; then
         local installed_version
         installed_version=$(
@@ -200,13 +308,35 @@ install_llmfit() {
         fi
         echo "Replacing llmfit ${installed_version:-unknown} with requested ${LLMFIT_RELEASE}"
     fi
-    local archive="${INSTALL_TMP_DIR}/llmfit.tar.gz"
-    wget -q "${LLMFIT_URL}" -O "$archive"
-    tar -xzf "$archive" -C "$INSTALL_TMP_DIR/"
-    sudo install -m 755 \
-        "$(find "$INSTALL_TMP_DIR/" -name llmfit -type f -print -quit)" \
-        "$LLMFIT_BIN"
-    rm -rf "$archive" "${INSTALL_TMP_DIR}"/llmfit-*
+    local work_dir archive status
+    local -a llmfit_binaries=()
+    work_dir=$(mktemp -d "${INSTALL_TMP_DIR%/}/auto-vllm-llmfit.XXXXXX")
+    archive="${work_dir}/llmfit.tar.gz"
+    if wget -q "${LLMFIT_URL}" -O "$archive"; then
+        :
+    else
+        status=$?
+        rm -rf "$work_dir"
+        return "$status"
+    fi
+    if ! verify_sha256 "$archive" "$LLMFIT_SHA256" "llmfit ${LLMFIT_RELEASE}"; then
+        rm -rf "$work_dir"
+        return 1
+    fi
+    tar -xzf "$archive" -C "$work_dir"
+    mapfile -t llmfit_binaries < <(find "$work_dir" -name llmfit -type f -print)
+    if [ "${#llmfit_binaries[@]}" -ne 1 ]; then
+        echo "FATAL: verified llmfit archive must contain exactly one llmfit binary" >&2
+        rm -rf "$work_dir"
+        return 1
+    fi
+    if sudo install -m 755 "${llmfit_binaries[0]}" "$LLMFIT_BIN"; then
+        status=0
+    else
+        status=$?
+    fi
+    rm -rf "$work_dir"
+    return "$status"
 }
 
 # --- Main ---
@@ -215,6 +345,11 @@ main() {
         echo "FATAL: AUTOVLLM_NFS_EXPORT is required for node provisioning" >&2
         return 2
     fi
+    reject_retired_flashinfer_index
+    require_sha256 "NVIDIA driver ${DRIVER_VERSION}" "$DRIVER_SHA256" \
+        "AUTOVLLM_NVIDIA_DRIVER_SHA256"
+    require_sha256 "llmfit ${LLMFIT_RELEASE}" "$LLMFIT_SHA256" \
+        "AUTOVLLM_LLMFIT_SHA256"
     step system_update run_system_update
     step nvidia_driver install_nvidia_driver
     step cuda_toolkit install_cuda_toolkit

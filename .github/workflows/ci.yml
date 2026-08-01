@@ -33,6 +33,7 @@ jobs:
         with:
           enable-cache: true
           python-version: "3.12"
+          version-file: auto-vllm/.uv-version
 
       - name: Install dependencies
         run: uv sync --locked --all-groups
@@ -42,6 +43,16 @@ jobs:
 
       - name: Check formatting
         run: uv run --frozen ruff format --check .
+
+      - name: Check node dependency lock
+        env:
+          UV_PROJECT_ENVIRONMENT: /tmp/auto-vllm-lock-check
+        run: |
+          uv lock --check --project auto-vllm
+          uv sync --project auto-vllm --frozen --no-dev --no-install-project --no-build --python 3.12 --python-platform x86_64-manylinux_2_34 --dry-run
+
+      - name: Check node scripts
+        run: shellcheck auto-vllm/*.sh
 
       - name: Type check
         run: uv run --frozen mypy inference_proxy
@@ -68,6 +79,7 @@ jobs:
         with:
           enable-cache: true
           python-version: "3.13"
+          version-file: auto-vllm/.uv-version
 
       - name: Install dependencies
         run: uv sync --locked --all-groups

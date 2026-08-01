@@ -104,6 +104,7 @@ class NodeProvisioner:
         self._etcd_client = etcd_client
         self._settings = settings
         self._llmfit_version = llmfit_settings.version
+        self._llmfit_sha256 = llmfit_settings.sha256
         self._endpoint_policy = endpoint_policy
         self._registry = registry
         self._tracker = connection_tracker
@@ -163,8 +164,10 @@ class NodeProvisioner:
             "AUTOVLLM_NFS_EXPORT": self._required_nfs_export(),
             "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
             "AUTOVLLM_NVIDIA_DRIVER_VERSION": self._settings.nvidia_driver_version,
+            "AUTOVLLM_NVIDIA_DRIVER_SHA256": self._settings.nvidia_driver_sha256,
             "AUTOVLLM_API_PORT": str(self._settings.vllm_port),
             "AUTOVLLM_LLMFIT_VERSION": self._llmfit_version,
+            "AUTOVLLM_LLMFIT_SHA256": self._llmfit_sha256,
         }
 
     def _start_script_env(self, model: str | None) -> dict[str, str]:

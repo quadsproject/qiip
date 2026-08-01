@@ -5,10 +5,12 @@ nested env var resolution works correctly through the root Settings class.
 Only the root Settings class inherits from BaseSettings.
 """
 
+import re
 import warnings
 from pathlib import Path
 from string import Formatter
 from typing import Self
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
@@ -19,6 +21,23 @@ from inference_proxy.models.endpoint import (
     EndpointValidationError,
     parse_endpoint,
 )
+
+DEFAULT_NVIDIA_DRIVER_VERSION = "580.126.09"
+DEFAULT_NVIDIA_DRIVER_SHA256 = (
+    "4cac53e48f8adff661d47c8788ed24059a248c9fd8098ceafd088a498986ec26"
+)
+DEFAULT_LLMFIT_VERSION = "1.1.6"
+DEFAULT_LLMFIT_SHA256 = (
+    "1e09232a128455596a2d348ab5893741d04b94aa6d924f1253462dc13304f7c6"
+)
+_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
+def _validate_sha256(value: str, *, setting: str) -> str:
+    normalized = value.strip().lower()
+    if _SHA256_PATTERN.fullmatch(normalized) is None:
+        raise ValueError(f"{setting} must be exactly 64 hexadecimal characters")
+    return normalized
 
 
 class GatewaySettings(BaseModel):
@@ -176,7 +195,8 @@ class ProvisioningSettings(BaseModel):
     boot_wait_timeout: int = 300  # D-05: 5 minutes for cold boot
     boot_wait_interval: int = 10
     nfs_mount_point: str = "/srv/hf-cache"
-    nvidia_driver_version: str = "580.126.09"
+    nvidia_driver_version: str = DEFAULT_NVIDIA_DRIVER_VERSION
+    nvidia_driver_sha256: str = DEFAULT_NVIDIA_DRIVER_SHA256
     retired_nfs_server: str | None = Field(
         default=None,
         validation_alias="nfs_server",
@@ -211,6 +231,25 @@ class ProvisioningSettings(BaseModel):
                 "configure INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT instead",
                 UserWarning,
                 stacklevel=2,
+            )
+        return self
+
+    @field_validator("nvidia_driver_sha256")
+    @classmethod
+    def nvidia_driver_digest_is_sha256(cls, value: str) -> str:
+        """Require a complete digest before remote driver installation."""
+        return _validate_sha256(value, setting="provisioning.nvidia_driver_sha256")
+
+    @model_validator(mode="after")
+    def custom_driver_version_has_explicit_digest(self) -> Self:
+        """Keep the committed default version and digest as one upgrade unit."""
+        if (
+            self.nvidia_driver_version != DEFAULT_NVIDIA_DRIVER_VERSION
+            and "nvidia_driver_sha256" not in self.model_fields_set
+        ):
+            raise ValueError(
+                "provisioning.nvidia_driver_sha256 must be configured when "
+                "nvidia_driver_version differs from the built-in default"
             )
         return self
 
@@ -255,8 +294,57 @@ class LLMFitSettings(BaseModel):
     binary_path: str = "/usr/local/bin/llmfit"
     timeout: float = 60.0
     allowed_providers: list[str] = []
-    version: str = "1.1.6"
+    version: str = DEFAULT_LLMFIT_VERSION
+    sha256: str = DEFAULT_LLMFIT_SHA256
     install_url: str = "https://github.com/AlexsJones/llmfit/releases/download/v{version}/llmfit-v{version}-x86_64-unknown-linux-musl.tar.gz"
+
+    @field_validator("sha256")
+    @classmethod
+    def digest_is_sha256(cls, value: str) -> str:
+        """Require a complete digest before remote binary installation."""
+        return _validate_sha256(value, setting="llmfit.sha256")
+
+    @field_validator("install_url")
+    @classmethod
+    def install_url_is_safe_template(cls, value: str) -> str:
+        """Allow one safely-rendered HTTP(S) release URL template."""
+        if any(ord(character) < 32 for character in value):
+            raise ValueError("llmfit.install_url must not contain control characters")
+        try:
+            parsed_fields = list(Formatter().parse(value))
+        except ValueError as exc:
+            raise ValueError("llmfit.install_url is malformed") from exc
+        fields = [
+            (field_name, format_spec, conversion)
+            for _literal, field_name, format_spec, conversion in parsed_fields
+            if field_name is not None
+        ]
+        if fields != [("version", "", None)]:
+            raise ValueError(
+                "llmfit.install_url must contain exactly one plain {version} field"
+            )
+
+        parsed = urlsplit(value.format(version="1.2.3"))
+        if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+            raise ValueError("llmfit.install_url must be an HTTP(S) URL with a host")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("llmfit.install_url must not contain credentials")
+        if parsed.fragment:
+            raise ValueError("llmfit.install_url must not contain a fragment")
+        return value
+
+    @model_validator(mode="after")
+    def custom_version_has_explicit_digest(self) -> Self:
+        """Keep the committed default version and digest as one upgrade unit."""
+        if (
+            self.version != DEFAULT_LLMFIT_VERSION
+            and "sha256" not in self.model_fields_set
+        ):
+            raise ValueError(
+                "llmfit.sha256 must be configured when version differs from the "
+                "built-in default"
+            )
+        return self
 
 
 class HuggingFaceSettings(BaseModel):

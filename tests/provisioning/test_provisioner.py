@@ -86,7 +86,7 @@ def _make_provisioner(
 @pytest.mark.asyncio
 async def test_llmfit_version_single_source() -> None:
     """E5: provisioning and repair install consume one LLMFit setting."""
-    settings = LLMFitSettings(version="8.7.6")
+    settings = LLMFitSettings(version="8.7.6", sha256="a" * 64)
     provisioner = _make_provisioner(llmfit_settings=settings)
     ssh = MagicMock()
     ssh.run = AsyncMock(return_value=("", "", 0))
@@ -95,8 +95,10 @@ async def test_llmfit_version_single_source() -> None:
     await runner._install("host1")
 
     assert provisioner._setup_script_env()["AUTOVLLM_LLMFIT_VERSION"] == "8.7.6"
+    assert provisioner._setup_script_env()["AUTOVLLM_LLMFIT_SHA256"] == "a" * 64
     install_command = ssh.run.await_args.args[1]
     assert "/v8.7.6/llmfit-v8.7.6-" in install_command
+    assert "a" * 64 in install_command
     assert "llmfit_version" not in ProvisioningSettings.model_fields
 
 
@@ -107,8 +109,9 @@ def test_script_env_prefix_exact() -> None:
             vllm_port=8123,
             nfs_mount_point="/srv/hf cache",
             nvidia_driver_version="999.1",
+            nvidia_driver_sha256="b" * 64,
         ),
-        llmfit_settings=LLMFitSettings(version="8.7.6"),
+        llmfit_settings=LLMFitSettings(version="8.7.6", sha256="c" * 64),
         nfs_export="nfs.example:/exports/hf cache",
         hf_token="hf secret",
     )
@@ -117,8 +120,10 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
         "AUTOVLLM_NVIDIA_DRIVER_VERSION": "999.1",
+        "AUTOVLLM_NVIDIA_DRIVER_SHA256": "b" * 64,
         "AUTOVLLM_API_PORT": "8123",
         "AUTOVLLM_LLMFIT_VERSION": "8.7.6",
+        "AUTOVLLM_LLMFIT_SHA256": "c" * 64,
     }
     assert provisioner._start_script_env("org/model") == {
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
@@ -132,8 +137,10 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_NFS_EXPORT=nfs.example:/exports/hf cache",
         "AUTOVLLM_NFS_MOUNT_POINT=/srv/hf cache",
         "AUTOVLLM_NVIDIA_DRIVER_VERSION=999.1",
+        f"AUTOVLLM_NVIDIA_DRIVER_SHA256={'b' * 64}",
         "AUTOVLLM_API_PORT=8123",
         "AUTOVLLM_LLMFIT_VERSION=8.7.6",
+        f"AUTOVLLM_LLMFIT_SHA256={'c' * 64}",
         "bash",
         "auto-vllm/setup.sh",
     ]

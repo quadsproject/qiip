@@ -8,6 +8,7 @@ constructor (DIP).
 from __future__ import annotations
 
 import json
+import shlex
 
 import structlog
 from pydantic import ValidationError
@@ -34,19 +35,39 @@ class LLMFitRunner:
         self._settings = settings or LLMFitSettings()
 
     async def _install(self, hostname: str) -> None:
-        """Install llmfit binary on remote host via wget+tar."""
+        """Install one verified llmfit release artifact on the remote host."""
         url = self._settings.install_url.format(version=self._settings.version)
-        cmd = (
-            f"wget -q '{url}' -O /tmp/llmfit.tar.gz"
-            " && tar -xzf /tmp/llmfit.tar.gz -C /tmp/"
-            ' && sudo install -m 755 "$(find /tmp/ -name llmfit -type f -print -quit)" {binary}'
-            " && rm -rf /tmp/llmfit.tar.gz /tmp/llmfit-*"
-        ).format(binary=self._settings.binary_path)
+        script = (
+            "set -euo pipefail; "
+            "work_dir=$(mktemp -d /tmp/llmfit-install.XXXXXX); "
+            "trap 'rm -rf \"$work_dir\"' EXIT; "
+            f'wget -q -- {shlex.quote(url)} -O "$work_dir/llmfit.tar.gz"; '
+            f"printf '%s  %s\\n' {shlex.quote(self._settings.sha256)} "
+            '"$work_dir/llmfit.tar.gz" | sha256sum -c - >/dev/null; '
+            'tar -xzf "$work_dir/llmfit.tar.gz" -C "$work_dir"; '
+            'mapfile -t binaries < <(find "$work_dir" -name llmfit -type f -print); '
+            'if [ "${#binaries[@]}" -ne 1 ]; then '
+            "echo 'verified llmfit archive must contain exactly one binary' >&2; "
+            "exit 1; fi; "
+            f'sudo install -m 755 "${{binaries[0]}}" '
+            f"{shlex.quote(self._settings.binary_path)}"
+        )
+        cmd = shlex.join(("bash", "-c", script))
         await self._ssh.run(hostname, cmd, timeout=self._settings.timeout)
 
     async def _run_recommend(self, hostname: str) -> tuple[str, str, int]:
         """Run the llmfit recommend command, raising TimeoutError on timeout."""
-        command = f"{self._settings.binary_path} recommend --json --runtime vllm -n 30"
+        command = shlex.join(
+            (
+                self._settings.binary_path,
+                "recommend",
+                "--json",
+                "--runtime",
+                "vllm",
+                "-n",
+                "30",
+            )
+        )
         return await self._ssh.run(hostname, command, timeout=self._settings.timeout)
 
     async def recommend(self, hostname: str) -> LLMFitResult:
@@ -66,7 +87,9 @@ class LLMFitRunner:
 
         try:
             stdout, _stderr, _exit = await self._run_recommend(hostname)
-        except RemoteCommandError:
+        except RemoteCommandError as exc:
+            if exc.exit_status != 127:
+                raise
             log.info("llmfit_not_found_installing", host=hostname)
             try:
                 await self._install(hostname)

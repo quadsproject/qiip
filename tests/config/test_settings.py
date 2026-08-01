@@ -14,6 +14,7 @@ from inference_proxy.config.settings import (
     EtcdSettings,
     GatewaySettings,
     HuggingFaceSettings,
+    LLMFitSettings,
     ProvisioningSettings,
     QUADSSettings,
     RedfishSettings,
@@ -282,6 +283,7 @@ class TestEnvVarOverrideProvisioningTimeout:
             "9.9.9",
         )
         monkeypatch.setenv("INFERENCE_PROXY_LLMFIT__VERSION", "2.0.0")
+        monkeypatch.setenv("INFERENCE_PROXY_LLMFIT__SHA256", "a" * 64)
 
         with pytest.warns(
             UserWarning,
@@ -291,6 +293,71 @@ class TestEnvVarOverrideProvisioningTimeout:
 
         assert settings.llmfit.version == "2.0.0"
         assert "llmfit_version" not in ProvisioningSettings.model_fields
+
+
+class TestArtifactDigestSettings:
+    def test_default_version_digest_pairs_are_usable(self) -> None:
+        provisioning = ProvisioningSettings()
+        llmfit = LLMFitSettings()
+
+        assert provisioning.nvidia_driver_version == "580.126.09"
+        assert provisioning.nvidia_driver_sha256 == (
+            "4cac53e48f8adff661d47c8788ed24059a248c9fd8098ceafd088a498986ec26"
+        )
+        assert llmfit.version == "1.1.6"
+        assert llmfit.sha256 == (
+            "1e09232a128455596a2d348ab5893741d04b94aa6d924f1253462dc13304f7c6"
+        )
+
+    @pytest.mark.parametrize("digest", ["", "a" * 63, "g" * 64, "sha256:" + "a" * 64])
+    def test_nvidia_driver_digest_must_be_sha256(self, digest: str) -> None:
+        with pytest.raises(ValidationError, match="64 hexadecimal characters"):
+            ProvisioningSettings(nvidia_driver_sha256=digest)
+
+    @pytest.mark.parametrize("digest", ["", "a" * 63, "g" * 64, "sha256:" + "a" * 64])
+    def test_llmfit_digest_must_be_sha256(self, digest: str) -> None:
+        with pytest.raises(ValidationError, match="64 hexadecimal characters"):
+            LLMFitSettings(sha256=digest)
+
+    def test_custom_driver_version_requires_explicit_digest(self) -> None:
+        with pytest.raises(ValidationError, match="nvidia_driver_sha256"):
+            ProvisioningSettings(nvidia_driver_version="999.1")
+
+        configured = ProvisioningSettings(
+            nvidia_driver_version="999.1", nvidia_driver_sha256="b" * 64
+        )
+        assert configured.nvidia_driver_sha256 == "b" * 64
+
+    def test_custom_llmfit_version_requires_explicit_digest(self) -> None:
+        with pytest.raises(ValidationError, match="llmfit.sha256"):
+            LLMFitSettings(version="2.0.0")
+
+        configured = LLMFitSettings(version="2.0.0", sha256="b" * 64)
+        assert configured.sha256 == "b" * 64
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "ftp://downloads.example/llmfit-{version}.tar.gz",
+            "https://user:secret@downloads.example/llmfit-{version}.tar.gz",
+            "https://downloads.example/llmfit.tar.gz",
+            "https://downloads.example/{version}/{version}/llmfit.tar.gz",
+            "https://downloads.example/llmfit-{version!r}.tar.gz",
+            "https://downloads.example/llmfit-{other}.tar.gz",
+            "https://downloads.example/llmfit-{version}.tar.gz#fragment",
+            "https://downloads.example/llmfit-{version}.tar.gz\ncommand",
+        ],
+    )
+    def test_llmfit_install_url_rejects_unsafe_templates(self, url: str) -> None:
+        with pytest.raises(ValidationError, match="llmfit.install_url"):
+            LLMFitSettings(install_url=url)
+
+    @pytest.mark.parametrize("scheme", ["https", "http"])
+    def test_llmfit_install_url_accepts_verified_mirrors(self, scheme: str) -> None:
+        settings = LLMFitSettings(
+            install_url=f"{scheme}://mirror.example/releases/{{version}}/llmfit.tar.gz"
+        )
+        assert settings.install_url.startswith(f"{scheme}://")
 
 
 class TestSSHAndProvisioningAreNotBaseSettings:
