@@ -106,6 +106,15 @@ def test_uv_pin_records_official_checksum_provenance() -> None:
     assert "uv lock --project auto-vllm --python 3.12 --upgrade" in documentation
 
 
+def test_ci_installs_uv_from_the_node_version_pin() -> None:
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+
+    assert "version-file:" not in workflow
+    assert workflow.count("id: uv_pin") == 2
+    assert workflow.count('version="$(<auto-vllm/.uv-version)"') == 2
+    assert workflow.count("version: ${{ steps.uv_pin.outputs.version }}") == 2
+
+
 def test_pinned_uv_reads_and_resolves_node_lock(tmp_path: Path) -> None:
     uv_binary = os.environ.get("AUTOVLLM_PINNED_UV_BIN", "uv")
     version = subprocess.run(

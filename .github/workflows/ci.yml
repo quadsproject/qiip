@@ -28,12 +28,23 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Resolve pinned uv version
+        id: uv_pin
+        shell: bash
+        run: |
+          version="$(<auto-vllm/.uv-version)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error file=auto-vllm/.uv-version::Expected a semantic version, got '$version'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Install uv and Python
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           python-version: "3.12"
-          version-file: auto-vllm/.uv-version
+          version: ${{ steps.uv_pin.outputs.version }}
 
       - name: Install dependencies
         run: uv sync --locked --all-groups
@@ -74,12 +85,23 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Resolve pinned uv version
+        id: uv_pin
+        shell: bash
+        run: |
+          version="$(<auto-vllm/.uv-version)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error file=auto-vllm/.uv-version::Expected a semantic version, got '$version'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Install uv and Python
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           python-version: "3.13"
-          version-file: auto-vllm/.uv-version
+          version: ${{ steps.uv_pin.outputs.version }}
 
       - name: Install dependencies
         run: uv sync --locked --all-groups
