@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -18,11 +19,12 @@ class TestTriggerDownload:
     @patch("inference_proxy.huggingface.downloader.snapshot_download")
     async def test_sets_status_downloading(self, mock_sd: MagicMock) -> None:
         svc = DownloadService(cache_dir="/tmp/test", token="test-token")
-        status = await svc.trigger_download("org/model")
+        result = await svc.trigger_download("org/model")
 
-        assert status.status == DownloadState.DOWNLOADING
-        assert status.repo_id == "org/model"
-        assert status.started_at is not None
+        assert result.started is True
+        assert result.status.status == DownloadState.DOWNLOADING
+        assert result.status.repo_id == "org/model"
+        assert result.status.started_at is not None
 
     @pytest.mark.asyncio
     @patch("inference_proxy.huggingface.downloader.snapshot_download")
@@ -67,23 +69,32 @@ class TestTriggerDownload:
     @pytest.mark.asyncio
     @patch("inference_proxy.huggingface.downloader.snapshot_download")
     async def test_duplicate_returns_existing(self, mock_sd: MagicMock) -> None:
-        # Make download hang so it stays in DOWNLOADING state
-        event = asyncio.Event()
-        mock_sd.side_effect = lambda *a, **kw: event.wait()
+        started = threading.Event()
+        release = threading.Event()
+
+        def block_download(*_args: object, **_kwargs: object) -> None:
+            started.set()
+            if not release.wait(timeout=2):
+                raise AssertionError("test did not release the download worker")
+
+        mock_sd.side_effect = block_download
 
         svc = DownloadService(cache_dir="/tmp/test", token="test-token")
-        status1 = await svc.trigger_download("org/model")
-        status2 = await svc.trigger_download("org/model")
+        first = await svc.trigger_download("org/model")
+        assert await asyncio.to_thread(started.wait, 1)
+        duplicate = await svc.trigger_download("org/model")
 
-        assert status1 is status2
-        # snapshot_download should only be invoked once (one background task)
-        # Give a tick for the task to start
-        await asyncio.sleep(0)
-        assert mock_sd.call_count <= 1
-
-        # Clean up: unblock the hanging call
-        event.set()
-        await asyncio.sleep(0.1)
+        tasks = tuple(svc._tasks)
+        try:
+            assert first.started is True
+            assert duplicate.started is False
+            assert duplicate.status is first.status
+            assert mock_sd.call_count == 1
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+        assert svc.get_status("org/model") is not None
+        assert svc.get_status("org/model").status == DownloadState.COMPLETE  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
     @patch("inference_proxy.huggingface.downloader.snapshot_download")
@@ -96,8 +107,50 @@ class TestTriggerDownload:
         assert svc.get_status("org/model").status == DownloadState.COMPLETE  # type: ignore[union-attr]
 
         # Trigger again -- should start a new download
-        status = await svc.trigger_download("org/model")
-        assert status.status == DownloadState.DOWNLOADING
+        result = await svc.trigger_download("org/model")
+        assert result.started is True
+        assert result.status.status == DownloadState.DOWNLOADING
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.downloader.snapshot_download")
+    async def test_concurrent_downloads_are_capped_at_two(
+        self, mock_sd: MagicMock
+    ) -> None:
+        release = threading.Event()
+        two_started = threading.Event()
+        third_started = threading.Event()
+        state_lock = threading.Lock()
+        active = 0
+
+        def block_download(*_args: object, **_kwargs: object) -> None:
+            nonlocal active
+            with state_lock:
+                active += 1
+                if active == 2:
+                    two_started.set()
+                elif active == 3:
+                    third_started.set()
+            if not release.wait(timeout=2):
+                raise AssertionError("test did not release the download workers")
+
+        mock_sd.side_effect = block_download
+        svc = DownloadService(cache_dir="/tmp/test", token="test-token")
+
+        await svc.trigger_download("org/model-a")
+        await svc.trigger_download("org/model-b")
+        await svc.trigger_download("org/model-c")
+
+        tasks = tuple(svc._tasks)
+        try:
+            assert await asyncio.to_thread(two_started.wait, 1)
+            assert not await asyncio.to_thread(third_started.wait, 0.1)
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
+        assert mock_sd.call_count == 3
+        assert {status.status for status in svc.get_all_statuses()} == {
+            DownloadState.COMPLETE
+        }
 
 
 class TestGetAllStatuses:

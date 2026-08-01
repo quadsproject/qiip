@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from inference_proxy.huggingface.downloader import DownloadTriggerResult
 from inference_proxy.models.admin import DownloadState, DownloadStatusResponse
 
 
@@ -27,10 +28,13 @@ class TestTriggerDownload:
         client: TestClient,
     ) -> None:
         mock_svc: MagicMock = app.state.download_service
-        mock_svc.trigger_download.return_value = DownloadStatusResponse(
-            repo_id="meta-llama/Llama-3.1-8B",
-            status=DownloadState.DOWNLOADING,
-            started_at=datetime.now(UTC),
+        mock_svc.trigger_download.return_value = DownloadTriggerResult(
+            status=DownloadStatusResponse(
+                repo_id="meta-llama/Llama-3.1-8B",
+                status=DownloadState.DOWNLOADING,
+                started_at=datetime.now(UTC),
+            ),
+            started=True,
         )
 
         response = client.post(
@@ -47,20 +51,24 @@ class TestTriggerDownload:
         response = client.post("/admin/models/download", json={})
         assert response.status_code == 422
 
-    def test_duplicate_returns_status(
+    def test_duplicate_returns_200(
         self,
         app: FastAPI,
         client: TestClient,
     ) -> None:
         mock_svc: MagicMock = app.state.download_service
-        mock_svc.trigger_download.return_value = DownloadStatusResponse(
-            repo_id="org/model",
-            status=DownloadState.DOWNLOADING,
-            started_at=datetime.now(UTC),
+        mock_svc.trigger_download.return_value = DownloadTriggerResult(
+            status=DownloadStatusResponse(
+                repo_id="org/model",
+                status=DownloadState.DOWNLOADING,
+                started_at=datetime.now(UTC),
+            ),
+            started=False,
         )
 
         response = client.post("/admin/models/download", json={"repo_id": "org/model"})
 
+        assert response.status_code == 200
         assert response.json()["status"] == "downloading"
 
 

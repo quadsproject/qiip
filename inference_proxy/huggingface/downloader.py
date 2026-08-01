@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import structlog
@@ -22,6 +23,14 @@ from huggingface_hub.errors import (
 from inference_proxy.models.admin import DownloadState, DownloadStatusResponse
 
 logger = structlog.get_logger()
+
+
+@dataclass(frozen=True, slots=True)
+class DownloadTriggerResult:
+    """Atomic result of requesting a model download."""
+
+    status: DownloadStatusResponse
+    started: bool
 
 
 class DownloadService:
@@ -56,16 +65,17 @@ class DownloadService:
         with self._lock:
             return list(self._statuses.values())
 
-    async def trigger_download(self, repo_id: str) -> DownloadStatusResponse:
+    async def trigger_download(self, repo_id: str) -> DownloadTriggerResult:
         """Start a background download for *repo_id*.
 
-        Returns existing status if a download is already in progress (D-10).
-        Allows re-download if previous attempt completed or failed (D-11).
+        The result identifies atomically whether this call started the download
+        or found one already in progress (D-10). Allows re-download if a
+        previous attempt completed or failed (D-11).
         """
         with self._lock:
             existing = self._statuses.get(repo_id)
             if existing is not None and existing.status == DownloadState.DOWNLOADING:
-                return existing
+                return DownloadTriggerResult(status=existing, started=False)
 
             status = DownloadStatusResponse(
                 repo_id=repo_id,
@@ -77,7 +87,7 @@ class DownloadService:
         task = asyncio.create_task(self._run_download(repo_id))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-        return status
+        return DownloadTriggerResult(status=status, started=True)
 
     async def _run_download(self, repo_id: str) -> None:
         """Execute the download, gated by the concurrency semaphore."""

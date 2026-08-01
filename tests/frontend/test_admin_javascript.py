@@ -512,6 +512,40 @@ sandbox.fetch = async function (url) {
     assert result["selectorVisible"] is True
 
 
+def test_catalog_degradation_is_visible_when_no_models_are_verified() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+sandbox.fetch = async function (url) {
+  if (url !== "/admin/models/catalog") throw new Error("unexpected URL " + url);
+  return { ok: true, json: async function () {
+    return { models: [], incomplete_count: 2, unverifiable_count: 3 };
+  } };
+};
+
+(async function () {
+  await sandbox.fetchCatalog();
+  process.stdout.write(JSON.stringify({
+    catalogModels: sandbox.catalogModels,
+    selectorVisible: byId("model-select").style.display !== "none",
+    statusVisible: byId("model-status").style.display !== "none",
+    status: byId("model-status").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "catalogModels": [],
+        "selectorVisible": False,
+        "statusVisible": True,
+        "status": (
+            "No verified models. 3 cached models lack manifest metadata and "
+            "were hidden; re-download them to migrate the cache. 2 incomplete "
+            "cached models were hidden; re-download them."
+        ),
+    }
+
+
 def _power_controls_result(status_code: int) -> object:
     return _run_node_detail_scenario(
         f"""

@@ -77,6 +77,7 @@ logger = structlog.get_logger()
 
 _DEGRADED_DATA_HEADER = "X-Inference-Proxy-Data-Degraded"
 _PROVISIONING_TASKS_DEGRADED = "provisioning-tasks"
+_MODEL_CATALOG_DEGRADED = "model-catalog"
 
 admin_router = APIRouter(
     prefix="/admin",
@@ -153,16 +154,20 @@ async def get_metrics(
 
 @admin_router.get("/models/catalog")
 async def list_catalog(
+    response: Response,
     catalog: ModelCatalogService = Depends(get_catalog_service),
 ) -> ModelCatalogResponse:
     """Return the list of models available in the HuggingFace NFS cache."""
-    models = await catalog.list_models()
-    return ModelCatalogResponse(models=models)
+    result = await catalog.list_models()
+    if result.incomplete_count or result.unverifiable_count:
+        response.headers[_DEGRADED_DATA_HEADER] = _MODEL_CATALOG_DEGRADED
+    return result
 
 
 @admin_router.post("/models/download", status_code=202)
 async def trigger_download(
     body: DownloadRequest,
+    response: Response,
     svc: DownloadService = Depends(get_download_service),
 ) -> DownloadStatusResponse:
     """Trigger a background model download (DL-01).
@@ -170,7 +175,9 @@ async def trigger_download(
     Returns 202 for new downloads. Duplicate POSTs for an in-progress
     download return 200 with the existing status (D-10).
     """
-    return await svc.trigger_download(body.repo_id)
+    result = await svc.trigger_download(body.repo_id)
+    response.status_code = 202 if result.started else 200
+    return result.status
 
 
 @admin_router.get("/models/downloads")

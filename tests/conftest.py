@@ -51,6 +51,7 @@ from inference_proxy.config.settings import (
     Settings,
 )
 from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.huggingface.catalog import ModelCatalogResponse
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.main import create_app
 from inference_proxy.proxy.client import ProxyClient
@@ -186,7 +187,7 @@ def app(
     application.state.llmfit_runner = mock_runner
     application.dependency_overrides[get_llmfit_runner] = lambda: mock_runner
     mock_catalog = MagicMock()
-    mock_catalog.list_models = AsyncMock(return_value=[])
+    mock_catalog.list_models = AsyncMock(return_value=ModelCatalogResponse(models=[]))
     application.state.catalog_service = mock_catalog
     application.dependency_overrides[get_catalog_service] = lambda: mock_catalog
     mock_download_service = MagicMock()

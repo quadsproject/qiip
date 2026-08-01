@@ -1729,14 +1729,19 @@ class TestModelCatalog:
         app: FastAPI,
         client: TestClient,
     ) -> None:
-        from inference_proxy.huggingface.catalog import CatalogEntry
+        from inference_proxy.huggingface.catalog import (
+            CatalogEntry,
+            ModelCatalogResponse,
+        )
 
         mock_catalog = MagicMock()
         mock_catalog.list_models = AsyncMock(
-            return_value=[
-                CatalogEntry(repo_id="meta-llama/Llama-3.1-8B-Instruct"),
-                CatalogEntry(repo_id="mistralai/Mistral-7B-v0.1"),
-            ]
+            return_value=ModelCatalogResponse(
+                models=[
+                    CatalogEntry(repo_id="meta-llama/Llama-3.1-8B-Instruct"),
+                    CatalogEntry(repo_id="mistralai/Mistral-7B-v0.1"),
+                ]
+            )
         )
         app.dependency_overrides[get_catalog_service] = lambda: mock_catalog
 
@@ -1757,11 +1762,46 @@ class TestModelCatalog:
         app: FastAPI,
         client: TestClient,
     ) -> None:
+        from inference_proxy.huggingface.catalog import ModelCatalogResponse
+
         mock_catalog = MagicMock()
-        mock_catalog.list_models = AsyncMock(return_value=[])
+        mock_catalog.list_models = AsyncMock(
+            return_value=ModelCatalogResponse(models=[])
+        )
         app.dependency_overrides[get_catalog_service] = lambda: mock_catalog
 
         response = client.get("/admin/models/catalog")
 
         assert response.status_code == 200
-        assert response.json() == {"models": []}
+        assert response.json() == {
+            "models": [],
+            "incomplete_count": 0,
+            "unverifiable_count": 0,
+        }
+
+    def test_catalog_surfaces_degraded_cache_counts(
+        self,
+        app: FastAPI,
+        client: TestClient,
+    ) -> None:
+        from inference_proxy.huggingface.catalog import ModelCatalogResponse
+
+        mock_catalog = MagicMock()
+        mock_catalog.list_models = AsyncMock(
+            return_value=ModelCatalogResponse(
+                models=[],
+                incomplete_count=2,
+                unverifiable_count=3,
+            )
+        )
+        app.dependency_overrides[get_catalog_service] = lambda: mock_catalog
+
+        response = client.get("/admin/models/catalog")
+
+        assert response.status_code == 200
+        assert response.headers["X-Inference-Proxy-Data-Degraded"] == ("model-catalog")
+        assert response.json() == {
+            "models": [],
+            "incomplete_count": 2,
+            "unverifiable_count": 3,
+        }

@@ -805,21 +805,33 @@ function getSelectedModel() {
 async function fetchCatalog() {
   var sel = document.getElementById("model-select");
   var status = document.getElementById("model-status");
+  var incompleteCount = 0;
+  var unverifiableCount = 0;
   try {
     var resp = await fetch("/admin/models/catalog");
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     var data = await resp.json();
     catalogModels = data.models || [];
+    incompleteCount = data.incomplete_count || 0;
+    unverifiableCount = data.unverifiable_count || 0;
   } catch (_) {
     catalogModels = [];
+  }
+  var warnings = [];
+  if (unverifiableCount > 0) {
+    warnings.push(unverifiableCount + " cached model" + (unverifiableCount === 1 ? " lacks" : "s lack") + " manifest metadata and " + (unverifiableCount === 1 ? "was" : "were") + " hidden; re-download " + (unverifiableCount === 1 ? "it" : "them") + " to migrate the cache.");
+  }
+  if (incompleteCount > 0) {
+    warnings.push(incompleteCount + " incomplete cached model" + (incompleteCount === 1 ? " was" : "s were") + " hidden; re-download " + (incompleteCount === 1 ? "it" : "them") + ".");
   }
   if (catalogModels.length === 0) {
     sel.style.display = "none";
     status.style.display = "inline";
-    status.textContent = "No models downloaded";
+    status.textContent = warnings.length > 0 ? "No verified models. " + warnings.join(" ") : "No models downloaded";
   } else {
     sel.style.display = "";
-    status.style.display = "none";
+    status.style.display = warnings.length > 0 ? "inline" : "none";
+    status.textContent = warnings.join(" ");
     sel.textContent = "";
     for (var i = 0; i < catalogModels.length; i++) {
       var opt = document.createElement("option");
