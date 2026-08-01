@@ -3,11 +3,19 @@ set -euo pipefail
 
 VLLM_PORT="${VLLM_PORT:-8000}"
 NFS_MOUNT_POINT="${NFS_MOUNT_POINT:-/srv/hf-cache}"
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SCRIPT_DIR="${AUTOVLLM_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 VLLM_BIN="${AUTOVLLM_BIN:-/opt/vllm-venv/bin/vllm}"
 PID_FILE="${AUTOVLLM_PID_FILE:-/var/run/vllm.pid}"
 HF_CACHE_LINK="${AUTOVLLM_HF_CACHE_LINK:-/root/.cache/huggingface}"
 VLLM_LOG_FILE="${AUTOVLLM_LOG_FILE:-/var/log/vllm-serve.log}"
+VLLM_PYTHON="${AUTOVLLM_PYTHON:-$(dirname "$VLLM_BIN")/python}"
+PROC_ROOT="${AUTOVLLM_PROC_ROOT:-/proc}"
+COMMAND_PATTERN="${AUTOVLLM_COMMAND_PATTERN:-${VLLM_BIN} serve}"
+STARTUP_GRACE_PERIOD="${AUTOVLLM_STARTUP_GRACE_PERIOD:-2}"
+STARTUP_LOG_LINES="${AUTOVLLM_STARTUP_LOG_LINES:-40}"
+
+# shellcheck source=auto-vllm/vllm-process.sh
+source "${SCRIPT_DIR}/vllm-process.sh"
 
 detect_gpu_info() {
     if ! command -v nvidia-smi &>/dev/null; then
@@ -36,16 +44,18 @@ configure_vllm_params() {
     case "$GPU_MODEL" in
         *"H100"*|*"A100"*)
             echo "High-end GPU detected: optimizing for throughput"
+            # BF16 weights need roughly two bytes per parameter. These
+            # thresholds leave additional memory for KV cache and runtime
+            # overhead at the configured GPU memory utilization.
             if [ $total_vram -ge 240 ]; then
                 MODEL="Qwen/Qwen2.5-72B-Instruct"
                 MAX_MODEL_LEN=32768
-            elif [ $total_vram -ge 160 ]; then
-                MODEL="Qwen/Qwen2.5-32B-Instruct"
-                MAX_MODEL_LEN=131072
-            else
+            elif [ $total_vram -ge 80 ]; then
                 MODEL="Qwen/Qwen2.5-32B-Instruct"
                 MAX_MODEL_LEN=32768
-                TENSOR_PARALLEL=1
+            else
+                MODEL="Qwen/Qwen2.5-14B-Instruct"
+                MAX_MODEL_LEN=32768
             fi
             GPU_MEM_UTIL=0.90
             ;;
@@ -71,8 +81,9 @@ configure_vllm_params() {
             TENSOR_PARALLEL=$GPU_COUNT
             GPU_MEM_UTIL=0.85
             MAX_MODEL_LEN=8192
+            EXTRA_ARGS="--dtype float16"
 
-            if [ $total_vram -ge 64 ]; then
+            if [ $total_vram -ge 96 ]; then
                 MODEL="Qwen/Qwen2.5-32B-Instruct"
             else
                 MODEL="Qwen/Qwen2.5-14B-Instruct"
@@ -85,7 +96,7 @@ configure_vllm_params() {
             GPU_MEM_UTIL=0.80
             MAX_MODEL_LEN=4096
 
-            if [ $GPU_VRAM_GB -ge 24 ]; then
+            if [ $GPU_VRAM_GB -ge 48 ]; then
                 MODEL="Qwen/Qwen2.5-14B-Instruct"
             else
                 MODEL="Qwen/Qwen2.5-7B-Instruct"
@@ -111,7 +122,47 @@ configure_vllm_params() {
     EXTRA_ARGS="${VLLM_EXTRA_ARGS:-$EXTRA_ARGS}"
 }
 
+verify_flashinfer_aot() {
+    if ! "$VLLM_PYTHON" -c \
+        'from importlib.metadata import version; from packaging.version import Version; import flashinfer_cubin; assert Version(version("flashinfer-cubin")).public == Version(version("flashinfer-python")).public' \
+        &>/dev/null; then
+        echo "FATAL: matching FlashInfer AOT kernels are unavailable; run setup.sh to install the matching flashinfer-cubin package" >&2
+        return 1
+    fi
+    export FLASHINFER_DISABLE_JIT=1
+}
+
+prepare_hf_cache() {
+    mkdir -p "$(dirname "$HF_CACHE_LINK")"
+    if [ -d "$HF_CACHE_LINK" ] && [ ! -L "$HF_CACHE_LINK" ]; then
+        echo "FATAL: Hugging Face cache target ${HF_CACHE_LINK} is a real directory; move it aside before linking the NFS cache" >&2
+        return 1
+    fi
+    ln -sfnT "${NFS_MOUNT_POINT}" "$HF_CACHE_LINK"
+}
+
+verify_vllm_started() {
+    local pid="$1"
+
+    sleep "$STARTUP_GRACE_PERIOD"
+    if is_vllm_pid "$pid"; then
+        return 0
+    fi
+
+    rm -f "$PID_FILE"
+    echo "FATAL: vLLM process ${pid} exited during startup; last ${STARTUP_LOG_LINES} log lines:" >&2
+    if [ -f "$VLLM_LOG_FILE" ]; then
+        tail -n "$STARTUP_LOG_LINES" "$VLLM_LOG_FILE" >&2
+    else
+        echo "(vLLM log file ${VLLM_LOG_FILE} was not created)" >&2
+    fi
+    return 1
+}
+
 run_vllm() {
+    verify_flashinfer_aot
+    prepare_hf_cache
+
     # Never launch over an older or orphaned server. A failed verified stop
     # aborts this script under set -e rather than registering the wrong model.
     bash "${SCRIPT_DIR}/stop-vllm.sh"
@@ -130,10 +181,9 @@ run_vllm() {
 
 EOF
 
-    mkdir -p "$(dirname "$HF_CACHE_LINK")"
-    ln -sfn "${NFS_MOUNT_POINT}" "$HF_CACHE_LINK"
-
     set -f
+    # EXTRA_ARGS is an intentional word-split shell override.
+    # shellcheck disable=SC2086
     "$VLLM_BIN" serve "$MODEL" \
         --host 0.0.0.0 \
         --port "${VLLM_PORT}" \
@@ -146,8 +196,10 @@ EOF
         ${EXTRA_ARGS:-} \
         > "$VLLM_LOG_FILE" 2>&1 &
 
-    echo $! > "$PID_FILE"
-    echo "vLLM started (PID $(cat "$PID_FILE"))"
+    local pid=$!
+    echo "$pid" > "$PID_FILE"
+    verify_vllm_started "$pid"
+    echo "vLLM started (PID ${pid})"
 }
 
 main() {
@@ -156,4 +208,6 @@ main() {
     run_vllm
 }
 
-main
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

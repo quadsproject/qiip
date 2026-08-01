@@ -7,6 +7,10 @@ STOP_TIMEOUT="${AUTOVLLM_STOP_TIMEOUT:-30}"
 STOP_INTERVAL="${AUTOVLLM_STOP_INTERVAL:-1}"
 VLLM_BIN="${AUTOVLLM_BIN:-/opt/vllm-venv/bin/vllm}"
 COMMAND_PATTERN="${AUTOVLLM_COMMAND_PATTERN:-${VLLM_BIN} serve}"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+# shellcheck source=auto-vllm/vllm-process.sh
+source "${SCRIPT_DIR}/vllm-process.sh"
 
 signal="TERM"
 if [ "${1:-}" = "--force" ]; then
@@ -15,16 +19,6 @@ elif [ "$#" -ne 0 ]; then
     echo "Usage: $0 [--force]" >&2
     exit 2
 fi
-
-is_vllm_pid() {
-    local pid="$1"
-    local cmdline
-
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    [ -r "${PROC_ROOT}/${pid}/cmdline" ] || return 1
-    cmdline=$(tr '\0' ' ' < "${PROC_ROOT}/${pid}/cmdline")
-    [[ "$cmdline" == *"$COMMAND_PATTERN"* ]]
-}
 
 declare -a targets=()
 declare -A seen=()

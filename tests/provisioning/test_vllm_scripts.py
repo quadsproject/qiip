@@ -11,8 +11,9 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-START_SCRIPT = REPO_ROOT / "auto-vllm" / "start-vllm.sh"
-STOP_SCRIPT = REPO_ROOT / "auto-vllm" / "stop-vllm.sh"
+SCRIPT_ROOT = Path(os.environ.get("AUTOVLLM_TEST_SCRIPT_ROOT", REPO_ROOT))
+START_SCRIPT = SCRIPT_ROOT / "auto-vllm" / "start-vllm.sh"
+STOP_SCRIPT = SCRIPT_ROOT / "auto-vllm" / "stop-vllm.sh"
 
 
 def _write_executable(path: Path, content: str) -> None:
@@ -48,6 +49,13 @@ case "$*" in
 esac
 """,
     )
+    flashinfer_python = tmp_path / "fake-python"
+    _write_executable(
+        flashinfer_python,
+        """#!/bin/bash
+[[ "${AUTOVLLM_FLASHINFER_AVAILABLE:-1}" == "1" ]]
+""",
+    )
 
     cache_dir = tmp_path / "nfs-cache"
     cache_dir.mkdir(exist_ok=True)
@@ -56,10 +64,13 @@ esac
         {
             "PATH": f"{bin_dir}:{env['PATH']}",
             "AUTOVLLM_BIN": str(vllm_bin),
+            "AUTOVLLM_SCRIPT_DIR": str(SCRIPT_ROOT / "auto-vllm"),
             "AUTOVLLM_COMMAND_PATTERN": f"{vllm_bin} serve",
             "AUTOVLLM_PID_FILE": str(tmp_path / "vllm.pid"),
             "AUTOVLLM_HF_CACHE_LINK": str(tmp_path / "cache" / "huggingface"),
             "AUTOVLLM_LOG_FILE": str(tmp_path / "vllm-serve.log"),
+            "AUTOVLLM_PYTHON": str(flashinfer_python),
+            "AUTOVLLM_STARTUP_GRACE_PERIOD": "0.05",
             "AUTOVLLM_STOP_TIMEOUT": "2",
             "AUTOVLLM_STOP_INTERVAL": "0.01",
             "AUTOVLLM_TEST_LOG": str(process_log),
@@ -67,6 +78,50 @@ esac
         }
     )
     return env
+
+
+def _configured_profile(
+    *,
+    gpu_model: str,
+    gpu_count: int,
+    gpu_vram_gb: int,
+    overrides: dict[str, str] | None = None,
+) -> list[str]:
+    env = os.environ.copy()
+    for name in (
+        "VLLM_MODEL",
+        "VLLM_TENSOR_PARALLEL",
+        "VLLM_GPU_MEM_UTIL",
+        "VLLM_MAX_MODEL_LEN",
+        "VLLM_MAX_BATCHED_TOKENS",
+        "VLLM_EXTRA_ARGS",
+    ):
+        env.pop(name, None)
+    env["AUTOVLLM_SCRIPT_DIR"] = str(SCRIPT_ROOT / "auto-vllm")
+    env.update(overrides or {})
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+GPU_MODEL={gpu_model!r}
+GPU_COUNT={gpu_count}
+GPU_VRAM_GB={gpu_vram_gb}
+configure_vllm_params
+printf '%s|%s|%s|%s|%s|%s\n' \
+    "$MODEL" "$TENSOR_PARALLEL" "$GPU_MEM_UTIL" \
+    "$MAX_MODEL_LEN" "$MAX_BATCHED_TOKENS" "$EXTRA_ARGS"
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.splitlines()[-1].split("|")
 
 
 def _start_fake_vllm(
@@ -272,3 +327,300 @@ while true; do sleep 1; done
         if process.poll() is None:
             process.kill()
             process.wait(timeout=2)
+
+
+def test_start_requires_flashinfer_aot_before_launch(tmp_path: Path) -> None:
+    process_log = tmp_path / "process.log"
+    vllm_bin = tmp_path / "fake-vllm"
+    _write_executable(
+        vllm_bin,
+        """#!/bin/bash
+echo launched >> "$AUTOVLLM_TEST_LOG"
+""",
+    )
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=vllm_bin,
+        process_log=process_log,
+    )
+    env["AUTOVLLM_FLASHINFER_AVAILABLE"] = "0"
+
+    result = subprocess.run(
+        ["bash", str(START_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "matching FlashInfer AOT kernels are unavailable" in result.stderr
+    assert not process_log.exists()
+    assert not Path(env["AUTOVLLM_PID_FILE"]).exists()
+
+
+def test_vllm_launch_disables_flashinfer_jit(tmp_path: Path) -> None:
+    process_log = tmp_path / "process.log"
+    vllm_bin = tmp_path / "fake-vllm"
+    _write_executable(
+        vllm_bin,
+        """#!/bin/bash
+echo "jit:${FLASHINFER_DISABLE_JIT:-unset}" >> "$AUTOVLLM_TEST_LOG"
+trap 'exit 0' TERM
+while true; do sleep 1; done
+""",
+    )
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=vllm_bin,
+        process_log=process_log,
+    )
+
+    try:
+        result = subprocess.run(
+            ["bash", str(START_SCRIPT)],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert process_log.read_text().splitlines() == ["jit:1"]
+    finally:
+        subprocess.run(
+            ["bash", str(STOP_SCRIPT), "--force"],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+
+
+def test_hf_cache_real_directory_aborts_before_launch(tmp_path: Path) -> None:
+    process_log = tmp_path / "process.log"
+    vllm_bin = tmp_path / "fake-vllm"
+    _write_executable(
+        vllm_bin,
+        """#!/bin/bash
+echo launched >> "$AUTOVLLM_TEST_LOG"
+""",
+    )
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=vllm_bin,
+        process_log=process_log,
+    )
+    cache_target = Path(env["AUTOVLLM_HF_CACHE_LINK"])
+    cache_target.mkdir(parents=True)
+    sentinel = cache_target / "locally-cached-model"
+    sentinel.write_text("keep")
+
+    result = subprocess.run(
+        ["bash", str(START_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "is a real directory" in result.stderr
+    assert cache_target.is_dir()
+    assert not cache_target.is_symlink()
+    assert sentinel.read_text() == "keep"
+    assert not (cache_target / Path(env["NFS_MOUNT_POINT"]).name).exists()
+    assert not process_log.exists()
+
+
+def test_hf_cache_stale_symlink_is_replaced_exactly(tmp_path: Path) -> None:
+    process_log = tmp_path / "process.log"
+    vllm_bin = tmp_path / "fake-vllm"
+    _write_executable(
+        vllm_bin,
+        """#!/bin/bash
+trap 'exit 0' TERM
+while true; do sleep 1; done
+""",
+    )
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=vllm_bin,
+        process_log=process_log,
+    )
+    cache_target = Path(env["AUTOVLLM_HF_CACHE_LINK"])
+    cache_target.parent.mkdir(parents=True)
+    cache_target.symlink_to(tmp_path / "old-cache")
+
+    try:
+        result = subprocess.run(
+            ["bash", str(START_SCRIPT)],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert cache_target.is_symlink()
+        assert os.readlink(cache_target) == env["NFS_MOUNT_POINT"]
+    finally:
+        subprocess.run(
+            ["bash", str(STOP_SCRIPT), "--force"],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("gpu_model", "gpu_count", "gpu_vram_gb", "expected"),
+    [
+        (
+            "NVIDIA A100",
+            3,
+            80,
+            ["Qwen/Qwen2.5-72B-Instruct", "3", "0.90", "32768", "32768", ""],
+        ),
+        (
+            "NVIDIA A100",
+            2,
+            80,
+            ["Qwen/Qwen2.5-32B-Instruct", "2", "0.90", "32768", "32768", ""],
+        ),
+        (
+            "NVIDIA A100",
+            1,
+            40,
+            ["Qwen/Qwen2.5-14B-Instruct", "1", "0.90", "32768", "32768", ""],
+        ),
+        (
+            "Tesla V100",
+            2,
+            32,
+            [
+                "Qwen/Qwen2.5-14B-Instruct",
+                "2",
+                "0.85",
+                "8192",
+                "32768",
+                "--dtype float16",
+            ],
+        ),
+        (
+            "Tesla V100",
+            3,
+            32,
+            [
+                "Qwen/Qwen2.5-32B-Instruct",
+                "3",
+                "0.85",
+                "8192",
+                "32768",
+                "--dtype float16",
+            ],
+        ),
+        (
+            "NVIDIA GeForce RTX 4090",
+            1,
+            24,
+            [
+                "Qwen/Qwen2.5-7B-Instruct",
+                "1",
+                "0.80",
+                "4096",
+                "32768",
+                "--enforce-eager",
+            ],
+        ),
+        (
+            "NVIDIA RTX 6000 Ada",
+            1,
+            48,
+            [
+                "Qwen/Qwen2.5-14B-Instruct",
+                "1",
+                "0.80",
+                "4096",
+                "32768",
+                "--enforce-eager",
+            ],
+        ),
+    ],
+)
+def test_gpu_profile_matrix_selects_runnable_configuration(
+    gpu_model: str,
+    gpu_count: int,
+    gpu_vram_gb: int,
+    expected: list[str],
+) -> None:
+    assert (
+        _configured_profile(
+            gpu_model=gpu_model,
+            gpu_count=gpu_count,
+            gpu_vram_gb=gpu_vram_gb,
+        )
+        == expected
+    )
+
+
+def test_explicit_vllm_overrides_still_win() -> None:
+    assert _configured_profile(
+        gpu_model="NVIDIA A100",
+        gpu_count=2,
+        gpu_vram_gb=80,
+        overrides={
+            "VLLM_MODEL": "example/custom-model",
+            "VLLM_TENSOR_PARALLEL": "1",
+            "VLLM_GPU_MEM_UTIL": "0.73",
+            "VLLM_MAX_MODEL_LEN": "1234",
+            "VLLM_MAX_BATCHED_TOKENS": "5678",
+            "VLLM_EXTRA_ARGS": "--dtype float16",
+        },
+    ) == [
+        "example/custom-model",
+        "1",
+        "0.73",
+        "1234",
+        "5678",
+        "--dtype float16",
+    ]
+
+
+def test_start_failure_returns_log_tail_immediately(tmp_path: Path) -> None:
+    process_log = tmp_path / "process.log"
+    vllm_bin = tmp_path / "failing-vllm"
+    _write_executable(
+        vllm_bin,
+        """#!/bin/bash
+echo 'CUDA initialization failed' >&2
+exit 7
+""",
+    )
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=vllm_bin,
+        process_log=process_log,
+    )
+
+    result = subprocess.run(
+        ["bash", str(START_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "exited during startup" in result.stderr
+    assert "CUDA initialization failed" in result.stderr
+    assert "vLLM started" not in result.stdout
+    assert not Path(env["AUTOVLLM_PID_FILE"]).exists()
