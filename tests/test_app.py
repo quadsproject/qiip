@@ -142,11 +142,7 @@ def test_default_allowlist_rejects_lab_endpoint_from_admin_nodes(
 
     with patch("inference_proxy.discovery.serializer.logger") as serializer_logger:
         routing = RoutingSettings()
-        policy_factory = getattr(routing, "endpoint_policy", None)
-        if policy_factory is None:
-            _initial_load(etcd_client, test_registry)
-        else:
-            _initial_load(etcd_client, test_registry, policy_factory())
+        _initial_load(etcd_client, test_registry, routing.endpoint_policy())
 
     assert test_registry.get_all() == []
     response = client.get("/admin/nodes")

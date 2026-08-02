@@ -10,22 +10,12 @@ from pathlib import Path
 
 import pytest
 
-try:
-    from inference_proxy.config.settings import (
-        DEFAULT_LLMFIT_SHA256,
-        DEFAULT_LLMFIT_VERSION,
-        DEFAULT_NVIDIA_DRIVER_SHA256,
-        DEFAULT_NVIDIA_DRIVER_VERSION,
-    )
-except ImportError:  # pragma: no cover - compatibility shim for baseline proof
-    DEFAULT_NVIDIA_DRIVER_VERSION = "580.126.09"
-    DEFAULT_NVIDIA_DRIVER_SHA256 = (
-        "4cac53e48f8adff661d47c8788ed24059a248c9fd8098ceafd088a498986ec26"
-    )
-    DEFAULT_LLMFIT_VERSION = "1.1.6"
-    DEFAULT_LLMFIT_SHA256 = (
-        "1e09232a128455596a2d348ab5893741d04b94aa6d924f1253462dc13304f7c6"
-    )
+from inference_proxy.config.settings import (
+    DEFAULT_LLMFIT_SHA256,
+    DEFAULT_LLMFIT_VERSION,
+    DEFAULT_NVIDIA_DRIVER_SHA256,
+    DEFAULT_NVIDIA_DRIVER_VERSION,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_ROOT = Path(os.environ.get("AUTOVLLM_TEST_SCRIPT_ROOT", REPO_ROOT))
@@ -58,8 +48,8 @@ def _source_and(
     replacements: dict[str, str] | None = None,
 ) -> str:
     script = shlex.quote(str(SETUP_SCRIPT))
-    # Keep the function-level tests executable against the pre-fix script,
-    # whose setup sequence ran unconditionally when sourced.
+    # Source only the function definitions; running the main setup sequence
+    # would attempt to modify the test host.
     sed_expressions = ["/^# --- Main ---/,$d"]
     for old, new in (replacements or {}).items():
         escaped_old = old.replace("\\", "\\\\").replace("|", "\\|")

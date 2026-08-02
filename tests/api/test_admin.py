@@ -13,7 +13,6 @@ Tests cover:
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import ANY, AsyncMock, MagicMock
@@ -46,19 +45,10 @@ from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationEr
 from inference_proxy.models.llmfit import LLMFitResult, ModelRecommendation, SystemInfo
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.models.quads import QUADSHost
-from inference_proxy.provisioning.provisioner import ProvisioningError
-
-try:
-    from inference_proxy.provisioning.provisioner import ProvisioningCapacityError
-except ImportError:
-    # Keep before-fix comparisons executable against the pre-PR interface.
-    class ProvisioningCapacityError(RuntimeError):
-        def __init__(self, *, active: int, limit: int) -> None:
-            self.active = active
-            self.limit = limit
-            super().__init__("provisioning capacity reached")
-
-
+from inference_proxy.provisioning.provisioner import (
+    ProvisioningCapacityError,
+    ProvisioningError,
+)
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
     SSHConnectionError,
@@ -91,9 +81,6 @@ def _make_node(
 
 def _real_redfish_client(http_client: httpx.AsyncClient) -> RedfishClient:
     auth = httpx.BasicAuth("operator", "redfish-secret")
-    if "hostname_policy" not in inspect.signature(RedfishClient).parameters:
-        http_client.auth = auth
-        return RedfishClient(http_client, "mgmt-{hostname}", "1")
     policy = EndpointPolicy.from_values(
         allowed_hosts=["gpu01"],
         allowed_networks=["10.0.0.0/8"],
@@ -672,8 +659,7 @@ def _clear_pending_hosts() -> None:
     """Clear the module-level pending_hosts between tests."""
     import inference_proxy.api.admin as admin_mod
 
-    if hasattr(admin_mod, "pending_hosts"):
-        admin_mod.pending_hosts.clear()
+    admin_mod.pending_hosts.clear()
 
 
 class TestSetupDedupGuard:

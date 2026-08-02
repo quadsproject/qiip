@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 
 import httpx
@@ -13,12 +12,7 @@ from pytest_httpx import HTTPXMock
 import inference_proxy.redfish.client as redfish_module
 from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.redfish.client import RedfishClient
-from inference_proxy.redfish.errors import RedfishError
-
-try:
-    from inference_proxy.redfish.errors import RedfishDestinationError
-except ImportError:  # Before-fix compatibility for behavioral comparison.
-    RedfishDestinationError = RedfishError
+from inference_proxy.redfish.errors import RedfishDestinationError, RedfishError
 
 BMC_TEMPLATE = "mgmt-{hostname}"
 SYSTEM_ID = "1"
@@ -43,21 +37,8 @@ def _redfish_client(
     poll_timeout: float = 60.0,
     poll_interval: float = 5.0,
 ) -> RedfishClient:
-    """Build against both old main and the destination-safe constructor.
-
-    The compatibility branch lets S1 fail on its outbound request against
-    unfixed main instead of failing mechanically on a changed signature.
-    """
+    """Build a destination-safe client with per-request authentication."""
     resolved_auth = auth or httpx.BasicAuth("admin", "secret")
-    if "hostname_policy" not in inspect.signature(RedfishClient).parameters:
-        client.auth = resolved_auth
-        return RedfishClient(
-            client,
-            template,
-            SYSTEM_ID,
-            poll_timeout=poll_timeout,
-            poll_interval=poll_interval,
-        )
     return RedfishClient(
         client,
         template,

@@ -10,7 +10,6 @@ Tests cover:
 
 from __future__ import annotations
 
-import inspect
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -60,11 +59,6 @@ def test_health_cycle_removes_idle_draining_node_without_request_traffic() -> No
     registry = NodeRegistry()
     registry.add(_make_node(status=NodeStatus.DRAINING))
     tracker = ConnectionTracker()
-    optional_args: dict[str, object] = {}
-    if "connection_tracker" in inspect.signature(_probe_all_nodes).parameters:
-        # Keep the pre-PR entry point callable so the old behavior reaches the
-        # assertion instead of failing mechanically on the new keyword.
-        optional_args["connection_tracker"] = tracker
 
     _probe_all_nodes(
         registry,
@@ -72,7 +66,7 @@ def test_health_cycle_removes_idle_draining_node_without_request_traffic() -> No
         MagicMock(spec=httpx.Client),
         _FailureCounts(),
         3,
-        **optional_args,
+        connection_tracker=tracker,
     )
 
     assert registry.get("node-1") is None

@@ -111,9 +111,7 @@ def circuit_breaker_registry(
 ) -> CircuitBreakerRegistry:
     """Return a fresh CircuitBreakerRegistry for testing."""
     registry = CircuitBreakerRegistry()
-    register_listener = getattr(test_registry, "register_remove_listener", None)
-    if register_listener is not None:
-        register_listener(registry.remove)
+    test_registry.register_remove_listener(registry.remove)
     return registry
 
 

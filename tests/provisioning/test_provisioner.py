@@ -7,7 +7,6 @@ provisioning sequence: setup.sh -> start-vllm.sh -> health poll -> register.
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import shlex
 from collections.abc import Callable
@@ -62,25 +61,20 @@ def _make_provisioner(
     hf_token: str | None = None,
 ) -> NodeProvisioner:
     """Build a NodeProvisioner with mock dependencies."""
-    constructor_args: dict[str, object] = {
-        "ssh_client": ssh_client or MagicMock(),
-        "etcd_client": etcd_client or MagicMock(),
-        "settings": settings
+    return NodeProvisioner(
+        ssh_client=ssh_client or MagicMock(),
+        etcd_client=etcd_client or MagicMock(),
+        settings=settings
         or ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0),
-        "endpoint_policy": endpoint_policy,
-        "registry": registry,
-        "connection_tracker": connection_tracker,
-        "circuit_breaker_registry": circuit_breaker_registry,
-        "redfish_client": redfish_client,
-        "hf_token": hf_token,
-    }
-    # Baseline comparisons run these tests against the pre-PR constructor so
-    # failures reach behavioral assertions rather than stopping at TypeError.
-    if "llmfit_settings" in inspect.signature(NodeProvisioner).parameters:
-        constructor_args["llmfit_settings"] = llmfit_settings or LLMFitSettings()
-    if "nfs_export" in inspect.signature(NodeProvisioner).parameters:
-        constructor_args["nfs_export"] = nfs_export
-    return NodeProvisioner(**constructor_args)
+        llmfit_settings=llmfit_settings or LLMFitSettings(),
+        endpoint_policy=endpoint_policy,
+        registry=registry,
+        connection_tracker=connection_tracker,
+        circuit_breaker_registry=circuit_breaker_registry,
+        redfish_client=redfish_client,
+        hf_token=hf_token,
+        nfs_export=nfs_export,
+    )
 
 
 @pytest.mark.asyncio

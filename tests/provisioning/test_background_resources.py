@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -14,16 +13,10 @@ from inference_proxy.config.settings import LLMFitSettings, ProvisioningSettings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.node import Node, NodeStatus
-from inference_proxy.provisioning.provisioner import NodeProvisioner
-
-try:
-    from inference_proxy.provisioning.provisioner import ProvisioningCapacityError
-except ImportError:
-    # Keep before-fix comparisons executable against the pre-PR interface.
-    class ProvisioningCapacityError(RuntimeError):
-        pass
-
-
+from inference_proxy.provisioning.provisioner import (
+    NodeProvisioner,
+    ProvisioningCapacityError,
+)
 from inference_proxy.quads.client import QUADSClient
 from inference_proxy.quads.schedule_enforcer import ScheduleEnforcer
 
@@ -49,10 +42,11 @@ def _fire_background(
     provisioning_hostname: str | None = None,
     task_name: str | None = None,
 ) -> asyncio.Task[None]:
-    kwargs = {"provisioning_hostname": provisioning_hostname}
-    if "task_name" in inspect.signature(provisioner.fire_background).parameters:
-        kwargs["task_name"] = task_name
-    return provisioner.fire_background(coro, **kwargs)
+    return provisioner.fire_background(
+        coro,
+        provisioning_hostname=provisioning_hostname,
+        task_name=task_name,
+    )
 
 
 @pytest.mark.asyncio
