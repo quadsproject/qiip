@@ -34,7 +34,7 @@ def _etcd_client(*, order: list[str] | None = None) -> MagicMock:
     return client
 
 
-def _bounded_health_worker(*args: object) -> None:
+def _bounded_health_worker(*args: object, **_kwargs: object) -> None:
     """Stand in for the health loop while still requiring its stop signal."""
     stop_event = args[2]
     if not isinstance(stop_event, threading.Event):
@@ -115,6 +115,29 @@ async def test_lifespan_stops_enforcer_before_provisioner_and_etcd(
 
     assert order.index("enforcer") < order.index("provisioner")
     assert order.index("provisioner") < order.index("etcd-close")
+
+
+@pytest.mark.asyncio
+async def test_gateway_shutdown_does_not_revoke_node_leases(
+    test_settings: Settings,
+) -> None:
+    """A replacement gateway retains the full TTL window to adopt leases."""
+    etcd = _etcd_client()
+
+    with (
+        patch("inference_proxy.main.EtcdClient", return_value=etcd),
+        patch("inference_proxy.main.EtcdWatcher"),
+        patch(
+            "inference_proxy.main.run_health_checker",
+            new=_bounded_health_worker,
+        ),
+    ):
+        app = create_app(settings=_without_legacy_shutdown_delay(test_settings))
+        async with app.router.lifespan_context(app):
+            pass
+
+    etcd.revoke_lease.assert_not_called()
+    etcd.close.assert_called_once()
 
 
 @pytest.mark.asyncio

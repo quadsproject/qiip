@@ -70,6 +70,14 @@ class EtcdSettings(BaseModel):
 
     endpoints: list[str] = ["http://localhost:2379"]
     node_prefix: str = "/nodes/"
+    node_lease_ttl: int = Field(
+        default=600,
+        gt=300,
+        description=(
+            "Managed-node lease TTL in seconds; must outlive the documented "
+            "five-minute gateway restart budget"
+        ),
+    )
 
     @field_validator("endpoints")
     @classmethod
@@ -496,5 +504,16 @@ class Settings(BaseSettings):
             raise ValueError(
                 "provisioning.vllm_port must be included in "
                 "routing.allowed_endpoint_ports"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def node_lease_outlives_health_cycles(self) -> Self:
+        """Leave enough lease headroom for three complete probe intervals."""
+        minimum_ttl = 3 * self.resilience.health_check_interval
+        if self.etcd.node_lease_ttl <= minimum_ttl:
+            raise ValueError(
+                "etcd.node_lease_ttl must be greater than three times "
+                "resilience.health_check_interval"
             )
         return self

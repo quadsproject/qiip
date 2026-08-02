@@ -22,6 +22,10 @@ from inference_proxy.discovery.etcd_client import (
     WatchCompactedError,
     WatchReadTimeoutError,
 )
+from inference_proxy.discovery.node_leases import (
+    NodeLeaseManager,
+    NodeLeaseObservation,
+)
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_from_etcd
 from inference_proxy.models.endpoint import EndpointPolicy
@@ -39,12 +43,14 @@ class EtcdWatcher:
         registry: NodeRegistry,
         stop_event: threading.Event,
         endpoint_policy: EndpointPolicy,
+        lease_manager: NodeLeaseManager | None = None,
         retry_delay: float = 5.0,
     ) -> None:
         self._etcd_client = etcd_client
         self._registry = registry
         self._stop_event = stop_event
         self._endpoint_policy = endpoint_policy
+        self._lease_manager = lease_manager
         self._retry_delay = retry_delay
         self._stream_lock = threading.Lock()
         self._active_stream: EtcdWatchStream | None = None
@@ -63,6 +69,7 @@ class EtcdWatcher:
                         self._registry,
                         self._etcd_client.prefix,
                         self._endpoint_policy,
+                        self._lease_manager,
                     )
                     resume_revision = snapshot.revision
                     logger.info(
@@ -87,6 +94,7 @@ class EtcdWatcher:
                             self._etcd_client.prefix,
                             key_revisions,
                             self._endpoint_policy,
+                            self._lease_manager,
                         )
                         # Advance only after the whole batch succeeds. Per-key
                         # gates make replay safe if a later event fails.
@@ -158,6 +166,7 @@ def run_watcher(
     registry: NodeRegistry,
     stop_event: threading.Event,
     endpoint_policy: EndpointPolicy,
+    lease_manager: NodeLeaseManager | None = None,
     retry_delay: float = 5.0,
 ) -> None:
     """Compatibility entry point for callers that do not need direct stop()."""
@@ -166,6 +175,7 @@ def run_watcher(
         registry,
         stop_event,
         endpoint_policy,
+        lease_manager,
         retry_delay,
     ).run()
 
@@ -175,11 +185,13 @@ def _reconcile_snapshot(
     registry: NodeRegistry,
     prefix: str,
     endpoint_policy: EndpointPolicy,
+    lease_manager: NodeLeaseManager | None = None,
 ) -> dict[str, int]:
     """Apply one prefix snapshot and seed per-key revision gates."""
     nodes: dict[str, Node] = {}
     present_node_ids: set[str] = set()
     key_revisions: dict[str, int] = {}
+    lease_records: dict[str, NodeLeaseObservation] = {}
 
     for record in snapshot.records:
         node_id = _node_id(record.key, prefix)
@@ -195,8 +207,15 @@ def _reconcile_snapshot(
         )
         if node is not None:
             nodes[node_id] = node
+            lease_records[node_id] = NodeLeaseObservation(
+                value=record.value,
+                mod_revision=record.mod_revision,
+                lease_id=getattr(record, "lease_id", 0),
+            )
 
     missing_node_ids = registry.reconcile_discovered(nodes, present_node_ids)
+    if lease_manager is not None:
+        lease_manager.reconcile_snapshot(lease_records)
 
     # Missing keys have no mod_revision in a range response. Retain a
     # tombstone at the authoritative snapshot revision so replayed events,
@@ -212,6 +231,7 @@ def _apply_batch(
     prefix: str,
     key_revisions: dict[str, int],
     endpoint_policy: EndpointPolicy,
+    lease_manager: NodeLeaseManager | None = None,
 ) -> None:
     """Apply every event in a response using independent per-key gates."""
     for event in batch.events:
@@ -227,7 +247,14 @@ def _apply_batch(
                 applied_revision=previous_revision,
             )
             continue
-        _apply_event(event, node_id, registry, prefix, endpoint_policy)
+        _apply_event(
+            event,
+            node_id,
+            registry,
+            prefix,
+            endpoint_policy,
+            lease_manager,
+        )
         key_revisions[node_id] = event.mod_revision
 
 
@@ -237,8 +264,11 @@ def _apply_event(
     registry: NodeRegistry,
     prefix: str,
     endpoint_policy: EndpointPolicy,
+    lease_manager: NodeLeaseManager | None = None,
 ) -> None:
     if event.is_delete:
+        if lease_manager is not None:
+            lease_manager.observe_delete(node_id, mod_revision=event.mod_revision)
         if registry.drain(node_id):
             logger.info("node draining", node_id=node_id)
         else:
@@ -256,6 +286,17 @@ def _apply_event(
     )
     if node is not None:
         registry.add_discovered(node)
+        # Publish lease metadata only after the corresponding registry value.
+        # The health thread can then never refresh a new lease using health
+        # evidence collected for the prior endpoint, and malformed PUTs do
+        # not become lease-maintenance targets.
+        if lease_manager is not None:
+            lease_manager.observe_put(
+                node_id,
+                value=event.value,
+                mod_revision=event.mod_revision,
+                lease_id=getattr(event, "lease_id", 0),
+            )
         logger.info(
             "node added",
             node_id=node.node_id,

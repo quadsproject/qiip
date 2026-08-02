@@ -6,7 +6,7 @@ import base64
 import json
 import socket
 from collections.abc import Iterator
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 from requests.exceptions import ConnectionError as RequestsConnectionError
@@ -145,6 +145,7 @@ class TestEtcdSnapshot:
                     # Deliberately not the store revision. Taking max KV
                     # revision would lose deletions and activity elsewhere.
                     "mod_revision": "9",
+                    "lease": "922337203685477580",
                 }
             ],
         }
@@ -156,6 +157,8 @@ class TestEtcdSnapshot:
         assert isinstance(snapshot.revision, int)
         assert snapshot.records[0].mod_revision == 9
         assert isinstance(snapshot.records[0].mod_revision, int)
+        assert snapshot.records[0].lease_id == 922337203685477580
+        assert isinstance(snapshot.records[0].lease_id, int)
         assert snapshot.records[0].key == b"/nodes/node-1"
         assert snapshot.records[0].value == b'{"endpoint":"node-1:8000"}'
         mock_instance.post.assert_called_once_with(
@@ -191,6 +194,47 @@ class TestEtcdSnapshot:
 
 class TestEtcdWrites:
     @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_grant_uses_configured_node_ttl(
+        self,
+        mock_etcd3_cls: MagicMock,
+    ) -> None:
+        mock_etcd3_cls.return_value.lease.return_value.id = 7001
+        client = EtcdClient(EtcdSettings(node_lease_ttl=777))
+
+        assert client.grant_node_lease() == 7001
+        mock_etcd3_cls.return_value.lease.assert_called_once_with(777)
+
+    @patch("inference_proxy.discovery.etcd_client.Lease")
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_put_refresh_and_revoke_use_exact_lease_id(
+        self,
+        mock_etcd3_cls: MagicMock,
+        mock_lease_cls: MagicMock,
+    ) -> None:
+        lease = mock_lease_cls.return_value
+        lease.refresh.return_value = -1
+        lease.revoke.return_value = True
+        mock_etcd3_cls.return_value.put.return_value = True
+        client = EtcdClient(_settings())
+
+        assert client.put("/nodes/gpu01", b"node", lease_id=7001) is True
+        assert client.refresh_lease(7001) == -1
+        assert client.revoke_lease(7001) is True
+
+        assert mock_lease_cls.call_args_list == [
+            call(7001, mock_etcd3_cls.return_value),
+            call(7001, mock_etcd3_cls.return_value),
+            call(7001, mock_etcd3_cls.return_value),
+        ]
+        mock_etcd3_cls.return_value.put.assert_called_once_with(
+            "/nodes/gpu01",
+            b"node",
+            lease=lease,
+        )
+        lease.refresh.assert_called_once_with()
+        lease.revoke.assert_called_once_with()
+
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
     def test_replace_delegates_compare_and_swap(
         self,
         mock_etcd3_cls: MagicMock,
@@ -206,6 +250,54 @@ class TestEtcdWrites:
             "/nodes/gpu01",
             b"old",
             b"new",
+        )
+
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_attach_lease_compares_revision_and_current_lease(
+        self,
+        mock_etcd3_cls: MagicMock,
+    ) -> None:
+        mock_instance = mock_etcd3_cls.return_value
+        mock_instance.transaction.return_value = {"succeeded": True}
+        client = EtcdClient(_settings())
+
+        attached = client.attach_lease_if_current(
+            "/nodes/gpu01",
+            b'{"status":"healthy"}',
+            expected_mod_revision=41,
+            expected_lease_id=0,
+            lease_id=123,
+        )
+
+        assert attached is True
+        mock_instance.replace.assert_not_called()
+        mock_instance.transaction.assert_called_once_with(
+            {
+                "compare": [
+                    {
+                        "key": _b64(b"/nodes/gpu01"),
+                        "result": "EQUAL",
+                        "target": "MOD",
+                        "mod_revision": "41",
+                    },
+                    {
+                        "key": _b64(b"/nodes/gpu01"),
+                        "result": "EQUAL",
+                        "target": "LEASE",
+                        "lease": "0",
+                    },
+                ],
+                "success": [
+                    {
+                        "request_put": {
+                            "key": _b64(b"/nodes/gpu01"),
+                            "value": _b64(b'{"status":"healthy"}'),
+                            "lease": "123",
+                        }
+                    }
+                ],
+                "failure": [],
+            }
         )
 
 
@@ -227,6 +319,7 @@ class TestRawWatch:
                                     "key": _b64(b"/nodes/node-1"),
                                     "value": _b64(b'{"endpoint":"one:8000"}'),
                                     "mod_revision": "10",
+                                    "lease": "77",
                                 }
                             },
                             {
@@ -256,6 +349,9 @@ class TestRawWatch:
         assert [event.mod_revision for event in batches[0].events] == [10, 10]
         assert all(isinstance(event.mod_revision, int) for event in batches[0].events)
         assert batches[0].events[0].value == b'{"endpoint":"one:8000"}'
+        assert batches[0].events[0].lease_id == 77
+        assert isinstance(batches[0].events[0].lease_id, int)
+        assert batches[0].events[1].lease_id == 0
         assert batches[0].events[1].is_delete is True
         assert response.raise_calls == 1
         mock_instance.session.post.assert_called_once_with(

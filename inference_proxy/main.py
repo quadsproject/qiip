@@ -39,6 +39,7 @@ from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.logging import configure_logging
 from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.etcd_client import EtcdClient
+from inference_proxy.discovery.node_leases import NodeLeaseManager
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_from_etcd
 from inference_proxy.discovery.watcher import EtcdWatcher
@@ -185,6 +186,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             etcd_client = EtcdClient(resolved_settings.etcd)
             resources.callback(_safe_sync_cleanup, "etcd client", etcd_client.close)
             registry = NodeRegistry()
+            lease_manager = NodeLeaseManager(etcd_client)
             endpoint_policy = resolved_settings.routing.endpoint_policy()
 
             allowlist_fields = {
@@ -211,6 +213,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 registry,
                 stop_event,
                 endpoint_policy,
+                lease_manager,
             )
             worker_threads: list[threading.Thread] = []
             resources.push_async_callback(
@@ -235,6 +238,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             registry.register_remove_listener(circuit_breaker_registry.remove)
             app.state.circuit_breaker_registry = circuit_breaker_registry
 
+            connection_tracker = ConnectionTracker()
+            node_selector = NodeSelector(registry, connection_tracker)
+            app.state.node_selector = node_selector
+
             health_thread = threading.Thread(
                 target=run_health_checker,
                 name="health-checker",
@@ -245,14 +252,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     resolved_settings.resilience.health_check_interval,
                     resolved_settings.resilience.health_check_failure_threshold,
                 ),
+                kwargs={
+                    "connection_tracker": connection_tracker,
+                    "lease_manager": lease_manager,
+                },
                 daemon=True,
             )
             health_thread.start()
             worker_threads.append(health_thread)
-
-            connection_tracker = ConnectionTracker()
-            node_selector = NodeSelector(registry, connection_tracker)
-            app.state.node_selector = node_selector
 
             request_metrics = RequestMetrics()
             app.state.request_metrics = request_metrics

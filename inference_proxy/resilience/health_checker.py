@@ -39,10 +39,13 @@ import threading
 import httpx
 import structlog
 
+from inference_proxy.discovery.node_leases import NodeLeaseManager
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.endpoint import build_backend_url
 from inference_proxy.models.node import NodeStatus
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
+from inference_proxy.routing import drain_cleanup
+from inference_proxy.routing.connection_tracker import ConnectionTracker
 
 logger = structlog.get_logger()
 
@@ -88,6 +91,8 @@ def run_health_checker(
     stop_event: threading.Event,
     interval: float = 30.0,
     failure_threshold: int = 3,
+    connection_tracker: ConnectionTracker | None = None,
+    lease_manager: NodeLeaseManager | None = None,
 ) -> None:
     """Probe registered nodes and manage HEALTHY/UNHEALTHY transitions.
 
@@ -113,6 +118,8 @@ def run_health_checker(
                 client,
                 consecutive_failures,
                 failure_threshold,
+                connection_tracker=connection_tracker,
+                lease_manager=lease_manager,
             )
             if stop_event.wait(timeout=interval):
                 break
@@ -127,6 +134,9 @@ def _probe_all_nodes(
     client: httpx.Client,
     consecutive_failures: _ConsecutiveFailures,
     failure_threshold: int,
+    *,
+    connection_tracker: ConnectionTracker | None = None,
+    lease_manager: NodeLeaseManager | None = None,
 ) -> None:
     """Probe every node in the registry once.
 
@@ -134,6 +144,8 @@ def _probe_all_nodes(
     Single Responsibility Principle: the loop manages timing, this
     function manages probing logic.
     """
+    if connection_tracker is not None:
+        drain_cleanup.sweep_drained_nodes(registry, connection_tracker)
     nodes = registry.get_all()
     for node in nodes:
         if node.status == NodeStatus.PROVISIONING:
@@ -147,6 +159,7 @@ def _probe_all_nodes(
             client=client,
             consecutive_failures=consecutive_failures,
             failure_threshold=failure_threshold,
+            lease_manager=lease_manager,
         )
 
 
@@ -159,6 +172,7 @@ def _probe_node(
     client: httpx.Client,
     consecutive_failures: _ConsecutiveFailures,
     failure_threshold: int,
+    lease_manager: NodeLeaseManager | None = None,
 ) -> None:
     """Probe a single node and update its status if needed.
 
@@ -175,13 +189,24 @@ def _probe_node(
         url = build_backend_url(endpoint, "/health")
         response = client.get(url)
         if response.status_code == 200:
-            _handle_probe_success(
+            health_evidence = _handle_probe_success(
                 node_id=node_id,
                 registry=registry,
                 circuit_breaker_registry=circuit_breaker_registry,
                 client=client,
                 consecutive_failures=consecutive_failures,
             )
+            if health_evidence and lease_manager is not None:
+                current = registry.get(node_id)
+                if current is not None and current.endpoint == endpoint:
+                    lease_manager.maintain_after_success(current)
+                elif current is not None:
+                    logger.debug(
+                        "lease refresh withheld after endpoint changed",
+                        node_id=node_id,
+                        probed_endpoint=endpoint,
+                        current_endpoint=current.endpoint,
+                    )
         else:
             _handle_probe_failure(
                 node_id=node_id,
@@ -212,26 +237,44 @@ def _handle_probe_success(
     circuit_breaker_registry: CircuitBreakerRegistry,
     client: httpx.Client,
     consecutive_failures: _ConsecutiveFailures,
-) -> None:
+) -> bool:
     """Handle a successful health probe for a node."""
     consecutive_failures.reset(node_id)
     current = registry.get(node_id)
-    if current is None or current.status not in _RECOVERABLE_STATUSES:
+    if current is None:
         logger.debug("health probe succeeded", node_id=node_id)
-        return
+        return False
+
+    if current.status in {
+        NodeStatus.DRAINING,
+        NodeStatus.PROVISIONING,
+        NodeStatus.FAILED,
+    }:
+        logger.debug("health probe succeeded for protected node", node_id=node_id)
+        return False
 
     breaker = circuit_breaker_registry.get(node_id)
+    if current.status == NodeStatus.HEALTHY:
+        if breaker is not None and breaker.is_open:
+            logger.debug(
+                "healthy node has open breaker; lease refresh withheld",
+                node_id=node_id,
+            )
+            return False
+        logger.debug("health probe succeeded", node_id=node_id)
+        return True
+
     if breaker is not None and breaker.is_open:
         if not breaker.try_half_open():
             logger.debug("half-open probe already active", node_id=node_id)
-            return
+            return False
         if not current.model:
             breaker.reopen()
             logger.warning(
                 "cannot probe inference recovery without a registered model",
                 node_id=node_id,
             )
-            return
+            return False
         try:
             response = client.post(
                 build_backend_url(current.endpoint, "/v1/completions"),
@@ -253,7 +296,7 @@ def _handle_probe_success(
                 node_id=node_id,
                 exc_info=True,
             )
-            return
+            return False
 
         try:
             transitioned = registry.update_status(
@@ -273,7 +316,7 @@ def _handle_probe_success(
                 "half-open inference succeeded after node state changed",
                 node_id=node_id,
             )
-        return
+        return transitioned
 
     transitioned = registry.update_status(
         node_id,
@@ -284,6 +327,7 @@ def _handle_probe_success(
         logger.info("node recovered to healthy", node_id=node_id)
     else:
         logger.debug("health probe succeeded", node_id=node_id)
+    return transitioned
 
 
 def _handle_probe_failure(

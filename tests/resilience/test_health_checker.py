@@ -10,6 +10,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import inspect
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +27,7 @@ from inference_proxy.resilience.health_checker import (
     _probe_all_nodes,
     run_health_checker,
 )
+from inference_proxy.routing.connection_tracker import ConnectionTracker
 
 
 def _make_node(
@@ -51,6 +53,29 @@ class _FailureCounts(dict[str, int]):
 
     def close(self) -> None:
         pass
+
+
+def test_health_cycle_removes_idle_draining_node_without_request_traffic() -> None:
+    """R7: periodic health work removes a ghost without request finalization."""
+    registry = NodeRegistry()
+    registry.add(_make_node(status=NodeStatus.DRAINING))
+    tracker = ConnectionTracker()
+    optional_args: dict[str, object] = {}
+    if "connection_tracker" in inspect.signature(_probe_all_nodes).parameters:
+        # Keep the pre-PR entry point callable so the old behavior reaches the
+        # assertion instead of failing mechanically on the new keyword.
+        optional_args["connection_tracker"] = tracker
+
+    _probe_all_nodes(
+        registry,
+        CircuitBreakerRegistry(),
+        MagicMock(spec=httpx.Client),
+        _FailureCounts(),
+        3,
+        **optional_args,
+    )
+
+    assert registry.get("node-1") is None
 
 
 @pytest.mark.parametrize("status", list(NodeStatus))

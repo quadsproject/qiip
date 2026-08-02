@@ -19,6 +19,7 @@ from inference_proxy.config.settings import (
     ProvisioningSettings,
     QUADSSettings,
     RedfishSettings,
+    ResilienceSettings,
     RoutingSettings,
     Settings,
     SSHSettings,
@@ -129,6 +130,24 @@ class TestDefaultEtcdSettings:
         settings = Settings(_env_file=None)
         assert settings.etcd.endpoints == ["http://localhost:2379"]
         assert settings.etcd.node_prefix == "/nodes/"
+        assert settings.etcd.node_lease_ttl == 600
+
+    def test_node_lease_ttl_exceeds_health_and_restart_budgets(self) -> None:
+        settings = Settings(_env_file=None)
+
+        assert settings.etcd.node_lease_ttl > 300
+        assert (
+            settings.etcd.node_lease_ttl > 3 * settings.resilience.health_check_interval
+        )
+
+        with pytest.raises(ValidationError, match="greater than 300"):
+            EtcdSettings(node_lease_ttl=300)
+        with pytest.raises(ValidationError, match="three times"):
+            Settings(
+                _env_file=None,
+                etcd=EtcdSettings(node_lease_ttl=600),
+                resilience=ResilienceSettings(health_check_interval=200),
+            )
 
 
 class TestDefaultRoutingSettings:

@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 import structlog
 from etcd3gw.client import Etcd3Client
+from etcd3gw.lease import Lease
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import ReadTimeout as RequestsReadTimeout
 from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
@@ -69,6 +70,7 @@ class EtcdRecord:
     key: bytes
     value: bytes
     mod_revision: int
+    lease_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -87,6 +89,7 @@ class EtcdEvent:
     value: bytes | None
     mod_revision: int
     is_delete: bool
+    lease_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -155,7 +158,7 @@ def _parse_kv(
     context: str,
     *,
     value_required: bool,
-) -> tuple[bytes, bytes | None, int]:
+) -> tuple[bytes, bytes | None, int, int]:
     if not isinstance(raw_kv, dict):
         raise EtcdProtocolError(f"{context} kv must be an object")
     value = None
@@ -165,6 +168,7 @@ def _parse_kv(
         _decode(raw_kv.get("key"), f"{context} kv.key"),
         value,
         _revision(raw_kv.get("mod_revision"), f"{context} kv.mod_revision"),
+        _revision(raw_kv.get("lease", 0), f"{context} kv.lease"),
     )
 
 
@@ -230,7 +234,7 @@ class EtcdWatchStream:
                 if not isinstance(raw_event, dict):
                     raise EtcdProtocolError("watch event must be an object")
                 is_delete = raw_event.get("type", "PUT") == "DELETE"
-                key, value, mod_revision = _parse_kv(
+                key, value, mod_revision, lease_id = _parse_kv(
                     raw_event.get("kv"),
                     "watch",
                     value_required=not is_delete,
@@ -241,6 +245,7 @@ class EtcdWatchStream:
                         value=value,
                         mod_revision=mod_revision,
                         is_delete=is_delete,
+                        lease_id=lease_id,
                     )
                 )
             if any(event.mod_revision > response_revision for event in events):
@@ -310,6 +315,7 @@ class EtcdClient:
             timeout=5,
         )
         self._prefix = settings.node_prefix
+        self._node_lease_ttl = settings.node_lease_ttl
 
     @property
     def prefix(self) -> str:
@@ -349,7 +355,7 @@ class EtcdClient:
             raise EtcdProtocolError("range kvs must be a list")
         records: list[EtcdRecord] = []
         for raw_record in raw_records:
-            key, value, mod_revision = _parse_kv(
+            key, value, mod_revision, lease_id = _parse_kv(
                 raw_record,
                 "range",
                 value_required=True,
@@ -361,23 +367,93 @@ class EtcdClient:
                     key=key,
                     value=value,
                     mod_revision=mod_revision,
+                    lease_id=lease_id,
                 )
             )
         if any(record.mod_revision > snapshot_revision for record in records):
             raise EtcdProtocolError("range kv revision exceeds snapshot revision")
         return EtcdSnapshot(tuple(records), snapshot_revision)
 
-    def put(self, key: str, value: str | bytes) -> bool:
+    def put(
+        self,
+        key: str,
+        value: str | bytes,
+        *,
+        lease_id: int | None = None,
+    ) -> bool:
         """Put a key-value pair into etcd.
 
         Args:
             key: The full key (e.g., ``/nodes/hostname``).
             value: The value to store (typically JSON-encoded).
+            lease_id: Optional existing etcd lease to attach to the key.
 
         Returns:
             True on success.
         """
-        return self._client.put(key, value)
+        if lease_id is None:
+            return self._client.put(key, value)
+        return self._client.put(key, value, lease=Lease(lease_id, self._client))
+
+    def grant_node_lease(self) -> int:
+        """Grant one lease using the configured managed-node TTL."""
+        return self._client.lease(self._node_lease_ttl).id
+
+    def refresh_lease(self, lease_id: int) -> int:
+        """Refresh an existing lease, returning ``-1`` after expiry."""
+        return Lease(lease_id, self._client).refresh()
+
+    def revoke_lease(self, lease_id: int) -> bool:
+        """Revoke an existing lease and any keys still attached to it."""
+        return Lease(lease_id, self._client).revoke()
+
+    def attach_lease_if_current(
+        self,
+        key: str,
+        value: str | bytes,
+        *,
+        expected_mod_revision: int,
+        expected_lease_id: int,
+        lease_id: int,
+    ) -> bool:
+        """Attach *lease_id* only to the exact key revision observed.
+
+        ``etcd3gw.replace()`` compares values only and cannot attach a lease.
+        Adoption therefore uses the raw transaction API to compare both the
+        modification revision and current lease before writing the same value
+        back with its new lease.
+        """
+        raw_key = key.encode("utf-8")
+        raw_value = value.encode("utf-8") if isinstance(value, str) else value
+        result = self._client.transaction(
+            {
+                "compare": [
+                    {
+                        "key": _encode(raw_key),
+                        "result": "EQUAL",
+                        "target": "MOD",
+                        "mod_revision": str(expected_mod_revision),
+                    },
+                    {
+                        "key": _encode(raw_key),
+                        "result": "EQUAL",
+                        "target": "LEASE",
+                        "lease": str(expected_lease_id),
+                    },
+                ],
+                "success": [
+                    {
+                        "request_put": {
+                            "key": _encode(raw_key),
+                            "value": _encode(raw_value),
+                            "lease": str(lease_id),
+                        }
+                    }
+                ],
+                "failure": [],
+            }
+        )
+        return bool(result.get("succeeded", False))
 
     def replace(
         self,

@@ -699,7 +699,44 @@ class NodeProvisioner:
         )
         key, value = node_to_etcd(node, self._etcd_client.prefix)
         # ponytail: etcd3gw is sync, asyncio.to_thread wraps it (Pitfall 5)
-        await asyncio.to_thread(self._etcd_client.put, key, value)
+        lease_id: int | None = None
+        if managed:
+            try:
+                lease_id = await asyncio.to_thread(self._etcd_client.grant_node_lease)
+            except Exception:
+                # Lease protection is convergent rather than a precondition
+                # for completing an otherwise successful hour-long provision.
+                # The health checker adopts this managed key after its next
+                # successful probe.
+                logger.warning(
+                    "node_lease_grant_failed_during_registration",
+                    hostname=hostname,
+                    exc_info=True,
+                )
+                self._log(
+                    hostname,
+                    "warning",
+                    "Node registered without a lease; health checking will retry",
+                )
+
+        try:
+            if lease_id is None:
+                await asyncio.to_thread(self._etcd_client.put, key, value)
+            else:
+                await asyncio.to_thread(
+                    self._etcd_client.put,
+                    key,
+                    value,
+                    lease_id=lease_id,
+                )
+        except Exception:
+            if lease_id is not None:
+                with suppress(Exception):
+                    await asyncio.to_thread(
+                        self._etcd_client.revoke_lease,
+                        lease_id,
+                    )
+            raise
         logger.info("node_registered", hostname=hostname, model=model, key=key)
 
     def fire_background(

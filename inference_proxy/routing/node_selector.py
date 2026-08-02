@@ -20,6 +20,7 @@ import structlog
 
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.routing import drain_cleanup
 from inference_proxy.routing.connection_tracker import ConnectionTracker
 
 logger = structlog.get_logger()
@@ -165,20 +166,9 @@ class NodeSelector:
 
     def _release(self, node_id: str) -> None:
         """Release a connection and atomically remove fully drained nodes."""
-        removed: list[str] = []
         with self._registry.locked():
             self._tracker.decrement(node_id)
-            for node in self._registry.get_all():
-                if (
-                    node.status == NodeStatus.DRAINING
-                    and self._tracker.get(node.node_id) == 0
-                ):
-                    self._registry.remove(node.node_id)
-                    self._tracker.remove(node.node_id)
-                    removed.append(node.node_id)
-
-        for removed_node_id in removed:
-            logger.info("drained node removed", node_id=removed_node_id)
+            drain_cleanup.sweep_drained_nodes(self._registry, self._tracker)
 
     def has_model(self, model: str) -> bool:
         """Check whether any registered node serves the given model.

@@ -13,7 +13,7 @@ import shlex
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import asyncssh
 import httpx
@@ -254,7 +254,13 @@ def _recording_etcd() -> tuple[MagicMock, dict[str, bytes], list[dict[str, objec
     values: dict[str, bytes] = {}
     state_payloads: list[dict[str, object]] = []
 
-    def put(key: str, value: bytes) -> bool:
+    def put(
+        key: str,
+        value: bytes,
+        *,
+        lease_id: int | None = None,
+    ) -> bool:
+        del lease_id
         values[key] = value
         if key.startswith("/provisioning/"):
             state_payloads.append(json.loads(value))
@@ -270,6 +276,7 @@ def _recording_etcd() -> tuple[MagicMock, dict[str, bytes], list[dict[str, objec
         return values.pop(key, None) is not None
 
     etcd.put = MagicMock(side_effect=put)
+    etcd.grant_node_lease = MagicMock(return_value=7001)
     etcd.replace = MagicMock(side_effect=replace)
     etcd.delete = MagicMock(side_effect=delete)
     return etcd, values, state_payloads
@@ -619,7 +626,7 @@ class TestNodeRegistration:
             "inference_proxy.provisioning.provisioner.asyncio.to_thread",
             new_callable=AsyncMock,
         ) as mock_to_thread:
-            mock_to_thread.return_value = True
+            mock_to_thread.side_effect = [7001, True]
             with patch(
                 "inference_proxy.provisioning.provisioner.node_to_etcd"
             ) as mock_serialize:
@@ -635,10 +642,62 @@ class TestNodeRegistration:
                 assert node.endpoint == "http://host1:8000"
                 assert node.last_heartbeat is not None
 
-                # Verify etcd.put called via asyncio.to_thread
-                mock_to_thread.assert_called_once_with(
-                    etcd.put, "/nodes/host1", b'{"model":"test"}'
-                )
+                # Each managed registration gets a fresh lease before its PUT.
+                assert mock_to_thread.call_args_list == [
+                    call(etcd.grant_node_lease),
+                    call(
+                        etcd.put,
+                        "/nodes/host1",
+                        b'{"model":"test"}',
+                        lease_id=7001,
+                    ),
+                ]
+
+    @pytest.mark.asyncio
+    async def test_unmanaged_registration_remains_unleased(self) -> None:
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        provisioner = _make_provisioner(etcd_client=etcd)
+
+        await provisioner._register_node("host1", "test-model", managed=False)
+
+        etcd.grant_node_lease.assert_not_called()
+        etcd.put.assert_called_once()
+        assert "lease_id" not in etcd.put.call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_managed_healthy_registration_uses_unique_lease(self) -> None:
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        etcd.grant_node_lease.side_effect = [7001, 7002]
+        provisioner = _make_provisioner(
+            etcd_client=etcd,
+            endpoint_policy=EndpointPolicy.from_values(
+                allowed_hosts=["host1", "host2"],
+                allowed_networks=[],
+                allowed_ports=[8000],
+            ),
+        )
+
+        await provisioner._register_node("host1", "test-model")
+        await provisioner._register_node("host2", "test-model")
+
+        assert etcd.put.call_args_list[0].kwargs["lease_id"] == 7001
+        assert etcd.put.call_args_list[1].kwargs["lease_id"] == 7002
+
+    @pytest.mark.asyncio
+    async def test_lease_grant_failure_falls_back_to_unleased_registration(
+        self,
+    ) -> None:
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        etcd.grant_node_lease.side_effect = RuntimeError("etcd lease unavailable")
+        provisioner = _make_provisioner(etcd_client=etcd)
+
+        await provisioner._register_node("host1", "test-model")
+
+        etcd.put.assert_called_once()
+        assert "lease_id" not in etcd.put.call_args.kwargs
 
 
 class TestSetupFailure:
@@ -1170,9 +1229,11 @@ class TestStateTracking:
 
         call_count = 0
 
-        async def flaky_to_thread(fn, *args):
+        async def flaky_to_thread(fn, *args, **_kwargs):
             nonlocal call_count
             call_count += 1
+            if fn is etcd.grant_node_lease:
+                return 7001
             key = args[0] if args else ""
             # Fail all /provisioning/ writes, allow /nodes/ writes
             if isinstance(key, str) and "/provisioning/" in key:
@@ -1225,6 +1286,13 @@ class TestStateTracking:
                         first_call = mock_ser.call_args_list[0]
                         node = first_call[0][0]
                         assert node.status == NodeStatus.PROVISIONING
+                        node_puts = [
+                            call
+                            for call in mock_to_thread.call_args_list
+                            if call.args and call.args[0] is etcd.put
+                        ]
+                        assert node_puts
+                        assert "lease_id" not in node_puts[0].kwargs
 
     @pytest.mark.asyncio
     async def test_preflight_called_before_setup(self) -> None:
