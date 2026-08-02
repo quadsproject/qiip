@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from unittest.mock import MagicMock, call
 
 import httpx
+import pytest
 
 from inference_proxy.discovery.etcd_client import (
     EtcdEvent,
@@ -24,23 +25,22 @@ from inference_proxy.discovery.watcher import _apply_batch, _reconcile_snapshot
 from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
-from inference_proxy.resilience.health_checker import _probe_all_nodes
+from inference_proxy.resilience.health_checker import (
+    _ConsecutiveFailures,
+    _probe_all_nodes,
+)
 from inference_proxy.routing import drain_cleanup
 from inference_proxy.routing.connection_tracker import ConnectionTracker
 from inference_proxy.routing.node_selector import NodeSelector
 
 
-class _FailureCounts(dict[str, int]):
-    def reset(self, node_id: str) -> None:
-        self[node_id] = 0
+class _FailureCounts(_ConsecutiveFailures):
+    """Real counter behavior without registering a removal listener."""
 
-    def increment(self, node_id: str) -> int:
-        count = self.get(node_id, 0) + 1
-        self[node_id] = count
-        return count
-
-    def close(self) -> None:
-        pass
+    def __init__(self, counts: dict[str, int] | None = None) -> None:
+        self._counts = dict(counts or {})
+        self._lock = threading.Lock()
+        self._unregister = lambda: None
 
 
 def _node(
@@ -324,7 +324,7 @@ def test_drain_sweep_does_not_remove_concurrent_reregistration() -> None:
 
 
 def test_request_release_and_health_cycle_share_atomic_drain_cleanup(
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
 

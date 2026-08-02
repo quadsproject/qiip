@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Coroutine
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -59,7 +61,11 @@ def _enforcer(
     )
     provisioner.teardown = AsyncMock()
 
-    def close_background(coro, *, task_name=None):
+    def close_background(
+        coro: Coroutine[Any, Any, None],
+        *,
+        task_name: str | None = None,
+    ) -> MagicMock:
         coro.close()
         return MagicMock()
 
@@ -73,6 +79,13 @@ def _enforcer(
         check_interval=300,
     )
     return enforcer, registry, provisioner
+
+
+def _get_available_mock(enforcer: ScheduleEnforcer) -> AsyncMock:
+    """Return the runtime AsyncMock behind the typed QUADS client method."""
+    get_available = enforcer._client.get_available
+    assert isinstance(get_available, AsyncMock)
+    return get_available
 
 
 class TestEnforceOnce:
@@ -235,7 +248,7 @@ class TestEnforceOnce:
 
         await enforcer._enforce_once()
 
-        enforcer._client.get_available.assert_awaited_once_with(end=expected_end)
+        _get_available_mock(enforcer).assert_awaited_once_with(end=expected_end)
 
 
 class TestTeardownRetry:
@@ -256,12 +269,20 @@ class TestTeardownRetry:
         tasks: list[asyncio.Task[None]] = []
         attempts = 0
 
-        def fire_background(coro, *, task_name=None):
+        def fire_background(
+            coro: Coroutine[Any, Any, None],
+            *,
+            task_name: str | None = None,
+        ) -> asyncio.Task[None]:
             task = asyncio.create_task(coro)
             tasks.append(task)
             return task
 
-        async def teardown(hostname: str, *, lifecycle_lease) -> None:
+        async def teardown(
+            hostname: str,
+            *,
+            lifecycle_lease: MagicMock,
+        ) -> None:
             nonlocal attempts
             attempts += 1
             registry.drain(hostname)
@@ -288,7 +309,7 @@ class TestTeardownRetry:
             for log in logs
         )
 
-        enforcer._client.get_available.return_value = ["gpu01"]
+        _get_available_mock(enforcer).return_value = ["gpu01"]
         await enforcer._enforce_once()
         assert len(tasks) == 1
 
@@ -315,12 +336,20 @@ class TestTeardownRetry:
         )
         tasks: list[asyncio.Task[None]] = []
 
-        def fire_background(coro, *, task_name=None):
+        def fire_background(
+            coro: Coroutine[Any, Any, None],
+            *,
+            task_name: str | None = None,
+        ) -> asyncio.Task[None]:
             task = asyncio.create_task(coro)
             tasks.append(task)
             return task
 
-        async def teardown(hostname: str, *, lifecycle_lease) -> None:
+        async def teardown(
+            hostname: str,
+            *,
+            lifecycle_lease: MagicMock,
+        ) -> None:
             registry.drain(hostname)
             raise RuntimeError("host unreachable")
 
@@ -366,7 +395,11 @@ class TestTeardownRetry:
         )
         scheduled = 0
 
-        def fire_background(coro, *, task_name=None):
+        def fire_background(
+            coro: Coroutine[Any, Any, None],
+            *,
+            task_name: str | None = None,
+        ) -> MagicMock:
             nonlocal scheduled
             scheduled += 1
             if scheduled == 1:
@@ -426,7 +459,7 @@ class TestPollerFailure:
             available=[],
             nodes=[_node("gpu01")],
         )
-        enforcer._client.get_available.side_effect = QUADSConnectionError("down")
+        _get_available_mock(enforcer).side_effect = QUADSConnectionError("down")
 
         await enforcer._enforce_once()
 

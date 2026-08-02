@@ -19,10 +19,12 @@ import pytest
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.resilience.circuit_breaker import (
+    CircuitBreaker,
     CircuitBreakerRegistry,
     CircuitBreakerState,
 )
 from inference_proxy.resilience.health_checker import (
+    _ConsecutiveFailures,
     _probe_all_nodes,
     run_health_checker,
 )
@@ -39,19 +41,21 @@ def _make_node(
     return Node(node_id=node_id, endpoint=endpoint, status=status, model=model)
 
 
-class _FailureCounts(dict[str, int]):
-    """Counter interface accepted by both pre- and post-fix probe code."""
+class _FailureCounts(_ConsecutiveFailures):
+    """Real counter behavior without registering a removal listener."""
 
-    def reset(self, node_id: str) -> None:
-        self[node_id] = 0
+    def __init__(self, counts: dict[str, int] | None = None) -> None:
+        self._counts = dict(counts or {})
+        self._lock = threading.Lock()
+        self._unregister = lambda: None
 
-    def increment(self, node_id: str) -> int:
-        count = self.get(node_id, 0) + 1
-        self[node_id] = count
-        return count
 
-    def close(self) -> None:
-        pass
+def _assert_breaker_state(
+    breaker: CircuitBreaker,
+    expected: CircuitBreakerState,
+) -> None:
+    """Assert mutable breaker state without retaining mypy's prior narrowing."""
+    assert breaker.state is expected
 
 
 def test_health_cycle_removes_idle_draining_node_without_request_traffic() -> None:
@@ -278,11 +282,13 @@ class TestHealthyNodeStaysHealthy:
                 return True
             return original_wait(timeout)
 
-        with patch(
-            "inference_proxy.resilience.health_checker.httpx.Client",
-            return_value=mock_client,
+        with (
+            patch(
+                "inference_proxy.resilience.health_checker.httpx.Client",
+                return_value=mock_client,
+            ),
+            patch.object(stop_event, "wait", side_effect=stop_after_one_iteration),
         ):
-            stop_event.wait = stop_after_one_iteration  # type: ignore[assignment]
             run_health_checker(registry, cb_registry, stop_event, interval=0.01)
 
         result_node = registry.get("node-1")
@@ -315,11 +321,13 @@ class TestUnhealthyAfterThreeFailures:
                 return True
             return False
 
-        with patch(
-            "inference_proxy.resilience.health_checker.httpx.Client",
-            return_value=mock_client,
+        with (
+            patch(
+                "inference_proxy.resilience.health_checker.httpx.Client",
+                return_value=mock_client,
+            ),
+            patch.object(stop_event, "wait", side_effect=stop_after_three_iterations),
         ):
-            stop_event.wait = stop_after_three_iterations  # type: ignore[assignment]
             run_health_checker(
                 registry,
                 cb_registry,
@@ -357,11 +365,13 @@ class TestUnhealthyAfterThreeFailures:
                 return True
             return False
 
-        with patch(
-            "inference_proxy.resilience.health_checker.httpx.Client",
-            return_value=mock_client,
+        with (
+            patch(
+                "inference_proxy.resilience.health_checker.httpx.Client",
+                return_value=mock_client,
+            ),
+            patch.object(stop_event, "wait", side_effect=stop_after_three_iterations),
         ):
-            stop_event.wait = stop_after_three_iterations  # type: ignore[assignment]
             run_health_checker(
                 registry,
                 cb_registry,
@@ -387,7 +397,7 @@ class TestRecoveryAfterOneSuccess:
         breaker = cb_registry.get_or_create("node-1")
         for _ in range(3):
             breaker.record_failure()
-        assert breaker.state == CircuitBreakerState.OPEN
+        _assert_breaker_state(breaker, CircuitBreakerState.OPEN)
 
         failures = _FailureCounts()
         client = MagicMock(spec=httpx.Client)
@@ -397,7 +407,7 @@ class TestRecoveryAfterOneSuccess:
             current = registry.get("node-1")
             assert current is not None
             assert current.status == NodeStatus.UNHEALTHY
-            assert breaker.state == CircuitBreakerState.HALF_OPEN
+            _assert_breaker_state(breaker, CircuitBreakerState.HALF_OPEN)
             return httpx.Response(
                 200,
                 request=httpx.Request("POST", "http://10.0.1.100:8000/v1/completions"),
@@ -418,7 +428,7 @@ class TestRecoveryAfterOneSuccess:
         result_node = registry.get("node-1")
         assert result_node is not None
         assert result_node.status == NodeStatus.HEALTHY
-        assert breaker.state == CircuitBreakerState.CLOSED
+        _assert_breaker_state(breaker, CircuitBreakerState.CLOSED)
         client.post.assert_called_once_with(
             "http://10.0.1.100:8000/v1/completions",
             json={"model": "llama-3", "prompt": "ping", "max_tokens": 1},
@@ -468,7 +478,7 @@ class TestRecoveryAfterOneSuccess:
         current = registry.get("node-1")
         assert current is not None
         assert current.status == NodeStatus.UNHEALTHY
-        assert breaker.state == CircuitBreakerState.OPEN
+        _assert_breaker_state(breaker, CircuitBreakerState.OPEN)
 
     def test_half_open_success_does_not_recover_concurrent_draining_node(
         self,
@@ -507,7 +517,7 @@ class TestRecoveryAfterOneSuccess:
         current = registry.get("node-1")
         assert current is not None
         assert current.status == NodeStatus.DRAINING
-        assert breaker.state == CircuitBreakerState.OPEN
+        _assert_breaker_state(breaker, CircuitBreakerState.OPEN)
 
     def test_health_demoted_node_recovers_without_inference_probe(self) -> None:
         registry = NodeRegistry()
@@ -534,11 +544,11 @@ class TestRecoveryAfterOneSuccess:
         current = registry.get("node-1")
         assert current is not None
         assert current.status == NodeStatus.HEALTHY
-        assert breaker.state == CircuitBreakerState.CLOSED
+        _assert_breaker_state(breaker, CircuitBreakerState.CLOSED)
         client.post.assert_not_called()
 
         breaker.record_failure()
-        assert breaker.state == CircuitBreakerState.OPEN
+        _assert_breaker_state(breaker, CircuitBreakerState.OPEN)
 
     def test_half_open_timeout_does_not_block_remaining_probe_cycle(
         self,
@@ -642,10 +652,12 @@ class TestRecoveryAfterOneSuccess:
                 return True
             return False
 
-        stop_event.wait = replace_after_two_failures  # type: ignore[assignment]
-        with patch(
-            "inference_proxy.resilience.health_checker.httpx.Client",
-            return_value=client,
+        with (
+            patch(
+                "inference_proxy.resilience.health_checker.httpx.Client",
+                return_value=client,
+            ),
+            patch.object(stop_event, "wait", side_effect=replace_after_two_failures),
         ):
             run_health_checker(
                 registry,
@@ -711,11 +723,13 @@ class TestProbeExceptionDoesNotCrash:
                 return True
             return False
 
-        with patch(
-            "inference_proxy.resilience.health_checker.httpx.Client",
-            return_value=mock_client,
+        with (
+            patch(
+                "inference_proxy.resilience.health_checker.httpx.Client",
+                return_value=mock_client,
+            ),
+            patch.object(stop_event, "wait", side_effect=stop_after_two_iterations),
         ):
-            stop_event.wait = stop_after_two_iterations  # type: ignore[assignment]
             run_health_checker(
                 registry,
                 cb_registry,
@@ -772,11 +786,13 @@ class TestProvisioningNodeSkipped:
                 return True
             return False
 
-        with patch(
-            "inference_proxy.resilience.health_checker.httpx.Client",
-            return_value=mock_client,
+        with (
+            patch(
+                "inference_proxy.resilience.health_checker.httpx.Client",
+                return_value=mock_client,
+            ),
+            patch.object(stop_event, "wait", side_effect=stop_after_one_iteration),
         ):
-            stop_event.wait = stop_after_one_iteration  # type: ignore[assignment]
             run_health_checker(registry, cb_registry, stop_event, interval=0.01)
 
         # Only the healthy node was probed

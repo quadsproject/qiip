@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from contextlib import suppress
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -67,7 +68,7 @@ async def test_teardown_cancels_active_provision(
     order: list[str] = []
     scheduled: list[asyncio.Task[None]] = []
 
-    async def run_inline(function, *args):
+    async def run_inline(function: Callable[..., Any], *args: Any) -> Any:
         return function(*args)
 
     monkeypatch.setattr(asyncio, "to_thread", run_inline)

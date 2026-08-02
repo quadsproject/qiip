@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 from requests.exceptions import ConnectionError as RequestsConnectionError
+from urllib3 import HTTPConnectionPool
 from urllib3.exceptions import ReadTimeoutError as Urllib3ReadTimeoutError
 
 from inference_proxy.config.settings import EtcdSettings
@@ -389,7 +390,11 @@ class TestRawWatch:
 
     def test_streamed_read_timeout_is_normalized(self) -> None:
         wrapped_timeout = RequestsConnectionError(
-            Urllib3ReadTimeoutError(None, None, "read timed out")
+            Urllib3ReadTimeoutError(
+                HTTPConnectionPool("localhost"),
+                None,
+                "read timed out",
+            )
         )
         response = _StreamingResponse([], error=wrapped_timeout)
 

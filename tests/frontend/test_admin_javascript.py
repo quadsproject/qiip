@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,7 +15,7 @@ _NODE_DETAIL_JS = _ROOT / "inference_proxy/static/js/node_detail.js"
 _DASHBOARD_JS = _ROOT / "inference_proxy/static/js/dashboard.js"
 
 
-def _run_node(source: Path, harness: str) -> object:
+def _run_node(source: Path, harness: str) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
         pytest.fail(
@@ -30,7 +31,9 @@ def _run_node(source: Path, harness: str) -> object:
         timeout=3,
     )
     assert result.returncode == 0, result.stderr
-    return json.loads(result.stdout)
+    parsed: object = json.loads(result.stdout)
+    assert isinstance(parsed, dict)
+    return parsed
 
 
 @pytest.mark.parametrize("managed", [True, False])
@@ -307,7 +310,7 @@ __SCENARIO__
 """
 
 
-def _run_node_detail_scenario(scenario: str) -> object:
+def _run_node_detail_scenario(scenario: str) -> dict[str, Any]:
     return _run_node(
         _NODE_DETAIL_JS,
         _NODE_DETAIL_HARNESS.replace("__SCENARIO__", scenario),

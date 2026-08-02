@@ -516,10 +516,10 @@ class _AsyncLineIter:
     def __init__(self, lines: list[str]) -> None:
         self._lines = lines
 
-    def __aiter__(self):  # noqa: ANN204
+    def __aiter__(self) -> AsyncIterator[str]:
         return self._iter()
 
-    async def _iter(self):  # noqa: ANN201
+    async def _iter(self) -> AsyncIterator[str]:
         for line in self._lines:
             yield line
 
@@ -556,7 +556,7 @@ class _AsyncCM:
     def __init__(self, value: object) -> None:
         self._value = value
 
-    async def __aenter__(self):  # noqa: ANN204
+    async def __aenter__(self) -> object:
         return self._value
 
     async def __aexit__(self, *args: object) -> None:
@@ -569,7 +569,7 @@ class _AsyncCMRaises:
     def __init__(self, exc: BaseException) -> None:
         self._exc = exc
 
-    async def __aenter__(self):  # noqa: ANN204
+    async def __aenter__(self) -> object:
         raise self._exc
 
     async def __aexit__(self, *args: object) -> None:

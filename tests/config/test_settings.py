@@ -122,7 +122,7 @@ class TestLoggingSettings:
     @pytest.mark.parametrize("configured", ["TRACE", "VERBOSE", "inf", "", 10])
     def test_unknown_log_level_is_rejected(self, configured: object) -> None:
         with pytest.raises(ValidationError, match="logging.level"):
-            LoggingSettings(level=configured)  # type: ignore[arg-type]
+            LoggingSettings.model_validate({"level": configured})
 
 
 class TestDefaultEtcdSettings:

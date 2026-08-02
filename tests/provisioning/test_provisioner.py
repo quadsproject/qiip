@@ -9,9 +9,10 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import asyncssh
@@ -235,7 +236,9 @@ async def test_missing_nfs_export_fails_before_remote_work() -> None:
     etcd.put.assert_not_called()
 
 
-async def _async_iter(items: list[tuple[str, str]]):
+async def _async_iter(
+    items: list[tuple[str, str]],
+) -> AsyncIterator[tuple[str, str]]:
     """Helper: async generator yielding items."""
     for item in items:
         yield item
@@ -289,7 +292,10 @@ class TestProvisionSequence:
 
         call_order: list[str] = []
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             if "setup.sh" in command:
                 call_order.append("setup")
                 for item in [
@@ -386,10 +392,17 @@ class TestScriptUpload:
 
         call_order: list[str] = []
 
-        async def mock_upload(host, local_path, remote_path="."):
+        async def mock_upload(
+            host: str,
+            local_path: Path,
+            remote_path: str = ".",
+        ) -> None:
             call_order.append("upload")
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             if "setup.sh" in command:
                 call_order.append("setup")
                 for item in [("stdout", "[STEP:system_update:START]")]:
@@ -431,7 +444,11 @@ class TestScriptUpload:
         etcd.prefix = "/nodes/"
         etcd.put = MagicMock(return_value=True)
 
-        async def mock_upload(host, local_path, remote_path="."):
+        async def mock_upload(
+            host: str,
+            local_path: Path,
+            remote_path: str = ".",
+        ) -> None:
             raise SSHConnectionError("host1", "upload failed")
 
         ssh.upload = mock_upload
@@ -454,7 +471,10 @@ class TestStepMarkerParsing:
     async def test_parses_step_markers(self) -> None:
         ssh = MagicMock()
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             for item in [
                 ("stdout", "[STEP:system_update:START]"),
                 ("stdout", "some debug output"),
@@ -484,7 +504,10 @@ class TestModelExtraction:
     async def test_extracts_model_name(self) -> None:
         ssh = MagicMock()
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             for item in [
                 ("stdout", "Starting container..."),
                 ("stdout", "# Model:              Qwen/Qwen2.5-72B-Instruct"),
@@ -502,7 +525,10 @@ class TestModelExtraction:
     async def test_raises_on_missing_model(self) -> None:
         ssh = MagicMock()
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             for item in [("stdout", "no model line here")]:
                 yield item
 
@@ -518,7 +544,10 @@ class TestModelExtraction:
         ssh = MagicMock()
         captured_commands: list[str] = []
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             captured_commands.append(command)
             for item in [("stdout", "# Model:              org/model")]:
                 yield item
@@ -538,7 +567,10 @@ class TestModelExtraction:
         ssh = MagicMock()
         captured_commands: list[str] = []
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             captured_commands.append(command)
             for item in [("stdout", "# Model:              auto-detected")]:
                 yield item
@@ -555,7 +587,10 @@ class TestModelExtraction:
         ssh = MagicMock()
         captured_commands: list[str] = []
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             captured_commands.append(command)
             for item in [("stdout", "# Model:              safe")]:
                 yield item
@@ -704,7 +739,10 @@ class TestSetupFailure:
         etcd.prefix = "/nodes/"
         etcd.put = MagicMock(return_value=True)
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             yield ("stdout", "[STEP:system_update:START]")
             raise RemoteCommandError("host1", "bash setup.sh", 1)
 
@@ -728,7 +766,10 @@ class TestSetupFailure:
         etcd.prefix = "/nodes/"
         etcd.put = MagicMock(return_value=True)
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             raise SSHConnectionError("host1", "connection refused")
             # Make it an async generator
             yield  # pragma: no cover
@@ -754,7 +795,7 @@ class TestProvisioningFailureAccuracy:
     async def test_initial_registration_failure_aborts_before_ssh(self) -> None:
         etcd, _values, state_payloads = _recording_etcd()
         registration_error = RuntimeError("etcd registration unavailable")
-        normal_put = etcd.put.side_effect
+        normal_put: Callable[[str, bytes], bool] = etcd.put.side_effect
 
         def fail_node_registration(key: str, value: bytes) -> bool:
             if key == "/nodes/host1":
@@ -801,7 +842,10 @@ class TestProvisioningFailureAccuracy:
         ssh = MagicMock()
         ssh.upload = AsyncMock()
 
-        async def setup_failure(host: str, command: str):
+        async def setup_failure(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             assert host == "host1"
             assert "setup.sh" in command
             yield ("stdout", "[STEP:nvidia_driver:START]")
@@ -822,7 +866,10 @@ class TestProvisioningFailureAccuracy:
         ssh = MagicMock()
         ssh.upload = AsyncMock()
 
-        async def setup_failure(host: str, command: str):
+        async def setup_failure(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             yield ("stdout", "[STEP:system_update:START]")
             raise RuntimeError("setup interrupted")
 
@@ -845,7 +892,10 @@ class TestProvisioningFailureAccuracy:
         ssh = MagicMock()
         ssh.upload = AsyncMock()
 
-        async def setup_warning(host: str, command: str):
+        async def setup_warning(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             yield ("stdout", "[STEP:llmfit_install:WARN]")
             raise RuntimeError("later setup failure")
 
@@ -885,7 +935,10 @@ class TestProvisioningFailureAccuracy:
         ssh = MagicMock()
         ssh.upload = AsyncMock()
 
-        async def stopped(_host: str, _command: str):
+        async def stopped(
+            _host: str,
+            _command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             if False:  # pragma: no cover - defines an empty async generator
                 yield ("stdout", "")
 
@@ -1048,7 +1101,10 @@ def _make_full_provisioner(etcd: MagicMock) -> tuple[NodeProvisioner, MagicMock]
     """Build a provisioner with mocks suitable for full provision() tests."""
     ssh = MagicMock()
 
-    async def mock_streaming(host: str, command: str):
+    async def mock_streaming(
+        host: str,
+        command: str,
+    ) -> AsyncIterator[tuple[str, str]]:
         if "setup.sh" in command:
             for item in [
                 ("stdout", "[STEP:system_update:START]"),
@@ -1127,7 +1183,10 @@ class TestStateTracking:
         etcd = MagicMock()
         ssh = MagicMock()
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             if "setup.sh" in command:
                 raise RemoteCommandError("host1", "bash setup.sh", 1)
                 yield  # pragma: no cover
@@ -1223,7 +1282,11 @@ class TestStateTracking:
 
         call_count = 0
 
-        async def flaky_to_thread(fn, *args, **_kwargs):
+        async def flaky_to_thread(
+            fn: Callable[..., Any],
+            *args: Any,
+            **_kwargs: Any,
+        ) -> int:
             nonlocal call_count
             call_count += 1
             if fn is etcd.grant_node_lease:
@@ -1313,9 +1376,10 @@ class TestStateTracking:
                 on_step=on_step,
             )
 
-        provisioner._run_setup = tracking_setup
-
-        with patch.object(provisioner, "preflight", new_callable=AsyncMock) as mock_pf:
+        with (
+            patch.object(provisioner, "_run_setup", side_effect=tracking_setup),
+            patch.object(provisioner, "preflight", new_callable=AsyncMock) as mock_pf,
+        ):
             mock_pf.side_effect = PreflightError("host1", ["no gpus"])
             with patch(
                 "inference_proxy.provisioning.provisioner.asyncio.to_thread",
@@ -1365,7 +1429,10 @@ def _make_teardown_provisioner(
     else:
         tracker.get.return_value = tracker_get_returns
 
-    async def mock_streaming(host: str, command: str):
+    async def mock_streaming(
+        host: str,
+        command: str,
+    ) -> AsyncIterator[tuple[str, str]]:
         for item in [("stdout", "ok")]:
             yield item
 
@@ -1395,7 +1462,10 @@ class TestTeardownGraceful:
         provisioner, ssh, etcd, registry, tracker = _make_teardown_provisioner()
         state_steps: list[str] = []
 
-        async def capture_to_thread(fn, *args):
+        async def capture_to_thread(
+            fn: Callable[..., Any],
+            *args: Any,
+        ) -> bool:
             # Capture state writes to track step progression
             if fn == etcd.put and len(args) >= 2:
                 key = args[0]
@@ -1424,12 +1494,15 @@ class TestTeardownGraceful:
         commands: list[str] = []
         operation_order: list[str] = []
 
-        async def mock_upload(host: str, local_path) -> None:
+        async def mock_upload(host: str, local_path: Path) -> None:
             assert host == "host1"
             assert local_path == provisioner._settings.scripts_dir
             operation_order.append("upload")
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             commands.append(command)
             operation_order.append("stop")
             for item in [("stdout", "ok")]:
@@ -1457,7 +1530,10 @@ class TestTeardownGraceful:
         )
         commands: list[str] = []
 
-        async def capture_streaming(host: str, command: str):
+        async def capture_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             assert host == "host1"
             commands.append(command)
             if "start-vllm.sh" in command:
@@ -1496,7 +1572,10 @@ class TestTeardownGraceful:
         provisioner, ssh, etcd, registry, tracker = _make_teardown_provisioner()
         deleted_keys: list[str] = []
 
-        async def capture_to_thread(fn, *args):
+        async def capture_to_thread(
+            fn: Callable[..., Any],
+            *args: Any,
+        ) -> bool:
             if fn == etcd.delete:
                 deleted_keys.append(args[0])
             return True
@@ -1521,7 +1600,10 @@ class TestTeardownGraceful:
         commands: list[str] = []
         ssh.upload = AsyncMock(side_effect=asyncssh.SFTPFailure("disk full"))
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             assert host == "host1"
             commands.append(command)
             yield ("stdout", "stopped")
@@ -1550,7 +1632,10 @@ class TestTeardownForce:
         provisioner, ssh, etcd, registry, tracker = _make_teardown_provisioner()
         state_steps: list[str] = []
 
-        async def capture_to_thread(fn, *args):
+        async def capture_to_thread(
+            fn: Callable[..., Any],
+            *args: Any,
+        ) -> bool:
             if fn == etcd.put and len(args) >= 2 and "/provisioning/" in str(args[0]):
                 data = json.loads(args[1])
                 state_steps.append(data["current_step"])
@@ -1576,7 +1661,10 @@ class TestTeardownForce:
         provisioner, ssh, etcd, registry, tracker = _make_teardown_provisioner()
         commands: list[str] = []
 
-        async def mock_streaming(host: str, command: str):
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             commands.append(command)
             for item in [("stdout", "ok")]:
                 yield item
@@ -1604,7 +1692,10 @@ class TestDrainTimeout:
         )
         state_steps: list[str] = []
 
-        async def capture_to_thread(fn, *args):
+        async def capture_to_thread(
+            fn: Callable[..., Any],
+            *args: Any,
+        ) -> bool:
             if fn == etcd.put and len(args) >= 2 and "/provisioning/" in str(args[0]):
                 data = json.loads(args[1])
                 state_steps.append(data["current_step"])
@@ -1629,7 +1720,10 @@ class TestTeardownStateProgression:
         provisioner, ssh, etcd, registry, tracker = _make_teardown_provisioner()
         state_steps: list[str] = []
 
-        async def capture_to_thread(fn, *args):
+        async def capture_to_thread(
+            fn: Callable[..., Any],
+            *args: Any,
+        ) -> bool:
             if fn == etcd.put and len(args) >= 2 and "/provisioning/" in str(args[0]):
                 data = json.loads(args[1])
                 state_steps.append(data["current_step"])
@@ -1654,7 +1748,10 @@ class TestTeardownStateProgression:
         provisioner, ssh, etcd, registry, tracker = _make_teardown_provisioner()
         state_steps: list[str] = []
 
-        async def capture_to_thread(fn, *args):
+        async def capture_to_thread(
+            fn: Callable[..., Any],
+            *args: Any,
+        ) -> bool:
             if fn == etcd.put and len(args) >= 2 and "/provisioning/" in str(args[0]):
                 data = json.loads(args[1])
                 state_steps.append(data["current_step"])
@@ -1678,13 +1775,19 @@ class TestTeardownSSHFailure:
         provisioner, ssh, etcd, registry, tracker = _make_teardown_provisioner()
         state_steps: list[str] = []
 
-        async def failing_streaming(host: str, command: str):
+        async def failing_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             raise SSHConnectionError("host1", "connection refused")
             yield  # pragma: no cover
 
         ssh.run_streaming = failing_streaming
 
-        async def capture_to_thread(fn, *args):
+        async def capture_to_thread(
+            fn: Callable[..., Any],
+            *args: Any,
+        ) -> bool:
             if fn == etcd.put and len(args) >= 2 and "/provisioning/" in str(args[0]):
                 data = json.loads(args[1])
                 state_steps.append(data["current_step"])
@@ -1704,7 +1807,10 @@ class TestTeardownSSHFailure:
         """A failed verified stop cannot deregister a possibly-live backend."""
         provisioner, ssh, etcd, registry, tracker = _make_teardown_provisioner()
 
-        async def failing_streaming(host: str, command: str):
+        async def failing_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
             assert command == "bash auto-vllm/stop-vllm.sh --force"
             raise RemoteCommandError(host, command, 1, "process survived")
             yield  # pragma: no cover
@@ -1750,7 +1856,10 @@ class TestPowerOnIfNeeded:
 
         state_steps: list[str] = []
 
-        async def capture_to_thread(fn, *args):
+        async def capture_to_thread(
+            fn: Callable[..., Any],
+            *args: Any,
+        ) -> bool:
             if fn == etcd.put and len(args) >= 2 and "/provisioning/" in str(args[0]):
                 data = json.loads(args[1])
                 state_steps.append(data["current_step"])
@@ -1795,7 +1904,7 @@ class TestPowerOnIfNeeded:
 
         call_order: list[str] = []
 
-        async def tracking_power_action(hostname, action):
+        async def tracking_power_action(hostname: str, action: str) -> str:
             call_order.append("power_action")
             return "On"
 
@@ -1803,7 +1912,10 @@ class TestPowerOnIfNeeded:
 
         provisioner = _make_provisioner(etcd_client=etcd, redfish_client=redfish)
 
-        async def tracking_to_thread(fn, *args):
+        async def tracking_to_thread(
+            fn: Callable[..., Any],
+            *args: Any,
+        ) -> bool:
             if fn == etcd.put and len(args) >= 2 and "/provisioning/" in str(args[0]):
                 data = json.loads(args[1])
                 if data["current_step"] == "powering_on":
@@ -1860,7 +1972,7 @@ class TestWaitForSsh:
 
         attempt = 0
 
-        async def flaky_open(host, port):
+        async def flaky_open(host: str, port: int) -> tuple[MagicMock, MagicMock]:
             nonlocal attempt
             attempt += 1
             if attempt < 3:

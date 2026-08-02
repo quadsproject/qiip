@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Coroutine
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -37,7 +39,7 @@ def _make_provisioner(*, limit: int = 32) -> NodeProvisioner:
 
 def _fire_background(
     provisioner: NodeProvisioner,
-    coro,
+    coro: Coroutine[Any, Any, None],
     *,
     provisioning_hostname: str | None = None,
     task_name: str | None = None,
@@ -119,7 +121,11 @@ async def test_scheduling_failure_does_not_consume_capacity(
     real_create_task = asyncio.create_task
     calls = 0
 
-    def fail_once(coro, *, name=None):
+    def fail_once(
+        coro: Coroutine[Any, Any, None],
+        *,
+        name: str | None = None,
+    ) -> asyncio.Task[None]:
         nonlocal calls
         calls += 1
         if calls == 1:

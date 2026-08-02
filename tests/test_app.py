@@ -110,10 +110,9 @@ def test_lifespan_has_no_artificial_shutdown_gate(test_settings: Settings) -> No
 
     app = create_app(settings=test_settings)
 
-    assert all(
-        middleware.cls.__name__ != "ShutdownMiddleware"
-        for middleware in app.user_middleware
-    )
+    for middleware in app.user_middleware:
+        assert isinstance(middleware.cls, type)
+        assert middleware.cls.__name__ != "ShutdownMiddleware"
     assert not (
         Path(__file__).parents[1] / "inference_proxy/resilience/shutdown.py"
     ).exists()

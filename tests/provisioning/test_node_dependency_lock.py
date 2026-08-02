@@ -7,6 +7,7 @@ import re
 import subprocess
 import tomllib
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 NODE_PROJECT = REPO_ROOT / "auto-vllm"
@@ -16,17 +17,17 @@ EXPECTED_ENVIRONMENT = (
 )
 
 
-def _load_toml(path: Path) -> dict[str, object]:
+def _load_toml(path: Path) -> dict[str, Any]:
     return tomllib.loads(path.read_text())
 
 
 def test_node_project_targets_cpython312_linux_x86_64() -> None:
     project = _load_toml(NODE_PROJECT / "pyproject.toml")
     metadata = project["project"]
-    uv_settings = project["tool"]["uv"]  # type: ignore[index]
+    uv_settings = project["tool"]["uv"]
 
-    assert metadata["requires-python"] == "==3.12.*"  # type: ignore[index]
-    assert metadata["dependencies"] == [  # type: ignore[index]
+    assert metadata["requires-python"] == "==3.12.*"
+    assert metadata["dependencies"] == [
         "flashinfer-cubin==0.6.14",
         "flashinfer-python==0.6.14",
         "vllm==0.26.0",
@@ -51,7 +52,7 @@ def test_node_lock_contains_only_verified_registry_dependencies() -> None:
     packages = lock["package"]
     virtual_packages: list[str] = []
 
-    for package in packages:  # type: ignore[union-attr]
+    for package in packages:
         source = package["source"]
         if source == {"virtual": "."}:
             virtual_packages.append(package["name"])

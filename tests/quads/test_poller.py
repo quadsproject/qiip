@@ -17,7 +17,7 @@ HOST_B = QUADSHost(hostname="gpu02", gpu_vendor="AMD", gpu_model="MI300X", gpu_c
 def _mock_client(
     hosts: list[QUADSHost] | None = None,
     available: list[str] | None = None,
-) -> QUADSClient:
+) -> AsyncMock:
     """Build a mock QUADSClient with configurable returns."""
     client = AsyncMock(spec=QUADSClient)
     client.get_hosts.return_value = hosts or []

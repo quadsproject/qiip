@@ -12,12 +12,12 @@ from inference_proxy.models.node import Node, NodeCapabilities, NodeStatus
 
 class TestNodeStatusEnumValues:
     def test_node_status_enum_values(self) -> None:
-        assert NodeStatus.HEALTHY == "healthy"
-        assert NodeStatus.UNHEALTHY == "unhealthy"
-        assert NodeStatus.DRAINING == "draining"
-        assert NodeStatus.UNKNOWN == "unknown"
-        assert NodeStatus.PROVISIONING == "provisioning"
-        assert NodeStatus.FAILED == "failed"
+        assert NodeStatus.HEALTHY.value == "healthy"
+        assert NodeStatus.UNHEALTHY.value == "unhealthy"
+        assert NodeStatus.DRAINING.value == "draining"
+        assert NodeStatus.UNKNOWN.value == "unknown"
+        assert NodeStatus.PROVISIONING.value == "provisioning"
+        assert NodeStatus.FAILED.value == "failed"
         assert len(NodeStatus) == 6
 
 

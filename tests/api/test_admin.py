@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock
 
 import httpx
@@ -808,10 +810,10 @@ class TestSetupDedupGuard:
 
         class NeverStartedTask:
             def __init__(self) -> None:
-                self.background = None
-                self.callback = None
+                self.background: Coroutine[Any, Any, None] | None = None
+                self.callback: Callable[[Any], None] | None = None
 
-            def add_done_callback(self, callback) -> None:
+            def add_done_callback(self, callback: Callable[[Any], None]) -> None:
                 self.callback = callback
 
             def cancel_before_start(self) -> None:
@@ -822,7 +824,11 @@ class TestSetupDedupGuard:
 
         task = NeverStartedTask()
 
-        def hold_background(background, *, provisioning_hostname):
+        def hold_background(
+            background: Coroutine[Any, Any, None],
+            *,
+            provisioning_hostname: str,
+        ) -> NeverStartedTask:
             assert provisioning_hostname == "gpu01"
             task.background = background
             return task

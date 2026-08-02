@@ -31,17 +31,19 @@ class TestQUADSHostFrozen:
             gpu_count=4,
         )
         with pytest.raises(ValidationError):
-            host.hostname = "other"  # type: ignore[misc]
+            host.__setattr__("hostname", "other")
 
 
 class TestQUADSHostExtraFieldsIgnored:
     def test_extra_kwarg_does_not_raise(self) -> None:
-        host = QUADSHost(
-            hostname="gpu-host01",
-            gpu_vendor="NVIDIA",
-            gpu_model="A100",
-            gpu_count=4,
-            interfaces=["eth0", "eth1"],  # type: ignore[call-arg]
+        host = QUADSHost.model_validate(
+            {
+                "hostname": "gpu-host01",
+                "gpu_vendor": "NVIDIA",
+                "gpu_model": "A100",
+                "gpu_count": 4,
+                "interfaces": ["eth0", "eth1"],
+            }
         )
         assert host.hostname == "gpu-host01"
         assert not hasattr(host, "interfaces")

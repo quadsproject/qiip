@@ -6,6 +6,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -15,7 +16,7 @@ _DASHBOARD_JS = _ROOT / "inference_proxy/static/js/dashboard.js"
 _NODE_DETAIL_JS = _ROOT / "inference_proxy/static/js/node_detail.js"
 
 
-def _run_node(harness: str) -> object:
+def _run_node(harness: str) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
         pytest.fail(
@@ -31,7 +32,9 @@ def _run_node(harness: str) -> object:
         timeout=3,
     )
     assert result.returncode == 0, result.stderr
-    return json.loads(result.stdout)
+    parsed: object = json.loads(result.stdout)
+    assert isinstance(parsed, dict)
+    return parsed
 
 
 def _harness(base_url: str, model_id: str, func: str) -> str:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import structlog
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pytest_httpx import HTTPXMock
 
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import Node, NodeStatus
@@ -89,7 +90,7 @@ class TestRequestLoggingTargetNode:
         app: FastAPI,
         client: TestClient,
         test_registry: NodeRegistry,
-        httpx_mock,
+        httpx_mock: HTTPXMock,
     ) -> None:
         """POST /v1/chat/completions (non-streaming) logs target_node as the node endpoint string."""
         node = _make_node()
@@ -132,7 +133,7 @@ class TestRequestLoggingTargetNode:
         app: FastAPI,
         client: TestClient,
         test_registry: NodeRegistry,
-        httpx_mock,
+        httpx_mock: HTTPXMock,
     ) -> None:
         """POST /v1/completions (non-streaming) logs target_node as the node endpoint string."""
         node = _make_node()
@@ -173,7 +174,7 @@ class TestRequestLoggingTargetNode:
         app: FastAPI,
         client: TestClient,
         test_registry: NodeRegistry,
-        httpx_mock,
+        httpx_mock: HTTPXMock,
     ) -> None:
         """POST /v1/chat/completions with stream=true logs target_node."""
         node = _make_node()

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, MutableMapping
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -383,7 +383,7 @@ async def _drive_disconnect(
     *,
     after_first_event: bool,
     generator_waiting: asyncio.Event | None = None,
-) -> list[dict[str, Any]]:
+) -> list[MutableMapping[str, Any]]:
     """Drive the actual FastAPI router with a deterministic disconnect."""
     body = json.dumps(_request_body(stream=True)).encode()
     request_sent = False
@@ -391,7 +391,7 @@ async def _drive_disconnect(
     first_event_sent = asyncio.Event()
     disconnect_returned = asyncio.Event()
     hold_send_until_cancelled = asyncio.Event()
-    sent_messages: list[dict[str, Any]] = []
+    sent_messages: list[MutableMapping[str, Any]] = []
 
     async def receive() -> dict[str, Any]:
         nonlocal request_sent
@@ -408,7 +408,7 @@ async def _drive_disconnect(
         disconnect_returned.set()
         return {"type": "http.disconnect"}
 
-    async def send(message: dict[str, Any]) -> None:
+    async def send(message: MutableMapping[str, Any]) -> None:
         sent_messages.append(message)
         if message["type"] == "http.response.start":
             response_started.set()
