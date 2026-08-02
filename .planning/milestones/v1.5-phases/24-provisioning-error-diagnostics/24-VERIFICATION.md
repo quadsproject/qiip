@@ -98,7 +98,7 @@ None. Clean implementation:
 #### 1. Visual verification of expandable error sub-row in dashboard
 
 **Test:**
-1. Start the dev server: `cd /home/grafuls/Sources/inference-proxy && uv run uvicorn inference_proxy.main:app --reload`
+1. Start the dev server: `cd /home/developer/Sources/inference-proxy && uv run uvicorn inference_proxy.main:app --reload`
 2. Open http://localhost:8000/dashboard in a browser
 3. If no nodes are currently failed, trigger a failure: set up a node that will fail (e.g., a hostname with no SSH access)
 4. Verify the failed node shows a red "failed" badge in the State column

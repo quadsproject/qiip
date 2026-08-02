@@ -12,3 +12,20 @@ The files come from the packages published at
 `https://registry.npmjs.org/marked/-/marked-18.0.7.tgz` and
 `https://registry.npmjs.org/dompurify/-/dompurify-3.4.12.tgz`. Each package's
 license is stored beside its browser asset.
+
+## Updating vendored assets
+
+Treat a frontend dependency update as a reviewed supply-chain change:
+
+1. Select a released package version and review its security and compatibility
+   notes.
+2. Download the registry package, verify the registry integrity value, and
+   extract only the required browser asset and license.
+3. Recompute the vendored asset SHA-256 and update this table, template script
+   reference, asset, and license in the same commit.
+4. Run `uv run pytest tests/frontend` and the full quality gates.
+
+`test_chat_uses_pinned_local_frontend_dependencies` intentionally fails when
+an asset, version reference, or recorded digest changes independently. Do not
+silence it or reintroduce a CDN fallback; the local-only dependency is part of
+the authenticated admin origin's XSS boundary and air-gapped behavior.

@@ -73,7 +73,7 @@ None -- discussion stayed within phase scope
 | Library | Version (verified) | Purpose | Why Standard |
 |---------|-------------------|---------|--------------|
 | Python | 3.12.13 | Runtime | Available locally at `/usr/bin/python3.12`. Matches team target. System default is 3.14 but project pins 3.12. [VERIFIED: `uv python list`] |
-| uv | 0.6.5 | Package/project manager | Installed at `/home/grafuls/.local/bin/uv`. Handles venv, deps, lockfile. [VERIFIED: local install] |
+| uv | 0.6.5 | Package/project manager | Installed at `/home/developer/.local/bin/uv`. Handles venv, deps, lockfile. [VERIFIED: local install] |
 | FastAPI | 0.136.3 | HTTP framework | Latest stable. Native SSE (>=0.135), Pydantic v2 integration. [VERIFIED: PyPI registry] |
 | Uvicorn | 0.49.0 | ASGI server | Latest stable. Install with `[standard]` for uvloop. [VERIFIED: PyPI registry] |
 | Pydantic | 2.13.4 | Data validation | Latest stable. Rust-backed v2 validation. Core FastAPI dependency. [VERIFIED: PyPI registry] |

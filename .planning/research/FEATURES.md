@@ -7,7 +7,7 @@
 
 | Component | What It Does | New Features Build On |
 |-----------|-------------|----------------------|
-| NFS mount at `/srv/hf-cache` | Shared HF cache across all vLLM nodes (NFS server: `rdu-storage02.scalelab.redhat.com:/mnt/SATA/scratch/grafuls/hf-cache`) | Gateway downloads to same NFS share; catalog scans it |
+| NFS mount at `/srv/hf-cache` | Shared HF cache across all vLLM nodes (NFS server: `storage.example.com:/exports/huggingface`) | Gateway downloads to same NFS share; catalog scans it |
 | `start-vllm.sh` symlink | Links `/root/.cache/huggingface` -> NFS mount. vLLM resolves HF repo_ids (e.g. `Qwen/Qwen2.5-7B-Instruct`) through this symlink to the HF cache structure | Downloaded models immediately available to vLLM -- no config change on nodes |
 | `setup.sh` NFS step | Mounts NFS on target servers via `mount -t nfs -o vers=3,soft,timeo=100,retrans=2` | No change needed; mount already exists |
 | llmfit recommendations | Ranked model suggestions per server hardware. The `name` field uses HuggingFace repo_id format (e.g. `meta-llama/Llama-3.1-8B-Instruct`) -- confirmed via llmfit source (model DB scraped from HF API) | Download button per recommendation; `name` maps directly to `snapshot_download(repo_id=)` |

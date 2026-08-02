@@ -762,8 +762,8 @@ No files lack analogs. All patterns found in existing codebase.
 ## Metadata
 
 **Analog search scope:** 
-- `/home/grafuls/Sources/inference-proxy/inference_proxy/`
-- `/home/grafuls/Sources/inference-proxy/tests/`
+- `/home/developer/Sources/inference-proxy/inference_proxy/`
+- `/home/developer/Sources/inference-proxy/tests/`
 
 **Files scanned:** 20 Python files
 

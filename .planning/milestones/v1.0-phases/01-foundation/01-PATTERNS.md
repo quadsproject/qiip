@@ -570,7 +570,7 @@ The Settings model must cover the gateway.yaml fields from PLAN.md Appendix:
 
 ## Metadata
 
-**Analog search scope:** `/home/grafuls/Sources/inference-proxy/` (excluding `.git/`, `.planning/`)
+**Analog search scope:** `/home/developer/Sources/inference-proxy/` (excluding `.git/`, `.planning/`)
 **Files scanned:** 2 (PLAN.md, CLAUDE.md -- the only non-planning files in the repo)
 **Python source files found:** 0
 **Pattern extraction date:** 2026-06-10

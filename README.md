@@ -25,7 +25,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Automatic failover** — retries failed requests on alternate healthy nodes (configurable, default 3 attempts)
 - **Circuit breakers** — per-node circuit breakers trip after consecutive failures, preventing cascade
 - **Health checking** — background thread probes each node's `/health` endpoint; marks nodes unhealthy after repeated failures and recovers them automatically
-- **Graceful shutdown** — drains in-flight requests before stopping, with configurable timeout
+- **Graceful shutdown** — Uvicorn drains in-flight requests before application resources close; its server timeout remains configurable
 - **Structured logging** — JSON or pretty console output via structlog
 - **Operations dashboard** — interactive web UI at `/dashboard` with real-time node table, detail pages, and provisioning status
 - **QUADS integration** — background polling of QUADS inventory and availability; unified view merging QUADS hosts with etcd-registered nodes
@@ -153,28 +153,35 @@ print(response.choices[0].message.content)
 
 ## API Endpoints
 
+Public endpoints:
+
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Gateway health check (returns node count) |
 | `POST` | `/v1/chat/completions` | Chat completion (OpenAI-compatible) |
 | `POST` | `/v1/completions` | Text completion (OpenAI-compatible) |
 | `GET` | `/v1/models` | List models available across healthy nodes |
-| `GET` | `/chat` | Browser-based chat playground |
-| `GET` | `/dashboard` | Operations dashboard (HTTP Basic) |
-| `GET` | `/dashboard/nodes/{node_id}` | Node detail page (HTTP Basic) |
-| `GET` | `/admin/nodes` | Registered nodes and their status (HTTP Basic) |
-| `DELETE` | `/admin/nodes/{node_id}` | Tear down and deregister a node (HTTP Basic) |
-| `GET` | `/admin/metrics` | Per-model and per-node request counters (HTTP Basic) |
-| `GET` | `/admin/models/catalog` | Available models on shared NFS cache (HTTP Basic) |
-| `POST` | `/admin/models/download` | Start a background model download (HTTP Basic) |
-| `GET` | `/admin/models/downloads` | Status of background downloads (HTTP Basic) |
-| `POST` | `/admin/nodes/setup` | Provision a new inference node (HTTP Basic) |
-| `GET` | `/admin/provisioning/tasks` | Active provisioning/teardown tasks (HTTP Basic) |
-| `GET` | `/admin/provisioning/{hostname}/logs` | SSE stream of provisioning logs (HTTP Basic) |
-| `GET` | `/admin/quads/status` | QUADS poller status (HTTP Basic) |
-| `GET` | `/admin/nodes/{hostname}/power` | Query BMC power state via Redfish (HTTP Basic) |
-| `POST` | `/admin/nodes/{hostname}/power` | Set BMC power state via Redfish (HTTP Basic) |
-| `GET` | `/admin/nodes/{hostname}/recommendations` | Hardware-aware model recommendations (HTTP Basic) |
+| `GET` | `/chat` | Browser chat playground |
+
+HTTP Basic-protected administrative endpoints:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/admin/nodes` | Unified registered and QUADS node inventory |
+| `GET` | `/admin/metrics` | Request counters by model and node |
+| `GET` | `/admin/models/catalog` | Verified models in the shared HuggingFace cache |
+| `POST` | `/admin/models/download` | Start or inspect a duplicate-safe model download |
+| `GET` | `/admin/models/downloads` | List tracked model-download states |
+| `POST` | `/admin/nodes/setup` | Start background node provisioning |
+| `DELETE` | `/admin/nodes/{node_id}` | Drain and tear down a node; supports the documented force option |
+| `GET` | `/admin/provisioning/tasks` | List provisioning task states |
+| `GET` | `/admin/provisioning/{hostname}/logs` | Stream provisioning logs over SSE |
+| `GET` | `/admin/quads/status` | QUADS integration and cache status |
+| `GET` | `/admin/nodes/{hostname}/power` | Read Redfish power state |
+| `POST` | `/admin/nodes/{hostname}/power` | Execute an allowed Redfish power action |
+| `GET` | `/admin/nodes/{hostname}/recommendations` | Run hardware-aware model recommendations |
+| `GET` | `/dashboard` | Authenticated operations dashboard |
+| `GET` | `/dashboard/nodes/{node_id}` | Authenticated node detail page |
 
 ### Administrative access
 
@@ -202,7 +209,8 @@ does not protect an already-authenticated browser from same-origin XSS.
 
 ### Error responses
 
-All errors follow the OpenAI error format:
+Inference-proxy errors follow the OpenAI error format. Upstream 4xx responses
+are passed through without changing their JSON shape.
 
 | Code | Meaning |
 |------|---------|
@@ -211,30 +219,34 @@ All errors follow the OpenAI error format:
 | 503 | No healthy nodes available, or model temporarily unavailable |
 | 504 | Backend request timed out |
 
+When an attempt loop ends after at least one retryable backend failure, the
+error code is `failover_exhausted` and the response includes
+`X-Inference-Proxy-Failover: exhausted` and
+`X-Inference-Proxy-Attempts: <n>`. This means the configured attempt budget or
+eligible-node set ended; it does not claim that every fleet node was tried.
+See [Client-visible compatibility changes](UPGRADING.md#client-visible-compatibility-changes)
+before upgrading inference clients.
+
 ## Configuration
 
-All settings are loaded from environment variables with the prefix `INFERENCE_PROXY_` and double-underscore nesting for nested groups. A `.env` file is also supported.
+All settings are loaded from environment variables with the prefix
+`INFERENCE_PROXY_` and double-underscore nesting for nested groups. A `.env`
+file is also supported. The checked-in [.env.example](.env.example) is the
+exhaustive environment-variable reference; this section explains the settings
+whose interactions or security properties need more context.
 
 ### Upgrade requirements
 
-Deployments upgrading from releases before the reliability campaign must apply
-these changes together:
+Deployments upgrading from before the reliability campaign must follow the
+complete [upgrade and compatibility guide](UPGRADING.md). It covers startup
+requirements, silent behavior changes, node-package and mirror policy,
+lease-expiry recovery, and client-visible API changes.
 
-- Launch with `uvicorn inference_proxy.main:create_app --factory`; the old
-  `inference_proxy.main:app` target no longer exists.
-- Move any `GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT` setting to Uvicorn's
-  `--timeout-graceful-shutdown` launcher option. Uvicorn owns request draining;
-  the retired gateway setting is ignored with a startup warning.
-- Configure `ROUTING__ALLOWED_ENDPOINT_HOSTS`,
-  `ROUTING__ALLOWED_ENDPOINT_NETWORKS`, and
-  `ROUTING__ALLOWED_ENDPOINT_PORTS` for every backend the gateway may contact.
-- Configure `ADMIN__USERNAME` and `ADMIN__PASSWORD`. HTTP is permitted on a
-  trusted work LAN; use TLS when the network path is not trusted.
-- Add `"managed": true` to externally written etcd node records only when the
-  proxy should own and enforce their lifecycle. Missing values now default to
-  unmanaged.
-- When QUADS is enabled, configure `QUADS__SERVER_TIMEZONE` to the IANA timezone
-  used by the QUADS server's local clock.
+The easiest changes to miss are that `ROUTING__MAX_RETRIES` now counts total
+attempts rather than retries after the first attempt, missing etcd `managed`
+values now mean externally owned, proxy-managed keys expire after their lease
+TTL without successful health evidence, and streaming requests can return a
+non-200 response before SSE begins.
 
 Enabling QUADS requires both `INFERENCE_PROXY_QUADS__BASE_URL` and
 `INFERENCE_PROXY_QUADS__SERVER_TIMEZONE`. Set the latter to the IANA timezone
@@ -274,14 +286,21 @@ network.
 |----------|---------|-------------|
 | `INFERENCE_PROXY_ETCD__ENDPOINTS` | `["http://localhost:2379"]` | etcd cluster endpoints (JSON array) |
 | `INFERENCE_PROXY_ETCD__NODE_PREFIX` | `/nodes/` | etcd key prefix for node registration |
+| `INFERENCE_PROXY_ETCD__NODE_LEASE_TTL` | `600` | Lease TTL for healthy proxy-managed node keys; must exceed 300 seconds and three health cycles |
+
+Endpoint values must include an HTTP(S) scheme. The current client uses the
+first configured endpoint and warns when additional list entries are ignored;
+multiple values do not currently provide client-side etcd failover. See the
+[lease maintenance runbook](UPGRADING.md#8-plan-for-lease-backed-managed-registrations)
+before a gateway outage longer than the active managed-node TTL.
 
 ### Routing
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `INFERENCE_PROXY_ROUTING__STRATEGY` | `least_connections` | Load balancing strategy |
-| `INFERENCE_PROXY_ROUTING__MAX_RETRIES` | `3` | Max retry attempts on failure |
-| `INFERENCE_PROXY_ROUTING__TIMEOUT` | `30` | General routing timeout (seconds) |
+| `INFERENCE_PROXY_ROUTING__MAX_RETRIES` | `3` | Maximum total backend attempts, including the first request (legacy field name) |
+| `INFERENCE_PROXY_ROUTING__TIMEOUT` | `30` | Total pre-response streaming handshake budget across all attempts (seconds) |
 | `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_HOSTS` | `["localhost"]` | Exact backend DNS names or `*.suffix` rules (JSON array) |
 | `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_NETWORKS` | `["127.0.0.0/8","::1/128"]` | Backend IP CIDR allowlist (JSON array) |
 | `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_PORTS` | `[8000]` | Backend TCP port allowlist (JSON array) |
@@ -304,6 +323,16 @@ power, SSH, or installation work and name the allowlist setting to update.
 | `INFERENCE_PROXY_SSH__CONNECT_TIMEOUT` | `10` | SSH connection timeout (seconds) |
 | `INFERENCE_PROXY_SSH__STREAMING_COMMAND_TIMEOUT` | `3600` | Total wall-clock deadline for a streaming remote command (seconds) |
 | `INFERENCE_PROXY_SSH__STREAMING_INACTIVITY_TIMEOUT` | `900` | Maximum interval without stdout or stderr from a streaming command (seconds) |
+
+Provisioning resource and retention controls:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INFERENCE_PROXY_PROVISIONING__MAX_CONCURRENT_PROVISIONS` | `32` | Concurrent setup-task limit; excess setup requests return 429 while teardown remains available |
+| `INFERENCE_PROXY_PROVISIONING__LOG_MAX_ENTRIES_PER_HOST` | `1000` | Retained log entries per host operation |
+| `INFERENCE_PROXY_PROVISIONING__LOG_MAX_BYTES_PER_HOST` | `1048576` | Retained message bytes per host operation |
+| `INFERENCE_PROXY_PROVISIONING__LOG_MAX_ENTRY_BYTES` | `16384` | Maximum bytes in one retained log message |
+| `INFERENCE_PROXY_PROVISIONING__LOG_MAX_COMPLETED_HOSTS` | `64` | Completed host-operation buffers retained, oldest first |
 
 LLMFit has one version setting: `INFERENCE_PROXY_LLMFIT__VERSION`. The retired
 `INFERENCE_PROXY_PROVISIONING__LLMFIT_VERSION` variable is ignored and emits a
@@ -354,7 +383,7 @@ script inputs out of the environment namespace reserved by vLLM itself.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `INFERENCE_PROXY_LOGGING__JSON_OUTPUT` | `false` | `true` for JSON logs (production), `false` for pretty console |
-| `INFERENCE_PROXY_LOGGING__LEVEL` | `INFO` | Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `INFERENCE_PROXY_LOGGING__LEVEL` | `INFO` | Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`); invalid values fail startup |
 
 ### Redfish BMC
 
@@ -392,7 +421,7 @@ inference_proxy/
 │   ├── registry.py            # Thread-safe in-memory node registry
 │   ├── etcd_client.py         # etcd3gw wrapper
 │   ├── watcher.py             # Background thread watching etcd for changes
-│   ├── node_leases.py         # etcd lease reconciliation
+│   ├── node_leases.py         # Managed-node lease observation and keepalive
 │   └── serializer.py          # etcd value to Node model deserialization
 ├── huggingface/
 │   ├── catalog.py             # NFS model cache scanner
@@ -429,7 +458,7 @@ inference_proxy/
 │   ├── node_selector.py       # Least-connections node selection
 │   ├── connection_tracker.py  # Per-node in-flight request counter
 │   ├── request_metrics.py     # Per-model and per-node counters
-│   └── drain_cleanup.py       # Automatic DRAINING node removal
+│   └── drain_cleanup.py       # Atomic traffic-independent drain removal
 ├── services/
 │   └── unified_nodes.py       # Merged QUADS + etcd node view
 ├── static/                    # CSS, JS, vendored client libraries
@@ -448,7 +477,8 @@ inference_proxy/
 ### Background threads
 
 - **etcd watcher** — watches the configured key prefix for node PUT/DELETE events; updates the registry in real time
-- **Health checker** — probes each registered node's `/health` endpoint at a configurable interval; transitions nodes between HEALTHY and UNHEALTHY states
+- **Health checker** — probes each registered node's `/health` endpoint, transitions liveness state, maintains managed-node leases after valid evidence, and removes idle draining ghosts
+- **QUADS poller and schedule enforcer** — refresh QUADS inventory and tear down managed nodes before scheduling conflicts, with bounded retry backoff
 
 ## Development
 
