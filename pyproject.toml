@@ -9,7 +9,8 @@ dependencies = [
     "pydantic>=2.10,<3.0",
     "pydantic-settings>=2.14",
     "structlog>=26.1.0",
-    "etcd3gw>=2.5.0",
+    # The raw watch, revision, and lease adapter is exercised against this floor.
+    "etcd3gw>=2.7.0",
     "httpx>=0.28,<1.0",
     "httpx-sse>=0.4.3",
     "jinja2>=3.1",

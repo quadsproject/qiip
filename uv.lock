@@ -495,7 +495,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "asyncssh", specifier = ">=2.20,<3.0" },
-    { name = "etcd3gw", specifier = ">=2.5.0" },
+    { name = "etcd3gw", specifier = ">=2.7.0" },
     { name = "fastapi", specifier = ">=0.135,<1.0" },
     { name = "httpx", specifier = ">=0.28,<1.0" },
     { name = "httpx-sse", specifier = ">=0.4.3" },
