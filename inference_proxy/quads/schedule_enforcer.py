@@ -168,7 +168,10 @@ class ScheduleEnforcer:
 
         background = _teardown()
         try:
-            task = self._provisioner.fire_background(background)
+            task = self._provisioner.fire_background(
+                background,
+                task_name=f"schedule-teardown:{hostname}",
+            )
 
             def _release_lease(done_task: asyncio.Task[None]) -> None:
                 # A task cancelled before its coroutine starts never reaches

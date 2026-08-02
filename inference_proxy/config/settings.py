@@ -232,6 +232,11 @@ class ProvisioningSettings(BaseModel):
     scripts_dir: Path = Path("auto-vllm")
     boot_wait_timeout: int = 300  # D-05: 5 minutes for cold boot
     boot_wait_interval: int = 10
+    max_concurrent_provisions: int = Field(default=32, ge=1)
+    log_max_entries_per_host: int = Field(default=1_000, ge=1)
+    log_max_bytes_per_host: int = Field(default=1_048_576, ge=1)
+    log_max_entry_bytes: int = Field(default=16_384, ge=16)
+    log_max_completed_hosts: int = Field(default=64, ge=1)
     nfs_mount_point: str = "/srv/hf-cache"
     nvidia_driver_version: str = DEFAULT_NVIDIA_DRIVER_VERSION
     nvidia_driver_sha256: str = DEFAULT_NVIDIA_DRIVER_SHA256
@@ -277,6 +282,16 @@ class ProvisioningSettings(BaseModel):
     def nvidia_driver_digest_is_sha256(cls, value: str) -> str:
         """Require a complete digest before remote driver installation."""
         return _validate_sha256(value, setting="provisioning.nvidia_driver_sha256")
+
+    @model_validator(mode="after")
+    def log_entry_limit_fits_host_budget(self) -> Self:
+        """A single retained line cannot exceed the host-wide byte budget."""
+        if self.log_max_entry_bytes > self.log_max_bytes_per_host:
+            raise ValueError(
+                "provisioning.log_max_entry_bytes must not exceed "
+                "provisioning.log_max_bytes_per_host"
+            )
+        return self
 
     @model_validator(mode="after")
     def custom_driver_version_has_explicit_digest(self) -> Self:

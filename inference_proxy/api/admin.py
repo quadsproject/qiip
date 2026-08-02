@@ -56,7 +56,11 @@ from inference_proxy.models.admin import (
 )
 from inference_proxy.models.endpoint import EndpointValidationError
 from inference_proxy.models.node import NodeStatus
-from inference_proxy.provisioning.provisioner import NodeProvisioner, ProvisioningError
+from inference_proxy.provisioning.provisioner import (
+    NodeProvisioner,
+    ProvisioningCapacityError,
+    ProvisioningError,
+)
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
     SSHConnectionError,
@@ -317,6 +321,17 @@ async def setup_node(
                 background,
                 provisioning_hostname=hostname,
             )
+        except ProvisioningCapacityError as exc:
+            background.close()
+            pending_hosts.discard(hostname)
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Provisioning capacity reached: {exc.active} active "
+                    f"task(s), limit {exc.limit}; retry after an existing "
+                    "setup finishes"
+                ),
+            ) from exc
         except Exception:
             background.close()
             pending_hosts.discard(hostname)
@@ -421,7 +436,10 @@ async def teardown_node(
 
         background = _teardown_and_cleanup()
         try:
-            task = provisioner.fire_background(background)
+            task = provisioner.fire_background(
+                background,
+                task_name=f"teardown:{node_id}",
+            )
         except Exception:
             background.close()
             raise

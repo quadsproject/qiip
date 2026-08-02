@@ -59,7 +59,7 @@ def _enforcer(
     )
     provisioner.teardown = AsyncMock()
 
-    def close_background(coro):
+    def close_background(coro, *, task_name=None):
         coro.close()
         return MagicMock()
 
@@ -256,7 +256,7 @@ class TestTeardownRetry:
         tasks: list[asyncio.Task[None]] = []
         attempts = 0
 
-        def fire_background(coro):
+        def fire_background(coro, *, task_name=None):
             task = asyncio.create_task(coro)
             tasks.append(task)
             return task
@@ -315,7 +315,7 @@ class TestTeardownRetry:
         )
         tasks: list[asyncio.Task[None]] = []
 
-        def fire_background(coro):
+        def fire_background(coro, *, task_name=None):
             task = asyncio.create_task(coro)
             tasks.append(task)
             return task
@@ -366,7 +366,7 @@ class TestTeardownRetry:
         )
         scheduled = 0
 
-        def fire_background(coro):
+        def fire_background(coro, *, task_name=None):
             nonlocal scheduled
             scheduled += 1
             if scheduled == 1:

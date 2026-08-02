@@ -47,6 +47,18 @@ from inference_proxy.models.llmfit import LLMFitResult, ModelRecommendation, Sys
 from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.models.quads import QUADSHost
 from inference_proxy.provisioning.provisioner import ProvisioningError
+
+try:
+    from inference_proxy.provisioning.provisioner import ProvisioningCapacityError
+except ImportError:
+    # Keep before-fix comparisons executable against the pre-PR interface.
+    class ProvisioningCapacityError(RuntimeError):
+        def __init__(self, *, active: int, limit: int) -> None:
+            self.active = active
+            self.limit = limit
+            super().__init__("provisioning capacity reached")
+
+
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
     SSHConnectionError,
@@ -752,6 +764,51 @@ class TestSetupDedupGuard:
 
         assert "gpu01" not in admin_mod.pending_hosts
         lease.release.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_capacity_returns_429_without_leaking_pending_or_host_lease(
+        self,
+        app: FastAPI,
+        admin_auth_headers: dict[str, str],
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """S9: full global capacity rejects immediately and cleans route state."""
+        lease = MagicMock(hostname="gpu01")
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = lease
+        mock_provisioner.fire_background.side_effect = ProvisioningCapacityError(
+            active=32,
+            limit=32,
+        )
+
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+            headers=admin_auth_headers,
+        ) as client:
+            response = await asyncio.wait_for(
+                client.post(
+                    "/admin/nodes/setup",
+                    json={"hostname": "gpu01"},
+                ),
+                timeout=2,
+            )
+
+        assert response.status_code == 429
+        assert response.json() == {
+            "detail": (
+                "Provisioning capacity reached: 32 active task(s), limit 32; "
+                "retry after an existing setup finishes"
+            )
+        }
+        assert "Retry-After" not in response.headers
+
+        import inference_proxy.api.admin as admin_mod
+
+        assert "gpu01" not in admin_mod.pending_hosts
+        lease.release.assert_called_once()
+        mock_provisioner.provision.assert_not_awaited()
 
     def test_task_cancelled_before_start_releases_pending_and_host_lease(
         self,

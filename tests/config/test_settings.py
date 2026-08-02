@@ -422,6 +422,32 @@ class TestArtifactDigestSettings:
         assert settings.install_url.startswith(f"{scheme}://")
 
 
+class TestProvisioningResourceLimits:
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "max_concurrent_provisions",
+            "log_max_entries_per_host",
+            "log_max_bytes_per_host",
+            "log_max_entry_bytes",
+            "log_max_completed_hosts",
+        ],
+    )
+    def test_provisioning_resource_limits_reject_zero(self, field: str) -> None:
+        with pytest.raises(ValidationError):
+            ProvisioningSettings(**{field: 0})
+
+    def test_log_entry_limit_cannot_exceed_host_budget(self) -> None:
+        with pytest.raises(
+            ValidationError,
+            match="log_max_entry_bytes must not exceed",
+        ):
+            ProvisioningSettings(
+                log_max_bytes_per_host=100,
+                log_max_entry_bytes=101,
+            )
+
+
 class TestSSHAndProvisioningAreNotBaseSettings:
     def test_ssh_settings_is_base_model_not_base_settings(self) -> None:
         assert not issubclass(SSHSettings, BaseSettings)

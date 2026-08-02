@@ -107,11 +107,15 @@ async def test_teardown_cancels_active_provision(
         coro: Coroutine[object, object, None],
         *,
         provisioning_hostname: str | None = None,
+        task_name: str | None = None,
     ) -> asyncio.Task[None]:
         if provisioning_hostname is None:
             # Keep the regression runnable against the pre-fix method
             # signature so it fails on behavior, not a new keyword.
-            task = original_fire(coro)
+            if task_name is None:
+                task = original_fire(coro)
+            else:
+                task = original_fire(coro, task_name=task_name)
         else:
             task = original_fire(
                 coro,

@@ -58,6 +58,17 @@ class ProvisioningError(Exception):
     """Raised when any stage of provisioning fails."""
 
 
+class ProvisioningCapacityError(RuntimeError):
+    """Raised when the configured concurrent-provision limit is full."""
+
+    def __init__(self, *, active: int, limit: int) -> None:
+        self.active = active
+        self.limit = limit
+        super().__init__(
+            f"Provisioning capacity reached ({active}/{limit} active tasks)"
+        )
+
+
 class PreflightError(Exception):
     """Raised when pre-flight validation fails (D-01 through D-04).
 
@@ -110,7 +121,12 @@ class NodeProvisioner:
         self._tracker = connection_tracker
         self._cb_registry = circuit_breaker_registry
         self._redfish_client = redfish_client
-        self._log_buffer = log_buffer or ProvisioningLogBuffer()
+        self._log_buffer = log_buffer or ProvisioningLogBuffer(
+            max_entries_per_host=settings.log_max_entries_per_host,
+            max_bytes_per_host=settings.log_max_bytes_per_host,
+            max_entry_bytes=settings.log_max_entry_bytes,
+            max_completed_hosts=settings.log_max_completed_hosts,
+        )
         self._lifecycle = lifecycle_coordinator or HostLifecycleCoordinator()
         self._hf_token = hf_token
         self._nfs_export = nfs_export
@@ -744,14 +760,32 @@ class NodeProvisioner:
         coro: Coroutine[object, object, None],
         *,
         provisioning_hostname: str | None = None,
+        task_name: str | None = None,
     ) -> asyncio.Task[None]:
-        """Schedule a coroutine and optionally track host provisioning ownership."""
+        """Schedule and observe an owned background operation.
+
+        Provisioning capacity is reserved only after ``create_task`` succeeds,
+        so scheduling failures cannot leak a slot. Teardown and other cleanup
+        work omit ``provisioning_hostname`` and remain admissible when the
+        provisioning limit is full.
+        """
         if provisioning_hostname is not None:
             current = self._provisioning_tasks.get(provisioning_hostname)
             if current is not None and not current.task.done():
                 raise RuntimeError(
                     f"Provisioning task already active for '{provisioning_hostname}'"
                 )
+            active = sum(
+                not record.task.done() for record in self._provisioning_tasks.values()
+            )
+            if active >= self._settings.max_concurrent_provisions:
+                raise ProvisioningCapacityError(
+                    active=active,
+                    limit=self._settings.max_concurrent_provisions,
+                )
+
+            if task_name is None:
+                task_name = f"provision:{provisioning_hostname}"
 
         record: _ProvisioningTask | None = None
         scheduled_coro = coro
@@ -766,7 +800,10 @@ class NodeProvisioner:
             scheduled_coro = _tracked_provision()
 
         try:
-            task = asyncio.create_task(scheduled_coro)
+            if task_name is None:
+                task = asyncio.create_task(scheduled_coro)
+            else:
+                task = asyncio.create_task(scheduled_coro, name=task_name)
         except Exception:
             if scheduled_coro is not coro:
                 scheduled_coro.close()
@@ -786,6 +823,23 @@ class NodeProvisioner:
                 and self._provisioning_tasks.get(provisioning_hostname) is record
             ):
                 self._provisioning_tasks.pop(provisioning_hostname, None)
+
+            # Cancellation is the expected PR 20 shutdown path. Calling
+            # exception() on a cancelled task raises CancelledError and would
+            # turn clean shutdown into callback noise.
+            if done_task.cancelled():
+                return
+
+            error = done_task.exception()
+            if error is not None:
+                logger.error(
+                    "background_task_failed",
+                    task_name=done_task.get_name(),
+                    hostname=provisioning_hostname,
+                    error=str(error),
+                    exception_type=type(error).__name__,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
 
         task.add_done_callback(_task_done)
         return task

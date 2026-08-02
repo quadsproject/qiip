@@ -332,7 +332,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.redfish_client = None
                 logger.info("redfish disabled (BMC credentials not configured)")
 
-            log_buffer = ProvisioningLogBuffer()
+            log_buffer = ProvisioningLogBuffer(
+                max_entries_per_host=(
+                    resolved_settings.provisioning.log_max_entries_per_host
+                ),
+                max_bytes_per_host=(
+                    resolved_settings.provisioning.log_max_bytes_per_host
+                ),
+                max_entry_bytes=resolved_settings.provisioning.log_max_entry_bytes,
+                max_completed_hosts=(
+                    resolved_settings.provisioning.log_max_completed_hosts
+                ),
+            )
 
             hf_token = resolved_settings.huggingface.api_token
             provisioner = NodeProvisioner(
