@@ -1,5 +1,7 @@
 # QIIP (QUADS Idle Inference Proxy)
 
+[![CI](https://github.com/quadsproject/qiip/actions/workflows/ci.yml/badge.svg)](https://github.com/quadsproject/qiip/actions/workflows/ci.yml)
+
 A QUADS-native inference abstraction framework that fully automates installation, drivers, setup and presentation of disparate, free/idle GPU-equipped systems into a single unified usage interface and inference API.
 
 QIIP provides a gateway service that proxies OpenAI-compatible requests to [vLLM](https://docs.vllm.ai/) inference nodes running on idle QUADS lab servers or standalone, free GPU-equipped hardware.  It dynamically discovers backends via etcd, health-checks them, and routes requests with automatic failover — so clients see a single, reliable endpoint.
@@ -17,6 +19,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 
 - **OpenAI-compatible API** — drop-in replacement for `/v1/chat/completions`, `/v1/completions`, and `/v1/models`
 - **Streaming support** — Server-Sent Events (SSE) for real-time token generation
+- **Chat playground** — browser-based chat UI at `/chat` with markdown rendering and model selection
 - **Service discovery** — watches etcd for node registration/deregistration in real time
 - **Least-connections load balancing** — routes to the node with the fewest in-flight requests
 - **Automatic failover** — retries failed requests on alternate healthy nodes (configurable, default 3 attempts)
@@ -156,7 +159,22 @@ print(response.choices[0].message.content)
 | `POST` | `/v1/chat/completions` | Chat completion (OpenAI-compatible) |
 | `POST` | `/v1/completions` | Text completion (OpenAI-compatible) |
 | `GET` | `/v1/models` | List models available across healthy nodes |
-| `GET` | `/admin/nodes` | Inspect all registered nodes and their status (HTTP Basic required) |
+| `GET` | `/chat` | Browser-based chat playground |
+| `GET` | `/dashboard` | Operations dashboard (HTTP Basic) |
+| `GET` | `/dashboard/nodes/{node_id}` | Node detail page (HTTP Basic) |
+| `GET` | `/admin/nodes` | Registered nodes and their status (HTTP Basic) |
+| `DELETE` | `/admin/nodes/{node_id}` | Tear down and deregister a node (HTTP Basic) |
+| `GET` | `/admin/metrics` | Per-model and per-node request counters (HTTP Basic) |
+| `GET` | `/admin/models/catalog` | Available models on shared NFS cache (HTTP Basic) |
+| `POST` | `/admin/models/download` | Start a background model download (HTTP Basic) |
+| `GET` | `/admin/models/downloads` | Status of background downloads (HTTP Basic) |
+| `POST` | `/admin/nodes/setup` | Provision a new inference node (HTTP Basic) |
+| `GET` | `/admin/provisioning/tasks` | Active provisioning/teardown tasks (HTTP Basic) |
+| `GET` | `/admin/provisioning/{hostname}/logs` | SSE stream of provisioning logs (HTTP Basic) |
+| `GET` | `/admin/quads/status` | QUADS poller status (HTTP Basic) |
+| `GET` | `/admin/nodes/{hostname}/power` | Query BMC power state via Redfish (HTTP Basic) |
+| `POST` | `/admin/nodes/{hostname}/power` | Set BMC power state via Redfish (HTTP Basic) |
+| `GET` | `/admin/nodes/{hostname}/recommendations` | Hardware-aware model recommendations (HTTP Basic) |
 
 ### Administrative access
 
@@ -358,34 +376,64 @@ destination.
 
 ```
 inference_proxy/
-├── main.py                 # App factory, lifespan (startup/shutdown)
+├── main.py                    # App factory, lifespan (startup/shutdown)
 ├── api/
-│   ├── routes.py           # OpenAI-compatible proxy endpoints
-│   ├── admin.py            # Admin inspection endpoints
-│   ├── middleware.py        # Request logging middleware
-│   └── errors.py           # Error response mapping
+│   ├── routes.py              # OpenAI-compatible proxy endpoints
+│   ├── admin.py               # Admin API endpoints
+│   ├── chat.py                # Chat playground page
+│   ├── dashboard.py           # Operations dashboard and node detail pages
+│   ├── errors.py              # Error response mapping
+│   └── middleware.py          # Request logging middleware
 ├── config/
-│   ├── settings.py         # Pydantic settings (env vars)
-│   ├── dependencies.py     # FastAPI dependency injection
-│   └── logging.py          # structlog configuration
+│   ├── settings.py            # Pydantic settings (env vars)
+│   ├── dependencies.py        # FastAPI dependency injection
+│   └── logging.py             # structlog configuration
 ├── discovery/
-│   ├── registry.py         # Thread-safe in-memory node registry
-│   ├── etcd_client.py      # etcd3gw wrapper
-│   ├── watcher.py          # Background thread watching etcd for changes
-│   └── serializer.py       # etcd value → Node model deserialization
+│   ├── registry.py            # Thread-safe in-memory node registry
+│   ├── etcd_client.py         # etcd3gw wrapper
+│   ├── watcher.py             # Background thread watching etcd for changes
+│   ├── node_leases.py         # etcd lease reconciliation
+│   └── serializer.py          # etcd value to Node model deserialization
+├── huggingface/
+│   ├── catalog.py             # NFS model cache scanner
+│   └── downloader.py          # Background model download service
+├── llmfit/
+│   ├── runner.py              # SSH-based llmfit execution and auto-install
+│   └── errors.py              # LLMFit error types
 ├── models/
-│   ├── node.py             # Node, NodeStatus, NodeCapabilities
-│   ├── openai.py           # OpenAI API request/response models
-│   └── admin.py            # Admin API response models
+│   ├── node.py                # Node, NodeStatus, NodeCapabilities
+│   ├── openai.py              # OpenAI API request/response models
+│   ├── admin.py               # Admin API response models
+│   ├── endpoint.py            # Endpoint parsing and allowlist policy
+│   ├── llmfit.py              # LLMFit data models
+│   └── quads.py               # QUADS data models
+├── provisioning/
+│   ├── provisioner.py         # End-to-end node setup pipeline
+│   ├── ssh_client.py          # Async SSH command execution
+│   ├── log_buffer.py          # Provisioning log ring buffer and SSE stream
+│   ├── host_lifecycle.py      # Per-host mutual exclusion leases
+│   └── state.py               # Provisioning step and state models
 ├── proxy/
-│   └── client.py           # httpx async client for forwarding requests
+│   └── client.py              # httpx async client for forwarding requests
+├── quads/
+│   ├── client.py              # QUADS REST API client
+│   ├── poller.py              # Background QUADS inventory polling
+│   └── schedule_enforcer.py   # Teardown on scheduling conflicts
+├── redfish/
+│   ├── client.py              # Redfish BMC power management
+│   └── errors.py              # Redfish error types
 ├── resilience/
-│   ├── health_checker.py   # Background health probe thread
-│   ├── circuit_breaker.py  # Per-node circuit breaker
-│   └── shutdown.py         # Graceful shutdown middleware
-└── routing/
-    ├── node_selector.py    # Least-connections node selection
-    └── connection_tracker.py  # Per-node in-flight request counter
+│   ├── health_checker.py      # Background health probe thread
+│   └── circuit_breaker.py     # Per-node circuit breaker
+├── routing/
+│   ├── node_selector.py       # Least-connections node selection
+│   ├── connection_tracker.py  # Per-node in-flight request counter
+│   ├── request_metrics.py     # Per-model and per-node counters
+│   └── drain_cleanup.py       # Automatic DRAINING node removal
+├── services/
+│   └── unified_nodes.py       # Merged QUADS + etcd node view
+├── static/                    # CSS, JS, vendored client libraries
+└── templates/                 # Jinja2 HTML (dashboard, node detail, chat)
 ```
 
 ### Request flow
@@ -421,7 +469,8 @@ source .venv/bin/activate
 uv run pytest
 
 # With coverage
-uv run pytest --cov=inference_proxy
+uv run coverage run -m pytest
+uv run coverage report
 
 # Specific module
 uv run pytest tests/api/test_routes.py -v
@@ -459,6 +508,9 @@ uv run mypy inference_proxy
 | Logging | structlog | Structured JSON/console logging |
 | Linter/Formatter | Ruff | Replaces flake8 + black + isort |
 | Type Checker | mypy (strict) | Static type safety |
+| Templates | Jinja2 | Dashboard, node detail, and chat HTML |
+| SSH | asyncssh | Async SSH for node provisioning |
+| Model Hub | huggingface-hub | Model catalog and background downloads |
 | Testing | pytest + pytest-asyncio + pytest-httpx | Async tests with HTTP mocking |
 
 ## License
