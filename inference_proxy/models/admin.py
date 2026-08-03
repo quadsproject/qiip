@@ -33,6 +33,7 @@ class AdminNodeResponse(BaseModel):
     status: str
     active_connections: int
     circuit_breaker_state: str
+    engine: str = "vllm"
     state: str = ""
     actions: list[str] = []
     gpu_vendor: str | None = None
