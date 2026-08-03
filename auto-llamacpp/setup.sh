@@ -59,11 +59,6 @@ install_llamacpp() {
         fi
     fi
 
-    # To bump llama.cpp version:
-    # 1. Update AUTOLLAMACPP_VERSION in provisioning settings (or env var)
-    # 2. Download the release tarball and compute: sha256sum llama-b{TAG}-*.tar.gz
-    # 3. Update AUTOLLAMACPP_SHA256 in provisioning settings (or env var)
-    # 4. Test provisioning on a single node before fleet rollout
     local cuda_suffix="cu12.2"
     local url="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMACPP_VERSION}/llama-${LLAMACPP_VERSION}-bin-ubuntu-x64-cuda-${cuda_suffix}.tar.gz"
 

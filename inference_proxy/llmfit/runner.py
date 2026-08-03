@@ -1,8 +1,7 @@
 """LLMFit remote execution via SSH.
 
-Runs ``llmfit recommend --json --runtime vllm -n 30`` on a remote host
-and returns a typed ``LLMFitResult``.  SSH transport is injected via
-constructor (DIP).
+Runs ``llmfit recommend --json -n 30`` on a remote host and returns a
+typed ``LLMFitResult``.  SSH transport is injected via constructor (DIP).
 """
 
 from __future__ import annotations
@@ -16,13 +15,7 @@ from pydantic import ValidationError
 from inference_proxy.config.settings import LLMFitSettings
 from inference_proxy.llmfit.errors import LLMFitParseError, LLMFitTimeoutError
 from inference_proxy.models.llmfit import LLMFitResult
-from inference_proxy.models.node import InferenceEngine
 from inference_proxy.provisioning.ssh_client import RemoteCommandError, SSHClient
-
-_LLMFIT_RUNTIMES: dict[str, str] = {
-    InferenceEngine.VLLM: "vllm",
-    InferenceEngine.LLAMA_CPP: "llamacpp",
-}
 
 logger = structlog.get_logger()
 
@@ -61,27 +54,20 @@ class LLMFitRunner:
         cmd = shlex.join(("bash", "-c", script))
         await self._ssh.run(hostname, cmd, timeout=self._settings.timeout)
 
-    async def _run_recommend(
-        self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
-    ) -> tuple[str, str, int]:
+    async def _run_recommend(self, hostname: str) -> tuple[str, str, int]:
         """Run the llmfit recommend command, raising TimeoutError on timeout."""
-        runtime = _LLMFIT_RUNTIMES.get(engine, "vllm")
         command = shlex.join(
             (
                 self._settings.binary_path,
                 "recommend",
                 "--json",
-                "--runtime",
-                runtime,
                 "-n",
                 "30",
             )
         )
         return await self._ssh.run(hostname, command, timeout=self._settings.timeout)
 
-    async def recommend(
-        self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
-    ) -> LLMFitResult:
+    async def recommend(self, hostname: str) -> LLMFitResult:
         """Run llmfit on *hostname* and return parsed recommendations.
 
         If llmfit is not installed, installs it first then retries.
@@ -97,7 +83,7 @@ class LLMFitRunner:
         log.debug("llmfit_recommend_start")
 
         try:
-            stdout, _stderr, _exit = await self._run_recommend(hostname, engine)
+            stdout, _stderr, _exit = await self._run_recommend(hostname)
         except RemoteCommandError as exc:
             if exc.exit_status != 127:
                 raise
@@ -107,7 +93,7 @@ class LLMFitRunner:
             except TimeoutError as exc:
                 raise LLMFitTimeoutError(hostname, self._settings.timeout) from exc
             try:
-                stdout, _stderr, _exit = await self._run_recommend(hostname, engine)
+                stdout, _stderr, _exit = await self._run_recommend(hostname)
             except TimeoutError as exc:
                 raise LLMFitTimeoutError(hostname, self._settings.timeout) from exc
         except TimeoutError as exc:

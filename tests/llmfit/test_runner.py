@@ -105,7 +105,7 @@ class TestRecommend:
         assert result.models[1].fit_level == "good"
         mock_ssh_client.run.assert_called_once_with(
             "gpu-host-01",
-            "/usr/local/bin/llmfit recommend --json --runtime vllm -n 30",
+            "/usr/local/bin/llmfit recommend --json -n 30",
             timeout=60.0,
         )
 
@@ -155,7 +155,7 @@ class TestFirstRecommendationInstall:
             install_url="https://downloads.example/llmfit-{version}.tar.gz",
         )
         runner = LLMFitRunner(mock_ssh_client, settings)
-        recommend_command = "/opt/llmfit recommend --json --runtime vllm -n 30"
+        recommend_command = "/opt/llmfit recommend --json -n 30"
         mock_ssh_client.run.side_effect = [
             RemoteCommandError("gpu-host-01", recommend_command, 127),
             ("", "", 0),

@@ -1708,7 +1708,7 @@ class TestRecommendationTargetPolicy:
         response = client.get("/admin/nodes/gpu01/recommendations")
 
         assert response.status_code == 200
-        mock_llmfit_runner.recommend.assert_awaited_once_with("gpu01", engine=ANY)
+        mock_llmfit_runner.recommend.assert_awaited_once_with("gpu01")
 
     def test_currently_available_quads_target_is_accepted(
         self,
@@ -1732,7 +1732,7 @@ class TestRecommendationTargetPolicy:
         response = client.get("/admin/nodes/gpu01/recommendations")
 
         assert response.status_code == 200
-        mock_llmfit_runner.recommend.assert_awaited_once_with("gpu01", engine=ANY)
+        mock_llmfit_runner.recommend.assert_awaited_once_with("gpu01")
 
     def test_quads_inventory_target_that_is_unavailable_is_rejected(
         self,
