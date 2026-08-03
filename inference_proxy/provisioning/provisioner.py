@@ -428,9 +428,7 @@ class NodeProvisioner:
             raise ValueError("lifecycle lease does not own this host")
 
         try:
-            await self._provision(
-                hostname, managed=managed, model=model, engine=engine
-            )
+            await self._provision(hostname, managed=managed, model=model, engine=engine)
         except asyncio.CancelledError:
             self._log(hostname, "error", "Provisioning cancelled by teardown")
             await self._update_state(
@@ -628,7 +626,9 @@ class NodeProvisioner:
             self._script_command(
                 "setup.sh",
                 env=self._setup_script_env(engine),
-                scripts_dir="auto-llamacpp" if engine == InferenceEngine.LLAMA_CPP else None,
+                scripts_dir="auto-llamacpp"
+                if engine == InferenceEngine.LLAMA_CPP
+                else None,
             ),
         ):
             if stream == "stdout":
@@ -691,7 +691,9 @@ class NodeProvisioner:
         command = self._script_command(
             script,
             env=self._start_script_env(model, engine),
-            scripts_dir="auto-llamacpp" if engine == InferenceEngine.LLAMA_CPP else None,
+            scripts_dir="auto-llamacpp"
+            if engine == InferenceEngine.LLAMA_CPP
+            else None,
         )
         model_name: str | None = None
         async for stream, line in self._ssh_client.run_streaming(hostname, command):
@@ -1064,7 +1066,9 @@ class NodeProvisioner:
             stop_command = self._script_command(
                 stop_script,
                 args=("--force",) if force else (),
-                scripts_dir="auto-llamacpp" if engine == InferenceEngine.LLAMA_CPP else None,
+                scripts_dir="auto-llamacpp"
+                if engine == InferenceEngine.LLAMA_CPP
+                else None,
             )
             await self._ssh_run_command(hostname, stop_command)
 
