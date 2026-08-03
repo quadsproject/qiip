@@ -17,30 +17,30 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 
 ## Features
 
-- **OpenAI-compatible API** — drop-in replacement for `/v1/chat/completions`, `/v1/completions`, and `/v1/models`
-- **Streaming support** — Server-Sent Events (SSE) for real-time token generation
-- **Chat playground** — browser-based chat UI at `/chat` with markdown rendering and model selection
-- **Service discovery** — watches etcd for node registration/deregistration in real time
-- **Least-connections load balancing** — routes to the node with the fewest in-flight requests
-- **Automatic failover** — retries transport, timeout, and 5xx failures on alternate healthy nodes before a response begins (configurable, default 3 attempts)
-- **Circuit breakers** — per-node circuit breakers trip after consecutive failures, preventing cascade
-- **Health checking** — background thread probes each node's `/health` endpoint; marks nodes unhealthy after repeated failures and recovers them automatically
-- **Graceful shutdown** — Uvicorn drains in-flight requests before application resources close; its server timeout remains configurable
-- **Structured logging** — JSON or pretty console output via structlog
-- **Operations dashboard** — interactive web UI at `/dashboard` with real-time node table, detail pages, and provisioning status
-- **QUADS integration** — background polling of QUADS inventory and availability; unified view merging QUADS hosts with etcd-registered nodes
-- **QUADS schedule enforcement** — automated teardown of managed nodes when QUADS reports an upcoming scheduling conflict
-- **End-to-end node provisioning** — SSH-based pipeline: BMC power-on, NVIDIA driver and CUDA toolkit install, inference engine setup (vLLM or llama.cpp), NFS mount, firewall, health poll, and etcd registration
-- **Node teardown** — graceful shutdown with connection draining, force teardown option, and provisioning task cancellation
-- **Provisioning log streaming** — live SSE stream of provisioning and inference engine logs viewable in the dashboard
-- **BMC power management (Redfish)** — query and control node power state; supports On, ForceOff, GracefulRestart, and ForceRestart
-- **Model catalog** — scans shared NFS-mounted HuggingFace cache, verifies model completeness via tree manifests, exposed via `/admin/models/catalog`
-- **Background model downloads** — concurrent HuggingFace downloads with status tracking; duplicate-safe and re-downloadable after completion or failure
-- **Hardware-aware model recommendations** — runs llmfit via SSH on a target host to produce ranked recommendations with fit levels, throughput, and memory estimates; auto-installs the binary on first use
-- **Request metrics** — per-model and per-node counters exposed via `/admin/metrics`
-- **Admin authentication** — HTTP Basic required on all `/admin/*` endpoints and `/dashboard*` pages; inference API remains public
-- **Backend endpoint allowlist** — configurable hostname wildcard, CIDR network, and port allowlists; rejects non-matching registrations with loopback-only defaults
-- **Client config downloads** — one-click download of OpenCode CLI and Pi coding agent configuration files from the dashboard and node detail pages; dashboard configs point at the proxy for load-balanced access, node detail configs point at individual backend endpoints
+- **OpenAI-compatible API** -- drop-in replacement for `/v1/chat/completions`, `/v1/completions`, and `/v1/models`
+- **Streaming support** -- Server-Sent Events (SSE) for real-time token generation
+- **Chat playground** -- browser-based chat UI at `/chat` with markdown rendering and model selection
+- **Service discovery** -- watches etcd for node registration/deregistration in real time
+- **Least-connections load balancing** -- routes to the node with the fewest in-flight requests
+- **Automatic failover** -- retries transport, timeout, and 5xx failures on alternate healthy nodes before a response begins (configurable, default 3 attempts)
+- **Circuit breakers** -- per-node circuit breakers trip after consecutive failures, preventing cascade
+- **Health checking** -- background thread probes each node's `/health` endpoint; marks nodes unhealthy after repeated failures and recovers them automatically
+- **Graceful shutdown** -- Uvicorn drains in-flight requests before application resources close; its server timeout remains configurable
+- **Structured logging** -- JSON or pretty console output via structlog
+- **Operations dashboard** -- interactive web UI at `/dashboard` with real-time node table, detail pages, and provisioning status
+- **QUADS integration** -- background polling of QUADS inventory and availability; unified view merging QUADS hosts with etcd-registered nodes
+- **QUADS schedule enforcement** -- automated teardown of managed nodes when QUADS reports an upcoming scheduling conflict
+- **End-to-end node provisioning** -- SSH-based pipeline: BMC power-on, NVIDIA driver and CUDA toolkit install, inference engine setup (vLLM or llama.cpp), NFS mount, firewall, health poll, and etcd registration
+- **Node teardown** -- graceful shutdown with connection draining, force teardown option, and provisioning task cancellation
+- **Provisioning log streaming** -- live SSE stream of provisioning and inference engine logs viewable in the dashboard
+- **BMC power management (Redfish)** -- query and control node power state; supports On, ForceOff, GracefulRestart, and ForceRestart
+- **Model catalog** -- scans shared NFS-mounted HuggingFace cache, verifies model completeness via tree manifests, exposed via `/admin/models/catalog`
+- **Background model downloads** -- concurrent HuggingFace downloads with status tracking; duplicate-safe and re-downloadable after completion or failure
+- **Hardware-aware model recommendations** -- runs llmfit via SSH on a target host to produce ranked recommendations with fit levels, throughput, and memory estimates; auto-installs the binary on first use
+- **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
+- **Admin authentication** -- HTTP Basic required on all `/admin/*` endpoints and `/dashboard*` pages; inference API remains public
+- **Backend endpoint allowlist** -- configurable hostname wildcard, CIDR network, and port allowlists; rejects non-matching registrations with loopback-only defaults
+- **Client config downloads** -- one-click download of OpenCode CLI and Pi coding agent configuration files from the dashboard and node detail pages; dashboard configs point at the proxy for load-balanced access, node detail configs point at individual backend endpoints
 
 ## Table of Contents
 
@@ -113,7 +113,7 @@ unavailable. Its discovery workers reconnect to etcd in the background, and
 inference requests become routable after a healthy node is registered.
 
 The administrative API and dashboard use HTTP Basic authentication, which sends
-base64-encoded credentials—not encryption—on every request. A trusted work LAN
+base64-encoded credentials --not encryption --on every request. A trusted work LAN
 may use HTTP; use a TLS terminator whenever that network path is not trusted.
 
 ### Verify it's running
@@ -234,7 +234,7 @@ are passed through without changing their JSON shape.
 
 | Code | Meaning |
 |------|---------|
-| 404 | Model not found — no node serves the requested model |
+| 404 | Model not found -- no node serves the requested model |
 | 502 | Backend connection failed |
 | 503 | No healthy nodes available, or model temporarily unavailable |
 | 504 | Backend request timed out |
@@ -387,7 +387,7 @@ record the repository commit externally.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `INFERENCE_PROXY_PROXY__CONNECT_TIMEOUT` | `5.0` | TCP connect timeout (seconds) |
-| `INFERENCE_PROXY_PROXY__READ_TIMEOUT` | `120.0` | Read timeout — high for LLM first-token latency |
+| `INFERENCE_PROXY_PROXY__READ_TIMEOUT` | `120.0` | Read timeout -- high for LLM first-token latency |
 | `INFERENCE_PROXY_PROXY__WRITE_TIMEOUT` | `10.0` | Write timeout (seconds) |
 | `INFERENCE_PROXY_PROXY__POOL_TIMEOUT` | `10.0` | Connection pool acquisition timeout |
 | `INFERENCE_PROXY_PROXY__MAX_CONNECTIONS` | `100` | Max total connections in pool |
@@ -503,9 +503,9 @@ inference_proxy/
 
 ### Background threads
 
-- **etcd watcher** — watches the configured key prefix for node PUT/DELETE events; updates the registry in real time
-- **Health checker** — probes each registered node's `/health` endpoint, transitions liveness state, maintains managed-node leases after valid evidence, and removes idle draining ghosts
-- **QUADS poller and schedule enforcer** — refresh QUADS inventory and tear down managed nodes before scheduling conflicts, with bounded retry backoff
+- **etcd watcher** -- watches the configured key prefix for node PUT/DELETE events; updates the registry in real time
+- **Health checker** -- probes each registered node's `/health` endpoint, transitions liveness state, maintains managed-node leases after valid evidence, and removes idle draining ghosts
+- **QUADS poller and schedule enforcer** -- refresh QUADS inventory and tear down managed nodes before scheduling conflicts, with bounded retry backoff
 
 ## Development
 
@@ -515,7 +515,7 @@ inference_proxy/
 # Install all dependencies (including dev)
 uv sync --locked --all-groups
 
-# Activate the virtual environment (optional — uv run handles this)
+# Activate the virtual environment (optional -- uv run handles this)
 source .venv/bin/activate
 ```
 
