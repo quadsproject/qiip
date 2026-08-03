@@ -116,6 +116,13 @@ def test_ci_installs_uv_from_the_node_version_pin() -> None:
     assert workflow.count("version: ${{ steps.uv_pin.outputs.version }}") == 2
 
 
+def test_ci_type_checks_production_and_tests() -> None:
+    """CI restructures must preserve the exact combined strict-mypy gate."""
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+
+    assert workflow.count("run: uv run --frozen mypy inference_proxy tests") == 1
+
+
 def test_pinned_uv_reads_and_resolves_node_lock(tmp_path: Path) -> None:
     uv_binary = os.environ.get("AUTOVLLM_PINNED_UV_BIN", "uv")
     node_environment = {
