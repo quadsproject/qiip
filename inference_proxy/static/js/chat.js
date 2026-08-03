@@ -76,7 +76,30 @@ function setInputEnabled(enabled) {
   chatInput.disabled = !enabled;
 }
 
-async function streamResponse(bubble) {
+function commitTurn(userMessage, assistantContent) {
+  messages.push(userMessage, { role: "assistant", content: assistantContent });
+}
+
+function extractedErrorMessage(errorData) {
+  var nested = errorData && errorData.error && errorData.error.message;
+  var flat = errorData && errorData.message;
+  var message = nested || flat;
+  return typeof message === "string" && message ? message : null;
+}
+
+function errorMessage(errorData, status) {
+  return extractedErrorMessage(errorData) || "Request failed: HTTP " + status;
+}
+
+function systemPromptGuidance(message) {
+  var prompt = systemPromptTextarea ? systemPromptTextarea.value.trim() : "";
+  if (prompt && message.toLowerCase().includes("conversation roles must alternate")) {
+    return message + "\n\nThis model may not accept a system role. Clear the System Prompt and try again.";
+  }
+  return message;
+}
+
+async function streamResponse(bubble, pendingUser) {
   var rawText = "";
   var cursor = document.createElement("span");
   cursor.className = "streaming-cursor";
@@ -87,7 +110,7 @@ async function streamResponse(bubble) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(function () {
-        var payloadMessages = messages.slice();
+        var payloadMessages = messages.concat([pendingUser]);
         var sp = systemPromptTextarea ? systemPromptTextarea.value.trim() : "";
         if (sp) {
           payloadMessages.unshift({ role: "system", content: sp });
@@ -98,8 +121,7 @@ async function streamResponse(bubble) {
 
     if (!resp.ok) {
       var errData = await resp.json().catch(function () { return {}; });
-      var errMsg = (errData.error && errData.error.message) || "Request failed: HTTP " + resp.status;
-      bubble.textContent = errMsg;
+      bubble.textContent = systemPromptGuidance(errorMessage(errData, resp.status));
       bubble.classList.add("bubble-error");
       return;
     }
@@ -125,8 +147,9 @@ async function streamResponse(bubble) {
 
         try {
           var parsed = JSON.parse(data);
-          if (parsed.error && parsed.error.message) {
-            bubble.textContent = parsed.error.message;
+          var streamError = extractedErrorMessage(parsed);
+          if (streamError) {
+            bubble.textContent = systemPromptGuidance(streamError);
             bubble.classList.add("bubble-error");
             return;
           }
@@ -148,10 +171,15 @@ async function streamResponse(bubble) {
 
     // finalize
     renderAssistantMarkdown(bubble, rawText);
-    messages.push({ role: "assistant", content: rawText });
+    // A protocol-successful empty response is still a completed assistant turn.
+    // Keeping the pair preserves the backend result in future context.
+    commitTurn(pendingUser, rawText);
   } catch (err) {
     showToast("Could not reach the server. Check your connection.", "error");
-    if (!rawText) {
+    if (rawText) {
+      // Preserve tokens the user saw so the next request has the same context.
+      commitTurn(pendingUser, rawText);
+    } else {
       bubble.textContent = "Connection error";
       bubble.classList.add("bubble-error");
     }
@@ -169,14 +197,14 @@ function sendMessage() {
   if (!text || streaming || !modelSelect.value) return;
   streaming = true;
 
-  messages.push({ role: "user", content: text });
+  var pendingUser = { role: "user", content: text };
   addMessage("user", text);
   chatInput.value = "";
   chatInput.style.height = "auto";
   setInputEnabled(false);
 
   var bubble = addMessage("assistant", "");
-  streamResponse(bubble);
+  return streamResponse(bubble, pendingUser);
 }
 
 async function loadModels() {
@@ -233,6 +261,10 @@ document.addEventListener("DOMContentLoaded", function () {
   var savedPrompt = localStorage.getItem("systemPrompt");
   if (savedPrompt !== null && systemPromptTextarea) {
     systemPromptTextarea.value = savedPrompt;
+    if (savedPrompt.trim() && systemPromptToggle) {
+      systemPromptToggle.setAttribute("aria-expanded", "true");
+      document.getElementById("system-prompt-panel").classList.add("expanded");
+    }
   }
 
   if (systemPromptToggle) {

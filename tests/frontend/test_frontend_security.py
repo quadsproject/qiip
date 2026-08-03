@@ -143,7 +143,7 @@ sandbox.modelsAvailable = true;
 
 (async function () {
   const bubble = sandbox.addMessage("assistant", "initial");
-  await sandbox.streamResponse(bubble);
+  await sandbox.streamResponse(bubble, { role: "user", content: "test" });
   process.stdout.write(JSON.stringify({
     html: bubble.innerHTML,
     config: observedConfig,
