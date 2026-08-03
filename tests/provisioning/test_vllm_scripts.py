@@ -600,7 +600,7 @@ def test_explicit_vllm_overrides_still_win() -> None:
     ]
 
 
-def test_retired_vllm_overrides_warn_and_are_ignored() -> None:
+def test_reserved_vllm_names_are_ignored_without_compatibility_warnings() -> None:
     env = os.environ.copy()
     retired = {
         "VLLM_TENSOR_PARALLEL": "1",
@@ -645,18 +645,7 @@ printf '%s|%s|%s|%s|%s\n' \
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[-1] == "2|0.90|32768|32768|"
-    for legacy, replacement in zip(
-        retired,
-        (
-            "AUTOVLLM_TENSOR_PARALLEL",
-            "AUTOVLLM_GPU_MEM_UTIL",
-            "AUTOVLLM_MAX_MODEL_LEN",
-            "AUTOVLLM_MAX_BATCHED_TOKENS",
-            "AUTOVLLM_EXTRA_ARGS",
-        ),
-        strict=True,
-    ):
-        assert f"{legacy} is ignored; use {replacement} instead" in result.stderr
+    assert result.stderr == ""
 
 
 def test_vllm_env_does_not_leak_script_params(tmp_path: Path) -> None:

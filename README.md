@@ -242,11 +242,11 @@ complete [upgrade and compatibility guide](UPGRADING.md). It covers startup
 requirements, silent behavior changes, node-package and mirror policy,
 lease-expiry recovery, and client-visible API changes.
 
-The easiest changes to miss are that `ROUTING__MAX_RETRIES` now counts total
-attempts rather than retries after the first attempt, missing etcd `managed`
-values now mean externally owned, proxy-managed keys expire after their lease
-TTL without successful health evidence, and streaming requests can return a
-non-200 response before SSE begins.
+The easiest changes to miss are that `ROUTING__MAX_ATTEMPTS` counts the first
+request, missing etcd `managed` values now mean externally owned,
+proxy-managed keys expire after their lease TTL without successful health
+evidence, and streaming requests can return a non-200 response before SSE
+begins.
 
 Enabling QUADS requires both `INFERENCE_PROXY_QUADS__BASE_URL` and
 `INFERENCE_PROXY_QUADS__SERVER_TIMEZONE`. Set the latter to the IANA timezone
@@ -264,9 +264,7 @@ timezone before querying availability.
 
 Uvicorn owns graceful request draining. Configure its
 `--timeout-graceful-shutdown <seconds>` launcher option when the default does
-not fit the deployment. The retired
-`INFERENCE_PROXY_GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT` setting is ignored and
-emits a migration warning.
+not fit the deployment.
 
 ### Admin authentication
 
@@ -299,7 +297,7 @@ before a gateway outage longer than the active managed-node TTL.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `INFERENCE_PROXY_ROUTING__STRATEGY` | `least_connections` | Load balancing strategy |
-| `INFERENCE_PROXY_ROUTING__MAX_RETRIES` | `3` | Maximum total backend attempts, including the first request (legacy field name) |
+| `INFERENCE_PROXY_ROUTING__MAX_ATTEMPTS` | `3` | Maximum total backend attempts, including the first request |
 | `INFERENCE_PROXY_ROUTING__TIMEOUT` | `30` | Total pre-response streaming handshake budget across all attempts (seconds) |
 | `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_HOSTS` | `["localhost"]` | Exact backend DNS names or `*.suffix` rules (JSON array) |
 | `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_NETWORKS` | `["127.0.0.0/8","::1/128"]` | Backend IP CIDR allowlist (JSON array) |
@@ -334,10 +332,7 @@ Provisioning resource and retention controls:
 | `INFERENCE_PROXY_PROVISIONING__LOG_MAX_ENTRY_BYTES` | `16384` | Maximum bytes in one retained log message |
 | `INFERENCE_PROXY_PROVISIONING__LOG_MAX_COMPLETED_HOSTS` | `64` | Completed host-operation buffers retained, oldest first |
 
-LLMFit has one version setting: `INFERENCE_PROXY_LLMFIT__VERSION`. The retired
-`INFERENCE_PROXY_PROVISIONING__LLMFIT_VERSION` variable is ignored and emits a
-startup warning so an existing pin cannot disappear silently. Remove the old
-variable and move its value to the LLMFit setting when upgrading.
+LLMFit has one version setting: `INFERENCE_PROXY_LLMFIT__VERSION`.
 
 The default NVIDIA driver and LLMFit versions each ship with a verified
 SHA-256. Changing either version requires configuring its matching digest via
@@ -348,15 +343,14 @@ when a custom version has no explicit digest.
 The gateway cache path and node cache mount may differ, but provisioning uses
 one declared backing export: `INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT`. It is
 optional for proxy-only deployments and required before a node setup operation
-can acquire a host lease or start SSH work. The retired
-`INFERENCE_PROXY_PROVISIONING__NFS_SERVER` variable is ignored with a startup
-warning; move its value to the HuggingFace setting when upgrading.
+can acquire a host lease or start SSH work.
 
 Node-side launch tuning uses the `AUTOVLLM_*` namespace. The retired
 `VLLM_TENSOR_PARALLEL`, `VLLM_GPU_MEM_UTIL`, `VLLM_MAX_MODEL_LEN`,
 `VLLM_MAX_BATCHED_TOKENS`, and `VLLM_EXTRA_ARGS` names are ignored by
-`start-vllm.sh` and produce a warning naming their replacements. This keeps
-script inputs out of the environment namespace reserved by vLLM itself.
+`start-vllm.sh`. All seven reserved legacy inputs, including `VLLM_MODEL` and
+`VLLM_PORT`, are removed from the child environment so script inputs cannot
+leak into the namespace reserved by vLLM itself.
 
 ### Proxy (HTTP client)
 

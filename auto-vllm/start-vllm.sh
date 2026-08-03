@@ -20,22 +20,6 @@ COMMAND_PATTERN="${AUTOVLLM_COMMAND_PATTERN:-${VLLM_BIN} serve}"
 STARTUP_GRACE_PERIOD="${AUTOVLLM_STARTUP_GRACE_PERIOD:-2}"
 STARTUP_LOG_LINES="${AUTOVLLM_STARTUP_LOG_LINES:-40}"
 
-warn_retired_override() {
-    local legacy_name="$1"
-    local replacement="$2"
-    if [[ -v $legacy_name ]]; then
-        echo "WARNING: ${legacy_name} is ignored; use ${replacement} instead" >&2
-    fi
-}
-
-# These five names were previously script-level tuning overrides. Warn only
-# for that retired set: vLLM legitimately owns other VLLM_* environment names.
-warn_retired_override VLLM_TENSOR_PARALLEL AUTOVLLM_TENSOR_PARALLEL
-warn_retired_override VLLM_GPU_MEM_UTIL AUTOVLLM_GPU_MEM_UTIL
-warn_retired_override VLLM_MAX_MODEL_LEN AUTOVLLM_MAX_MODEL_LEN
-warn_retired_override VLLM_MAX_BATCHED_TOKENS AUTOVLLM_MAX_BATCHED_TOKENS
-warn_retired_override VLLM_EXTRA_ARGS AUTOVLLM_EXTRA_ARGS
-
 # Ignore legacy script inputs instead of leaking them into vLLM's reserved
 # environment namespace. VLLM_MODEL was an internal gateway handoff;
 # VLLM_PORT is the upstream collision that motivated the namespace change.

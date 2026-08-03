@@ -70,7 +70,9 @@ def test_settings() -> Settings:
         etcd=EtcdSettings(
             endpoints=["http://localhost:2379"], node_prefix="/test-nodes/"
         ),
-        routing=RoutingSettings(strategy="least_connections", max_retries=3, timeout=5),
+        routing=RoutingSettings(
+            strategy="least_connections", max_attempts=3, timeout=5
+        ),
         admin=AdminSettings(
             username=_TEST_ADMIN_USERNAME,
             password=SecretStr(_TEST_ADMIN_PASSWORD),

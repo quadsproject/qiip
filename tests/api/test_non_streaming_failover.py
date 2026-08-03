@@ -67,7 +67,7 @@ def _set_attempt_budget(
     settings: Settings,
     attempts: int,
 ) -> None:
-    routing = settings.routing.model_copy(update={"max_retries": attempts})
+    routing = settings.routing.model_copy(update={"max_attempts": attempts})
     configured = settings.model_copy(update={"routing": routing})
     app.dependency_overrides[get_settings] = lambda: configured
 

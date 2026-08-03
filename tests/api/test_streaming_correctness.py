@@ -125,7 +125,7 @@ def _set_streaming_limits(
     attempts: int,
     timeout: int | float | None = None,
 ) -> None:
-    updates: dict[str, int | float] = {"max_retries": attempts}
+    updates: dict[str, int | float] = {"max_attempts": attempts}
     if timeout is not None:
         updates["timeout"] = timeout
     routing = settings.routing.model_copy(update=updates)

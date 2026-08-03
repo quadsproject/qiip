@@ -23,7 +23,7 @@ The guide separates three kinds of change:
 2. Record every current `/nodes/` etcd value and whether the proxy should manage that node's lifecycle.
 3. Update the launcher, required credentials, endpoint allowlist, and any QUADS configuration before starting the new gateway.
 4. Review the node package versions, artifact digests, NFS export, and retired node environment variables before provisioning another host.
-5. Review the client-visible changes, especially streaming HTTP statuses, `failover_exhausted`, verbatim 4xx responses, and the meaning of `max_retries`.
+5. Review the client-visible changes, especially streaming HTTP statuses, `failover_exhausted`, verbatim 4xx responses, and the `max_attempts` budget.
 6. Start the gateway and complete the verification checklist at the end of this guide.
 
 Do not treat a successful process start as sufficient verification. A loopback-only endpoint allowlist can produce a healthy gateway with an empty registry, and an expired managed-node lease can leave vLLM running on a host that the gateway no longer knows about.
@@ -45,7 +45,7 @@ Update systemd units, containers, shell wrappers, probes, and development comman
 
 ### 2. Move graceful-drain timeout ownership to Uvicorn
 
-`INFERENCE_PROXY_GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT` is retired and ignored with a startup warning. Uvicorn stops accepting requests and drains in-flight work before application lifespan cleanup begins, so configure its server-owned option instead:
+`INFERENCE_PROXY_GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT` has been removed and is silently ignored. Uvicorn stops accepting requests and drains in-flight work before application lifespan cleanup begins, so configure its server-owned option instead:
 
 ```bash
 uv run uvicorn inference_proxy.main:create_app \
@@ -53,7 +53,7 @@ uv run uvicorn inference_proxy.main:create_app \
   --timeout-graceful-shutdown 60
 ```
 
-Remove the retired environment variable after migrating the launcher.
+Remove the obsolete environment variable after migrating the launcher. Leaving it set does not configure either QIIP or Uvicorn.
 
 ### 3. Configure administrative credentials
 
@@ -82,17 +82,17 @@ DNS endpoints must match an exact name or `*.suffix` rule. IP literals match CID
 
 The configured provisioning vLLM port must be in the allowed-port list. Setup validates the hostname-derived endpoint before taking a host lease, opening SSH, or changing power state.
 
-### 5. Recalculate `max_retries` as total attempts
+### 5. Rename `max_retries` and recalculate the attempt budget
 
-The legacy field name remains `INFERENCE_PROXY_ROUTING__MAX_RETRIES`, but its meaning changed from retries after the first request to **total attempts including the first request**. The minimum is 1.
+`INFERENCE_PROXY_ROUTING__MAX_RETRIES` has been removed and is silently ignored. Replace it with `INFERENCE_PROXY_ROUTING__MAX_ATTEMPTS`, whose value is **total attempts including the first request**. The minimum is 1.
 
-| Previous value | Previous maximum attempts | Current maximum attempts | Value preserving the old budget |
+| Previous `MAX_RETRIES` value | Previous maximum attempts | Same `MAX_ATTEMPTS` value | `MAX_ATTEMPTS` value preserving the old budget |
 |---:|---:|---:|---:|
 | 1 | 2 | 1 | 2 |
 | 2 | 3 | 2 | 3 |
 | 3 | 4 | 3 | 4 |
 
-An existing value of 3 therefore loses one backend attempt unless it is changed to 4. The same total-attempt budget applies to non-streaming requests and the pre-response streaming handshake.
+Copying an existing value of 3 therefore loses one backend attempt unless it is changed to 4. The same total-attempt budget applies to non-streaming requests and the pre-response streaming handshake.
 
 ### 6. Mark externally registered nodes as managed explicitly
 
@@ -119,7 +119,7 @@ This is an operational contract, not merely a setting:
 - Before a planned maintenance window longer than the active leases' TTL, either keep a gateway lease maintainer running or plan to reprovision the managed nodes afterward.
 - `INFERENCE_PROXY_ETCD__NODE_LEASE_TTL` must be greater than 300 seconds and greater than three complete health-check intervals. Changing the configured value affects newly granted leases; do not assume it retroactively changes every existing etcd lease.
 
-Configure the active probe cadence with `INFERENCE_PROXY_RESILIENCE__HEALTH_CHECK_INTERVAL`. `INFERENCE_PROXY_ROUTING__HEALTH_CHECK_INTERVAL` remains only as a legacy compatibility field and is not the lease-maintenance cadence.
+Configure the active probe cadence with `INFERENCE_PROXY_RESILIENCE__HEALTH_CHECK_INTERVAL`. The removed `INFERENCE_PROXY_ROUTING__HEALTH_CHECK_INTERVAL` name is silently ignored and does not affect lease maintenance.
 
 ### 9. Configure the QUADS server timezone
 
@@ -138,7 +138,7 @@ Setup now checks the complete `QUADS__SCHEDULE_LOOKAHEAD_HOURS` window, not only
 
 ### 10. Declare the HuggingFace NFS export for provisioning
 
-`INFERENCE_PROXY_PROVISIONING__NFS_SERVER` is retired and ignored with a startup warning. Configure the single backing export instead:
+`INFERENCE_PROXY_PROVISIONING__NFS_SERVER` has been removed and is silently ignored. Configure the single backing export instead:
 
 ```dotenv
 INFERENCE_PROXY_HUGGINGFACE__CACHE_DIR=/data/huggingface
@@ -160,11 +160,11 @@ The setup and launch scripts no longer use their private inputs in vLLM's reserv
 | `VLLM_MAX_BATCHED_TOKENS` | `AUTOVLLM_MAX_BATCHED_TOKENS` |
 | `VLLM_EXTRA_ARGS` | `AUTOVLLM_EXTRA_ARGS` |
 
-The scripts warn when a retired name is present and ignore it. `VLLM_PORT` is not a supported API-port override; use `AUTOVLLM_API_PORT` when invoking the scripts directly or `INFERENCE_PROXY_PROVISIONING__VLLM_PORT` through the gateway.
+The removed names are silently ignored. The launcher also strips all seven old gateway inputs from the child environment so they cannot be reinterpreted by vLLM itself. `VLLM_PORT` is not a supported API-port override; use `AUTOVLLM_API_PORT` when invoking the scripts directly or `INFERENCE_PROXY_PROVISIONING__VLLM_PORT` through the gateway.
 
 ### 12. Move the LLMFit version to its single settings group
 
-`INFERENCE_PROXY_PROVISIONING__LLMFIT_VERSION` is retired and ignored with a startup warning. Move its value to:
+`INFERENCE_PROXY_PROVISIONING__LLMFIT_VERSION` has been removed and is silently ignored. Move its value to:
 
 ```dotenv
 INFERENCE_PROXY_LLMFIT__VERSION=1.1.6
@@ -265,7 +265,7 @@ The node-only `NVIDIA_DRIVER_URL` and `LLMFIT_URL` variables are intentionally d
 | Classification | Change | Client action |
 |---|---|---|
 | **New surface** | Retry-loop exhaustion sets OpenAI error `code` to `failover_exhausted` and adds `X-Inference-Proxy-Failover: exhausted` plus `X-Inference-Proxy-Attempts: <n>`. The HTTP status is the last attempted upstream status; transport failures without an upstream response map to 502, and timeouts map to 504. | Treat the marker as “the configured attempt loop ended after at least one backend failure,” not as proof every fleet node was tried. Preserve handling for the accompanying HTTP status. |
-| **Behavioral break** | `ROUTING__MAX_RETRIES` now counts total attempts, including the first request. | Increase existing values by one when preserving the old maximum attempt budget. |
+| **Behavioral break** | `ROUTING__MAX_RETRIES` was replaced by `ROUTING__MAX_ATTEMPTS`, which counts total attempts including the first request. The removed name is silently ignored. | Rename the variable and increase existing values by one when preserving the old maximum attempt budget. |
 | **Behavioral break** | Streaming no longer commits HTTP 200 before contacting an upstream. Pre-stream failures can return 502, 503, 504, or a preserved upstream 5xx response. | Ensure streaming callers handle non-200 responses before parsing SSE. |
 | **Behavioral break** | Streaming response headers wait for a successful upstream handshake. The complete retry phase is bounded by `ROUTING__TIMEOUT`, so header latency can be as high as that total deadline. | Set client header timeouts above the configured routing timeout plus expected network overhead. |
 | **Correctness fix** | Retryable non-streaming 5xx and transport failures now fail over to another eligible node and count against the circuit breaker. | Remove workarounds that manually retried every 5xx without considering the proxy's attempt budget. |

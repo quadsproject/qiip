@@ -6,7 +6,6 @@ Only the root Settings class inherits from BaseSettings.
 """
 
 import re
-import warnings
 from pathlib import Path
 from string import Formatter
 from typing import Self
@@ -45,24 +44,6 @@ class GatewaySettings(BaseModel):
 
     host: str = "0.0.0.0"
     port: int = 8080
-    retired_graceful_shutdown_timeout: int | None = Field(
-        default=None,
-        validation_alias="graceful_shutdown_timeout",
-        exclude=True,
-        repr=False,
-    )
-
-    @model_validator(mode="after")
-    def warn_about_retired_graceful_shutdown_timeout(self) -> Self:
-        """Direct operators to the server-owned graceful-drain setting."""
-        if self.retired_graceful_shutdown_timeout is not None:
-            warnings.warn(
-                "INFERENCE_PROXY_GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT is ignored; "
-                "configure uvicorn --timeout-graceful-shutdown instead",
-                UserWarning,
-                stacklevel=2,
-            )
-        return self
 
 
 class EtcdSettings(BaseModel):
@@ -92,8 +73,7 @@ class RoutingSettings(BaseModel):
     """Request routing and load balancing configuration."""
 
     strategy: str = "least_connections"
-    health_check_interval: int = 30
-    max_retries: int = Field(default=3, ge=1)
+    max_attempts: int = Field(default=3, ge=1)
     timeout: int = 30
     allowed_endpoint_hosts: list[str] = Field(default_factory=lambda: ["localhost"])
     allowed_endpoint_networks: list[str] = Field(
@@ -142,9 +122,7 @@ class ResilienceSettings(BaseModel):
     marking a node UNHEALTHY (per D-03, default 3).
 
     ``health_check_interval``: seconds between health check probe cycles
-    (default 30).  This is the canonical source; the legacy
-    ``RoutingSettings.health_check_interval`` is retained for backward
-    compatibility.
+    (default 30).
     """
 
     circuit_breaker_threshold: int = 3
@@ -240,42 +218,6 @@ class ProvisioningSettings(BaseModel):
     nfs_mount_point: str = "/srv/hf-cache"
     nvidia_driver_version: str = DEFAULT_NVIDIA_DRIVER_VERSION
     nvidia_driver_sha256: str = DEFAULT_NVIDIA_DRIVER_SHA256
-    retired_nfs_server: str | None = Field(
-        default=None,
-        validation_alias="nfs_server",
-        exclude=True,
-        repr=False,
-    )
-    retired_llmfit_version: str | None = Field(
-        default=None,
-        validation_alias="llmfit_version",
-        exclude=True,
-        repr=False,
-    )
-
-    @model_validator(mode="after")
-    def warn_about_retired_llmfit_version(self) -> Self:
-        """Make the retired provisioning-scoped LLMFit knob fail visibly."""
-        if self.retired_llmfit_version is not None:
-            warnings.warn(
-                "INFERENCE_PROXY_PROVISIONING__LLMFIT_VERSION is ignored; "
-                "configure INFERENCE_PROXY_LLMFIT__VERSION instead",
-                UserWarning,
-                stacklevel=2,
-            )
-        return self
-
-    @model_validator(mode="after")
-    def warn_about_retired_nfs_server(self) -> Self:
-        """Make migration from the duplicate NFS export knob visible."""
-        if self.retired_nfs_server is not None:
-            warnings.warn(
-                "INFERENCE_PROXY_PROVISIONING__NFS_SERVER is ignored; "
-                "configure INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT instead",
-                UserWarning,
-                stacklevel=2,
-            )
-        return self
 
     @field_validator("nvidia_driver_sha256")
     @classmethod

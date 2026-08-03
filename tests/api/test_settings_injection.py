@@ -47,7 +47,7 @@ async def test_injected_settings_govern_routes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """All four completion paths use the app's injected attempt budget."""
-    routing = test_settings.routing.model_copy(update={"max_retries": 2})
+    routing = test_settings.routing.model_copy(update={"max_attempts": 2})
     injected_settings = test_settings.model_copy(update={"routing": routing})
     app.dependency_overrides[get_settings] = lambda: injected_settings
 

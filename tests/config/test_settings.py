@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from pydantic import BaseModel, SecretStr, ValidationError
 from pydantic_settings import BaseSettings
 
 from inference_proxy.config.settings import (
+    DEFAULT_LLMFIT_VERSION,
     AdminSettings,
     DashboardSettings,
     EtcdSettings,
@@ -82,24 +84,6 @@ class TestDefaultGatewaySettings:
         assert settings.gateway.host == "0.0.0.0"
         assert settings.gateway.port == 8080
 
-    def test_retired_graceful_shutdown_timeout_warns_with_replacement(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setenv(
-            "INFERENCE_PROXY_GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT",
-            "60",
-        )
-
-        with pytest.warns(
-            UserWarning,
-            match="uvicorn --timeout-graceful-shutdown",
-        ):
-            settings = Settings(_env_file=None)
-
-        assert settings.gateway.retired_graceful_shutdown_timeout == 60
-        assert "graceful_shutdown_timeout" not in GatewaySettings.model_fields
-
 
 class TestLoggingSettings:
     @pytest.mark.parametrize(
@@ -154,8 +138,7 @@ class TestDefaultRoutingSettings:
     def test_default_routing_settings(self) -> None:
         settings = Settings(_env_file=None)
         assert settings.routing.strategy == "least_connections"
-        assert settings.routing.health_check_interval == 30
-        assert settings.routing.max_retries == 3
+        assert settings.routing.max_attempts == 3
         assert settings.routing.timeout == 30
         assert settings.routing.allowed_endpoint_hosts == ["localhost"]
         assert settings.routing.allowed_endpoint_networks == [
@@ -164,11 +147,31 @@ class TestDefaultRoutingSettings:
         ]
         assert settings.routing.allowed_endpoint_ports == [8000]
 
-    def test_max_retries_rejects_zero(self) -> None:
+    def test_max_attempts_rejects_zero(self) -> None:
         with pytest.raises(ValidationError) as caught:
-            RoutingSettings(max_retries=0)
+            RoutingSettings(max_attempts=0)
 
-        assert caught.value.errors()[0]["loc"] == ("max_retries",)
+        assert caught.value.errors()[0]["loc"] == ("max_attempts",)
+
+    def test_max_attempts_loads_from_environment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("INFERENCE_PROXY_ROUTING__MAX_ATTEMPTS", "4")
+
+        settings = Settings(_env_file=None)
+
+        assert settings.routing.max_attempts == 4
+
+    def test_max_retries_environment_name_is_not_accepted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("INFERENCE_PROXY_ROUTING__MAX_RETRIES", "9")
+
+        settings = Settings(_env_file=None)
+
+        assert settings.routing.max_attempts == 3
 
     def test_provisioning_port_must_be_allowed(self) -> None:
         with pytest.raises(
@@ -179,6 +182,49 @@ class TestDefaultRoutingSettings:
                 _env_file=None,
                 provisioning=ProvisioningSettings(vllm_port=9000),
             )
+
+
+class TestPreAdoptionSettingsCleanup:
+    def test_removed_compatibility_fields_are_absent(self) -> None:
+        """Guard only the retired fields, without freezing unrelated settings."""
+        affected_models = (GatewaySettings, RoutingSettings, ProvisioningSettings)
+        assert all(
+            not field_name.startswith("retired_")
+            for model in affected_models
+            for field_name in model.model_fields
+        )
+        assert "graceful_shutdown_timeout" not in GatewaySettings.model_fields
+        assert "health_check_interval" not in RoutingSettings.model_fields
+        assert "llmfit_version" not in ProvisioningSettings.model_fields
+        assert "nfs_server" not in ProvisioningSettings.model_fields
+        assert "max_retries" not in RoutingSettings.model_fields
+        assert "max_attempts" in RoutingSettings.model_fields
+
+    def test_removed_environment_names_are_silently_ignored(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT",
+            "60",
+        )
+        monkeypatch.setenv("INFERENCE_PROXY_ROUTING__HEALTH_CHECK_INTERVAL", "5")
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_PROVISIONING__LLMFIT_VERSION",
+            "9.9.9",
+        )
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_PROVISIONING__NFS_SERVER",
+            "legacy.example:/old/export",
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            settings = Settings(_env_file=None)
+
+        assert settings.resilience.health_check_interval == 30
+        assert settings.llmfit.version == DEFAULT_LLMFIT_VERSION
+        assert settings.huggingface.nfs_export is None
 
 
 class TestEnvVarOverrideGatewayPort:
@@ -335,26 +381,6 @@ class TestEnvVarOverrideProvisioningTimeout:
         monkeypatch.setenv("INFERENCE_PROXY_PROVISIONING__HEALTH_POLL_TIMEOUT", "300")
         settings = Settings(_env_file=None)
         assert settings.provisioning.health_poll_timeout == 300
-
-    def test_retired_provisioning_llmfit_version_warns(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setenv(
-            "INFERENCE_PROXY_PROVISIONING__LLMFIT_VERSION",
-            "9.9.9",
-        )
-        monkeypatch.setenv("INFERENCE_PROXY_LLMFIT__VERSION", "2.0.0")
-        monkeypatch.setenv("INFERENCE_PROXY_LLMFIT__SHA256", "a" * 64)
-
-        with pytest.warns(
-            UserWarning,
-            match="INFERENCE_PROXY_LLMFIT__VERSION",
-        ):
-            settings = Settings(_env_file=None)
-
-        assert settings.llmfit.version == "2.0.0"
-        assert "llmfit_version" not in ProvisioningSettings.model_fields
 
 
 class TestArtifactDigestSettings:
@@ -708,23 +734,6 @@ class TestHuggingFaceSettings:
     def test_explicit_empty_nfs_export_rejected(self, value: str) -> None:
         with pytest.raises(ValidationError, match="nfs_export must not be empty"):
             HuggingFaceSettings(cache_dir="/data/huggingface", nfs_export=value)
-
-    def test_retired_provisioning_nfs_server_warns(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv(
-            "INFERENCE_PROXY_PROVISIONING__NFS_SERVER",
-            "legacy.example:/old/export",
-        )
-
-        with pytest.warns(
-            UserWarning,
-            match="INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT",
-        ):
-            settings = Settings(_env_file=None)
-
-        assert settings.huggingface.nfs_export is None
-        assert "nfs_server" not in settings.provisioning.model_dump()
 
     def test_api_token_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("INFERENCE_PROXY_HUGGINGFACE__CACHE_DIR", "/data/hf")

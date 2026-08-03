@@ -237,7 +237,7 @@ async def _proxy_non_streaming(
     proxy: ProxyClient,
     circuit_breaker_registry: CircuitBreakerRegistry,
     request_metrics: RequestMetrics,
-    max_retries: int = 3,
+    max_attempts: int = 3,
     starlette_request: StarletteRequest | None = None,
 ) -> JSONResponse:
     """Forward a non-streaming request with retry-on-failover.
@@ -246,9 +246,8 @@ async def _proxy_non_streaming(
     retryable error (ConnectError, TimeoutException, 5xx).  Each failed
     node is excluded from subsequent selection via ``exclude_node_ids``.
 
-    ``max_retries`` is the legacy setting name; its value is the maximum
-    number of total attempts, including the initial request. Each retry goes
-    to a different node.
+    ``max_attempts`` includes the initial request. Each retry goes to a
+    different node.
     """
     model = body.get("model")
     excluded: set[str] = set()
@@ -256,7 +255,7 @@ async def _proxy_non_streaming(
     first_attempt = True
     attempts = 0
 
-    for _ in range(max_retries):
+    for _ in range(max_attempts):
         reservation = node_selector.select_and_reserve(
             model=model,
             exclude_node_ids=excluded or None,
@@ -308,7 +307,7 @@ async def _proxy_non_streaming(
                     "retrying on different node",
                     failed_node=node.node_id,
                     attempt=attempts,
-                    max_attempts=max_retries,
+                    max_attempts=max_attempts,
                     error=str(exc),
                 )
                 continue
@@ -360,7 +359,7 @@ async def chat_completions(
             circuit_breaker_registry=circuit_breaker_registry,
             request_metrics=request_metrics,
             starlette_request=starlette_request,
-            max_retries=settings.routing.max_retries,
+            max_attempts=settings.routing.max_attempts,
             handshake_timeout=settings.routing.timeout,
         )
     return await _proxy_non_streaming(
@@ -370,7 +369,7 @@ async def chat_completions(
         proxy,
         circuit_breaker_registry=circuit_breaker_registry,
         request_metrics=request_metrics,
-        max_retries=settings.routing.max_retries,
+        max_attempts=settings.routing.max_attempts,
         starlette_request=starlette_request,
     )
 
@@ -402,7 +401,7 @@ async def text_completions(
             circuit_breaker_registry=circuit_breaker_registry,
             request_metrics=request_metrics,
             starlette_request=starlette_request,
-            max_retries=settings.routing.max_retries,
+            max_attempts=settings.routing.max_attempts,
             handshake_timeout=settings.routing.timeout,
         )
     return await _proxy_non_streaming(
@@ -412,7 +411,7 @@ async def text_completions(
         proxy,
         circuit_breaker_registry=circuit_breaker_registry,
         request_metrics=request_metrics,
-        max_retries=settings.routing.max_retries,
+        max_attempts=settings.routing.max_attempts,
         starlette_request=starlette_request,
     )
 
@@ -457,7 +456,7 @@ async def _stream_completion(
     circuit_breaker_registry: CircuitBreakerRegistry,
     request_metrics: RequestMetrics,
     starlette_request: StarletteRequest | None = None,
-    max_retries: int = 3,
+    max_attempts: int = 3,
     handshake_timeout: float = 30,
 ) -> JSONResponse | EventSourceResponse:
     """Establish a backend SSE stream, then expose it to the client.
@@ -477,7 +476,7 @@ async def _stream_completion(
     first_attempt = True
     deadline = asyncio.get_running_loop().time() + handshake_timeout
 
-    for _ in range(max_retries):
+    for _ in range(max_attempts):
         if asyncio.get_running_loop().time() >= deadline:
             break
 
@@ -567,7 +566,7 @@ async def _stream_completion(
                     "retrying streaming handshake on different node",
                     failed_node=node.node_id,
                     attempt=attempts,
-                    max_attempts=max_retries,
+                    max_attempts=max_attempts,
                     error=str(exc),
                 )
                 continue
