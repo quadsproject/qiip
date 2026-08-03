@@ -1,7 +1,7 @@
 """Node provisioning orchestrator.
 
 Runs the full provisioning sequence on a remote host: setup.sh,
-start-vllm.sh, health poll, etcd registration.
+engine start script, health poll, etcd registration.
 
 Per D-15: Concrete class, no protocol/interface.
 """
@@ -17,7 +17,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from ipaddress import ip_address
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 import httpx
@@ -28,7 +28,7 @@ from inference_proxy.discovery.etcd_client import EtcdClient
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_to_etcd
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
-from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.provisioning.host_lifecycle import (
     HostLifecycleCoordinator,
     HostLifecycleLease,
@@ -89,7 +89,7 @@ class _ProvisioningTask:
 
 
 class NodeProvisioner:
-    """Orchestrates full provisioning of a vLLM node on a remote host.
+    """Orchestrates full provisioning of an inference node on a remote host.
 
     Accepts SSHClient, EtcdClient, ProvisioningSettings, and EndpointPolicy
     via constructor injection (DIP).
@@ -174,9 +174,11 @@ class NodeProvisioner:
             )
         return self._nfs_export
 
-    def _setup_script_env(self) -> dict[str, str]:
+    def _setup_script_env(
+        self, engine: InferenceEngine = InferenceEngine.VLLM
+    ) -> dict[str, str]:
         """Return the exact environment accepted by setup.sh."""
-        return {
+        env = {
             "AUTOVLLM_NFS_EXPORT": self._required_nfs_export(),
             "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
             "AUTOVLLM_NVIDIA_DRIVER_VERSION": self._settings.nvidia_driver_version,
@@ -185,15 +187,29 @@ class NodeProvisioner:
             "AUTOVLLM_LLMFIT_VERSION": self._llmfit_version,
             "AUTOVLLM_LLMFIT_SHA256": self._llmfit_sha256,
         }
+        if engine == InferenceEngine.LLAMA_CPP:
+            env["AUTOLLAMACPP_VERSION"] = self._settings.llamacpp_version
+            env["AUTOLLAMACPP_SHA256"] = self._settings.llamacpp_sha256
+        return env
 
-    def _start_script_env(self, model: str | None) -> dict[str, str]:
-        """Return the exact environment accepted by start-vllm.sh."""
-        env = {
-            "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
-            "AUTOVLLM_API_PORT": str(self._settings.vllm_port),
-        }
-        if model is not None:
-            env["AUTOVLLM_MODEL"] = model
+    def _start_script_env(
+        self, model: str | None, engine: InferenceEngine = InferenceEngine.VLLM
+    ) -> dict[str, str]:
+        """Return the exact environment accepted by the engine start script."""
+        if engine == InferenceEngine.LLAMA_CPP:
+            env = {
+                "AUTOLLAMACPP_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
+                "AUTOLLAMACPP_PORT": str(self._settings.vllm_port),
+            }
+            if model is not None:
+                env["AUTOLLAMACPP_MODEL"] = model
+        else:
+            env = {
+                "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
+                "AUTOVLLM_API_PORT": str(self._settings.vllm_port),
+            }
+            if model is not None:
+                env["AUTOVLLM_MODEL"] = model
         if self._hf_token:
             env["HF_TOKEN"] = self._hf_token
         return env
@@ -204,9 +220,11 @@ class NodeProvisioner:
         *,
         env: dict[str, str] | None = None,
         args: tuple[str, ...] = (),
+        scripts_dir: str | None = None,
     ) -> str:
         """Build one uniformly quoted remote script command."""
-        script_path = str(PurePosixPath(self._settings.scripts_dir.name, script_name))
+        dir_name = scripts_dir or self._settings.scripts_dir.name
+        script_path = str(PurePosixPath(dir_name, script_name))
         command = shlex.join(("bash", script_path, *args))
         if not env:
             return command
@@ -394,6 +412,7 @@ class NodeProvisioner:
         *,
         managed: bool = True,
         model: str | None = None,
+        engine: InferenceEngine = InferenceEngine.VLLM,
         lifecycle_lease: HostLifecycleLease | None = None,
     ) -> None:
         """Provision *hostname* under the shared host lifecycle coordinator."""
@@ -409,7 +428,9 @@ class NodeProvisioner:
             raise ValueError("lifecycle lease does not own this host")
 
         try:
-            await self._provision(hostname, managed=managed, model=model)
+            await self._provision(
+                hostname, managed=managed, model=model, engine=engine
+            )
         except asyncio.CancelledError:
             self._log(hostname, "error", "Provisioning cancelled by teardown")
             await self._update_state(
@@ -424,7 +445,12 @@ class NodeProvisioner:
             lease.release()
 
     async def _provision(
-        self, hostname: str, *, managed: bool = True, model: str | None = None
+        self,
+        hostname: str,
+        *,
+        managed: bool = True,
+        model: str | None = None,
+        engine: InferenceEngine = InferenceEngine.VLLM,
     ) -> None:
         """Run full provisioning sequence on *hostname*.
 
@@ -472,6 +498,7 @@ class NodeProvisioner:
                 endpoint=self.validate_endpoint(hostname),
                 status=NodeStatus.PROVISIONING,
                 model="",
+                engine=engine,
                 last_heartbeat=datetime.now(UTC),
                 managed=managed,
             )
@@ -484,7 +511,7 @@ class NodeProvisioner:
                 started_at=provision_started_at,
             )
             self._log(hostname, "info", "Uploading provisioning scripts")
-            await self._upload_scripts(hostname)
+            await self._upload_scripts(hostname, engine=engine)
             self._log(hostname, "info", "Running setup.sh")
 
             def set_current_step(step: str) -> None:
@@ -495,29 +522,39 @@ class NodeProvisioner:
                 hostname,
                 started_at=provision_started_at,
                 on_step=set_current_step,
+                engine=engine,
             )
             current_step = "gpu_verify"
-            await self._verify_gpu(hostname)
-            current_step = "starting_vllm"
+            if engine != InferenceEngine.LLAMA_CPP:
+                await self._verify_gpu(hostname)
+            current_step = "starting_engine"
+            if engine == InferenceEngine.LLAMA_CPP:
+                starting_step = ProvisioningStep.STARTING_LLAMACPP
+            else:
+                starting_step = ProvisioningStep.STARTING_VLLM
             await self._update_state(
                 hostname,
-                ProvisioningStep.STARTING_VLLM,
+                starting_step,
                 started_at=provision_started_at,
             )
-            self._log(hostname, "info", "Running start-vllm.sh")
-            model_name = await self._run_start_vllm(hostname, model=model)
+            self._log(hostname, "info", f"Starting {engine} inference engine")
+            model_name = await self._run_start_vllm(
+                hostname, model=model, engine=engine
+            )
             current_step = "health_poll"
             await self._update_state(
                 hostname, ProvisioningStep.HEALTH_POLL, started_at=provision_started_at
             )
-            self._log(hostname, "info", "Waiting for vLLM health endpoint")
-            await self._poll_health(hostname)
+            self._log(hostname, "info", "Waiting for health endpoint")
+            await self._poll_health(hostname, engine=engine)
             current_step = "registering"
             await self._update_state(
                 hostname, ProvisioningStep.REGISTERING, started_at=provision_started_at
             )
             self._log(hostname, "info", f"Registering node (model={model_name})")
-            await self._register_node(hostname, model_name, managed=managed)
+            await self._register_node(
+                hostname, model_name, managed=managed, engine=engine
+            )
             await self._update_state(
                 hostname, ProvisioningStep.COMPLETE, started_at=provision_started_at
             )
@@ -538,6 +575,7 @@ class NodeProvisioner:
                     endpoint=self.validate_endpoint(hostname),
                     status=NodeStatus.FAILED,
                     model="",
+                    engine=engine,
                     last_heartbeat=datetime.now(UTC),
                     managed=managed,
                 )
@@ -563,9 +601,18 @@ class NodeProvisioner:
 
         logger.info("provisioning_complete", hostname=hostname)
 
-    async def _upload_scripts(self, hostname: str) -> None:
+    async def _upload_scripts(
+        self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
+    ) -> None:
         """Copy provisioning scripts to the remote host via SCP."""
-        await self._ssh_client.upload(hostname, self._settings.scripts_dir)
+        if engine == InferenceEngine.LLAMA_CPP:
+            scripts_dir = Path("auto-llamacpp")
+        else:
+            scripts_dir = self._settings.scripts_dir
+        await self._ssh_client.upload(hostname, scripts_dir)
+        common_dir = Path("common")
+        if common_dir.is_dir():
+            await self._ssh_client.upload(hostname, common_dir)
 
     async def _run_setup(
         self,
@@ -573,11 +620,16 @@ class NodeProvisioner:
         *,
         started_at: datetime,
         on_step: Callable[[str], None],
+        engine: InferenceEngine = InferenceEngine.VLLM,
     ) -> None:
         """Run setup.sh and parse step markers from stdout (D-05, D-06)."""
         async for stream, line in self._ssh_client.run_streaming(
             hostname,
-            self._script_command("setup.sh", env=self._setup_script_env()),
+            self._script_command(
+                "setup.sh",
+                env=self._setup_script_env(engine),
+                scripts_dir="auto-llamacpp" if engine == InferenceEngine.LLAMA_CPP else None,
+            ),
         ):
             if stream == "stdout":
                 match = STEP_PATTERN.search(line)
@@ -624,10 +676,22 @@ class NodeProvisioner:
             raise ProvisioningError(f"No GPUs detected on {hostname} after setup")
         self._log(hostname, "info", f"Detected {len(gpu_lines)} GPU(s)")
 
-    async def _run_start_vllm(self, hostname: str, *, model: str | None = None) -> str:
-        """Run start-vllm.sh and extract model name from stdout."""
+    async def _run_start_vllm(
+        self,
+        hostname: str,
+        *,
+        model: str | None = None,
+        engine: InferenceEngine = InferenceEngine.VLLM,
+    ) -> str:
+        """Run the engine start script and extract model name from stdout."""
+        if engine == InferenceEngine.LLAMA_CPP:
+            script = "start-llamacpp.sh"
+        else:
+            script = "start-vllm.sh"
         command = self._script_command(
-            "start-vllm.sh", env=self._start_script_env(model)
+            script,
+            env=self._start_script_env(model, engine),
+            scripts_dir="auto-llamacpp" if engine == InferenceEngine.LLAMA_CPP else None,
         )
         model_name: str | None = None
         async for stream, line in self._ssh_client.run_streaming(hostname, command):
@@ -643,27 +707,35 @@ class NodeProvisioner:
 
         if model_name is None:
             raise ProvisioningError(
-                f"model name not found in start-vllm.sh output on {hostname}"
+                f"model name not found in {script} output on {hostname}"
             )
         return model_name
 
-    async def _tail_vllm_log(self, hostname: str) -> None:
-        """Tail vLLM log and feed lines into the provisioning log buffer."""
+    async def _tail_vllm_log(
+        self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
+    ) -> None:
+        """Tail engine log and feed lines into the provisioning log buffer."""
+        if engine == InferenceEngine.LLAMA_CPP:
+            log_path = "/var/log/llamacpp-serve.log"
+        else:
+            log_path = "/var/log/vllm-serve.log"
         try:
             async for _stream, line in self._ssh_client.run_streaming(
-                hostname, "tail -n +1 -f /var/log/vllm-serve.log"
+                hostname, f"tail -n +1 -f {log_path}"
             ):
-                self._log(hostname, "info", line, stream="vllm")
+                self._log(hostname, "info", line, stream=engine)
         except (SSHConnectionError, RemoteCommandError, asyncio.CancelledError):
             pass
 
-    async def _poll_health(self, hostname: str) -> None:
+    async def _poll_health(
+        self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
+    ) -> None:
         """Poll /health endpoint until 200 OK or timeout (D-10, D-09).
 
-        Tails /var/log/vllm-serve.log concurrently so vLLM startup output
-        appears in the live log pane while waiting.
+        Tails the engine log concurrently so startup output appears in
+        the live log pane while waiting.
         """
-        tail_task = asyncio.create_task(self._tail_vllm_log(hostname))
+        tail_task = asyncio.create_task(self._tail_vllm_log(hostname, engine))
 
         url = f"http://{hostname}:{self._settings.vllm_port}/health"
         deadline = (
@@ -702,7 +774,12 @@ class NodeProvisioner:
                 await tail_task
 
     async def _register_node(
-        self, hostname: str, model: str, *, managed: bool = True
+        self,
+        hostname: str,
+        model: str,
+        *,
+        managed: bool = True,
+        engine: InferenceEngine = InferenceEngine.VLLM,
     ) -> None:
         """Register node in etcd with correct fields (D-11, D-12)."""
         node = Node(
@@ -710,6 +787,7 @@ class NodeProvisioner:
             endpoint=self.validate_endpoint(hostname),
             status=NodeStatus.HEALTHY,
             model=model,
+            engine=engine,
             last_heartbeat=datetime.now(UTC),
             managed=managed,
         )
@@ -918,14 +996,23 @@ class NodeProvisioner:
         finally:
             lease.release()
 
+    def _detect_engine(self, hostname: str) -> InferenceEngine:
+        """Detect the engine from the registry for teardown dispatch."""
+        if self._registry is not None:
+            node = self._registry.get(hostname)
+            if node is not None:
+                return node.engine
+        return InferenceEngine.VLLM
+
     async def _teardown(self, hostname: str, *, force: bool = False) -> None:
         """Teardown a provisioned node.
 
-        Graceful: drain -> kill vllm -> deregister.
+        Graceful: drain -> stop engine -> deregister.
         Force: kill -9 -> deregister.
         """
+        engine = self._detect_engine(hostname)
         teardown_started_at = datetime.now(UTC)
-        logger.info("teardown_start", hostname=hostname, force=force)
+        logger.info("teardown_start", hostname=hostname, force=force, engine=engine)
         self._log_buffer.create(hostname)
         self._log(hostname, "info", f"Teardown started (force={force})")
 
@@ -940,15 +1027,19 @@ class NodeProvisioner:
                 await self._drain_wait(hostname)
                 self._log(hostname, "info", "Drain complete")
 
+            if engine == InferenceEngine.LLAMA_CPP:
+                stopping_step = ProvisioningStep.STOPPING_LLAMACPP
+            else:
+                stopping_step = ProvisioningStep.STOPPING_VLLM
             await self._update_state(
-                hostname, ProvisioningStep.STOPPING_VLLM, started_at=teardown_started_at
+                hostname, stopping_step, started_at=teardown_started_at
             )
-            self._log(hostname, "info", "Stopping vLLM process")
+            self._log(hostname, "info", f"Stopping {engine} process")
             # Existing nodes may predate stop-vllm.sh, and a cancelled setup
             # may not have reached its upload step. Refresh the bundle before
             # invoking the verified stop path.
             try:
-                await self._upload_scripts(hostname)
+                await self._upload_scripts(hostname, engine=engine)
             except Exception as exc:
                 # The refresh is upgrade compatibility, not a teardown
                 # precondition. The existing remote copy may still work; if
@@ -966,8 +1057,14 @@ class NodeProvisioner:
                     "Could not refresh teardown scripts; attempting the "
                     "existing remote stop script",
                 )
+            if engine == InferenceEngine.LLAMA_CPP:
+                stop_script = "stop-llamacpp.sh"
+            else:
+                stop_script = "stop-vllm.sh"
             stop_command = self._script_command(
-                "stop-vllm.sh", args=("--force",) if force else ()
+                stop_script,
+                args=("--force",) if force else (),
+                scripts_dir="auto-llamacpp" if engine == InferenceEngine.LLAMA_CPP else None,
             )
             await self._ssh_run_command(hostname, stop_command)
 

@@ -210,6 +210,8 @@ class ProvisioningSettings(BaseModel):
     nfs_mount_point: str = "/srv/hf-cache"
     nvidia_driver_version: str = DEFAULT_NVIDIA_DRIVER_VERSION
     nvidia_driver_sha256: str = DEFAULT_NVIDIA_DRIVER_SHA256
+    llamacpp_version: str = "b10242"
+    llamacpp_sha256: str = ""
 
     @field_validator("nvidia_driver_sha256")
     @classmethod

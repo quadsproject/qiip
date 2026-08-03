@@ -2,14 +2,14 @@
 
 [![CI](https://github.com/quadsproject/qiip/actions/workflows/ci.yml/badge.svg)](https://github.com/quadsproject/qiip/actions/workflows/ci.yml)
 
-A QUADS-native inference abstraction framework that fully automates installation, drivers, setup and presentation of disparate, free/idle GPU-equipped systems into a single unified usage interface and inference API.
+A QUADS-native inference abstraction framework that fully automates installation, drivers, setup and presentation of disparate, free/idle GPU-equipped systems into a single unified usage interface and inference API. QIIP profiles each node's hardware and automatically selects the best inference engine -- [vLLM](https://docs.vllm.ai/) for multi-GPU throughput or [llama.cpp](https://github.com/ggml-org/llama.cpp) for single-GPU and CPU-capable systems.
 
-QIIP provides a gateway service that proxies OpenAI-compatible requests to [vLLM](https://docs.vllm.ai/) inference nodes running on idle QUADS lab servers or standalone, free GPU-equipped hardware.  It dynamically discovers backends via etcd, health-checks them, and routes requests with automatic failover — so clients see a single, reliable endpoint.
+QIIP provides a gateway service that proxies OpenAI-compatible requests to inference nodes on idle QUADS lab servers or standalone, free GPU-equipped hardware. It dynamically discovers backends via etcd, health-checks them, and routes requests with automatic failover so clients see a single, reliable endpoint. Both engines expose OpenAI-compatible HTTP APIs; the proxy layer is engine-agnostic and the engine choice is invisible to API consumers. See [auto-vllm/](auto-vllm/README.md) and [auto-llamacpp/](auto-llamacpp/README.md) for engine-specific provisioning details.
 
 ```
 Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
                            │           ──► vLLM Node B
-                           │           ──► vLLM Node C
+                           │           ──► llama.cpp Node C
                            ▼
                           etcd
                      (service registry)
@@ -30,9 +30,9 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Operations dashboard** — interactive web UI at `/dashboard` with real-time node table, detail pages, and provisioning status
 - **QUADS integration** — background polling of QUADS inventory and availability; unified view merging QUADS hosts with etcd-registered nodes
 - **QUADS schedule enforcement** — automated teardown of managed nodes when QUADS reports an upcoming scheduling conflict
-- **End-to-end node provisioning** — SSH-based pipeline: BMC power-on, NVIDIA driver and CUDA toolkit install, vLLM setup, NFS mount, firewall, health poll, and etcd registration
+- **End-to-end node provisioning** — SSH-based pipeline: BMC power-on, NVIDIA driver and CUDA toolkit install, inference engine setup (vLLM or llama.cpp), NFS mount, firewall, health poll, and etcd registration
 - **Node teardown** — graceful shutdown with connection draining, force teardown option, and provisioning task cancellation
-- **Provisioning log streaming** — live SSE stream of provisioning and vLLM logs viewable in the dashboard
+- **Provisioning log streaming** — live SSE stream of provisioning and inference engine logs viewable in the dashboard
 - **BMC power management (Redfish)** — query and control node power state; supports On, ForceOff, GracefulRestart, and ForceRestart
 - **Model catalog** — scans shared NFS-mounted HuggingFace cache, verifies model completeness via tree manifests, exposed via `/admin/models/catalog`
 - **Background model downloads** — concurrent HuggingFace downloads with status tracking; duplicate-safe and re-downloadable after completion or failure
@@ -40,7 +40,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Request metrics** — per-model and per-node counters exposed via `/admin/metrics`
 - **Admin authentication** — HTTP Basic required on all `/admin/*` endpoints and `/dashboard*` pages; inference API remains public
 - **Backend endpoint allowlist** — configurable hostname wildcard, CIDR network, and port allowlists; rejects non-matching registrations with loopback-only defaults
-- **Client config downloads** — one-click download of OpenCode CLI and Pi coding agent configuration files from the dashboard and node detail pages; dashboard configs point at the proxy for load-balanced access, node detail configs point at individual vLLM endpoints
+- **Client config downloads** — one-click download of OpenCode CLI and Pi coding agent configuration files from the dashboard and node detail pages; dashboard configs point at the proxy for load-balanced access, node detail configs point at individual backend endpoints
 
 ## Table of Contents
 
@@ -86,7 +86,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 
 An etcd v3 service is required for persistent discovery, registration, and
 provisioning state, but a temporary outage does not prevent the gateway from
-starting. At least one healthy registered vLLM node is required to serve
+starting. At least one healthy registered inference node (vLLM or llama.cpp) is required to serve
 inference; health, discovery, dashboard, and provisioning functionality can
 start with an empty registry.
 

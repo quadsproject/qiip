@@ -53,9 +53,13 @@ async def _main(cache_dir: Path) -> None:
     started = asyncio.Event()
 
     async def blocked_provision(
-        hostname: str, *, managed: bool = True, model: str | None = None
+        hostname: str,
+        *,
+        managed: bool = True,
+        model: str | None = None,
+        engine: str = "vllm",
     ) -> None:
-        del hostname, managed, model
+        del hostname, managed, model, engine
         started.set()
         await asyncio.Event().wait()
 

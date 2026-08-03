@@ -13,6 +13,7 @@ from enum import Enum
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from inference_proxy.models.llmfit import ModelRecommendation, SystemInfo
+from inference_proxy.models.node import InferenceEngine
 
 
 class AdminNodeResponse(BaseModel):
@@ -64,6 +65,7 @@ class SetupRequest(BaseModel):
     hostname: str
     managed: bool = True
     model: str | None = Field(default=None, max_length=256)
+    engine: InferenceEngine = InferenceEngine.VLLM
 
     @field_validator("hostname")
     @classmethod

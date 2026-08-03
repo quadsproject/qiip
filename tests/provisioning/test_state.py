@@ -22,7 +22,7 @@ class TestProvisioningStepEnum:
     """ProvisioningStep has 13 members matching D-06 step sequence."""
 
     def test_member_count(self) -> None:
-        assert len(ProvisioningStep) == 20
+        assert len(ProvisioningStep) == 23
 
     def test_member_values(self) -> None:
         expected = {

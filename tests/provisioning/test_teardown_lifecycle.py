@@ -73,7 +73,7 @@ async def test_teardown_cancels_active_provision(
 
     monkeypatch.setattr(asyncio, "to_thread", run_inline)
 
-    async def block_health(_hostname: str) -> None:
+    async def block_health(_hostname: str, **_kwargs: object) -> None:
         poll_started.set()
         try:
             await asyncio.Event().wait()
@@ -269,7 +269,7 @@ async def test_failed_provision_does_not_resurrect_after_teardown(
     release_failure = asyncio.Event()
     upload_calls = 0
 
-    async def fail_upload(_hostname: str) -> None:
+    async def fail_upload(_hostname: str, **_kwargs: object) -> None:
         nonlocal upload_calls
         upload_calls += 1
         if upload_calls > 1:
@@ -334,7 +334,7 @@ async def test_failed_provision_does_not_resurrect_deleted_node(
     failure_reached = asyncio.Event()
     release_failure = asyncio.Event()
 
-    async def fail_upload(_hostname: str) -> None:
+    async def fail_upload(_hostname: str, **_kwargs: object) -> None:
         failure_reached.set()
         await release_failure.wait()
         raise RemoteCommandError("gpu01", "upload", 1)

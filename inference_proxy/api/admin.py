@@ -55,7 +55,7 @@ from inference_proxy.models.admin import (
     TeardownResponse,
 )
 from inference_proxy.models.endpoint import EndpointValidationError
-from inference_proxy.models.node import NodeStatus
+from inference_proxy.models.node import InferenceEngine, NodeStatus
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     ProvisioningCapacityError,
@@ -306,6 +306,7 @@ async def setup_node(
                     hostname,
                     managed=body.managed,
                     model=body.model,
+                    engine=body.engine,
                     lifecycle_lease=lease,
                 )
             finally:
@@ -532,7 +533,8 @@ async def get_recommendations(
             detail=f"Node '{hostname}' is not available for recommendations",
         ) from exc
 
-    registered = registry.get(hostname) is not None
+    node = registry.get(hostname)
+    registered = node is not None
     quads_available = False
     if poller is not None:
         inventory = {canonical_hostname(host.hostname) for host in poller.hosts}
@@ -548,7 +550,8 @@ async def get_recommendations(
         )
 
     try:
-        result = await runner.recommend(hostname)
+        engine = node.engine if node is not None else InferenceEngine.VLLM
+        result = await runner.recommend(hostname, engine=engine)
     except LLMFitTimeoutError as exc:
         logger.warning("llmfit_timeout", host=exc.host, timeout=exc.timeout)
         return JSONResponse(

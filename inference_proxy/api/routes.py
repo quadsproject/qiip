@@ -437,7 +437,7 @@ async def list_models(
                 "id": node.model,
                 "object": "model",
                 "created": 0,
-                "owned_by": "vllm",
+                "owned_by": node.engine,
             }
 
     return JSONResponse(
