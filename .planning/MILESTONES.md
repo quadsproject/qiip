@@ -1,5 +1,61 @@
 # Milestones
 
+## v1.9 Model Selection in Node Setup — SHIPPED 2026-07-29
+
+**Phases:** 1 | **Plans:** 1
+**Timeline:** 2026-07-29 (1 day)
+**Commits:** 1 feat
+**Requirements:** 3/3 complete (100%)
+
+### Key Accomplishments
+
+1. Model selector dropdown on node detail page populated from NFS model catalog API
+2. Setup blocked when no models downloaded, first model pre-selected when available
+
+**Archive:** [v1.9-ROADMAP.md](milestones/v1.9-ROADMAP.md) | [v1.9-REQUIREMENTS.md](milestones/v1.9-REQUIREMENTS.md)
+
+---
+
+## v1.8 Nodes Power Control — SHIPPED 2026-07-29
+
+**Phases:** 2 | **Plans:** 2
+**Timeline:** 2026-07-29 (1 day)
+**Commits:** 3 feat
+**Requirements:** 5/5 complete (100%)
+
+### Key Accomplishments
+
+1. BMC power state badge on node detail page with amber Unknown/error styling
+2. Power action buttons (Power On, Force Off, Graceful Restart, Force Restart) with context-aware visibility
+3. In-flight feedback with amber badge and disabled buttons during power operations
+
+**Archive:** [v1.8-ROADMAP.md](milestones/v1.8-ROADMAP.md) | [v1.8-REQUIREMENTS.md](milestones/v1.8-REQUIREMENTS.md)
+
+---
+
+## v1.6 LLMFit for Best Fit Models — SHIPPED 2026-07-26
+
+**Phases:** 5 | **Plans:** 7
+**Timeline:** 2026-07-24 to 2026-07-26 (3 days)
+**Commits:** 9 feat
+**Requirements:** 12/12 complete (100%)
+
+### Key Accomplishments
+
+1. llmfit Pydantic models, domain error hierarchy, and SSH-based LLMFitRunner with timeout protection
+2. Non-fatal llmfit installation during provisioning via soft_step wrapper
+3. Admin API endpoint GET /admin/nodes/{hostname}/recommendations with structured error responses
+4. SetupRequest.model field with VLLM_MODEL injection through provisioner (shlex.quote for shell safety)
+5. Dashboard recommendations card with button-triggered fetch for expensive remote operations
+
+### Known Deferred Items
+
+- Filtering/caching enhancements (FILT-01 through FILT-03, CACHE-01, FLEET-01) deferred to future milestone
+
+**Archive:** [v1.6-ROADMAP.md](milestones/v1.6-ROADMAP.md) | [v1.6-REQUIREMENTS.md](milestones/v1.6-REQUIREMENTS.md)
+
+---
+
 ## v1.7 HuggingFace Integration — SHIPPED 2026-07-29
 
 **Phases:** 3 | **Plans:** 5 | **Tests:** 568 | **LOC:** 16,237 (Python + HTML/CSS/JS)

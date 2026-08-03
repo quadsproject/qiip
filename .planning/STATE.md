@@ -1,52 +1,48 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.8
-milestone_name: Nodes Power Control
-status: executing
-stopped_at: Phase 33 context gathered
-last_updated: "2026-07-29T10:45:47.364Z"
-last_activity: 2026-07-29 -- Phase 33 execution started
+milestone: v1.9
+milestone_name: Model Selection in Node Setup
+status: complete
+stopped_at: All milestones through v1.9 shipped
+last_updated: "2026-08-03"
+last_activity: 2026-08-03 -- Milestones v1.6, v1.8, v1.9 archived
 progress:
-  total_phases: 2
-  completed_phases: 0
-  total_plans: 1
-  completed_plans: 0
-  percent: 0
+  total_phases: 35
+  completed_phases: 35
+  total_plans: 52
+  completed_plans: 52
+  percent: 100
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-07-29)
+See: .planning/PROJECT.md (updated 2026-08-03)
 
 **Core value:** Route inference requests to healthy vLLM nodes with automatic failover
-**Current focus:** Phase 33 — power-state-display
+**Current focus:** Planning next milestone
 
 ## Current Position
 
-Phase: 33 (power-state-display) — EXECUTING
-Plan: 1 of 1
-Status: Executing Phase 33
-Last activity: 2026-07-29 -- Phase 33 execution started
+All milestones through v1.9 shipped (35 phases, 52 plans).
+Last milestone shipped: 2026-07-29
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 49
-- Average duration: -
-- Total execution time: 0 hours
+- Total plans completed: 52
+- Milestones shipped: 10 (v1.0 through v1.9)
+- Timeline: 2026-06-02 to 2026-07-29 (57 days)
 
 ## Accumulated Context
 
 ### Decisions
 
 Decisions are logged in PROJECT.md Key Decisions table.
-
-- v1.8: Frontend-only milestone — backend power API (GET/POST /admin/nodes/{hostname}/power) and Redfish client already complete from v1.5
 
 ### Pending Todos
 
@@ -69,6 +65,5 @@ None active.
 
 ## Session Continuity
 
-Last session: 2026-07-29T10:11:17.697Z
-Stopped at: Phase 33 context gathered
-Resume file: .planning/phases/33-power-state-display/33-CONTEXT.md
+Last session: 2026-08-03
+Stopped at: All milestones archived
