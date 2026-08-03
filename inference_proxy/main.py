@@ -3,7 +3,7 @@
 Usage::
 
     # Development server
-    uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 8000
+    uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 8080
 
     # Programmatic access (tests)
     from inference_proxy.main import create_app

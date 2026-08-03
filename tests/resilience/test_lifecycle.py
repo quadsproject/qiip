@@ -42,14 +42,6 @@ def _bounded_health_worker(*args: object, **_kwargs: object) -> None:
     stop_event.wait(timeout=1)
 
 
-def _without_legacy_shutdown_delay(settings: Settings) -> Settings:
-    """Keep old-main comparisons behavioral instead of waiting 30 seconds."""
-    if "graceful_shutdown_timeout" not in type(settings.gateway).model_fields:
-        return settings
-    gateway = settings.gateway.model_copy(update={"graceful_shutdown_timeout": 0})
-    return settings.model_copy(update={"gateway": gateway})
-
-
 def test_lifespan_cancels_provision_before_etcd_close(
     tmp_path: Path,
 ) -> None:
@@ -90,9 +82,7 @@ async def test_lifespan_stops_enforcer_before_provisioner_and_etcd(
         base_url="http://quads.example.com",
         server_timezone="America/New_York",
     )
-    settings = _without_legacy_shutdown_delay(
-        test_settings.model_copy(update={"quads": quads})
-    )
+    settings = test_settings.model_copy(update={"quads": quads})
 
     with (
         patch("inference_proxy.main.EtcdClient", return_value=etcd),
@@ -132,7 +122,7 @@ async def test_gateway_shutdown_does_not_revoke_node_leases(
             new=_bounded_health_worker,
         ),
     ):
-        app = create_app(settings=_without_legacy_shutdown_delay(test_settings))
+        app = create_app(settings=test_settings)
         async with app.router.lifespan_context(app):
             pass
 
@@ -161,7 +151,7 @@ async def test_early_startup_failure_rolls_back_without_masking_error(
             side_effect=RuntimeError("catalog startup failed"),
         ),
     ):
-        app = create_app(settings=_without_legacy_shutdown_delay(test_settings))
+        app = create_app(settings=test_settings)
         with pytest.raises(RuntimeError, match="catalog startup failed"):
             async with app.router.lifespan_context(app):
                 pytest.fail("lifespan unexpectedly started")
@@ -198,7 +188,7 @@ async def test_late_startup_failure_closes_constructed_resources(
             side_effect=RuntimeError("proxy startup failed"),
         ),
     ):
-        app = create_app(settings=_without_legacy_shutdown_delay(test_settings))
+        app = create_app(settings=test_settings)
         with pytest.raises(RuntimeError, match="proxy startup failed"):
             async with app.router.lifespan_context(app):
                 pytest.fail("lifespan unexpectedly started")
@@ -232,7 +222,7 @@ async def test_uvicorn_drains_inflight_request_before_lifespan_cleanup(
         cleanup_started.set()
         await original_shutdown(service)
 
-    app = create_app(settings=_without_legacy_shutdown_delay(test_settings))
+    app = create_app(settings=test_settings)
 
     @app.get("/_test/inflight")
     async def inflight() -> dict[str, str]:

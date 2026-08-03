@@ -116,7 +116,6 @@ def test_lifespan_has_no_artificial_shutdown_gate(test_settings: Settings) -> No
     assert not (
         Path(__file__).parents[1] / "inference_proxy/resilience/shutdown.py"
     ).exists()
-    assert "graceful_shutdown_timeout" not in type(test_settings.gateway).model_fields
 
 
 def test_default_allowlist_rejects_lab_endpoint_from_admin_nodes(

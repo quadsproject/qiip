@@ -15,7 +15,6 @@ from pydantic import SecretStr
 
 from inference_proxy.config.settings import (
     AdminSettings,
-    GatewaySettings,
     HuggingFaceSettings,
     Settings,
 )
@@ -41,7 +40,6 @@ async def _main(cache_dir: Path) -> None:
     etcd.put.side_effect = lambda *_args: order.append("state-write")
     etcd.close.side_effect = lambda: order.append("etcd-close")
     settings = Settings(
-        gateway=GatewaySettings(host="127.0.0.1", port=9999),
         admin=AdminSettings(
             username="test-admin",
             password=SecretStr("test-password"),
@@ -51,9 +49,6 @@ async def _main(cache_dir: Path) -> None:
             nfs_export="storage.example:/exports/huggingface",
         ),
     )
-    if "graceful_shutdown_timeout" in type(settings.gateway).model_fields:
-        gateway = settings.gateway.model_copy(update={"graceful_shutdown_timeout": 0})
-        settings = settings.model_copy(update={"gateway": gateway})
 
     started = asyncio.Event()
 

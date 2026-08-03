@@ -22,7 +22,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Chat playground** — browser-based chat UI at `/chat` with markdown rendering and model selection
 - **Service discovery** — watches etcd for node registration/deregistration in real time
 - **Least-connections load balancing** — routes to the node with the fewest in-flight requests
-- **Automatic failover** — retries failed requests on alternate healthy nodes (configurable, default 3 attempts)
+- **Automatic failover** — retries transport, timeout, and 5xx failures on alternate healthy nodes before a response begins (configurable, default 3 attempts)
 - **Circuit breakers** — per-node circuit breakers trip after consecutive failures, preventing cascade
 - **Health checking** — background thread probes each node's `/health` endpoint; marks nodes unhealthy after repeated failures and recovers them automatically
 - **Graceful shutdown** — Uvicorn drains in-flight requests before application resources close; its server timeout remains configurable
@@ -50,16 +50,18 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Verify it's running](#verify-its-running)
   - [Send a request](#send-a-request)
   - [Use with the OpenAI Python SDK](#use-with-the-openai-python-sdk)
+  - [Chat playground](#chat-playground)
 - [API Endpoints](#api-endpoints)
   - [Administrative access](#administrative-access)
   - [Error responses](#error-responses)
 - [Configuration](#configuration)
   - [Upgrade requirements](#upgrade-requirements)
-  - [Gateway](#gateway)
+  - [Server launch](#server-launch)
   - [Admin authentication](#admin-authentication)
   - [etcd](#etcd)
   - [Routing](#routing)
   - [SSH and provisioning commands](#ssh-and-provisioning-commands)
+  - [HuggingFace model downloads](#huggingface-model-downloads)
   - [Proxy (HTTP client)](#proxy-http-client)
   - [Resilience](#resilience)
   - [Logging](#logging)
@@ -79,14 +81,20 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 
 - Python 3.12 or 3.13
 - [uv](https://github.com/astral-sh/uv) (package manager)
-- A running etcd cluster (v3 API)
-- One or more vLLM nodes registered in etcd
+- Node.js for the frontend behavioral tests (CI uses version 24; not required
+  at runtime)
+
+An etcd v3 service is required for persistent discovery, registration, and
+provisioning state, but a temporary outage does not prevent the gateway from
+starting. At least one healthy registered vLLM node is required to serve
+inference; health, discovery, dashboard, and provisioning functionality can
+start with an empty registry.
 
 ## Quick Start
 
 ```bash
 # Clone the repository
-git clone <repo-url> && cd inference-proxy
+git clone https://github.com/quadsproject/qiip.git && cd qiip
 
 # Install dependencies
 uv sync
@@ -100,7 +108,9 @@ cp .env.example .env
 uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 8080
 ```
 
-The gateway starts, connects to etcd, discovers available vLLM nodes, and begins accepting requests.
+The gateway starts even when etcd or inference nodes are temporarily
+unavailable. Its discovery workers reconnect to etcd in the background, and
+inference requests become routable after a healthy node is registered.
 
 The administrative API and dashboard use HTTP Basic authentication, which sends
 base64-encoded credentials—not encryption—on every request. A trusted work LAN
@@ -150,6 +160,16 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 ```
+
+### Chat playground
+
+The `/chat` playground saves its optional System Prompt in browser local
+storage and sends it to the backend as an OpenAI `system` message. Some model
+chat templates enforce strict user/assistant alternation and reject that role.
+If such a model reports that conversation roles must alternate, clear the
+System Prompt and retry. Failed turns are not retained in the next request's
+history; partial assistant text already shown after a connection failure is
+retained so the visible transcript and future context stay aligned.
 
 ## API Endpoints
 
@@ -255,16 +275,13 @@ QUADS availability endpoint accepts timezone-naive `YYYY-MM-DDTHH:MM` values,
 so the proxy converts its UTC scheduling deadline into that configured server
 timezone before querying availability.
 
-### Gateway
+### Server launch
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `INFERENCE_PROXY_GATEWAY__HOST` | `0.0.0.0` | Bind address |
-| `INFERENCE_PROXY_GATEWAY__PORT` | `8080` | Bind port |
-
-Uvicorn owns graceful request draining. Configure its
-`--timeout-graceful-shutdown <seconds>` launcher option when the default does
-not fit the deployment.
+Uvicorn owns the listening socket and graceful request draining. Configure the
+bind address and port with its `--host` and `--port` launcher options; there are
+no `INFERENCE_PROXY_GATEWAY__*` bind settings. Configure
+`--timeout-graceful-shutdown <seconds>` when Uvicorn's default drain timeout
+does not fit the deployment.
 
 ### Admin authentication
 
@@ -296,12 +313,15 @@ before a gateway outage longer than the active managed-node TTL.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INFERENCE_PROXY_ROUTING__STRATEGY` | `least_connections` | Load balancing strategy |
 | `INFERENCE_PROXY_ROUTING__MAX_ATTEMPTS` | `3` | Maximum total backend attempts, including the first request |
 | `INFERENCE_PROXY_ROUTING__TIMEOUT` | `30` | Total pre-response streaming handshake budget across all attempts (seconds) |
 | `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_HOSTS` | `["localhost"]` | Exact backend DNS names or `*.suffix` rules (JSON array) |
 | `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_NETWORKS` | `["127.0.0.0/8","::1/128"]` | Backend IP CIDR allowlist (JSON array) |
 | `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_PORTS` | `[8000]` | Backend TCP port allowlist (JSON array) |
+
+QIIP currently implements least-connections routing only. There is no strategy
+setting; adding another algorithm requires an implementation rather than a
+configuration-only change.
 
 The endpoint allowlist is intentionally loopback-only by default. Configure the
 GPU host suffixes or IP networks before upgrading an existing deployment;
@@ -351,6 +371,16 @@ Node-side launch tuning uses the `AUTOVLLM_*` namespace. The retired
 `start-vllm.sh`. All seven reserved legacy inputs, including `VLLM_MODEL` and
 `VLLM_PORT`, are removed from the child environment so script inputs cannot
 leak into the namespace reserved by vLLM itself.
+
+### HuggingFace model downloads
+
+The administrative download API currently accepts a repository ID without a
+revision. Each request therefore resolves that repository's default revision
+at download time. Re-downloading the same `repo_id` later can produce different
+weights, configuration, or chat templates, and the current status record does
+not preserve the resolved commit SHA. Revision recording or pinning is a
+separate implementation change; operators who require reproducibility should
+record the repository commit externally.
 
 ### Proxy (HTTP client)
 
@@ -465,8 +495,11 @@ inference_proxy/
 2. `NodeSelector` picks the healthiest node with the fewest active connections
 3. `ProxyClient` forwards the request to the vLLM backend via httpx
 4. On success, the response (or SSE stream) is relayed back to the client
-5. On failure, the circuit breaker records the failure and the request retries on a different node
-6. Once retries are exhausted, an OpenAI-format error is returned
+5. Upstream 4xx responses are returned verbatim and neither increment nor reset the circuit breaker
+6. Other exceptions record a circuit-breaker failure; non-retryable exceptions return a mapped error immediately
+7. Transport, timeout, and 5xx exceptions are retryable on another eligible node while the attempt budget remains
+8. Once an SSE response begins, stream failures are returned as an in-band error event followed by `[DONE]` without failover
+9. When pre-response retries are exhausted, an OpenAI-format error and failover headers are returned
 
 ### Background threads
 
@@ -480,7 +513,7 @@ inference_proxy/
 
 ```bash
 # Install all dependencies (including dev)
-uv sync
+uv sync --locked --all-groups
 
 # Activate the virtual environment (optional — uv run handles this)
 source .venv/bin/activate
@@ -490,39 +523,39 @@ source .venv/bin/activate
 
 ```bash
 # All tests
-uv run pytest
+uv run --frozen pytest
 
 # With branch coverage (the same gate used by CI)
 uv run --frozen coverage run -m pytest
 uv run --frozen coverage report
 
 # Specific module
-uv run pytest tests/api/test_routes.py -v
+uv run --frozen pytest tests/api/test_routes.py -v
 ```
 
 Coverage is measured over `inference_proxy` with branch tracking enabled. CI
-enforces a 91% combined statement-and-branch floor against the 91.75% baseline
-measured when the gate was introduced. This floor prevents new untested code from
-materially reducing coverage; it does not prove that covered behavior is asserted
-correctly.
+enforces a 91% combined statement-and-branch floor. The measured total was
+91.75% when the gate was introduced and may move as code is added or removed.
+The floor prevents new untested code from materially reducing coverage; it
+does not prove that covered behavior is asserted correctly.
 
 ### Lint and format
 
 ```bash
 # Check lint
-uv run ruff check .
+uv run --frozen ruff check .
 
 # Auto-fix lint issues
-uv run ruff check --fix .
+uv run --frozen ruff check --fix .
 
 # Format code
-uv run ruff format .
+uv run --frozen ruff format .
 ```
 
 ### Type check
 
 ```bash
-uv run mypy inference_proxy
+uv run --frozen mypy inference_proxy tests
 ```
 
 ## Technology Stack

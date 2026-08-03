@@ -39,13 +39,6 @@ def _validate_sha256(value: str, *, setting: str) -> str:
     return normalized
 
 
-class GatewaySettings(BaseModel):
-    """Gateway server configuration."""
-
-    host: str = "0.0.0.0"
-    port: int = 8080
-
-
 class EtcdSettings(BaseModel):
     """etcd service discovery configuration."""
 
@@ -72,7 +65,6 @@ class EtcdSettings(BaseModel):
 class RoutingSettings(BaseModel):
     """Request routing and load balancing configuration."""
 
-    strategy: str = "least_connections"
     max_attempts: int = Field(default=3, ge=1)
     timeout: int = 30
     allowed_endpoint_hosts: list[str] = Field(default_factory=lambda: ["localhost"])
@@ -429,7 +421,7 @@ class Settings(BaseSettings):
     Loads configuration from environment variables with the prefix
     ``INFERENCE_PROXY_`` and nested delimiter ``__``.
 
-    Example env var: ``INFERENCE_PROXY_GATEWAY__PORT=9090``
+    Example env var: ``INFERENCE_PROXY_ROUTING__MAX_ATTEMPTS=4``
     """
 
     model_config = SettingsConfigDict(
@@ -439,7 +431,6 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
     )
 
-    gateway: GatewaySettings = GatewaySettings()
     etcd: EtcdSettings = EtcdSettings()
     routing: RoutingSettings = RoutingSettings()
     proxy: ProxySettings = ProxySettings()

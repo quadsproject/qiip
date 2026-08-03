@@ -43,7 +43,13 @@ uv run uvicorn inference_proxy.main:create_app \
 
 Update systemd units, containers, shell wrappers, probes, and development commands that still name `inference_proxy.main:app`.
 
-### 2. Move graceful-drain timeout ownership to Uvicorn
+### 2. Move server ownership to Uvicorn
+
+`INFERENCE_PROXY_GATEWAY__HOST` and `INFERENCE_PROXY_GATEWAY__PORT` never
+controlled the listening socket and have been removed. They are silently
+ignored. Configure the bind address and port with Uvicorn's `--host` and
+`--port` launcher options shown above, then remove the obsolete environment
+variables.
 
 `INFERENCE_PROXY_GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT` has been removed and is silently ignored. Uvicorn stops accepting requests and drains in-flight work before application lifespan cleanup begins, so configure its server-owned option instead:
 
@@ -93,6 +99,11 @@ The configured provisioning vLLM port must be in the allowed-port list. Setup va
 | 3 | 4 | 3 | 4 |
 
 Copying an existing value of 3 therefore loses one backend attempt unless it is changed to 4. The same total-attempt budget applies to non-streaming requests and the pre-response streaming handshake.
+
+`INFERENCE_PROXY_ROUTING__STRATEGY` was also accepted but never changed
+routing; QIIP has always used least-connections selection. The inert setting
+has been removed and is silently ignored. There is no replacement unless
+another routing strategy is implemented.
 
 ### 6. Mark externally registered nodes as managed explicitly
 

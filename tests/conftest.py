@@ -45,7 +45,6 @@ from inference_proxy.config.dependencies import (
 from inference_proxy.config.settings import (
     AdminSettings,
     EtcdSettings,
-    GatewaySettings,
     HuggingFaceSettings,
     RoutingSettings,
     Settings,
@@ -66,13 +65,10 @@ from inference_proxy.services.unified_nodes import UnifiedNodeService
 def test_settings() -> Settings:
     """Return a Settings instance with test-safe defaults."""
     return Settings(
-        gateway=GatewaySettings(host="127.0.0.1", port=9999),
         etcd=EtcdSettings(
             endpoints=["http://localhost:2379"], node_prefix="/test-nodes/"
         ),
-        routing=RoutingSettings(
-            strategy="least_connections", max_attempts=3, timeout=5
-        ),
+        routing=RoutingSettings(max_attempts=3, timeout=5),
         admin=AdminSettings(
             username=_TEST_ADMIN_USERNAME,
             password=SecretStr(_TEST_ADMIN_PASSWORD),

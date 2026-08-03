@@ -14,7 +14,6 @@ from inference_proxy.config.settings import (
     AdminSettings,
     DashboardSettings,
     EtcdSettings,
-    GatewaySettings,
     HuggingFaceSettings,
     LLMFitSettings,
     LoggingSettings,
@@ -78,13 +77,6 @@ class TestAdminSettings:
         assert settings.admin.password.get_secret_value() == "admin-secret"
 
 
-class TestDefaultGatewaySettings:
-    def test_default_gateway_settings(self) -> None:
-        settings = Settings(_env_file=None)
-        assert settings.gateway.host == "0.0.0.0"
-        assert settings.gateway.port == 8080
-
-
 class TestLoggingSettings:
     @pytest.mark.parametrize(
         ("configured", "canonical"),
@@ -137,7 +129,6 @@ class TestDefaultEtcdSettings:
 class TestDefaultRoutingSettings:
     def test_default_routing_settings(self) -> None:
         settings = Settings(_env_file=None)
-        assert settings.routing.strategy == "least_connections"
         assert settings.routing.max_attempts == 3
         assert settings.routing.timeout == 30
         assert settings.routing.allowed_endpoint_hosts == ["localhost"]
@@ -187,13 +178,14 @@ class TestDefaultRoutingSettings:
 class TestPreAdoptionSettingsCleanup:
     def test_removed_compatibility_fields_are_absent(self) -> None:
         """Guard only the retired fields, without freezing unrelated settings."""
-        affected_models = (GatewaySettings, RoutingSettings, ProvisioningSettings)
+        affected_models = (RoutingSettings, ProvisioningSettings)
         assert all(
             not field_name.startswith("retired_")
             for model in affected_models
             for field_name in model.model_fields
         )
-        assert "graceful_shutdown_timeout" not in GatewaySettings.model_fields
+        assert "gateway" not in Settings.model_fields
+        assert "strategy" not in RoutingSettings.model_fields
         assert "health_check_interval" not in RoutingSettings.model_fields
         assert "llmfit_version" not in ProvisioningSettings.model_fields
         assert "nfs_server" not in ProvisioningSettings.model_fields
@@ -208,6 +200,9 @@ class TestPreAdoptionSettingsCleanup:
             "INFERENCE_PROXY_GATEWAY__GRACEFUL_SHUTDOWN_TIMEOUT",
             "60",
         )
+        monkeypatch.setenv("INFERENCE_PROXY_GATEWAY__HOST", "127.0.0.1")
+        monkeypatch.setenv("INFERENCE_PROXY_GATEWAY__PORT", "9090")
+        monkeypatch.setenv("INFERENCE_PROXY_ROUTING__STRATEGY", "round_robin")
         monkeypatch.setenv("INFERENCE_PROXY_ROUTING__HEALTH_CHECK_INTERVAL", "5")
         monkeypatch.setenv(
             "INFERENCE_PROXY_PROVISIONING__LLMFIT_VERSION",
@@ -227,15 +222,6 @@ class TestPreAdoptionSettingsCleanup:
         assert settings.huggingface.nfs_export is None
 
 
-class TestEnvVarOverrideGatewayPort:
-    def test_env_var_override_gateway_port(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("INFERENCE_PROXY_GATEWAY__PORT", "9090")
-        settings = Settings(_env_file=None)
-        assert settings.gateway.port == 9090
-
-
 class TestEnvVarOverrideEtcdPrefix:
     def test_env_var_override_etcd_prefix(
         self, monkeypatch: pytest.MonkeyPatch
@@ -245,14 +231,7 @@ class TestEnvVarOverrideEtcdPrefix:
         assert settings.etcd.node_prefix == "/test-nodes/"
 
 
-class TestEnvVarOverrideRoutingStrategy:
-    def test_env_var_override_routing_strategy(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("INFERENCE_PROXY_ROUTING__STRATEGY", "round_robin")
-        settings = Settings(_env_file=None)
-        assert settings.routing.strategy == "round_robin"
-
+class TestEnvVarOverrideRoutingAllowlist:
     def test_endpoint_allowlist_env_overrides(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -293,11 +272,9 @@ class TestEnvVarOverrideDashboardPollInterval:
 
 class TestSubModelsAreNotBaseSettings:
     def test_sub_models_are_not_base_settings(self) -> None:
-        assert not issubclass(GatewaySettings, BaseSettings)
         assert not issubclass(EtcdSettings, BaseSettings)
         assert not issubclass(RoutingSettings, BaseSettings)
         assert not issubclass(DashboardSettings, BaseSettings)
-        assert issubclass(GatewaySettings, BaseModel)
         assert issubclass(EtcdSettings, BaseModel)
         assert issubclass(RoutingSettings, BaseModel)
         assert issubclass(DashboardSettings, BaseModel)
