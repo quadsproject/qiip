@@ -468,13 +468,19 @@ source .venv/bin/activate
 # All tests
 uv run pytest
 
-# With coverage
-uv run coverage run -m pytest
-uv run coverage report
+# With branch coverage (the same gate used by CI)
+uv run --frozen coverage run -m pytest
+uv run --frozen coverage report
 
 # Specific module
 uv run pytest tests/api/test_routes.py -v
 ```
+
+Coverage is measured over `inference_proxy` with branch tracking enabled. CI
+enforces a 91% combined statement-and-branch floor against the 91.75% baseline
+measured when the gate was introduced. This floor prevents new untested code from
+materially reducing coverage; it does not prove that covered behavior is asserted
+correctly.
 
 ### Lint and format
 

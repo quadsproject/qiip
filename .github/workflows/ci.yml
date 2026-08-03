@@ -68,8 +68,10 @@ jobs:
       - name: Type check
         run: uv run --frozen mypy inference_proxy tests
 
-      - name: Test
-        run: uv run --frozen pytest
+      - name: Test with coverage
+        run: |
+          uv run --frozen coverage run -m pytest
+          uv run --frozen coverage report
 
   compatibility:
     name: Python 3.13

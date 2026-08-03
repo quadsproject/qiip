@@ -299,6 +299,46 @@ class TestHealthyNodeStaysHealthy:
 class TestUnhealthyAfterThreeFailures:
     """3 consecutive probe failures mark a node UNHEALTHY (D-03)."""
 
+    def test_successful_probe_resets_consecutive_failure_budget(self) -> None:
+        """A successful probe restores the full three-failure budget."""
+        registry = NodeRegistry()
+        registry.add(_make_node())
+        failures = _FailureCounts()
+        client = MagicMock(spec=httpx.Client)
+        cb_registry = CircuitBreakerRegistry()
+
+        def probe(status_code: int) -> None:
+            client.get.return_value = MagicMock(status_code=status_code)
+            _probe_all_nodes(
+                registry,
+                cb_registry,
+                client,
+                failures,
+                failure_threshold=3,
+            )
+
+        try:
+            probe(500)
+            probe(500)
+            probe(200)
+
+            probe(500)
+            current = registry.get("node-1")
+            assert current is not None
+            assert current.status == NodeStatus.HEALTHY
+
+            probe(500)
+            current = registry.get("node-1")
+            assert current is not None
+            assert current.status == NodeStatus.HEALTHY
+
+            probe(500)
+            current = registry.get("node-1")
+            assert current is not None
+            assert current.status == NodeStatus.UNHEALTHY
+        finally:
+            failures.close()
+
     def test_three_failures_marks_unhealthy(self) -> None:
         registry = NodeRegistry()
         node = _make_node()
