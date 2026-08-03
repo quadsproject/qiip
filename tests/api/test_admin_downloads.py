@@ -108,3 +108,53 @@ class TestListDownloads:
         assert len(data) == 2
         repo_ids = {d["repo_id"] for d in data}
         assert repo_ids == {"org/model-a", "org/model-b"}
+
+
+class TestDownloadAllowPatterns:
+    """POST /admin/models/download passes allow_patterns to service."""
+
+    def test_passes_allow_patterns(
+        self,
+        app: FastAPI,
+        client: TestClient,
+    ) -> None:
+        mock_svc: MagicMock = app.state.download_service
+        mock_svc.trigger_download.return_value = DownloadTriggerResult(
+            status=DownloadStatusResponse(
+                repo_id="org/model-GGUF",
+                status=DownloadState.DOWNLOADING,
+                started_at=datetime.now(UTC),
+            ),
+            started=True,
+        )
+
+        response = client.post(
+            "/admin/models/download",
+            json={"repo_id": "org/model-GGUF", "allow_patterns": ["*q4_k_m*"]},
+        )
+
+        assert response.status_code == 202
+        mock_svc.trigger_download.assert_awaited_once_with(
+            "org/model-GGUF", allow_patterns=["*q4_k_m*"]
+        )
+
+    def test_defaults_to_none_without_patterns(
+        self,
+        app: FastAPI,
+        client: TestClient,
+    ) -> None:
+        mock_svc: MagicMock = app.state.download_service
+        mock_svc.trigger_download.return_value = DownloadTriggerResult(
+            status=DownloadStatusResponse(
+                repo_id="org/model",
+                status=DownloadState.DOWNLOADING,
+                started_at=datetime.now(UTC),
+            ),
+            started=True,
+        )
+
+        client.post("/admin/models/download", json={"repo_id": "org/model"})
+
+        mock_svc.trigger_download.assert_awaited_once_with(
+            "org/model", allow_patterns=None
+        )

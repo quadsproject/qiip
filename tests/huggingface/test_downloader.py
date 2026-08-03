@@ -238,6 +238,44 @@ class TestDownloadShutdown:
         assert result.returncode == 0, result.stderr
 
 
+class TestAllowPatterns:
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.downloader.snapshot_download")
+    async def test_passes_allow_patterns_to_snapshot_download(
+        self, mock_sd: MagicMock
+    ) -> None:
+        svc = DownloadService(cache_dir="/tmp/test", token="tok")
+        await svc.trigger_download("org/model-GGUF", allow_patterns=["*q4_k_m*"])
+        await asyncio.sleep(0.1)
+
+        mock_sd.assert_called_once()
+        call_kwargs = mock_sd.call_args
+        assert call_kwargs.kwargs.get("allow_patterns") == ["*q4_k_m*"]
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.downloader.snapshot_download")
+    async def test_omits_allow_patterns_when_none(self, mock_sd: MagicMock) -> None:
+        svc = DownloadService(cache_dir="/tmp/test", token="tok")
+        await svc.trigger_download("org/model")
+        await asyncio.sleep(0.1)
+
+        mock_sd.assert_called_once()
+        call_kwargs = mock_sd.call_args
+        assert "allow_patterns" not in call_kwargs.kwargs
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.downloader.snapshot_download")
+    async def test_different_patterns_are_separate_downloads(
+        self, mock_sd: MagicMock
+    ) -> None:
+        svc = DownloadService(cache_dir="/tmp/test", token="tok")
+        first = await svc.trigger_download("org/model", allow_patterns=["*q4*"])
+        second = await svc.trigger_download("org/model", allow_patterns=["*q8*"])
+
+        assert first.started is True
+        assert second.started is True
+
+
 class TestGetAllStatuses:
     @pytest.mark.asyncio
     @patch("inference_proxy.huggingface.downloader.snapshot_download")

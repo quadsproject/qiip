@@ -179,7 +179,9 @@ async def trigger_download(
     Returns 202 for new downloads. Duplicate POSTs for an in-progress
     download return 200 with the existing status (D-10).
     """
-    result = await svc.trigger_download(body.repo_id)
+    result = await svc.trigger_download(
+        body.repo_id, allow_patterns=body.allow_patterns
+    )
     response.status_code = 202 if result.started else 200
     return result.status
 

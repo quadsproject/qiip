@@ -90,17 +90,31 @@ class DownloadService:
         with self._lock:
             return list(self._statuses.values())
 
-    async def trigger_download(self, repo_id: str) -> DownloadTriggerResult:
+    @staticmethod
+    def _dedup_key(repo_id: str, allow_patterns: list[str] | None) -> str:
+        if not allow_patterns:
+            return repo_id
+        return f"{repo_id}::{','.join(sorted(allow_patterns))}"
+
+    async def trigger_download(
+        self,
+        repo_id: str,
+        allow_patterns: list[str] | None = None,
+    ) -> DownloadTriggerResult:
         """Start a background download for *repo_id*.
 
         The result identifies atomically whether this call started the download
         or found one already in progress (D-10). Allows re-download if a
         previous attempt completed or failed (D-11).
+
+        Pass *allow_patterns* to filter files (e.g. ``["*q4_k_m*"]`` for
+        a specific GGUF quantization).
         """
+        key = self._dedup_key(repo_id, allow_patterns)
         with self._lock:
             if self._closed:
                 raise RuntimeError("download service is shutting down")
-            existing = self._statuses.get(repo_id)
+            existing = self._statuses.get(key)
             if existing is not None and existing.status == DownloadState.DOWNLOADING:
                 return DownloadTriggerResult(status=existing, started=False)
 
@@ -109,47 +123,55 @@ class DownloadService:
                 status=DownloadState.DOWNLOADING,
                 started_at=datetime.now(UTC),
             )
-            self._statuses[repo_id] = status
+            self._statuses[key] = status
 
-        task = asyncio.create_task(self._run_download(repo_id))
+        task = asyncio.create_task(
+            self._run_download(key, repo_id, allow_patterns=allow_patterns)
+        )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return DownloadTriggerResult(status=status, started=True)
 
-    async def _run_download(self, repo_id: str) -> None:
+    async def _run_download(
+        self,
+        key: str,
+        repo_id: str,
+        allow_patterns: list[str] | None = None,
+    ) -> None:
         """Execute the download, gated by the concurrency semaphore."""
         async with self._ensure_semaphore():
             log = logger.bind(repo_id=repo_id)
             log.info("download started")
+            download_kwargs: dict[str, object] = {
+                "cache_dir": self._cache_dir,
+                "token": self._token,
+            }
+            if allow_patterns:
+                download_kwargs["allow_patterns"] = allow_patterns
             try:
                 await _run_in_daemon_thread(
-                    partial(
-                        snapshot_download,
-                        repo_id,
-                        cache_dir=self._cache_dir,
-                        token=self._token,
-                    ),
+                    partial(snapshot_download, repo_id, **download_kwargs),
                     name=f"huggingface-download:{repo_id}",
                 )
             except GatedRepoError:
                 self._set_failed(
-                    repo_id, f"Repository '{repo_id}' requires access approval"
+                    key, f"Repository '{repo_id}' requires access approval"
                 )
                 return
             except RepositoryNotFoundError:
-                self._set_failed(repo_id, f"Repository '{repo_id}' not found")
+                self._set_failed(key, f"Repository '{repo_id}' not found")
                 return
             except RevisionNotFoundError:
-                self._set_failed(repo_id, f"Revision not found for '{repo_id}'")
+                self._set_failed(key, f"Revision not found for '{repo_id}'")
                 return
             except Exception as exc:
-                self._set_failed(repo_id, str(exc))
+                self._set_failed(key, str(exc))
                 return
 
             now = datetime.now(UTC)
             with self._lock:
-                prev = self._statuses[repo_id]
-                self._statuses[repo_id] = DownloadStatusResponse(
+                prev = self._statuses[key]
+                self._statuses[key] = DownloadStatusResponse(
                     repo_id=repo_id,
                     status=DownloadState.COMPLETE,
                     started_at=prev.started_at,
@@ -172,15 +194,15 @@ class DownloadService:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    def _set_failed(self, repo_id: str, error: str) -> None:
+    def _set_failed(self, key: str, error: str) -> None:
         now = datetime.now(UTC)
         with self._lock:
-            prev = self._statuses[repo_id]
-            self._statuses[repo_id] = DownloadStatusResponse(
-                repo_id=repo_id,
+            prev = self._statuses[key]
+            self._statuses[key] = DownloadStatusResponse(
+                repo_id=prev.repo_id,
                 status=DownloadState.FAILED,
                 started_at=prev.started_at,
                 completed_at=now,
                 error=error,
             )
-        logger.error("download failed", repo_id=repo_id, error=error)
+        logger.error("download failed", key=key, error=error)

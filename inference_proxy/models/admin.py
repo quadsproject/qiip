@@ -157,6 +157,7 @@ class DownloadRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     repo_id: str
+    allow_patterns: list[str] | None = None
 
 
 class DownloadStatusResponse(BaseModel):
