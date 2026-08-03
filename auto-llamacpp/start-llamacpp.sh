@@ -45,7 +45,7 @@ find_gguf_model() {
     if [ -d "$gguf_dir" ]; then
         if [ -n "$model_name" ]; then
             local model_pattern
-            model_pattern=$(echo "$model_name" | sed 's|/|--|g')
+            model_pattern="${model_name//\//--}"
             mapfile -t candidates < <(
                 find "$gguf_dir" -path "*${model_pattern}*" -name "*${quant_lower}*" -name "*.gguf" -type f 2>/dev/null
             )

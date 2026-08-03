@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2034
 set -euo pipefail
 
 # --- Configurable defaults (shared vars use AUTOVLLM_ prefix for compat) ---
@@ -42,7 +43,7 @@ unset AUTOVLLM_LLMFIT_BIN AUTOVLLM_TMP_DIR AUTOLLAMACPP_SCRIPT_DIR
 unset AUTOLLAMACPP_VERSION AUTOLLAMACPP_SHA256
 
 # Source shared setup functions
-# shellcheck source=../common/setup-base.sh
+# shellcheck disable=SC1091 source=../common/setup-base.sh
 source "$(cd -- "${SCRIPT_DIR}/.." && pwd)/common/setup-base.sh"
 
 # --- llama.cpp-specific functions ---

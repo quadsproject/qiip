@@ -63,7 +63,7 @@ jobs:
           uv sync --project auto-vllm --frozen --no-dev --no-install-project --no-build --python 3.12 --python-platform x86_64-manylinux_2_34 --dry-run
 
       - name: Check node scripts
-        run: shellcheck auto-vllm/*.sh
+        run: shellcheck auto-vllm/*.sh auto-llamacpp/*.sh common/*.sh
 
       - name: Type check
         run: uv run --frozen mypy inference_proxy tests

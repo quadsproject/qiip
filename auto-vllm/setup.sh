@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2034
 set -euo pipefail
 
 # --- Configurable defaults ---
@@ -50,7 +51,7 @@ unset AUTOVLLM_VENV AUTOVLLM_LLMFIT_BIN AUTOVLLM_TMP_DIR
 unset AUTOVLLM_UV_BIN AUTOVLLM_UV_PROJECT AUTOVLLM_SCRIPT_DIR FLASHINFER_INDEX_URL
 
 # Source shared setup functions
-# shellcheck source=../common/setup-base.sh
+# shellcheck disable=SC1091 source=../common/setup-base.sh
 source "$(cd -- "${SCRIPT_DIR}/.." && pwd)/common/setup-base.sh"
 
 # --- vLLM-specific functions ---
