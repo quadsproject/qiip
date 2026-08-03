@@ -11,6 +11,7 @@ from typing import cast
 import pytest
 from structlog.testing import capture_logs
 
+import inference_proxy.discovery.watcher as watcher_module
 from inference_proxy.discovery.etcd_client import (
     EtcdClient,
     WatchCompactedError,
@@ -222,6 +223,11 @@ def _stop_watcher(
 def _wait_for_stream(stream: _FakeStream) -> bool:
     """Bound waiting for a revision-aware watch stream to start."""
     return stream.started.wait(timeout=_TIMEOUT)
+
+
+def test_run_watcher_compatibility_entry_point_is_removed() -> None:
+    """Prevent restoring the orphaned pre-adoption compatibility wrapper."""
+    assert "run_watcher" not in vars(watcher_module)
 
 
 def test_start_watcher_does_not_hide_constructor_type_error(

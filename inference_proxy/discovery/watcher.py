@@ -161,25 +161,6 @@ class EtcdWatcher:
                 self._active_stream = None
 
 
-def run_watcher(
-    etcd_client: EtcdClient,
-    registry: NodeRegistry,
-    stop_event: threading.Event,
-    endpoint_policy: EndpointPolicy,
-    lease_manager: NodeLeaseManager | None = None,
-    retry_delay: float = 5.0,
-) -> None:
-    """Compatibility entry point for callers that do not need direct stop()."""
-    EtcdWatcher(
-        etcd_client,
-        registry,
-        stop_event,
-        endpoint_policy,
-        lease_manager,
-        retry_delay,
-    ).run()
-
-
 def _reconcile_snapshot(
     snapshot: EtcdSnapshot,
     registry: NodeRegistry,
