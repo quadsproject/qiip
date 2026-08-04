@@ -1,43 +1,65 @@
 # auto-llamacpp
 
-Provision and run llama.cpp (llama-server) directly on bare-metal GPU nodes.
+Provision and run CUDA-enabled llama.cpp (`llama-server`) directly on
+bare-metal NVIDIA GPU nodes.
 
 ## Prerequisites
 
 - RHEL 9-compatible Linux on x86_64
-- NVIDIA GPU (optional; CPU-only inference is supported)
-- Reachable NFS export for the shared HuggingFace cache with GGUF models
-  in the `gguf/` subdirectory
+- An NVIDIA GPU and access to the configured NVIDIA package repositories;
+  setup installs or validates the driver and CUDA toolkit
+- Reachable NFS export for the shared HuggingFace cache with GGUF models in the
+  `gguf/` subdirectory
 
-## Binary acquisition
+QIIP-managed provisioning requires CUDA and fails before starting an engine if
+GPU verification fails. The start script retains a standalone CPU branch for
+direct development use, but CPU-only nodes are not a supported QIIP-managed
+deployment target.
 
-`setup.sh` downloads a pre-built CUDA binary from the llama.cpp GitHub
-releases and verifies its SHA-256 when a digest is configured. The binary
-is installed to `/usr/local/bin/llama-server`. The `llama-quantize` tool is
-also installed when present in the release archive.
+## Verified source build
 
-The version is a build tag (e.g. `b10242`). llama.cpp ships multiple builds
-per day with no LTS, so pinning is essential.
+Linux CUDA archives are not published for the pinned `b10242` release.
+`setup.sh` therefore downloads the pinned GitHub tag source archive, verifies
+its committed SHA-256 before extraction, and compiles `llama-server` and
+`llama-quantize` with `GGML_CUDA=ON` and the attached GPUs' native CUDA
+architecture.
+
+Installations are immutable and build-identified under
+`/opt/llama.cpp/<version>-<identity>`. The two public binaries in
+`/usr/local/bin` are replaced with same-directory atomic symlink renames only
+after the new build reports the configured version. Repeating setup with the
+same source digest and GPU capabilities reuses that installation.
+
+The full llama.cpp setup command has a separate two-hour default deadline
+(`INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT`) because it includes
+package setup and a CUDA compilation. Its 15-minute SSH inactivity deadline
+still applies, so build output remains a liveness signal.
 
 ### Bumping the llama.cpp version
 
-1. Pick a release tag from https://github.com/ggml-org/llama.cpp/releases
-2. Download the CUDA binary for your platform and compute the SHA-256:
+1. Pick a `b<number>` tag from <https://github.com/ggml-org/llama.cpp/releases>.
+2. Download the tag source archive and compute its SHA-256:
+
    ```bash
-   curl -fSL -o llamacpp.tar.gz \
-     "https://github.com/ggml-org/llama.cpp/releases/download/b12345/llama-b12345-bin-ubuntu-x64-cuda-cu12.2.tar.gz"
-   sha256sum llamacpp.tar.gz
+   curl -fSL -o llama.cpp-b12345.tar.gz \
+     "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b12345.tar.gz"
+   sha256sum llama.cpp-b12345.tar.gz
    ```
-3. Update the provisioning settings:
+
+3. Configure the matching version and digest:
+
    ```dotenv
    INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION=b12345
    INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256=<hash-from-step-2>
    ```
-   Or update the defaults in `inference_proxy/config/settings.py`.
-4. Test provisioning on a single node before fleet rollout.
 
-The `install_llamacpp()` function is idempotent and skips download when the
-installed version already matches.
+   A custom version without an explicitly configured digest fails validation.
+   A mirror can be selected with
+   `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL`, but the downloaded bytes
+   must match the configured digest.
+
+4. Validate the CUDA build and launch on representative fleet GPU models before
+   rollout.
 
 ## Shared setup infrastructure
 
@@ -60,7 +82,7 @@ compatibility with existing provisioning infrastructure.
 
 ## Run
 
-Start llama-server (auto-detects GPU and selects a GGUF model):
+Start llama-server (detects the GPU and selects a GGUF model):
 
 ```bash
 ./start-llamacpp.sh
@@ -73,6 +95,12 @@ Script-specific launch overrides use the `AUTOLLAMACPP_*` namespace:
 `AUTOLLAMACPP_MODEL`, `AUTOLLAMACPP_PORT`, `AUTOLLAMACPP_GPU_LAYERS`,
 `AUTOLLAMACPP_CTX_SIZE`, `AUTOLLAMACPP_PARALLEL`, `AUTOLLAMACPP_BATCH_SIZE`,
 `AUTOLLAMACPP_QUANTIZATION`, and `AUTOLLAMACPP_EXTRA_ARGS`.
+
+The launcher clears inherited `LLAMA_ARG_*` variables before invoking
+`llama-server`; only the reviewed command-line arguments and the
+`AUTOLLAMACPP_*` inputs above control the child process. CUDA is required by
+default. A standalone user deliberately exercising the retained CPU path must
+opt out explicitly with `AUTOLLAMACPP_REQUIRE_CUDA=0`.
 
 Context size is divided across parallel slots. If `AUTOLLAMACPP_CTX_SIZE=8192`
 and `AUTOLLAMACPP_PARALLEL=4`, each slot gets 2048 tokens.

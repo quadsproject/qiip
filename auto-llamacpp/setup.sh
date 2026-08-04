@@ -32,15 +32,31 @@ LLMFIT_URL="${LLMFIT_URL:-https://github.com/AlexsJones/llmfit/releases/download
 LLMFIT_BIN="${AUTOVLLM_LLMFIT_BIN:-/usr/local/bin/llmfit}"
 INSTALL_TMP_DIR="${AUTOVLLM_TMP_DIR:-/tmp}"
 
-# llama.cpp-specific
-LLAMACPP_VERSION="${AUTOLLAMACPP_VERSION:-b10242}"
-LLAMACPP_SHA256="${AUTOLLAMACPP_SHA256:-}"
+# llama.cpp-specific. GitHub does not publish a Linux CUDA archive for this
+# release, so managed nodes compile the verified source for their attached GPU.
+DEFAULT_LLAMACPP_VERSION="b10242"
+DEFAULT_LLAMACPP_SHA256="b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3"
+LLAMACPP_VERSION="${AUTOLLAMACPP_VERSION-$DEFAULT_LLAMACPP_VERSION}"
+if [[ -v AUTOLLAMACPP_SHA256 ]]; then
+    LLAMACPP_SHA256="$AUTOLLAMACPP_SHA256"
+elif [ "$LLAMACPP_VERSION" = "$DEFAULT_LLAMACPP_VERSION" ]; then
+    LLAMACPP_SHA256="$DEFAULT_LLAMACPP_SHA256"
+else
+    LLAMACPP_SHA256=""
+fi
+LLAMACPP_SOURCE_URL="${AUTOLLAMACPP_SOURCE_URL:-https://github.com/ggml-org/llama.cpp/archive/refs/tags/${LLAMACPP_VERSION}.tar.gz}"
+LLAMACPP_INSTALL_ROOT="${AUTOLLAMACPP_INSTALL_ROOT:-/opt/llama.cpp}"
+LLAMACPP_LINK_DIR="${AUTOLLAMACPP_LINK_DIR:-/usr/local/bin}"
+LLAMACPP_CUDA_ARCHITECTURES="${AUTOLLAMACPP_CUDA_ARCHITECTURES:-native}"
+CUDA_NVCC="${AUTOLLAMACPP_NVCC:-/usr/local/cuda/bin/nvcc}"
 
 unset AUTOVLLM_NFS_EXPORT AUTOVLLM_NFS_MOUNT_POINT
 unset AUTOVLLM_NVIDIA_DRIVER_VERSION AUTOVLLM_NVIDIA_DRIVER_SHA256 AUTOVLLM_API_PORT
 unset AUTOVLLM_LLMFIT_VERSION AUTOVLLM_LLMFIT_SHA256
 unset AUTOVLLM_LLMFIT_BIN AUTOVLLM_TMP_DIR AUTOLLAMACPP_SCRIPT_DIR
-unset AUTOLLAMACPP_VERSION AUTOLLAMACPP_SHA256
+unset AUTOLLAMACPP_VERSION AUTOLLAMACPP_SHA256 AUTOLLAMACPP_SOURCE_URL
+unset AUTOLLAMACPP_INSTALL_ROOT AUTOLLAMACPP_LINK_DIR
+unset AUTOLLAMACPP_CUDA_ARCHITECTURES AUTOLLAMACPP_NVCC
 
 # Source shared setup functions
 # shellcheck disable=SC1091 source=../common/setup-base.sh
@@ -48,59 +64,143 @@ source "$(cd -- "${SCRIPT_DIR}/.." && pwd)/common/setup-base.sh"
 
 # --- llama.cpp-specific functions ---
 
-install_llamacpp() {
-    if [ -x /usr/local/bin/llama-server ]; then
-        local installed_version
-        installed_version=$(/usr/local/bin/llama-server --version 2>/dev/null \
-            | grep -Eo 'b[0-9]+' | head -n 1) || true
-        if [ "$installed_version" = "$LLAMACPP_VERSION" ]; then
-            echo "llama-server ${LLAMACPP_VERSION} already installed, skipping"
-            return 0
-        fi
-    fi
+installed_llamacpp_version() {
+    local binary="$1"
+    "$binary" --version 2>&1 \
+        | sed -nE 's/^version:[[:space:]]*([0-9]+).*/b\1/p' \
+        | head -n 1
+}
 
-    local cuda_suffix="cu12.2"
-    local url="https://github.com/ggml-org/llama.cpp/releases/download/${LLAMACPP_VERSION}/llama-${LLAMACPP_VERSION}-bin-ubuntu-x64-cuda-${cuda_suffix}.tar.gz"
-
-    if [ -n "$LLAMACPP_SHA256" ]; then
-        require_sha256 "llama.cpp ${LLAMACPP_VERSION}" "$LLAMACPP_SHA256" \
-            "AUTOLLAMACPP_SHA256"
-    fi
-
-    local work_dir status
-    work_dir=$(mktemp -d "${INSTALL_TMP_DIR%/}/auto-llamacpp.XXXXXX")
-    if wget -q "$url" -O "${work_dir}/llamacpp.tar.gz"; then
-        :
-    else
-        status=$?
-        rm -rf "$work_dir"
-        return "$status"
-    fi
-
-    if [ -n "$LLAMACPP_SHA256" ]; then
-        if ! verify_sha256 "${work_dir}/llamacpp.tar.gz" "$LLAMACPP_SHA256" \
-            "llama.cpp ${LLAMACPP_VERSION}"; then
-            rm -rf "$work_dir"
-            return 1
-        fi
-    fi
-
-    tar xzf "${work_dir}/llamacpp.tar.gz" -C "$work_dir"
-    local server_bin
-    server_bin=$(find "$work_dir" -name llama-server -type f | head -n 1)
-    local quantize_bin
-    quantize_bin=$(find "$work_dir" -name llama-quantize -type f | head -n 1)
-
-    if [ -z "$server_bin" ]; then
-        echo "FATAL: llama-server binary not found in release archive" >&2
-        rm -rf "$work_dir"
+cuda_compute_capabilities() {
+    local capabilities
+    if ! capabilities=$(
+        nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null \
+            | sed '/^[[:space:]]*$/d' \
+            | sort -Vu
+    ); then
+        echo "FATAL: nvidia-smi could not query CUDA compute capabilities" >&2
         return 1
     fi
-    sudo install -m 755 "$server_bin" /usr/local/bin/llama-server
-    if [ -n "$quantize_bin" ]; then
-        sudo install -m 755 "$quantize_bin" /usr/local/bin/llama-quantize
+    if [ -z "$capabilities" ] \
+        || grep -Evq '^[[:space:]]*[0-9]+\.[0-9]+[[:space:]]*$' <<<"$capabilities"; then
+        echo "FATAL: no valid NVIDIA CUDA compute capability was detected" >&2
+        return 1
     fi
-    rm -rf "$work_dir"
+    printf '%s\n' "$capabilities"
+}
+
+atomic_link() {
+    local target="$1"
+    local link="$2"
+    local temporary_link="${link}.qiip.$$"
+    sudo ln -sfn "$target" "$temporary_link"
+    sudo mv -Tf "$temporary_link" "$link"
+}
+
+install_llamacpp() {
+    require_sha256 "llama.cpp ${LLAMACPP_VERSION}" "$LLAMACPP_SHA256" \
+        "AUTOLLAMACPP_SHA256"
+    if [[ ! "$LLAMACPP_VERSION" =~ ^b[1-9][0-9]*$ ]]; then
+        echo "FATAL: AUTOLLAMACPP_VERSION must use the b<number> build-tag format" >&2
+        return 2
+    fi
+    if [[ ! "$LLAMACPP_SOURCE_URL" =~ ^https?:// ]]; then
+        echo "FATAL: AUTOLLAMACPP_SOURCE_URL must be an HTTP(S) URL" >&2
+        return 2
+    fi
+    if ! command -v cmake >/dev/null || ! command -v ninja >/dev/null; then
+        echo "FATAL: cmake and ninja are required to build llama.cpp" >&2
+        return 1
+    fi
+    if [ ! -x "$CUDA_NVCC" ]; then
+        echo "FATAL: CUDA nvcc is required to build managed llama.cpp" >&2
+        return 1
+    fi
+
+    local compute_capabilities build_identity install_dir marker
+    compute_capabilities=$(cuda_compute_capabilities) || return
+    marker=$(printf 'version=%s\nsource_sha256=%s\ncompute_capabilities=%s\ncmake_cuda_architectures=%s\n' \
+        "$LLAMACPP_VERSION" \
+        "$LLAMACPP_SHA256" \
+        "${compute_capabilities//$'\n'/,}" \
+        "$LLAMACPP_CUDA_ARCHITECTURES")
+    build_identity=$(printf '%s' "$marker" | sha256sum | cut -c1-16)
+    install_dir="${LLAMACPP_INSTALL_ROOT%/}/${LLAMACPP_VERSION}-${build_identity}"
+
+    if [ -x "${install_dir}/bin/llama-server" ] \
+        && [ -f "${install_dir}/BUILD-INFO" ] \
+        && [ "$(<"${install_dir}/BUILD-INFO")" = "$marker" ] \
+        && [ "$(installed_llamacpp_version "${install_dir}/bin/llama-server")" = "$LLAMACPP_VERSION" ]; then
+        sudo mkdir -p "$LLAMACPP_LINK_DIR"
+        atomic_link "${install_dir}/bin/llama-server" "${LLAMACPP_LINK_DIR%/}/llama-server"
+        atomic_link "${install_dir}/bin/llama-quantize" "${LLAMACPP_LINK_DIR%/}/llama-quantize"
+        echo "llama-server ${LLAMACPP_VERSION} already installed for CUDA capabilities ${compute_capabilities//$'\n'/,}, skipping"
+        return 0
+    fi
+
+    # run_with_errexit invokes steps inside its own set -e subshell, where a
+    # function RETURN trap is not reliable. Keep the entire build and publish
+    # sequence in a dedicated subshell whose EXIT trap owns all cleanup.
+    (
+        set -e
+        local work_dir archive source_dir build_dir server_bin quantize_bin build_status
+        work_dir=$(mktemp -d "${INSTALL_TMP_DIR%/}/auto-llamacpp.XXXXXX")
+        # shellcheck disable=SC2317,SC2329  # Invoked indirectly by the EXIT trap.
+        cleanup_llamacpp_build() {
+            build_status=$?
+            trap - EXIT
+            rm -rf "$work_dir"
+            exit "$build_status"
+        }
+        trap cleanup_llamacpp_build EXIT
+        archive="${work_dir}/llamacpp.tar.gz"
+        source_dir="${work_dir}/source"
+        build_dir="${work_dir}/build"
+        mkdir -p "$source_dir"
+
+        wget -q "$LLAMACPP_SOURCE_URL" -O "$archive"
+        verify_sha256 "$archive" "$LLAMACPP_SHA256" \
+            "llama.cpp ${LLAMACPP_VERSION} source"
+        tar xzf "$archive" -C "$source_dir" --strip-components=1
+
+        cmake -S "$source_dir" -B "$build_dir" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_COMPILER="$CUDA_NVCC" \
+            -DCMAKE_CUDA_ARCHITECTURES="$LLAMACPP_CUDA_ARCHITECTURES" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_CUDA=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_APP=OFF \
+            -DLLAMA_BUILD_UI=OFF \
+            -DLLAMA_BUILD_MTMD=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_BUILD_NUMBER="${LLAMACPP_VERSION#b}" \
+            -DLLAMA_BUILD_COMMIT="$LLAMACPP_VERSION"
+        cmake --build "$build_dir" --target llama-server llama-quantize \
+            --parallel "$(nproc)"
+
+        server_bin="${build_dir}/bin/llama-server"
+        quantize_bin="${build_dir}/bin/llama-quantize"
+        if [ ! -x "$server_bin" ] || [ ! -x "$quantize_bin" ]; then
+            echo "FATAL: llama.cpp build did not produce the required binaries" >&2
+            exit 1
+        fi
+        if [ "$(installed_llamacpp_version "$server_bin")" != "$LLAMACPP_VERSION" ]; then
+            echo "FATAL: built llama-server did not report ${LLAMACPP_VERSION}" >&2
+            exit 1
+        fi
+
+        printf '%s\n' "$marker" > "${work_dir}/BUILD-INFO"
+        sudo mkdir -p "${install_dir}/bin" "$LLAMACPP_LINK_DIR"
+        sudo install -m 755 "$server_bin" "${install_dir}/bin/llama-server"
+        sudo install -m 755 "$quantize_bin" "${install_dir}/bin/llama-quantize"
+        sudo install -m 644 "${work_dir}/BUILD-INFO" "${install_dir}/BUILD-INFO"
+        atomic_link "${install_dir}/bin/llama-server" "${LLAMACPP_LINK_DIR%/}/llama-server"
+        atomic_link "${install_dir}/bin/llama-quantize" "${LLAMACPP_LINK_DIR%/}/llama-quantize"
+    )
 }
 
 # --- Main ---
@@ -113,6 +213,8 @@ main() {
         "AUTOVLLM_NVIDIA_DRIVER_SHA256"
     require_sha256 "llmfit ${LLMFIT_RELEASE}" "$LLMFIT_SHA256" \
         "AUTOVLLM_LLMFIT_SHA256"
+    require_sha256 "llama.cpp ${LLAMACPP_VERSION}" "$LLAMACPP_SHA256" \
+        "AUTOLLAMACPP_SHA256"
     step system_update run_system_update
     step nvidia_driver install_nvidia_driver
     step cuda_toolkit install_cuda_toolkit

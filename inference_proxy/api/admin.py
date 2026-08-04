@@ -210,7 +210,7 @@ async def setup_node(
 
     try:
         provisioner.validate_endpoint(hostname)
-        provisioner.validate_setup_configuration()
+        provisioner.validate_setup_configuration(body.engine)
     except (EndpointValidationError, ProvisioningError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

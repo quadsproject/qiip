@@ -15,7 +15,7 @@ def test_ci_enforces_branch_coverage_floor() -> None:
 
     assert coverage["run"]["branch"] is True
     assert coverage["run"]["source"] == ["inference_proxy"]
-    assert coverage["report"]["fail_under"] == 91
+    assert coverage["report"]["fail_under"] == 91.5
     assert coverage["report"]["precision"] == 2
     assert coverage["report"]["show_missing"] is True
 

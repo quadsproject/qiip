@@ -5,7 +5,8 @@ PID_FILE="${AUTOLLAMACPP_PID_FILE:-/var/run/llamacpp.pid}"
 PROC_ROOT="${AUTOLLAMACPP_PROC_ROOT:-/proc}"
 STOP_TIMEOUT="${AUTOLLAMACPP_STOP_TIMEOUT:-30}"
 STOP_INTERVAL="${AUTOLLAMACPP_STOP_INTERVAL:-1}"
-COMMAND_PATTERN="${AUTOLLAMACPP_COMMAND_PATTERN:-llama-server}"
+LLAMACPP_BIN="${AUTOLLAMACPP_BIN:-/usr/local/bin/llama-server}"
+LLAMACPP_INSTALL_ROOT="${AUTOLLAMACPP_INSTALL_ROOT:-/opt/llama.cpp}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 # shellcheck source=auto-llamacpp/llamacpp-process.sh

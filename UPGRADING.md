@@ -254,6 +254,32 @@ Redfish is disabled only when both BMC credentials are absent. Configuring only 
 
 Power endpoints accept DNS hostnames that pass the routing hostname allowlist; IP literals are rejected for BMC template expansion. Credentials are attached per request only after both the input hostname and rendered BMC destination validate. `REDFISH__VERIFY_SSL=false` remains the default for self-signed BMC certificates.
 
+### 20. Prepare managed llama.cpp nodes for verified CUDA source builds
+
+QIIP no longer attempts to download a Linux CUDA archive that upstream does not
+publish. Managed llama.cpp setup downloads the pinned tag source, verifies its
+SHA-256 before extraction, and builds CUDA-enabled `llama-server` and
+`llama-quantize` binaries on the node. The default setup deadline for this path
+is two hours:
+
+```dotenv
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION=b10242
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256=b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT=7200
+```
+
+Changing the version requires an explicitly configured matching digest. A
+custom source mirror is selected through the validated
+`INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` template. Ensure managed
+nodes can reach the selected source and NVIDIA package repositories and have
+enough local space for a CUDA build.
+
+Managed setup and launch now require a verified NVIDIA GPU and never fall back
+to CPU inference. Direct use of the scripts retains the existing standalone CPU
+branch, but it is outside QIIP's managed-node support boundary. Validate a
+disposable node from each GPU family before fleet rollout because the build is
+specialized for the attached CUDA architecture.
+
 ## Artifact Sources and Mirror Policy
 
 There is no single global mirror switch. Each source has a different trust and configuration boundary.
@@ -263,6 +289,7 @@ There is no single global mirror switch. Each source has a different trust and c
 | NVIDIA `.run` installer used by `setup.sh` | Node-side `NVIDIA_DRIVER_URL`; the gateway does not forward a URL setting | `AUTOVLLM_NVIDIA_DRIVER_SHA256`, normally populated from `PROVISIONING__NVIDIA_DRIVER_SHA256` | Point the node-side variable at a mirror serving byte-identical content, or configure the matching custom digest with the custom version. |
 | LLMFit archive used by `setup.sh` | Node-side `LLMFIT_URL`; the gateway forwards version and digest but not this URL | `AUTOVLLM_LLMFIT_SHA256`, normally populated from `LLMFIT__SHA256` | Point the node-side variable at byte-identical mirrored content. When invoking setup through QIIP, arrange the variable in the node's SSH environment or customize the shipped bundle. |
 | On-demand LLMFit runner install | `INFERENCE_PROXY_LLMFIT__INSTALL_URL` | `INFERENCE_PROXY_LLMFIT__SHA256` | Set the validated HTTP(S) `{version}` URL template and matching digest. Configure this separately from the setup-script URL. |
+| llama.cpp source archive | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` with the pinned `LLAMACPP_VERSION` | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256`; verification happens before extraction or build | Point the validated `{version}` URL template at a mirror serving byte-identical tag archives, or configure the matching digest with a custom version. Managed nodes compile CUDA-enabled binaries locally because the pinned release has no Linux CUDA archive. |
 | uv bootstrap binary | Pinned GitHub release in `setup.sh` and `auto-vllm/.uv-version` | Vendored checksum from Astral's release assets | Air-gapped nodes may preinstall the exact pinned uv version at the expected path. Changing the download source requires a reviewed bundle change. |
 | vLLM, FlashInfer, and Python dependencies | `auto-vllm/pyproject.toml` plus `auto-vllm/uv.lock` | Registry artifact hashes for the full installable closure; source builds are refused | Regenerate and review the node project and lock for a custom index. Runtime `FLASHINFER_INDEX_URL` overrides are rejected. A pre-seeded uv cache may be used only when it satisfies the frozen lock. |
 | DNF and CUDA RPM packages | Node repository configuration; setup also enables NVIDIA's RHEL 9 CUDA repository | Repository metadata and RPM signatures | Manage mirrors through node repository policy or a reviewed setup-bundle customization. QIIP has no gateway-level DNF mirror setting. |
@@ -282,9 +309,17 @@ The node-only `NVIDIA_DRIVER_URL` and `LLMFIT_URL` variables are intentionally d
 | **Correctness fix** | Retryable non-streaming 5xx and transport failures now fail over to another eligible node and count against the circuit breaker. | Remove workarounds that manually retried every 5xx without considering the proxy's attempt budget. |
 | **Correctness fix** | Upstream 4xx responses pass through verbatim, are not retried, and do not carry the exhaustion marker. A 4xx is neutral circuit-breaker evidence: it neither increments failures nor clears earlier failures. | Expect upstream `error.type`, `error.code`, `param`, and other fields to survive unchanged. Remove wrapper-specific parsing workarounds. |
 | **Correctness fix** | Chat messages preserve tool calls, `content: null`, multimodal content parts, and additional OpenAI-compatible fields. Completion prompts preserve string, string-array, token-ID, and nested token-ID forms. | Remove client-side transformations that existed only to prevent the proxy from stripping these fields; retaining them can cause duplicate handling. |
+| **Behavioral break** | `/v1/models[].owned_by` now reports the registered node's engine (`vllm` or `llama_cpp`) instead of always reporting `vllm`. | Treat `owned_by` as backend metadata rather than a constant. Do not filter otherwise valid models solely because the value is not `vllm`. |
 | **Defined boundary** | After a streaming response has started, an upstream failure is not retried. The proxy emits an OpenAI-format error event followed by `[DONE]`. | Treat a mid-stream error as terminal and do not concatenate a second backend's output onto the partial response. |
 
 No failover marker is added when no backend attempt occurred, such as when no node serves the requested model. A non-retryable error returned after one attempt is also not marked as exhausted.
+
+Node records now accept and ignore unknown additive fields during
+deserialization. This permits mixed-version gateways to read records written by
+a newer peer without discarding the node. The `engine` value itself remains a
+closed enum: an unrecognized engine string makes the record invalid and the
+watcher excludes it, so introduce new engine values only with an ordered
+gateway rollout.
 
 ### Administrative API and browser interfaces
 

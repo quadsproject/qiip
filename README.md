@@ -2,7 +2,12 @@
 
 [![CI](https://github.com/quadsproject/qiip/actions/workflows/ci.yml/badge.svg)](https://github.com/quadsproject/qiip/actions/workflows/ci.yml)
 
-A QUADS-native inference abstraction framework that fully automates installation, drivers, setup and presentation of disparate, free/idle GPU-equipped systems into a single unified usage interface and inference API. QIIP profiles each node's hardware and automatically selects the best inference engine -- [vLLM](https://docs.vllm.ai/) for multi-GPU throughput or [llama.cpp](https://github.com/ggml-org/llama.cpp) for single-GPU and CPU-capable systems.
+A QUADS-native inference abstraction framework that automates installation,
+drivers, setup, and presentation of disparate, free or idle NVIDIA GPU systems
+through one inference API. Setup requests explicitly choose either
+[vLLM](https://docs.vllm.ai/) or
+[llama.cpp](https://github.com/ggml-org/llama.cpp); QIIP then applies the
+engine-specific provisioning path.
 
 QIIP provides a gateway service that proxies OpenAI-compatible requests to inference nodes on idle QUADS lab servers or standalone, free GPU-equipped hardware. It dynamically discovers backends via etcd, health-checks them, and routes requests with automatic failover so clients see a single, reliable endpoint. Both engines expose OpenAI-compatible HTTP APIs; the proxy layer is engine-agnostic and the engine choice is invisible to API consumers. See [auto-vllm/](auto-vllm/README.md) and [auto-llamacpp/](auto-llamacpp/README.md) for engine-specific provisioning details.
 
@@ -30,7 +35,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Operations dashboard** -- interactive web UI at `/dashboard` with real-time node table, detail pages, and provisioning status
 - **QUADS integration** -- background polling of QUADS inventory and availability; unified view merging QUADS hosts with etcd-registered nodes
 - **QUADS schedule enforcement** -- automated teardown of managed nodes when QUADS reports an upcoming scheduling conflict
-- **End-to-end node provisioning** -- SSH-based pipeline: BMC power-on, NVIDIA driver and CUDA toolkit install, inference engine setup (vLLM or llama.cpp), NFS mount, firewall, health poll, and etcd registration
+- **End-to-end node provisioning** -- SSH-based pipeline: BMC power-on, NVIDIA GPU verification, driver and CUDA toolkit install, inference engine setup (vLLM or llama.cpp), NFS mount, firewall, health poll, and etcd registration
 - **Node teardown** -- graceful shutdown with connection draining, force teardown option, and provisioning task cancellation
 - **Provisioning log streaming** -- live SSE stream of provisioning and inference engine logs viewable in the dashboard
 - **BMC power management (Redfish)** -- query and control node power state; supports On, ForceOff, GracefulRestart, and ForceRestart
@@ -352,6 +357,24 @@ Provisioning resource and retention controls:
 | `INFERENCE_PROXY_PROVISIONING__LOG_MAX_ENTRY_BYTES` | `16384` | Maximum bytes in one retained log message |
 | `INFERENCE_PROXY_PROVISIONING__LOG_MAX_COMPLETED_HOSTS` | `64` | Completed host-operation buffers retained, oldest first |
 
+Managed llama.cpp provisioning builds a verified source tag with CUDA enabled
+for the NVIDIA GPU attached to the node. It has four gateway settings:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION` | `b10242` | Pinned llama.cpp build tag |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256` | committed digest | SHA-256 of the source archive selected by the version |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` | GitHub tag archive | Validated HTTP(S) URL template containing exactly one `{version}` placeholder |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT` | `7200` | Total wall-clock deadline for the llama.cpp setup command, including the CUDA source build (seconds) |
+
+Changing `LLAMACPP_VERSION` requires an explicitly configured matching digest.
+The node verifies the archive before extracting it, builds only
+`llama-server` and `llama-quantize`, and atomically publishes a versioned
+installation under `/opt/llama.cpp`. The source build requires a working
+NVIDIA driver and CUDA compiler; QIIP-managed llama.cpp nodes do not fall back
+to CPU inference. See [auto-llamacpp](auto-llamacpp/README.md) for the direct
+script contract and build details.
+
 LLMFit has one version setting: `INFERENCE_PROXY_LLMFIT__VERSION`.
 
 The default NVIDIA driver and LLMFit versions each ship with a verified
@@ -534,7 +557,7 @@ uv run --frozen pytest tests/api/test_routes.py -v
 ```
 
 Coverage is measured over `inference_proxy` with branch tracking enabled. CI
-enforces a 91% combined statement-and-branch floor. The measured total was
+enforces a 91.5% combined statement-and-branch floor. The measured total was
 91.75% when the gate was introduced and may move as code is added or removed.
 The floor prevents new untested code from materially reducing coverage; it
 does not prove that covered behavior is asserted correctly.

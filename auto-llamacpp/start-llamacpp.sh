@@ -12,12 +12,13 @@ QUANTIZATION="${AUTOLLAMACPP_QUANTIZATION:-Q4_K_M}"
 EXTRA_ARGS_OVERRIDE="${AUTOLLAMACPP_EXTRA_ARGS:-}"
 SCRIPT_DIR="${AUTOLLAMACPP_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 LLAMACPP_BIN="${AUTOLLAMACPP_BIN:-/usr/local/bin/llama-server}"
+LLAMACPP_INSTALL_ROOT="${AUTOLLAMACPP_INSTALL_ROOT:-/opt/llama.cpp}"
 PID_FILE="${AUTOLLAMACPP_PID_FILE:-/var/run/llamacpp.pid}"
 LLAMACPP_LOG_FILE="${AUTOLLAMACPP_LOG_FILE:-/var/log/llamacpp-serve.log}"
 PROC_ROOT="${AUTOLLAMACPP_PROC_ROOT:-/proc}"
-COMMAND_PATTERN="${AUTOLLAMACPP_COMMAND_PATTERN:-llama-server}"
 STARTUP_GRACE_PERIOD="${AUTOLLAMACPP_STARTUP_GRACE_PERIOD:-2}"
 STARTUP_LOG_LINES="${AUTOLLAMACPP_STARTUP_LOG_LINES:-40}"
+REQUIRE_CUDA="${AUTOLLAMACPP_REQUIRE_CUDA:-1}"
 
 # shellcheck source=auto-llamacpp/llamacpp-process.sh
 source "${SCRIPT_DIR}/llamacpp-process.sh"
@@ -32,6 +33,10 @@ detect_gpu_info() {
         GPU_COUNT=$(nvidia-smi --list-gpus | wc -l)
         GPU_VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i 0)
         GPU_VRAM_GB=$(( (GPU_VRAM_MB + 512) / 1024 ))
+    fi
+    if [ "$REQUIRE_CUDA" = "1" ] && [ "$GPU_COUNT" -eq 0 ]; then
+        echo "FATAL: managed llama.cpp requires a working NVIDIA GPU" >&2
+        return 1
     fi
 }
 
@@ -128,10 +133,20 @@ clear_script_environment() {
     unset AUTOLLAMACPP_PORT AUTOLLAMACPP_NFS_MOUNT_POINT AUTOLLAMACPP_MODEL
     unset AUTOLLAMACPP_GPU_LAYERS AUTOLLAMACPP_CTX_SIZE AUTOLLAMACPP_PARALLEL
     unset AUTOLLAMACPP_BATCH_SIZE AUTOLLAMACPP_QUANTIZATION AUTOLLAMACPP_EXTRA_ARGS
-    unset AUTOLLAMACPP_SCRIPT_DIR AUTOLLAMACPP_BIN AUTOLLAMACPP_PID_FILE
-    unset AUTOLLAMACPP_LOG_FILE AUTOLLAMACPP_PROC_ROOT AUTOLLAMACPP_COMMAND_PATTERN
+    unset AUTOLLAMACPP_SCRIPT_DIR AUTOLLAMACPP_BIN AUTOLLAMACPP_INSTALL_ROOT
+    unset AUTOLLAMACPP_PID_FILE
+    unset AUTOLLAMACPP_LOG_FILE AUTOLLAMACPP_PROC_ROOT
     unset AUTOLLAMACPP_STARTUP_GRACE_PERIOD AUTOLLAMACPP_STARTUP_LOG_LINES
     unset AUTOLLAMACPP_STOP_TIMEOUT AUTOLLAMACPP_STOP_INTERVAL
+    unset AUTOLLAMACPP_REQUIRE_CUDA
+
+    # llama-server owns LLAMA_ARG_* as an alternate option namespace. QIIP
+    # supplies the complete managed command line, so ambient values must not
+    # alter the process after provisioning validated its configuration.
+    local name
+    while IFS= read -r name; do
+        unset "$name"
+    done < <(compgen -A variable LLAMA_ARG_)
 }
 
 verify_llamacpp_started() {
@@ -204,7 +219,7 @@ EOF
         -c "$CTX_SIZE" \
         --parallel "$PARALLEL" \
         -b "$BATCH_SIZE" \
-        -fa \
+        --flash-attn auto \
         --cont-batching \
         --metrics \
         ${EXTRA_ARGS:-} \

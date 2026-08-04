@@ -56,7 +56,8 @@ run_system_update() {
     local running_kernel
     running_kernel=$(uname -r)
     sudo dnf -y install kernel-devel-"${running_kernel}" kernel-headers-"${running_kernel}" \
-        gcc make wget nfs-utils elfutils-libelf-devel python3.12 python3.12-devel
+        cmake gcc gcc-c++ make wget nfs-utils elfutils-libelf-devel \
+        python3.12 python3.12-devel
     sudo dnf -y update '--exclude=kernel*'
 }
 
@@ -121,14 +122,14 @@ install_nvidia_driver() {
 }
 
 install_cuda_toolkit() {
+    sudo dnf -y install dnf-plugins-core ninja-build
     if [ -x /usr/local/cuda/bin/nvcc ]; then
         echo "CUDA toolkit already installed, skipping"
-        return 0
+    else
+        sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+        sudo dnf -y install cuda-toolkit
     fi
-    sudo dnf -y install dnf-plugins-core ninja-build
-    sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
-    sudo dnf -y install cuda-toolkit
-    ln -sfn /usr/bin/ninja-build /usr/local/bin/ninja
+    sudo ln -sfn /usr/bin/ninja-build /usr/local/bin/ninja
 }
 
 mount_nfs_cache() {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import warnings
 from pathlib import Path
 
@@ -10,6 +11,9 @@ from pydantic import BaseModel, SecretStr, ValidationError
 from pydantic_settings import BaseSettings
 
 from inference_proxy.config.settings import (
+    DEFAULT_LLAMACPP_SHA256,
+    DEFAULT_LLAMACPP_SOURCE_URL,
+    DEFAULT_LLAMACPP_VERSION,
     DEFAULT_LLMFIT_VERSION,
     AdminSettings,
     DashboardSettings,
@@ -369,6 +373,12 @@ class TestArtifactDigestSettings:
         assert provisioning.nvidia_driver_sha256 == (
             "4cac53e48f8adff661d47c8788ed24059a248c9fd8098ceafd088a498986ec26"
         )
+        assert provisioning.llamacpp_version == DEFAULT_LLAMACPP_VERSION
+        assert provisioning.llamacpp_sha256 == DEFAULT_LLAMACPP_SHA256
+        assert provisioning.llamacpp_source_url == DEFAULT_LLAMACPP_SOURCE_URL
+        assert provisioning.llamacpp_source_download_url() == (
+            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b10242.tar.gz"
+        )
         assert llmfit.version == "1.1.6"
         assert llmfit.sha256 == (
             "1e09232a128455596a2d348ab5893741d04b94aa6d924f1253462dc13304f7c6"
@@ -383,6 +393,11 @@ class TestArtifactDigestSettings:
     def test_llmfit_digest_must_be_sha256(self, digest: str) -> None:
         with pytest.raises(ValidationError, match="64 hexadecimal characters"):
             LLMFitSettings(sha256=digest)
+
+    @pytest.mark.parametrize("digest", ["", "a" * 63, "g" * 64, "sha256:" + "a" * 64])
+    def test_llamacpp_digest_must_be_sha256(self, digest: str) -> None:
+        with pytest.raises(ValidationError, match="64 hexadecimal characters"):
+            ProvisioningSettings(llamacpp_sha256=digest)
 
     def test_custom_driver_version_requires_explicit_digest(self) -> None:
         with pytest.raises(ValidationError, match="nvidia_driver_sha256"):
@@ -399,6 +414,51 @@ class TestArtifactDigestSettings:
 
         configured = LLMFitSettings(version="2.0.0", sha256="b" * 64)
         assert configured.sha256 == "b" * 64
+
+    def test_custom_llamacpp_version_requires_explicit_digest(self) -> None:
+        with pytest.raises(ValidationError, match="llamacpp_sha256"):
+            ProvisioningSettings(llamacpp_version="b12345")
+
+        configured = ProvisioningSettings(
+            llamacpp_version="b12345", llamacpp_sha256="b" * 64
+        )
+        assert configured.llamacpp_sha256 == "b" * 64
+
+    @pytest.mark.parametrize("version", ["10242", "v10242", "b0", "b1.2", "latest"])
+    def test_llamacpp_version_requires_build_tag(self, version: str) -> None:
+        with pytest.raises(ValidationError, match=r"b<number>"):
+            ProvisioningSettings(
+                llamacpp_version=version,
+                llamacpp_sha256="b" * 64,
+            )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "ftp://downloads.example/llama-{version}.tar.gz",
+            "https://user:secret@downloads.example/llama-{version}.tar.gz",
+            "https://downloads.example/llama.tar.gz",
+            "https://downloads.example/{version}/{version}/llama.tar.gz",
+            "https://downloads.example/llama-{version!r}.tar.gz",
+            "https://downloads.example/llama-{other}.tar.gz",
+            "https://downloads.example/llama-{version}.tar.gz#fragment",
+            "https://downloads.example/llama-{version}.tar.gz\ncommand",
+        ],
+    )
+    def test_llamacpp_source_url_rejects_unsafe_templates(self, url: str) -> None:
+        with pytest.raises(ValidationError, match="llamacpp_source_url"):
+            ProvisioningSettings(llamacpp_source_url=url)
+
+    @pytest.mark.parametrize("scheme", ["https", "http"])
+    def test_llamacpp_source_url_accepts_verified_mirrors(self, scheme: str) -> None:
+        settings = ProvisioningSettings(
+            llamacpp_source_url=(
+                f"{scheme}://mirror.example/llama/{{version}}/source.tar.gz"
+            )
+        )
+        assert settings.llamacpp_source_download_url() == (
+            f"{scheme}://mirror.example/llama/b10242/source.tar.gz"
+        )
 
     @pytest.mark.parametrize(
         "url",
@@ -724,3 +784,25 @@ class TestHuggingFaceSettingsIsNotBaseSettings:
     def test_huggingface_settings_is_base_model_not_base_settings(self) -> None:
         assert not issubclass(HuggingFaceSettings, BaseSettings)
         assert issubclass(HuggingFaceSettings, BaseModel)
+
+
+def test_env_example_covers_every_application_setting_exactly_once() -> None:
+    """Keep the shipped environment inventory synchronized with Settings."""
+    expected: set[str] = set()
+    for group_name, group_field in Settings.model_fields.items():
+        model = group_field.annotation
+        assert isinstance(model, type)
+        assert issubclass(model, BaseModel)
+        expected.update(
+            f"INFERENCE_PROXY_{group_name.upper()}__{field_name.upper()}"
+            for field_name in model.model_fields
+        )
+
+    env_example = Path(__file__).resolve().parents[2] / ".env.example"
+    occurrences = re.findall(
+        r"(?m)^\s*#?\s*(INFERENCE_PROXY_[A-Z0-9_]+)=",
+        env_example.read_text(),
+    )
+
+    assert len(occurrences) == len(set(occurrences)), "duplicate .env.example entry"
+    assert set(occurrences) == expected

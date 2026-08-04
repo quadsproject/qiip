@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shlex
+import shutil
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -27,7 +28,7 @@ from inference_proxy.config.settings import (
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
-from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     PreflightError,
@@ -160,6 +161,30 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_MODEL": "org/model",
         "HF_TOKEN": "hf secret",
     }
+    llama_setup = provisioner._setup_script_env(InferenceEngine.LLAMA_CPP)
+    assert llama_setup == {
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
+        "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_NVIDIA_DRIVER_VERSION": "999.1",
+        "AUTOVLLM_NVIDIA_DRIVER_SHA256": "b" * 64,
+        "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_LLMFIT_VERSION": "8.7.6",
+        "AUTOVLLM_LLMFIT_SHA256": "c" * 64,
+        "AUTOLLAMACPP_VERSION": "b10242",
+        "AUTOLLAMACPP_SHA256": (
+            "b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3"
+        ),
+        "AUTOLLAMACPP_SOURCE_URL": (
+            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b10242.tar.gz"
+        ),
+    }
+    assert provisioner._start_script_env("org/model", InferenceEngine.LLAMA_CPP) == {
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOLLAMACPP_PORT": "8123",
+        "AUTOLLAMACPP_REQUIRE_CUDA": "1",
+        "AUTOLLAMACPP_MODEL": "org/model",
+        "HF_TOKEN": "hf secret",
+    }
     assert shlex.split(
         provisioner._script_command("setup.sh", env=provisioner._setup_script_env())
     ) == [
@@ -234,6 +259,79 @@ async def test_missing_nfs_export_fails_before_remote_work() -> None:
     ssh.upload.assert_not_called()
     ssh.run_streaming.assert_not_called()
     etcd.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_missing_engine_bundle_fails_before_remote_work(tmp_path: Path) -> None:
+    ssh = MagicMock()
+    provisioner = _make_provisioner(
+        ssh_client=ssh,
+        settings=ProvisioningSettings(scripts_dir=tmp_path / "auto-vllm"),
+    )
+
+    with patch.object(provisioner, "_provision", new_callable=AsyncMock) as body:
+        with pytest.raises(ProvisioningError, match="bundle is incomplete"):
+            await provisioner.provision("host1", engine=InferenceEngine.LLAMA_CPP)
+        body.assert_not_awaited()
+
+    ssh.upload.assert_not_called()
+    ssh.run_streaming.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_bundle_uses_configured_sibling_root(tmp_path: Path) -> None:
+    bundle_root = tmp_path / "bundle -- root with spaces"
+    vllm_dir = bundle_root / "renamed vllm bundle"
+    llama_dir = bundle_root / "auto-llamacpp"
+    common_dir = bundle_root / "common"
+    shutil.copytree(Path("auto-vllm"), vllm_dir)
+    shutil.copytree(Path("auto-llamacpp"), llama_dir)
+    shutil.copytree(Path("common"), common_dir)
+    ssh = MagicMock()
+    ssh.upload = AsyncMock()
+    provisioner = _make_provisioner(
+        ssh_client=ssh,
+        settings=ProvisioningSettings(scripts_dir=vllm_dir),
+    )
+
+    await provisioner._upload_scripts("host1", InferenceEngine.LLAMA_CPP)
+
+    assert [item.args for item in ssh.upload.await_args_list] == [
+        ("host1", llama_dir),
+        ("host1", common_dir),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_setup_uses_its_extended_total_timeout() -> None:
+    seen: list[tuple[str, str, float | None]] = []
+
+    async def mock_streaming(
+        host: str,
+        command: str,
+        *,
+        total_timeout: float | None = None,
+    ) -> AsyncIterator[tuple[str, str]]:
+        seen.append((host, command, total_timeout))
+        yield ("stdout", "[STEP:llamacpp_install:OK]")
+
+    ssh = MagicMock()
+    ssh.run_streaming = mock_streaming
+    provisioner = _make_provisioner(
+        ssh_client=ssh,
+        settings=ProvisioningSettings(llamacpp_setup_timeout=4321),
+    )
+
+    await provisioner._run_setup(
+        "host1",
+        started_at=datetime.now(UTC),
+        on_step=lambda _step: None,
+        engine=InferenceEngine.LLAMA_CPP,
+    )
+
+    assert seen[0][0] == "host1"
+    assert "auto-llamacpp/setup.sh" in seen[0][1]
+    assert seen[0][2] == 4321
 
 
 async def _async_iter(
@@ -1096,6 +1194,41 @@ class TestVerifyGpu:
         ):
             await provisioner._verify_gpu("host1")  # Should not raise
 
+    @pytest.mark.asyncio
+    async def test_llamacpp_provision_requires_gpu_before_engine_start(self) -> None:
+        """Managed llama.cpp never degrades into its standalone CPU branch."""
+        provisioner = _make_provisioner()
+        with (
+            patch.object(provisioner, "_update_state", new_callable=AsyncMock),
+            patch.object(provisioner, "_power_on_if_needed", new_callable=AsyncMock),
+            patch.object(provisioner, "preflight", new_callable=AsyncMock),
+            patch.object(provisioner, "_upload_scripts", new_callable=AsyncMock),
+            patch.object(provisioner, "_run_setup", new_callable=AsyncMock),
+            patch.object(
+                provisioner,
+                "_verify_gpu",
+                new_callable=AsyncMock,
+                side_effect=ProvisioningError("No GPUs detected"),
+            ) as verify_gpu,
+            patch.object(
+                provisioner, "_run_start_vllm", new_callable=AsyncMock
+            ) as start_engine,
+            patch(
+                "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            with pytest.raises(ProvisioningError, match="No GPUs detected"):
+                await provisioner._provision(
+                    "host1",
+                    model="org/model",
+                    engine=InferenceEngine.LLAMA_CPP,
+                )
+
+        verify_gpu.assert_awaited_once_with("host1")
+        start_engine.assert_not_awaited()
+
 
 def _make_full_provisioner(etcd: MagicMock) -> tuple[NodeProvisioner, MagicMock]:
     """Build a provisioner with mocks suitable for full provision() tests."""
@@ -1496,7 +1629,10 @@ class TestTeardownGraceful:
 
         async def mock_upload(host: str, local_path: Path) -> None:
             assert host == "host1"
-            assert local_path == provisioner._settings.scripts_dir
+            assert local_path in {
+                provisioner._settings.scripts_dir,
+                provisioner._settings.scripts_dir.parent / "common",
+            }
             operation_order.append("upload")
 
         async def mock_streaming(
@@ -1519,12 +1655,16 @@ class TestTeardownGraceful:
             await provisioner.teardown("host1")
 
         assert commands == ["bash auto-vllm/stop-vllm.sh"]
-        assert operation_order == ["upload", "stop"]
+        assert operation_order == ["upload", "upload", "stop"]
 
     @pytest.mark.asyncio
-    async def test_scripts_dir_respected_in_commands(self) -> None:
+    async def test_scripts_dir_respected_in_commands(self, tmp_path: Path) -> None:
         """E12: upload, setup, start, and stop share the configured bundle."""
-        scripts_dir = Path("bundles/provision scripts")
+        bundle_root = tmp_path / "bundles -- root"
+        scripts_dir = bundle_root / "provision scripts -- vllm"
+        shutil.copytree(Path("auto-vllm"), scripts_dir)
+        common_dir = bundle_root / "common"
+        shutil.copytree(Path("common"), common_dir)
         provisioner, ssh, _etcd, _registry, _tracker = _make_teardown_provisioner(
             scripts_dir=scripts_dir
         )
@@ -1551,10 +1691,13 @@ class TestTeardownGraceful:
         )
         await provisioner._run_start_vllm("host1", model="org/model")
 
-        assert ssh.upload.await_args_list[0].args == ("host1", scripts_dir)
+        assert [item.args for item in ssh.upload.await_args_list[:2]] == [
+            ("host1", scripts_dir),
+            ("host1", common_dir),
+        ]
         assert [shlex.split(command)[-1] for command in commands[:2]] == [
-            "provision scripts/setup.sh",
-            "provision scripts/start-vllm.sh",
+            "provision scripts -- vllm/setup.sh",
+            "provision scripts -- vllm/start-vllm.sh",
         ]
         assert all("auto-vllm/" not in command for command in commands)
 
@@ -1562,7 +1705,7 @@ class TestTeardownGraceful:
 
         assert shlex.split(commands[2]) == [
             "bash",
-            "provision scripts/stop-vllm.sh",
+            "provision scripts -- vllm/stop-vllm.sh",
             "--force",
         ]
         assert all("auto-vllm/" not in command for command in commands)

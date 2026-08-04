@@ -42,7 +42,7 @@ branch = true
 source = ["inference_proxy"]
 
 [tool.coverage.report]
-fail_under = 91
+fail_under = 91.5
 precision = 2
 show_missing = true
 

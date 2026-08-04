@@ -45,7 +45,7 @@ from inference_proxy.llmfit.errors import LLMFitParseError, LLMFitTimeoutError
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
 from inference_proxy.models.llmfit import LLMFitResult, ModelRecommendation, SystemInfo
-from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.models.quads import QUADSHost
 from inference_proxy.provisioning.provisioner import (
     ProvisioningCapacityError,
@@ -359,6 +359,9 @@ class TestSetupEndpoint:
         response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
         assert response.status_code == 202
         assert response.json() == {"task_id": "gpu01"}
+        mock_provisioner.validate_setup_configuration.assert_called_once_with(
+            InferenceEngine.VLLM
+        )
 
     def test_calls_fire_background(
         self,

@@ -29,6 +29,13 @@ DEFAULT_LLMFIT_VERSION = "1.1.6"
 DEFAULT_LLMFIT_SHA256 = (
     "1e09232a128455596a2d348ab5893741d04b94aa6d924f1253462dc13304f7c6"
 )
+DEFAULT_LLAMACPP_VERSION = "b10242"
+DEFAULT_LLAMACPP_SHA256 = (
+    "b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3"
+)
+DEFAULT_LLAMACPP_SOURCE_URL = (
+    "https://github.com/ggml-org/llama.cpp/archive/refs/tags/{version}.tar.gz"
+)
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 
@@ -210,14 +217,74 @@ class ProvisioningSettings(BaseModel):
     nfs_mount_point: str = "/srv/hf-cache"
     nvidia_driver_version: str = DEFAULT_NVIDIA_DRIVER_VERSION
     nvidia_driver_sha256: str = DEFAULT_NVIDIA_DRIVER_SHA256
-    llamacpp_version: str = "b10242"
-    llamacpp_sha256: str = ""
+    llamacpp_version: str = DEFAULT_LLAMACPP_VERSION
+    llamacpp_sha256: str = DEFAULT_LLAMACPP_SHA256
+    llamacpp_source_url: str = DEFAULT_LLAMACPP_SOURCE_URL
+    llamacpp_setup_timeout: float = Field(default=7200.0, gt=0)
 
     @field_validator("nvidia_driver_sha256")
     @classmethod
     def nvidia_driver_digest_is_sha256(cls, value: str) -> str:
         """Require a complete digest before remote driver installation."""
         return _validate_sha256(value, setting="provisioning.nvidia_driver_sha256")
+
+    @field_validator("llamacpp_version")
+    @classmethod
+    def llamacpp_version_is_build_tag(cls, value: str) -> str:
+        """Accept the upstream ``b<number>`` build-tag format only."""
+        if re.fullmatch(r"b[1-9][0-9]*", value) is None:
+            raise ValueError(
+                "provisioning.llamacpp_version must use the b<number> build-tag format"
+            )
+        return value
+
+    @field_validator("llamacpp_sha256")
+    @classmethod
+    def llamacpp_digest_is_sha256(cls, value: str) -> str:
+        """Require a complete digest before compiling upstream source."""
+        return _validate_sha256(value, setting="provisioning.llamacpp_sha256")
+
+    @field_validator("llamacpp_source_url")
+    @classmethod
+    def llamacpp_source_url_is_safe_template(cls, value: str) -> str:
+        """Allow one safely rendered HTTP(S) source-archive URL template."""
+        if any(ord(character) < 32 for character in value):
+            raise ValueError(
+                "provisioning.llamacpp_source_url must not contain control characters"
+            )
+        try:
+            parsed_fields = list(Formatter().parse(value))
+        except ValueError as exc:
+            raise ValueError("provisioning.llamacpp_source_url is malformed") from exc
+        fields = [
+            (field_name, format_spec, conversion)
+            for _literal, field_name, format_spec, conversion in parsed_fields
+            if field_name is not None
+        ]
+        if fields != [("version", "", None)]:
+            raise ValueError(
+                "provisioning.llamacpp_source_url must contain exactly one plain "
+                "{version} field"
+            )
+
+        parsed = urlsplit(value.format(version=DEFAULT_LLAMACPP_VERSION))
+        if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+            raise ValueError(
+                "provisioning.llamacpp_source_url must be an HTTP(S) URL with a host"
+            )
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError(
+                "provisioning.llamacpp_source_url must not contain credentials"
+            )
+        if parsed.fragment:
+            raise ValueError(
+                "provisioning.llamacpp_source_url must not contain a fragment"
+            )
+        return value
+
+    def llamacpp_source_download_url(self) -> str:
+        """Render the validated source URL for the selected build tag."""
+        return self.llamacpp_source_url.format(version=self.llamacpp_version)
 
     @model_validator(mode="after")
     def log_entry_limit_fits_host_budget(self) -> Self:
@@ -239,6 +306,19 @@ class ProvisioningSettings(BaseModel):
             raise ValueError(
                 "provisioning.nvidia_driver_sha256 must be configured when "
                 "nvidia_driver_version differs from the built-in default"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def custom_llamacpp_version_has_explicit_digest(self) -> Self:
+        """Keep the committed llama.cpp version and digest as one upgrade unit."""
+        if (
+            self.llamacpp_version != DEFAULT_LLAMACPP_VERSION
+            and "llamacpp_sha256" not in self.model_fields_set
+        ):
+            raise ValueError(
+                "provisioning.llamacpp_sha256 must be configured when "
+                "llamacpp_version differs from the built-in default"
             )
         return self
 

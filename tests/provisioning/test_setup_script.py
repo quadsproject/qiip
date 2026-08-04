@@ -694,7 +694,7 @@ def test_runtime_flashinfer_index_override_fails_before_setup_work(
     assert not attempted_work.exists()
 
 
-def test_system_update_pins_running_kernel(tmp_path: Path) -> None:
+def test_system_update_pins_running_kernel_and_build_packages(tmp_path: Path) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     operation_log = tmp_path / "operations.log"
@@ -718,14 +718,17 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
         }
     )
 
-    result = _run_shell(_source_and("run_system_update"), env=env)
+    result = _run_shell(_source_and("run_system_update\ninstall_cuda_toolkit"), env=env)
 
     assert result.returncode == 0, result.stderr
     operations = operation_log.read_text().splitlines()
-    assert operations[0].startswith(
-        "dnf -y install kernel-devel-5.14.0-test kernel-headers-5.14.0-test"
+    assert operations[0] == (
+        "dnf -y install kernel-devel-5.14.0-test kernel-headers-5.14.0-test "
+        "cmake gcc gcc-c++ make wget nfs-utils elfutils-libelf-devel "
+        "python3.12 python3.12-devel"
     )
     assert operations[1] == "dnf -y update --exclude=kernel*"
+    assert operations[2] == "dnf -y install dnf-plugins-core ninja-build"
 
 
 @pytest.mark.parametrize("backend", ["firewalld", "iptables", "none"])

@@ -52,6 +52,24 @@ logger = structlog.get_logger()
 
 STEP_PATTERN = re.compile(r"\[STEP:(\w+):(START|OK|FAIL|WARN)\]")
 MODEL_PATTERN = re.compile(r"#\s*Model:\s+(.+)")
+_ENGINE_BUNDLE_FILES = {
+    InferenceEngine.VLLM: {
+        ".uv-version",
+        "pyproject.toml",
+        "setup.sh",
+        "start-vllm.sh",
+        "stop-vllm.sh",
+        "uv.lock",
+        "uv-x86_64-unknown-linux-gnu.tar.gz.sha256",
+        "vllm-process.sh",
+    },
+    InferenceEngine.LLAMA_CPP: {
+        "llamacpp-process.sh",
+        "setup.sh",
+        "start-llamacpp.sh",
+        "stop-llamacpp.sh",
+    },
+}
 
 
 class ProvisioningError(Exception):
@@ -160,9 +178,12 @@ class NodeProvisioner:
                 f"endpoint {candidate!r}: {exc}; {allowlist_hint}"
             ) from exc
 
-    def validate_setup_configuration(self) -> None:
+    def validate_setup_configuration(
+        self, engine: InferenceEngine = InferenceEngine.VLLM
+    ) -> None:
         """Require settings used only by the node-provisioning workflow."""
         self._required_nfs_export()
+        self._required_script_bundles(engine)
 
     def _required_nfs_export(self) -> str:
         """Return the canonical NFS export or reject node provisioning."""
@@ -173,6 +194,31 @@ class NodeProvisioner:
                 "deployments may leave it unset"
             )
         return self._nfs_export
+
+    def _engine_scripts_dir(self, engine: InferenceEngine) -> Path:
+        """Resolve an engine bundle beside the configured vLLM bundle."""
+        if engine == InferenceEngine.VLLM:
+            return self._settings.scripts_dir
+        return self._settings.scripts_dir.parent / "auto-llamacpp"
+
+    def _common_scripts_dir(self) -> Path:
+        return self._settings.scripts_dir.parent / "common"
+
+    def _required_script_bundles(self, engine: InferenceEngine) -> tuple[Path, Path]:
+        """Return complete engine/common bundles or fail before remote work."""
+        engine_dir = self._engine_scripts_dir(engine)
+        common_dir = self._common_scripts_dir()
+        required = {
+            *(engine_dir / name for name in _ENGINE_BUNDLE_FILES[engine]),
+            common_dir / "setup-base.sh",
+        }
+        missing = sorted(str(path) for path in required if not path.is_file())
+        if missing:
+            raise ProvisioningError(
+                "Provisioning script bundle is incomplete; missing: "
+                + ", ".join(missing)
+            )
+        return engine_dir, common_dir
 
     def _setup_script_env(
         self, engine: InferenceEngine = InferenceEngine.VLLM
@@ -190,6 +236,9 @@ class NodeProvisioner:
         if engine == InferenceEngine.LLAMA_CPP:
             env["AUTOLLAMACPP_VERSION"] = self._settings.llamacpp_version
             env["AUTOLLAMACPP_SHA256"] = self._settings.llamacpp_sha256
+            env["AUTOLLAMACPP_SOURCE_URL"] = (
+                self._settings.llamacpp_source_download_url()
+            )
         return env
 
     def _start_script_env(
@@ -200,6 +249,7 @@ class NodeProvisioner:
             env = {
                 "AUTOLLAMACPP_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
                 "AUTOLLAMACPP_PORT": str(self._settings.vllm_port),
+                "AUTOLLAMACPP_REQUIRE_CUDA": "1",
             }
             if model is not None:
                 env["AUTOLLAMACPP_MODEL"] = model
@@ -419,7 +469,7 @@ class NodeProvisioner:
         # Validate before acquiring the lifecycle lease or touching the host.
         # The API also calls this synchronously so configuration errors become
         # immediate 400 responses instead of failed background operations.
-        self.validate_setup_configuration()
+        self.validate_setup_configuration(engine)
         self.validate_endpoint(hostname)
         lease = lifecycle_lease
         if lease is None:
@@ -523,8 +573,7 @@ class NodeProvisioner:
                 engine=engine,
             )
             current_step = "gpu_verify"
-            if engine != InferenceEngine.LLAMA_CPP:
-                await self._verify_gpu(hostname)
+            await self._verify_gpu(hostname)
             current_step = "starting_engine"
             if engine == InferenceEngine.LLAMA_CPP:
                 starting_step = ProvisioningStep.STARTING_LLAMACPP
@@ -603,14 +652,9 @@ class NodeProvisioner:
         self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
     ) -> None:
         """Copy provisioning scripts to the remote host via SCP."""
-        if engine == InferenceEngine.LLAMA_CPP:
-            scripts_dir = Path("auto-llamacpp")
-        else:
-            scripts_dir = self._settings.scripts_dir
+        scripts_dir, common_dir = self._required_script_bundles(engine)
         await self._ssh_client.upload(hostname, scripts_dir)
-        common_dir = Path("common")
-        if common_dir.is_dir():
-            await self._ssh_client.upload(hostname, common_dir)
+        await self._ssh_client.upload(hostname, common_dir)
 
     async def _run_setup(
         self,
@@ -621,16 +665,20 @@ class NodeProvisioner:
         engine: InferenceEngine = InferenceEngine.VLLM,
     ) -> None:
         """Run setup.sh and parse step markers from stdout (D-05, D-06)."""
-        async for stream, line in self._ssh_client.run_streaming(
-            hostname,
-            self._script_command(
-                "setup.sh",
-                env=self._setup_script_env(engine),
-                scripts_dir="auto-llamacpp"
-                if engine == InferenceEngine.LLAMA_CPP
-                else None,
-            ),
-        ):
+        command = self._script_command(
+            "setup.sh",
+            env=self._setup_script_env(engine),
+            scripts_dir=self._engine_scripts_dir(engine).name,
+        )
+        if engine == InferenceEngine.LLAMA_CPP:
+            output = self._ssh_client.run_streaming(
+                hostname,
+                command,
+                total_timeout=self._settings.llamacpp_setup_timeout,
+            )
+        else:
+            output = self._ssh_client.run_streaming(hostname, command)
+        async for stream, line in output:
             if stream == "stdout":
                 match = STEP_PATTERN.search(line)
                 if match:
@@ -691,9 +739,7 @@ class NodeProvisioner:
         command = self._script_command(
             script,
             env=self._start_script_env(model, engine),
-            scripts_dir="auto-llamacpp"
-            if engine == InferenceEngine.LLAMA_CPP
-            else None,
+            scripts_dir=self._engine_scripts_dir(engine).name,
         )
         model_name: str | None = None
         async for stream, line in self._ssh_client.run_streaming(hostname, command):
@@ -1066,9 +1112,7 @@ class NodeProvisioner:
             stop_command = self._script_command(
                 stop_script,
                 args=("--force",) if force else (),
-                scripts_dir="auto-llamacpp"
-                if engine == InferenceEngine.LLAMA_CPP
-                else None,
+                scripts_dir=self._engine_scripts_dir(engine).name,
             )
             await self._ssh_run_command(hostname, stop_command)
 

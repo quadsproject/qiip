@@ -117,14 +117,19 @@ class SSHClient:
         self._streaming_inactivity_timeout = settings.streaming_inactivity_timeout
 
     async def run_streaming(
-        self, host: str, command: str
+        self,
+        host: str,
+        command: str,
+        *,
+        total_timeout: float | None = None,
     ) -> AsyncIterator[tuple[str, str]]:
         """Run *command* on *host*, yielding ``(stream, line)`` tuples.
 
         *stream* is ``"stdout"`` or ``"stderr"``. Both streams are drained
         concurrently so either remote pipe can exceed asyncssh's receive
         window without deadlocking the other. The total command and
-        no-output intervals are bounded independently.
+        no-output intervals are bounded independently. ``total_timeout`` may
+        extend one known-long operation without weakening the client default.
 
         Raises:
             SSHConnectionError: On auth failure, disconnect, or OS error.
@@ -134,6 +139,12 @@ class SSHClient:
         # Bound buffering without returning to the old one-stream-at-a-time
         # deadlock: both pumps share the same queue and receive backpressure
         # symmetrically when a consumer falls behind.
+        effective_total_timeout = (
+            self._streaming_command_timeout if total_timeout is None else total_timeout
+        )
+        if effective_total_timeout <= 0:
+            raise ValueError("total_timeout must be greater than zero")
+
         queue: asyncio.Queue[_StreamEvent] = asyncio.Queue(
             maxsize=_STREAM_QUEUE_MAXSIZE
         )
@@ -197,19 +208,19 @@ class SSHClient:
                     )
 
         async def supervise() -> None:
-            total_timeout = asyncio.timeout(self._streaming_command_timeout)
+            command_timeout = asyncio.timeout(effective_total_timeout)
             try:
-                async with total_timeout:
+                async with command_timeout:
                     await run_remote()
             except asyncio.CancelledError:
                 raise
             except TimeoutError as timeout_error:
                 error: Exception = timeout_error
-                if total_timeout.expired():
+                if command_timeout.expired():
                     error = SSHCommandTimeoutError(
                         host,
                         command,
-                        self._streaming_command_timeout,
+                        effective_total_timeout,
                         deadline="total",
                     )
                 await queue.put(_StreamError(error))
