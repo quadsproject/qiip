@@ -6,17 +6,12 @@ Per D-02: Client-side fetch -- HTML shell rendered by Jinja2, JS fetches /admin/
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
-from fastapi.templating import Jinja2Templates
 
+from inference_proxy.api.templating import templates
 from inference_proxy.config.dependencies import get_settings, require_admin_auth
 from inference_proxy.config.settings import Settings
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 dashboard_router = APIRouter(
     tags=["dashboard"],

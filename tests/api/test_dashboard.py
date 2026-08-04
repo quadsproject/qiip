@@ -233,6 +233,12 @@ class TestDashboardBadgeCSS:
         css = self._css_path.read_text()
         assert ".btn-config" in css, "Missing CSS class: .btn-config"
 
+    def test_setup_engine_selector_has_visible_theme_styling(self) -> None:
+        """The engine selector cannot collapse to an unstyled empty control."""
+        css = self._css_path.read_text()
+        assert ".setup-select {" in css
+        assert ".setup-engine-select { min-width: 6.5rem; }" in css
+
 
 class TestSetupForm:
     """Dashboard HTML contains the setup form elements (DASH-01, D-04, D-05)."""
@@ -271,7 +277,10 @@ class TestSetupForm:
     def test_contains_engine_specific_setup_selectors(self, client: TestClient) -> None:
         """Manual setup exposes mutually exclusive engine artifact selectors."""
         response = client.get("/dashboard")
-        assert 'id="setup-engine-select"' in response.text
+        assert (
+            'id="setup-engine-select" class="setup-select setup-engine-select"'
+            in response.text
+        )
         assert 'id="model-select"' in response.text
         assert 'id="artifact-select"' in response.text
 
@@ -360,6 +369,9 @@ class TestNodeDetailPage:
         """Node detail renders engine identity and catalog-backed setup controls."""
         response = client.get("/dashboard/nodes/test-node")
         assert '<th scope="col">Engine</th>' in response.text
-        assert 'id="setup-engine-select"' in response.text
+        assert (
+            'id="setup-engine-select" class="setup-select setup-engine-select"'
+            in response.text
+        )
         assert 'id="artifact-select"' in response.text
         assert 'colspan="10"' in response.text

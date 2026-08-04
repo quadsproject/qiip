@@ -113,6 +113,9 @@ const llamaBody = controller.buildBody({ hostname: "gpu01" });
 process.stdout.write(JSON.stringify({
   vllmBody,
   llamaBody,
+  engineOptions: byId("setup-engine-select").children.map(function (child) {
+    return { value: child.value, label: child.textContent };
+  }),
   modelValues: byId("model-select").children.map(function (child) { return child.value; }),
   artifactValues: byId("artifact-select").children.map(function (child) { return child.value; }),
 }));
@@ -130,6 +133,10 @@ process.stdout.write(JSON.stringify({
             "engine": "llama_cpp",
             "artifact_id": "a" * 64,
         },
+        "engineOptions": [
+            {"value": "vllm", "label": "vLLM"},
+            {"value": "llama_cpp", "label": "llama.cpp"},
+        ],
         "modelValues": ["org/vllm-model"],
         "artifactValues": ["a" * 64],
     }

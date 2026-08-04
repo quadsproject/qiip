@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Open+Sans:wght@400;500;600;700&family=Poppins:wght@500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="{{ url_for('static', path='css/dashboard.css') }}">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
     <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
 </head>
 <body>
@@ -73,9 +73,9 @@
             <section class="card" id="setup-config-panel">
                 <h2 class="card-title">Setup Configuration</h2>
                 <div>
-                    <label>Engine <select id="setup-engine-select"></select></label>
-                    <select id="model-select" style="background:var(--bg);color:var(--fg);border:1px solid var(--border);padding:0.375rem 0.5rem;border-radius:4px;font-size:0.875rem;width:100%;max-width:400px"></select>
-                    <select id="artifact-select" aria-label="GGUF artifact" style="display:none;background:var(--bg);color:var(--fg);border:1px solid var(--border);padding:0.375rem 0.5rem;border-radius:4px;font-size:0.875rem;width:100%;max-width:600px"></select>
+                    <label>Engine <select id="setup-engine-select" class="setup-select setup-engine-select"></select></label>
+                    <select id="model-select" class="setup-select setup-model-select" aria-label="vLLM model"></select>
+                    <select id="artifact-select" class="setup-select setup-artifact-select" aria-label="GGUF artifact" style="display:none"></select>
                     <span id="model-status" style="color:var(--muted);font-size:0.875rem;display:none"></span>
                 </div>
             </section>
@@ -129,8 +129,8 @@
         const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};
         const NODE_ID = {{ node_id | tojson }};
     </script>
-    <script src="{{ url_for('static', path='js/config_download.js') }}"></script>
-    <script src="{{ url_for('static', path='js/setup_selection.js') }}"></script>
-    <script src="{{ url_for('static', path='js/node_detail.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/config_download.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/setup_selection.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/node_detail.js') }}"></script>
 </body>
 </html>
