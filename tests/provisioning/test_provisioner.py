@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 import shutil
+import subprocess
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,6 +28,11 @@ from inference_proxy.config.settings import (
     RoutingSettings,
 )
 from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.huggingface.artifacts import (
+    GGUFArtifact,
+    GGUFArtifactStore,
+    GGUFDownloadSpec,
+)
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
 from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
@@ -48,6 +55,18 @@ _TEST_ENDPOINT_POLICY = EndpointPolicy.from_values(
 )
 
 
+def _artifact(alias: str = "org/model--with---separators") -> GGUFArtifact:
+    return GGUFArtifact(
+        artifact_id="a" * 64,
+        repo_id=alias,
+        resolved_revision="b" * 40,
+        files=("model -- Q4.gguf",),
+        entrypoint="model -- Q4.gguf",
+        model_alias=alias,
+        file_sizes={"model -- Q4.gguf": 7},
+    )
+
+
 def _make_provisioner(
     *,
     ssh_client: MagicMock | None = None,
@@ -61,6 +80,7 @@ def _make_provisioner(
     endpoint_policy: EndpointPolicy = _TEST_ENDPOINT_POLICY,
     nfs_export: str | None = "nfs.example:/exports/huggingface",
     hf_token: str | None = None,
+    artifact_store: GGUFArtifactStore | None = None,
 ) -> NodeProvisioner:
     """Build a NodeProvisioner with mock dependencies."""
     return NodeProvisioner(
@@ -76,6 +96,7 @@ def _make_provisioner(
         redfish_client=redfish_client,
         hf_token=hf_token,
         nfs_export=nfs_export,
+        artifact_store=artifact_store,
     )
 
 
@@ -178,11 +199,13 @@ def test_script_env_prefix_exact() -> None:
             "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b10242.tar.gz"
         ),
     }
-    assert provisioner._start_script_env("org/model", InferenceEngine.LLAMA_CPP) == {
+    artifact = _artifact()
+    assert provisioner._start_script_env(None, InferenceEngine.LLAMA_CPP, artifact) == {
         "AUTOLLAMACPP_NFS_MOUNT_POINT": "/srv/hf cache",
         "AUTOLLAMACPP_PORT": "8123",
         "AUTOLLAMACPP_REQUIRE_CUDA": "1",
-        "AUTOLLAMACPP_MODEL": "org/model",
+        "AUTOLLAMACPP_GGUF_PATH": artifact.cache_relative_entrypoint,
+        "AUTOLLAMACPP_MODEL_ALIAS": artifact.model_alias,
         "HF_TOKEN": "hf secret",
     }
     assert shlex.split(
@@ -198,6 +221,68 @@ def test_script_env_prefix_exact() -> None:
         "bash",
         "auto-vllm/setup.sh",
     ]
+
+
+def test_published_artifact_resolves_through_managed_launcher(tmp_path: Path) -> None:
+    """Compose publication, setup selection, environment, and node resolution."""
+    repo_id = "org/model--with---separators-GGUF"
+    revision = "c" * 40
+    files = (
+        "quant/model -- q4-00001-of-00002.gguf",
+        "quant/model -- q4-00002-of-00002.gguf",
+    )
+    snapshot = (
+        tmp_path / f"models--{repo_id.replace('/', '--')}" / "snapshots" / revision
+    )
+    for relative in files:
+        source = snapshot / relative
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(relative.encode())
+
+    store = GGUFArtifactStore(tmp_path)
+    published = store.publish(
+        repo_id=repo_id,
+        resolved_revision=revision,
+        snapshot_path=snapshot,
+        spec=GGUFDownloadSpec(files=files, entrypoint=files[0]),
+    )
+    provisioner = _make_provisioner(
+        settings=ProvisioningSettings(nfs_mount_point=str(tmp_path)),
+        artifact_store=store,
+    )
+
+    selected = provisioner.resolve_artifact_selection(
+        InferenceEngine.LLAMA_CPP, published.artifact_id
+    )
+    assert selected == published
+    env = {
+        **os.environ,
+        **provisioner._start_script_env(None, InferenceEngine.LLAMA_CPP, selected),
+    }
+    start_script = (
+        Path(__file__).resolve().parents[2] / "auto-llamacpp" / "start-llamacpp.sh"
+    )
+    command = "\n".join(
+        (
+            f"source {shlex.quote(str(start_script))}",
+            "resolve_gguf_artifact",
+            'printf "%s\\n%s\\n" "$GGUF_PATH" "$MODEL_ALIAS"',
+        )
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", command],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    expected_entrypoint = tmp_path / published.cache_relative_entrypoint
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [str(expected_entrypoint.resolve()), repo_id]
+    assert expected_entrypoint.is_symlink()
 
 
 def test_env_prefix_quoting() -> None:
@@ -477,6 +562,22 @@ class TestProvisionEndpointPolicy:
         etcd.put.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_llamacpp_without_artifact_fails_before_remote_work() -> None:
+    ssh = MagicMock()
+    etcd = MagicMock()
+    provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
+
+    with patch.object(provisioner, "_provision", new_callable=AsyncMock) as body:
+        with pytest.raises(ProvisioningError, match="requires artifact_id"):
+            await provisioner.provision("host1", engine=InferenceEngine.LLAMA_CPP)
+        body.assert_not_awaited()
+
+    ssh.upload.assert_not_called()
+    ssh.run_streaming.assert_not_called()
+    etcd.put.assert_not_called()
+
+
 class TestScriptUpload:
     """Scripts are uploaded to remote host before setup."""
 
@@ -635,6 +736,26 @@ class TestModelExtraction:
 
         with pytest.raises(ProvisioningError, match="model name not found"):
             await provisioner._run_start_vllm("host1")
+
+    @pytest.mark.asyncio
+    async def test_llamacpp_reported_alias_must_match_selected_artifact(self) -> None:
+        ssh = MagicMock()
+
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
+            yield ("stdout", "# Model:              wrong/model")
+
+        ssh.run_streaming = mock_streaming
+        provisioner = _make_provisioner(ssh_client=ssh)
+
+        with pytest.raises(ProvisioningError, match="expected selected artifact"):
+            await provisioner._run_start_vllm(
+                "host1",
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact=_artifact(),
+            )
 
     @pytest.mark.asyncio
     async def test_includes_model_in_start_environment(self) -> None:

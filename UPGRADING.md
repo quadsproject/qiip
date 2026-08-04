@@ -280,6 +280,32 @@ branch, but it is outside QIIP's managed-node support boundary. Validate a
 disposable node from each GPU family before fleet rollout because the build is
 specialized for the attached CUDA architecture.
 
+### 21. Use exact immutable GGUF artifacts
+
+The short-lived `allow_patterns` field on `POST /admin/models/download` has
+been removed. It could select multiple unrelated files and could not identify
+one loadable split GGUF generation. Unknown request fields are now rejected,
+so callers still sending `allow_patterns` receive 422 rather than a silently
+different download.
+
+For llama.cpp, send `engine: "llama_cpp"` plus an exact `gguf` object containing
+the ordered repository-relative files and the entrypoint. Download status now
+includes a stable `download_id`, the requested revision, the resolved commit
+SHA, and the published artifact. Setup requires that artifact's 64-character
+`artifact_id`; a missing, unknown, or invalid artifact is rejected before a
+host lease, QUADS lookup, SSH, driver installation, or CUDA source build.
+
+`AUTOLLAMACPP_MODEL` and `AUTOLLAMACPP_QUANTIZATION` no longer select files.
+Standalone launchers must provide `AUTOLLAMACPP_GGUF_PATH` and
+`AUTOLLAMACPP_MODEL_ALIAS`. The path is cache-relative and must resolve beneath
+the configured NFS mount.
+
+Artifact identity uses the resolved commit SHA, exact ordered file set,
+entrypoint, and alias. Re-downloading a moving branch therefore creates a new
+immutable generation instead of replacing the old one. QIIP deliberately does
+not prune generations or backing HuggingFace snapshots; coordinate retention
+only after confirming no running or restartable node depends on them.
+
 ## Artifact Sources and Mirror Policy
 
 There is no single global mirror switch. Each source has a different trust and configuration boundary.
@@ -290,6 +316,7 @@ There is no single global mirror switch. Each source has a different trust and c
 | LLMFit archive used by `setup.sh` | Node-side `LLMFIT_URL`; the gateway forwards version and digest but not this URL | `AUTOVLLM_LLMFIT_SHA256`, normally populated from `LLMFIT__SHA256` | Point the node-side variable at byte-identical mirrored content. When invoking setup through QIIP, arrange the variable in the node's SSH environment or customize the shipped bundle. |
 | On-demand LLMFit runner install | `INFERENCE_PROXY_LLMFIT__INSTALL_URL` | `INFERENCE_PROXY_LLMFIT__SHA256` | Set the validated HTTP(S) `{version}` URL template and matching digest. Configure this separately from the setup-script URL. |
 | llama.cpp source archive | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` with the pinned `LLAMACPP_VERSION` | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256`; verification happens before extraction or build | Point the validated `{version}` URL template at a mirror serving byte-identical tag archives, or configure the matching digest with a custom version. Managed nodes compile CUDA-enabled binaries locally because the pinned release has no Linux CUDA archive. |
+| HuggingFace model snapshots and GGUF files | Repository ID, optional requested revision, and exact GGUF file set in the administrative download request | Download status records the resolved immutable commit; GGUF manifests bind that commit to an exact entrypoint and file set | Pre-seed the standard HuggingFace cache on the declared NFS export. QIIP does not provide a separate model-hub mirror URL. A resolved commit records reproducibility but is not an independently configured content digest. |
 | uv bootstrap binary | Pinned GitHub release in `setup.sh` and `auto-vllm/.uv-version` | Vendored checksum from Astral's release assets | Air-gapped nodes may preinstall the exact pinned uv version at the expected path. Changing the download source requires a reviewed bundle change. |
 | vLLM, FlashInfer, and Python dependencies | `auto-vllm/pyproject.toml` plus `auto-vllm/uv.lock` | Registry artifact hashes for the full installable closure; source builds are refused | Regenerate and review the node project and lock for a custom index. Runtime `FLASHINFER_INDEX_URL` overrides are rejected. A pre-seeded uv cache may be used only when it satisfies the frozen lock. |
 | DNF and CUDA RPM packages | Node repository configuration; setup also enables NVIDIA's RHEL 9 CUDA repository | Repository metadata and RPM signatures | Manage mirrors through node repository policy or a reviewed setup-bundle customization. QIIP has no gateway-level DNF mirror setting. |
@@ -330,6 +357,8 @@ gateway rollout.
 | **New surface** | Setup returns 429 when the configurable provisioning limit is full, including the active count and limit in `detail`. | Retry after another setup completes; teardown remains available and should not be blocked behind setup retries. |
 | **New surface** | `/admin/nodes` and `/admin/models/catalog` can return `X-Inference-Proxy-Data-Degraded` with `provisioning-tasks` or `model-catalog`. | Surface the degraded state instead of treating missing task fields or an empty catalog as authoritative. |
 | **Correctness fix** | A duplicate model-download POST returns 200 with the existing status; a newly accepted download returns 202. | Accept both success codes and inspect the returned download state. |
+| **Behavioral break** | Model downloads reject the removed `allow_patterns` field. llama.cpp downloads require an exact `gguf.files` and `gguf.entrypoint`; setup requires the resulting `artifact_id`. | Update direct administrative clients to the exact-artifact contract and handle 422 for obsolete request bodies. |
+| **New surface** | Download status records `download_id`, requested and resolved revisions, and published artifacts. The catalog returns validated GGUF generations in `gguf_artifacts`, separate from full vLLM `models`. | Persist the resolved SHA and artifact ID when reproducibility matters. Do not treat intentional partial GGUF snapshots as missing vLLM models. |
 | **Correctness fix** | Setup eligibility is status-aware and serialized by a per-host lifecycle lease. Live healthy or unhealthy nodes require explicit teardown; stale provisioning, failed, unknown, or zero-connection draining records can be cleaned before retry. | Handle actionable 400/409 responses rather than assuming every repeated setup request is accepted. |
 | **Correctness fix** | Recommendation targets must be registered or currently QUADS-available and must pass the endpoint allowlist. | Do not use the recommendation endpoint as an unrestricted SSH target. |
 | **Correctness fix** | `GracefulRestart` and `ForceRestart` always issue a Redfish reset even when the machine is already On. Only `On` and `ForceOff` are idempotent shortcuts. Malformed or unsupported BMC power states return a structured 502. | Do not use a restart action as a state probe; expect it to restart a running machine. |
@@ -348,10 +377,11 @@ Do not recreate expired keys manually with `managed: true` unless the external w
 
 ### Empty or degraded model catalog
 
-1. Request `/admin/models/catalog` with headers and inspect `incomplete_count`, `unverifiable_count`, and `X-Inference-Proxy-Data-Degraded`.
+1. Request `/admin/models/catalog` with headers and inspect `incomplete_count`, `unverifiable_count`, `invalid_artifact_count`, `cache_warning_count`, and `X-Inference-Proxy-Data-Degraded`.
 2. For incomplete snapshots, restart the download and verify the download status reaches completion.
 3. For unverifiable legacy snapshots, re-download with the current HuggingFace tooling so tree-manifest metadata is created.
-4. Refresh the catalog and verify both degraded counts are zero before provisioning a node with one of those models.
+4. For invalid GGUF artifacts, preserve the backing snapshot for diagnosis and re-run the exact download rather than editing a manifest or link manually.
+5. Refresh the catalog and verify all degraded counts are zero before provisioning a node with one of those models.
 
 The catalog intentionally hides entries it cannot prove complete. Do not work around this by advertising the directory name directly; vLLM can otherwise start a long re-download or fail during model load while setup reports only a health-poll timeout.
 

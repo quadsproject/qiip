@@ -3,12 +3,12 @@ set -euo pipefail
 
 API_PORT="${AUTOLLAMACPP_PORT:-8000}"
 NFS_MOUNT_POINT="${AUTOLLAMACPP_NFS_MOUNT_POINT:-/srv/hf-cache}"
-MODEL_OVERRIDE="${AUTOLLAMACPP_MODEL:-}"
+GGUF_RELATIVE_PATH="${AUTOLLAMACPP_GGUF_PATH:-}"
+MODEL_ALIAS="${AUTOLLAMACPP_MODEL_ALIAS:-}"
 GPU_LAYERS_OVERRIDE="${AUTOLLAMACPP_GPU_LAYERS:-}"
 CTX_SIZE_OVERRIDE="${AUTOLLAMACPP_CTX_SIZE:-}"
 PARALLEL_OVERRIDE="${AUTOLLAMACPP_PARALLEL:-}"
 BATCH_SIZE_OVERRIDE="${AUTOLLAMACPP_BATCH_SIZE:-}"
-QUANTIZATION="${AUTOLLAMACPP_QUANTIZATION:-Q4_K_M}"
 EXTRA_ARGS_OVERRIDE="${AUTOLLAMACPP_EXTRA_ARGS:-}"
 SCRIPT_DIR="${AUTOLLAMACPP_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 LLAMACPP_BIN="${AUTOLLAMACPP_BIN:-/usr/local/bin/llama-server}"
@@ -40,45 +40,52 @@ detect_gpu_info() {
     fi
 }
 
-find_gguf_model() {
-    local model_name="$1"
-    local quant_lower
-    quant_lower=$(echo "$QUANTIZATION" | tr '[:upper:]' '[:lower:]')
-    local gguf_dir="${NFS_MOUNT_POINT}/gguf"
-
-    local -a candidates=()
-    if [ -d "$gguf_dir" ]; then
-        if [ -n "$model_name" ]; then
-            local model_pattern
-            model_pattern="${model_name//\//--}"
-            mapfile -t candidates < <(
-                find "$gguf_dir" -path "*${model_pattern}*" -name "*${quant_lower}*" -name "*.gguf" -type f 2>/dev/null
-            )
-        fi
-        if [ "${#candidates[@]}" -eq 0 ]; then
-            mapfile -t candidates < <(
-                find "$gguf_dir" -name "*${quant_lower}*" -name "*.gguf" -type f 2>/dev/null
-            )
-        fi
+resolve_gguf_artifact() {
+    if [ -z "$GGUF_RELATIVE_PATH" ]; then
+        echo "FATAL: AUTOLLAMACPP_GGUF_PATH must name an exact cache-relative .gguf file" >&2
+        return 1
     fi
-
-    if [ "${#candidates[@]}" -gt 0 ]; then
-        GGUF_PATH="${candidates[0]}"
-        return 0
+    if [ -z "$MODEL_ALIAS" ]; then
+        echo "FATAL: AUTOLLAMACPP_MODEL_ALIAS must name the selected artifact" >&2
+        return 1
     fi
-
-    echo "No GGUF file found for quantization ${QUANTIZATION} in ${gguf_dir}" >&2
-    return 1
-}
-
-derive_model_alias() {
-    local gguf_path="$1"
-    local dir_name
-    dir_name=$(basename "$(dirname "$gguf_path")")
-    # Strip -GGUF suffix and convert -- back to /
-    MODEL_ALIAS="${dir_name/--//}"
-    MODEL_ALIAS="${MODEL_ALIAS%-GGUF}"
-    MODEL_ALIAS="${MODEL_ALIAS%-gguf}"
+    if [[ "$GGUF_RELATIVE_PATH" == /* ]]; then
+        echo "FATAL: AUTOLLAMACPP_GGUF_PATH must be relative to the NFS mount" >&2
+        return 1
+    fi
+    case "$GGUF_RELATIVE_PATH" in
+        ../*|*/../*|.|./*|*/./*|*//*|*\\*)
+            echo "FATAL: AUTOLLAMACPP_GGUF_PATH must be a canonical relative POSIX path" >&2
+            return 1
+            ;;
+    esac
+    case "$GGUF_RELATIVE_PATH" in
+        *.gguf) ;;
+        *)
+            echo "FATAL: AUTOLLAMACPP_GGUF_PATH must end in .gguf" >&2
+            return 1
+            ;;
+    esac
+    local mount_root
+    mount_root=$(readlink -f -- "$NFS_MOUNT_POINT") || {
+        echo "FATAL: NFS mount is unavailable: ${NFS_MOUNT_POINT}" >&2
+        return 1
+    }
+    GGUF_PATH=$(readlink -f -- "${mount_root}/${GGUF_RELATIVE_PATH}") || {
+        echo "FATAL: selected GGUF artifact is unavailable: ${GGUF_RELATIVE_PATH}" >&2
+        return 1
+    }
+    case "$GGUF_PATH" in
+        "${mount_root}"/*) ;;
+        *)
+            echo "FATAL: selected GGUF artifact escapes the NFS mount" >&2
+            return 1
+            ;;
+    esac
+    if [ ! -f "$GGUF_PATH" ]; then
+        echo "FATAL: selected GGUF artifact is not a regular file: ${GGUF_RELATIVE_PATH}" >&2
+        return 1
+    fi
 }
 
 configure_llamacpp_params() {
@@ -130,9 +137,10 @@ configure_llamacpp_params() {
 }
 
 clear_script_environment() {
-    unset AUTOLLAMACPP_PORT AUTOLLAMACPP_NFS_MOUNT_POINT AUTOLLAMACPP_MODEL
+    unset AUTOLLAMACPP_PORT AUTOLLAMACPP_NFS_MOUNT_POINT
+    unset AUTOLLAMACPP_GGUF_PATH AUTOLLAMACPP_MODEL_ALIAS
     unset AUTOLLAMACPP_GPU_LAYERS AUTOLLAMACPP_CTX_SIZE AUTOLLAMACPP_PARALLEL
-    unset AUTOLLAMACPP_BATCH_SIZE AUTOLLAMACPP_QUANTIZATION AUTOLLAMACPP_EXTRA_ARGS
+    unset AUTOLLAMACPP_BATCH_SIZE AUTOLLAMACPP_EXTRA_ARGS
     unset AUTOLLAMACPP_SCRIPT_DIR AUTOLLAMACPP_BIN AUTOLLAMACPP_INSTALL_ROOT
     unset AUTOLLAMACPP_PID_FILE
     unset AUTOLLAMACPP_LOG_FILE AUTOLLAMACPP_PROC_ROOT
@@ -166,29 +174,7 @@ verify_llamacpp_started() {
 }
 
 run_llamacpp() {
-    if [ -n "$MODEL_OVERRIDE" ]; then
-        if ! find_gguf_model "$MODEL_OVERRIDE"; then
-            echo "FATAL: could not locate GGUF model for ${MODEL_OVERRIDE}" >&2
-            exit 1
-        fi
-    else
-        local gguf_dir="${NFS_MOUNT_POINT}/gguf"
-        local quant_lower
-        quant_lower=$(echo "$QUANTIZATION" | tr '[:upper:]' '[:lower:]')
-        local -a all_ggufs=()
-        if [ -d "$gguf_dir" ]; then
-            mapfile -t all_ggufs < <(
-                find "$gguf_dir" -name "*${quant_lower}*" -name "*.gguf" -type f 2>/dev/null
-            )
-        fi
-        if [ "${#all_ggufs[@]}" -eq 0 ]; then
-            echo "FATAL: no GGUF models found in ${gguf_dir}" >&2
-            exit 1
-        fi
-        GGUF_PATH="${all_ggufs[0]}"
-    fi
-
-    derive_model_alias "$GGUF_PATH"
+    resolve_gguf_artifact
 
     bash "${SCRIPT_DIR}/stop-llamacpp.sh"
     clear_script_environment
@@ -200,7 +186,6 @@ run_llamacpp() {
 # GPU:                ${GPU_COUNT} x ${GPU_MODEL} (${GPU_VRAM_GB} GB)
 # Model:              ${MODEL_ALIAS}
 # GGUF:               ${GGUF_PATH}
-# Quantization:       ${QUANTIZATION}
 # GPU Layers:         ${N_GPU_LAYERS}
 # Context Size:       ${CTX_SIZE} tokens
 # Parallel Slots:     ${PARALLEL}

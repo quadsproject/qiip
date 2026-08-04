@@ -142,6 +142,7 @@ class TestAdminBasicAuthentication:
             managed=False,
             model=None,
             engine=ANY,
+            artifact_id=None,
             lifecycle_lease=ANY,
         )
 

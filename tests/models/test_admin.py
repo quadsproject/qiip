@@ -15,8 +15,10 @@ from pydantic import ValidationError
 from inference_proxy.models.admin import (
     AdminMetricsResponse,
     AdminNodeResponse,
+    DownloadRequest,
     SetupRequest,
 )
+from inference_proxy.models.node import InferenceEngine
 
 
 class TestAdminNodeResponse:
@@ -123,3 +125,46 @@ class TestSetupRequest:
         req = SetupRequest(hostname="gpu01", model="org/model")
         with pytest.raises(ValidationError):
             req.model = "other"  # type: ignore[misc]
+
+    @pytest.mark.parametrize("hostname", ["", "-gpu01", "gpu_01"])
+    def test_hostname_rejects_empty_or_invalid_values(self, hostname: str) -> None:
+        with pytest.raises(ValidationError):
+            SetupRequest(hostname=hostname)
+
+    def test_llamacpp_requires_only_an_artifact(self) -> None:
+        artifact_id = "a" * 64
+        request = SetupRequest(
+            hostname="gpu01",
+            engine=InferenceEngine.LLAMA_CPP,
+            artifact_id=artifact_id,
+        )
+        assert request.artifact_id == artifact_id
+
+        with pytest.raises(ValidationError, match="requires artifact_id"):
+            SetupRequest(hostname="gpu01", engine=InferenceEngine.LLAMA_CPP)
+        with pytest.raises(ValidationError, match="uses artifact_id, not model"):
+            SetupRequest(
+                hostname="gpu01",
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact_id=artifact_id,
+                model="org/model",
+            )
+
+    def test_vllm_rejects_an_artifact(self) -> None:
+        with pytest.raises(ValidationError, match="only valid for llama_cpp"):
+            SetupRequest(hostname="gpu01", artifact_id="a" * 64)
+
+
+class TestDownloadRequest:
+    def test_llamacpp_requires_exact_gguf_specification(self) -> None:
+        with pytest.raises(ValidationError, match="require an exact gguf"):
+            DownloadRequest(repo_id="org/model", engine=InferenceEngine.LLAMA_CPP)
+
+    def test_vllm_rejects_gguf_specification(self) -> None:
+        from inference_proxy.huggingface.artifacts import GGUFDownloadSpec
+
+        with pytest.raises(ValidationError, match="only valid for llama_cpp"):
+            DownloadRequest(
+                repo_id="org/model",
+                gguf=GGUFDownloadSpec(files=("model.gguf",), entrypoint="model.gguf"),
+            )

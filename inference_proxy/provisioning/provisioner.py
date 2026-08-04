@@ -27,6 +27,11 @@ from inference_proxy.config.settings import LLMFitSettings, ProvisioningSettings
 from inference_proxy.discovery.etcd_client import EtcdClient
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_to_etcd
+from inference_proxy.huggingface.artifacts import (
+    GGUFArtifact,
+    GGUFArtifactError,
+    GGUFArtifactStore,
+)
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
 from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.provisioning.host_lifecycle import (
@@ -128,6 +133,7 @@ class NodeProvisioner:
         lifecycle_coordinator: HostLifecycleCoordinator | None = None,
         hf_token: str | None = None,
         nfs_export: str | None = None,
+        artifact_store: GGUFArtifactStore | None = None,
     ) -> None:
         self._ssh_client = ssh_client
         self._etcd_client = etcd_client
@@ -148,6 +154,7 @@ class NodeProvisioner:
         self._lifecycle = lifecycle_coordinator or HostLifecycleCoordinator()
         self._hf_token = hf_token
         self._nfs_export = nfs_export
+        self._artifact_store = artifact_store
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._provisioning_tasks: dict[str, _ProvisioningTask] = {}
 
@@ -184,6 +191,32 @@ class NodeProvisioner:
         """Require settings used only by the node-provisioning workflow."""
         self._required_nfs_export()
         self._required_script_bundles(engine)
+
+    def resolve_artifact_selection(
+        self,
+        engine: InferenceEngine,
+        artifact_id: str | None,
+    ) -> GGUFArtifact | None:
+        """Resolve the exact llama.cpp artifact or reject the engine contract."""
+        if engine == InferenceEngine.VLLM:
+            if artifact_id is not None:
+                raise ProvisioningError(
+                    "artifact_id is only valid for llama_cpp provisioning"
+                )
+            return None
+        if artifact_id is None:
+            raise ProvisioningError("llama_cpp provisioning requires artifact_id")
+        if self._artifact_store is None:
+            raise ProvisioningError("GGUF artifact storage is not configured")
+        try:
+            artifact = self._artifact_store.get(artifact_id)
+        except GGUFArtifactError as exc:
+            raise ProvisioningError(
+                f"GGUF artifact {artifact_id!r} is invalid: {exc}"
+            ) from exc
+        if artifact is None:
+            raise ProvisioningError(f"GGUF artifact {artifact_id!r} was not found")
+        return artifact
 
     def _required_nfs_export(self) -> str:
         """Return the canonical NFS export or reject node provisioning."""
@@ -242,7 +275,10 @@ class NodeProvisioner:
         return env
 
     def _start_script_env(
-        self, model: str | None, engine: InferenceEngine = InferenceEngine.VLLM
+        self,
+        model: str | None,
+        engine: InferenceEngine = InferenceEngine.VLLM,
+        artifact: GGUFArtifact | None = None,
     ) -> dict[str, str]:
         """Return the exact environment accepted by the engine start script."""
         if engine == InferenceEngine.LLAMA_CPP:
@@ -251,8 +287,10 @@ class NodeProvisioner:
                 "AUTOLLAMACPP_PORT": str(self._settings.vllm_port),
                 "AUTOLLAMACPP_REQUIRE_CUDA": "1",
             }
-            if model is not None:
-                env["AUTOLLAMACPP_MODEL"] = model
+            if artifact is None:
+                raise ProvisioningError("llama_cpp start requires a GGUF artifact")
+            env["AUTOLLAMACPP_GGUF_PATH"] = artifact.cache_relative_entrypoint
+            env["AUTOLLAMACPP_MODEL_ALIAS"] = artifact.model_alias
         else:
             env = {
                 "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
@@ -463,6 +501,7 @@ class NodeProvisioner:
         managed: bool = True,
         model: str | None = None,
         engine: InferenceEngine = InferenceEngine.VLLM,
+        artifact_id: str | None = None,
         lifecycle_lease: HostLifecycleLease | None = None,
     ) -> None:
         """Provision *hostname* under the shared host lifecycle coordinator."""
@@ -471,6 +510,7 @@ class NodeProvisioner:
         # immediate 400 responses instead of failed background operations.
         self.validate_setup_configuration(engine)
         self.validate_endpoint(hostname)
+        artifact = self.resolve_artifact_selection(engine, artifact_id)
         lease = lifecycle_lease
         if lease is None:
             lease = await self._lifecycle.acquire(hostname)
@@ -478,7 +518,13 @@ class NodeProvisioner:
             raise ValueError("lifecycle lease does not own this host")
 
         try:
-            await self._provision(hostname, managed=managed, model=model, engine=engine)
+            await self._provision(
+                hostname,
+                managed=managed,
+                model=model,
+                engine=engine,
+                artifact=artifact,
+            )
         except asyncio.CancelledError:
             self._log(hostname, "error", "Provisioning cancelled by teardown")
             await self._update_state(
@@ -499,6 +545,7 @@ class NodeProvisioner:
         managed: bool = True,
         model: str | None = None,
         engine: InferenceEngine = InferenceEngine.VLLM,
+        artifact: GGUFArtifact | None = None,
     ) -> None:
         """Run full provisioning sequence on *hostname*.
 
@@ -586,7 +633,7 @@ class NodeProvisioner:
             )
             self._log(hostname, "info", f"Starting {engine} inference engine")
             model_name = await self._run_start_vllm(
-                hostname, model=model, engine=engine
+                hostname, model=model, engine=engine, artifact=artifact
             )
             current_step = "health_poll"
             await self._update_state(
@@ -730,6 +777,7 @@ class NodeProvisioner:
         *,
         model: str | None = None,
         engine: InferenceEngine = InferenceEngine.VLLM,
+        artifact: GGUFArtifact | None = None,
     ) -> str:
         """Run the engine start script and extract model name from stdout."""
         if engine == InferenceEngine.LLAMA_CPP:
@@ -738,7 +786,7 @@ class NodeProvisioner:
             script = "start-vllm.sh"
         command = self._script_command(
             script,
-            env=self._start_script_env(model, engine),
+            env=self._start_script_env(model, engine, artifact),
             scripts_dir=self._engine_scripts_dir(engine).name,
         )
         model_name: str | None = None
@@ -757,7 +805,12 @@ class NodeProvisioner:
             raise ProvisioningError(
                 f"model name not found in {script} output on {hostname}"
             )
-        return model_name
+        if artifact is not None and model_name != artifact.model_alias:
+            raise ProvisioningError(
+                f"{script} reported model {model_name!r}, expected selected "
+                f"artifact alias {artifact.model_alias!r}"
+            )
+        return artifact.model_alias if artifact is not None else model_name
 
     async def _tail_vllm_log(
         self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM

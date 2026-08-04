@@ -7,9 +7,15 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from huggingface_hub.errors import CorruptedCacheException
 from structlog.testing import capture_logs
 
-from inference_proxy.huggingface.catalog import CatalogEntry, ModelCatalogService
+from inference_proxy.huggingface.artifacts import GGUFArtifactStore, GGUFDownloadSpec
+from inference_proxy.huggingface.catalog import (
+    CatalogEntry,
+    ModelCatalogService,
+    _SnapshotCheck,
+)
 
 
 def _mock_repo(
@@ -17,18 +23,25 @@ def _mock_repo(
     repo_type: str = "model",
     *,
     repo_path: Path | None = None,
+    revisions: tuple[str, ...] = (),
 ) -> MagicMock:
     repo = MagicMock()
     repo.repo_id = repo_id
     repo.repo_type = repo_type
     if repo_path is not None:
         repo.repo_path = repo_path
+    repo.revisions = frozenset(
+        MagicMock(commit_hash=commit_hash) for commit_hash in revisions
+    )
     return repo
 
 
-def _mock_cache_info(repos: list[MagicMock]) -> MagicMock:
+def _mock_cache_info(
+    repos: list[MagicMock], *, warnings: tuple[Exception, ...] = ()
+) -> MagicMock:
     info = MagicMock()
     info.repos = frozenset(repos)
+    info.warnings = warnings
     return info
 
 
@@ -72,7 +85,9 @@ def _write_cached_snapshot(
 
 class TestListModels:
     @pytest.mark.asyncio
-    @patch.object(ModelCatalogService, "_snapshot_state", return_value="complete")
+    @patch.object(
+        ModelCatalogService, "_snapshot_state", return_value=_SnapshotCheck("complete")
+    )
     @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
     async def test_returns_model_repos(
         self, mock_scan: MagicMock, mock_state: MagicMock
@@ -92,11 +107,14 @@ class TestListModels:
         assert all(isinstance(e, CatalogEntry) for e in result.models)
         assert result.incomplete_count == 0
         assert result.unverifiable_count == 0
+        assert result.gguf_artifacts == []
         mock_scan.assert_called_once_with("/data/hf")
         assert mock_state.call_count == 2
 
     @pytest.mark.asyncio
-    @patch.object(ModelCatalogService, "_snapshot_state", return_value="complete")
+    @patch.object(
+        ModelCatalogService, "_snapshot_state", return_value=_SnapshotCheck("complete")
+    )
     @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
     async def test_filters_non_model_repos(
         self, mock_scan: MagicMock, mock_state: MagicMock
@@ -170,7 +188,110 @@ class TestListModels:
             {
                 "event": "catalog scan skipped models",
                 "incomplete_count": 1,
+                "invalid_artifact_count": 0,
                 "log_level": "warning",
+                "cache_warning_count": 0,
                 "unverifiable_count": 1,
             }
         ]
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
+    async def test_valid_partial_gguf_is_cataloged_without_degradation(
+        self, mock_scan: MagicMock, tmp_path: Path
+    ) -> None:
+        repo_id = "org/model-GGUF"
+        revision = "c" * 40
+        snapshot = tmp_path / "models--org--model-GGUF" / "snapshots" / revision
+        snapshot.mkdir(parents=True)
+        (snapshot / "model.gguf").write_bytes(b"weights")
+        artifact = GGUFArtifactStore(tmp_path).publish(
+            repo_id=repo_id,
+            resolved_revision=revision,
+            snapshot_path=snapshot,
+            spec=GGUFDownloadSpec(files=("model.gguf",), entrypoint="model.gguf"),
+        )
+        repo = _mock_repo(
+            repo_id,
+            repo_path=snapshot.parents[1],
+            revisions=(revision,),
+        )
+        mock_scan.return_value = _mock_cache_info([repo])
+        service = ModelCatalogService(str(tmp_path))
+
+        with patch.object(
+            service,
+            "_snapshot_state",
+            return_value=_SnapshotCheck("incomplete", revision),
+        ):
+            result = await service.list_models()
+
+        assert result.models == []
+        assert result.gguf_artifacts == [artifact]
+        assert result.incomplete_count == 0
+        assert result.invalid_artifact_count == 0
+        assert result.cache_warning_count == 0
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
+    async def test_artifact_does_not_hide_a_different_incomplete_revision(
+        self, mock_scan: MagicMock, tmp_path: Path
+    ) -> None:
+        repo_id = "org/model-GGUF"
+        artifact_revision = "c" * 40
+        incomplete_revision = "d" * 40
+        snapshot = (
+            tmp_path / "models--org--model-GGUF" / "snapshots" / artifact_revision
+        )
+        snapshot.mkdir(parents=True)
+        (snapshot / "model.gguf").write_bytes(b"weights")
+        artifact = GGUFArtifactStore(tmp_path).publish(
+            repo_id=repo_id,
+            resolved_revision=artifact_revision,
+            snapshot_path=snapshot,
+            spec=GGUFDownloadSpec(files=("model.gguf",), entrypoint="model.gguf"),
+        )
+        mock_scan.return_value = _mock_cache_info(
+            [
+                _mock_repo(
+                    repo_id,
+                    repo_path=snapshot.parents[1],
+                    revisions=(artifact_revision, incomplete_revision),
+                )
+            ]
+        )
+        service = ModelCatalogService(str(tmp_path))
+
+        with patch.object(
+            service,
+            "_snapshot_state",
+            return_value=_SnapshotCheck("incomplete", incomplete_revision),
+        ):
+            result = await service.list_models()
+
+        assert result.gguf_artifacts == [artifact]
+        assert result.incomplete_count == 1
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
+    async def test_only_exact_artifact_root_cache_warning_is_tolerated(
+        self, mock_scan: MagicMock, tmp_path: Path
+    ) -> None:
+        artifact_root = tmp_path / "gguf"
+        artifact_root.mkdir()
+        (artifact_root / "invalid-artifact").mkdir()
+        artifact_root_warning = CorruptedCacheException(
+            f"Repo path is not a valid HuggingFace cache directory: {artifact_root}"
+        )
+        real_corruption = CorruptedCacheException(
+            "Repo path is not a valid HuggingFace cache directory: "
+            f"{tmp_path / 'broken'}"
+        )
+        mock_scan.return_value = _mock_cache_info(
+            [], warnings=(artifact_root_warning, real_corruption)
+        )
+
+        result = await ModelCatalogService(str(tmp_path)).list_models()
+
+        assert result.cache_warning_count == 1
+        assert result.invalid_artifact_count == 1

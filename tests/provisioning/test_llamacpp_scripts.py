@@ -52,6 +52,133 @@ def _source_setup(command: str) -> str:
     )
 
 
+def _source_start(command: str) -> str:
+    start_script = shlex.quote(str(START_SCRIPT))
+    return f"source {start_script}\n{command}"
+
+
+def test_start_resolves_exact_artifact_and_preserves_alias(tmp_path: Path) -> None:
+    model = tmp_path / "gguf" / "artifact -- id" / "files" / "model---Q4.gguf"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"weights")
+    alias = "org/model--with---separators"
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
+        "AUTOLLAMACPP_GGUF_PATH": str(model.relative_to(tmp_path)),
+        "AUTOLLAMACPP_MODEL_ALIAS": alias,
+    }
+
+    result = _run_shell(
+        _source_start(
+            'resolve_gguf_artifact; printf "%s\\n%s\\n" "$GGUF_PATH" "$MODEL_ALIAS"'
+        ),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [str(model.resolve()), alias]
+
+
+def test_managed_launch_uses_exact_artifact_and_explicit_alias(tmp_path: Path) -> None:
+    """Exercise the public launch path without relying on the new helper name."""
+    exact = tmp_path / "gguf" / "artifact -- id" / "files" / "model---q4_k_m.gguf"
+    exact.parent.mkdir(parents=True)
+    exact.write_bytes(b"selected")
+    decoy = tmp_path / "gguf" / "unrelated" / "wrong-q4_k_m.gguf"
+    decoy.parent.mkdir(parents=True)
+    decoy.write_bytes(b"wrong")
+    alias = "org/model--with---separators"
+
+    fake_bin = tmp_path / "fake llama-server"
+    args_file = tmp_path / "llama args"
+    _write_executable(
+        fake_bin,
+        '#!/bin/bash\nprintf \'%s\\n\' "$@" > "$AUTOLLAMACPP_TEST_ARGS"\n',
+    )
+    script_bundle = tmp_path / "script bundle"
+    script_bundle.mkdir()
+    _write_executable(script_bundle / "stop-llamacpp.sh", "#!/bin/bash\nexit 0\n")
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
+        "AUTOLLAMACPP_GGUF_PATH": str(exact.relative_to(tmp_path)),
+        "AUTOLLAMACPP_MODEL_ALIAS": alias,
+        "AUTOLLAMACPP_BIN": str(fake_bin),
+        "AUTOLLAMACPP_PID_FILE": str(tmp_path / "llama.pid"),
+        "AUTOLLAMACPP_LOG_FILE": str(tmp_path / "llama.log"),
+        "AUTOLLAMACPP_TEST_ARGS": str(args_file),
+    }
+    command = "\n".join(
+        (
+            f"SCRIPT_DIR={shlex.quote(str(script_bundle))}",
+            'GPU_COUNT=1; GPU_MODEL="fixture"; GPU_VRAM_GB=80',
+            "N_GPU_LAYERS=99; CTX_SIZE=4096; PARALLEL=1; BATCH_SIZE=512",
+            'verify_llamacpp_started() { wait "$1"; }',
+            "run_llamacpp",
+        )
+    )
+
+    result = _run_shell(_source_start(command), env=env)
+
+    assert result.returncode == 0, result.stderr
+    args = args_file.read_text(encoding="utf-8").splitlines()
+    assert args[args.index("--model") + 1] == str(exact.resolve())
+    assert args[args.index("--alias") + 1] == alias
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "message"),
+    [
+        ("../outside.gguf", "canonical relative POSIX path"),
+        ("/absolute.gguf", "relative to the NFS mount"),
+        ("not-a-model.bin", "must end in .gguf"),
+    ],
+)
+def test_start_rejects_unsafe_artifact_paths(
+    tmp_path: Path, relative_path: str, message: str
+) -> None:
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
+        "AUTOLLAMACPP_GGUF_PATH": relative_path,
+        "AUTOLLAMACPP_MODEL_ALIAS": "org/model",
+    }
+
+    result = _run_shell(_source_start("resolve_gguf_artifact"), env=env)
+
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_start_rejects_artifact_symlink_escaping_mount(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.gguf"
+    outside.write_bytes(b"outside")
+    link = tmp_path / "gguf" / "artifact" / "files" / "model.gguf"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(outside)
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
+        "AUTOLLAMACPP_GGUF_PATH": str(link.relative_to(tmp_path)),
+        "AUTOLLAMACPP_MODEL_ALIAS": "org/model",
+    }
+
+    result = _run_shell(_source_start("resolve_gguf_artifact"), env=env)
+
+    assert result.returncode != 0
+    assert "escapes the NFS mount" in result.stderr
+
+
+def test_start_has_no_global_search_alias_derivation_or_quantization_selector() -> None:
+    source = START_SCRIPT.read_text(encoding="utf-8")
+
+    assert "find_gguf_model" not in source
+    assert "derive_model_alias" not in source
+    assert "AUTOLLAMACPP_QUANTIZATION" not in source
+    assert 'find "$gguf_dir"' not in source
+
+
 def _build_fixture(
     tmp_path: Path, *, valid_checksum: bool = True
 ) -> tuple[dict[str, str], Path, Path]:

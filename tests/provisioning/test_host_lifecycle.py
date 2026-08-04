@@ -77,6 +77,7 @@ async def test_same_host_provision_and_teardown_are_serialized(
         managed: bool = True,
         model: str | None = None,
         engine: str = "vllm",
+        artifact: object | None = None,
     ) -> None:
         assert hostname == "gpu01"
         assert managed is True
@@ -143,6 +144,7 @@ async def test_different_hosts_can_run_lifecycle_operations_concurrently(
         managed: bool = True,
         model: str | None = None,
         engine: str = "vllm",
+        artifact: object | None = None,
     ) -> None:
         assert hostname == "gpu01"
         provision_entered.set()
@@ -185,6 +187,7 @@ async def test_reserved_lease_remains_busy_through_background_provision(
         managed: bool = True,
         model: str | None = None,
         engine: str = "vllm",
+        artifact: object | None = None,
     ) -> None:
         provision_entered.set()
         await release.wait()

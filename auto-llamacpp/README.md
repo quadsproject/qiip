@@ -82,19 +82,23 @@ compatibility with existing provisioning infrastructure.
 
 ## Run
 
-Start llama-server (detects the GPU and selects a GGUF model):
+Start llama-server with an exact cache-relative GGUF artifact and explicit
+model alias:
 
 ```bash
-./start-llamacpp.sh
+AUTOLLAMACPP_GGUF_PATH=gguf/<artifact-id>/files/model-Q4_K_M.gguf \
+AUTOLLAMACPP_MODEL_ALIAS=org/model \
+  ./start-llamacpp.sh
 ```
 
 llama-server runs as a background process. PID is written to
 `/var/run/llamacpp.pid`, logs to `/var/log/llamacpp-serve.log`.
 
 Script-specific launch overrides use the `AUTOLLAMACPP_*` namespace:
-`AUTOLLAMACPP_MODEL`, `AUTOLLAMACPP_PORT`, `AUTOLLAMACPP_GPU_LAYERS`,
-`AUTOLLAMACPP_CTX_SIZE`, `AUTOLLAMACPP_PARALLEL`, `AUTOLLAMACPP_BATCH_SIZE`,
-`AUTOLLAMACPP_QUANTIZATION`, and `AUTOLLAMACPP_EXTRA_ARGS`.
+`AUTOLLAMACPP_GGUF_PATH`, `AUTOLLAMACPP_MODEL_ALIAS`, `AUTOLLAMACPP_PORT`,
+`AUTOLLAMACPP_GPU_LAYERS`, `AUTOLLAMACPP_CTX_SIZE`,
+`AUTOLLAMACPP_PARALLEL`, `AUTOLLAMACPP_BATCH_SIZE`, and
+`AUTOLLAMACPP_EXTRA_ARGS`.
 
 The launcher clears inherited `LLAMA_ARG_*` variables before invoking
 `llama-server`; only the reviewed command-line arguments and the
@@ -107,17 +111,22 @@ and `AUTOLLAMACPP_PARALLEL=4`, each slot gets 2048 tokens.
 
 ### GGUF model storage
 
-GGUF files are stored under `<NFS_MOUNT_POINT>/gguf/` in directories named
-after the HuggingFace repo (e.g. `Qwen--Qwen2.5-7B-Instruct-GGUF/`). The
-start script selects a file matching the configured quantization level
-(default `Q4_K_M`).
+QIIP publishes immutable artifacts under
+`<NFS_MOUNT_POINT>/gguf/<artifact-id>/`. Each artifact contains a versioned
+manifest and relative links to an exact HuggingFace snapshot commit. The
+launcher requires the manifest's exact cache-relative entrypoint; it never
+scans globally or chooses the first quantization match.
+
+Artifact generations are not removed automatically. Older commits may still
+back running or restartable nodes, so operators must coordinate cache and
+artifact retention deliberately.
 
 ### Model name aliasing
 
 The `--alias` flag sets the canonical model name reported by `/v1/models`.
-The start script derives the alias by stripping the `-GGUF` suffix from the
-directory name and converting `--` back to `/`, so a vLLM node and a
-llama.cpp node serving the same model report the same name to the router.
+QIIP passes the explicit alias stored in the artifact manifest and verifies
+that the launcher reports the same value. Directory names are never decoded,
+so repository names containing repeated `--` or `---` remain exact.
 
 ## Health check
 

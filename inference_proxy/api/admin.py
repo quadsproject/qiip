@@ -163,7 +163,12 @@ async def list_catalog(
 ) -> ModelCatalogResponse:
     """Return the list of models available in the HuggingFace NFS cache."""
     result = await catalog.list_models()
-    if result.incomplete_count or result.unverifiable_count:
+    if (
+        result.incomplete_count
+        or result.unverifiable_count
+        or result.invalid_artifact_count
+        or result.cache_warning_count
+    ):
         response.headers[_DEGRADED_DATA_HEADER] = _MODEL_CATALOG_DEGRADED
     return result
 
@@ -180,7 +185,10 @@ async def trigger_download(
     download return 200 with the existing status (D-10).
     """
     result = await svc.trigger_download(
-        body.repo_id, allow_patterns=body.allow_patterns
+        body.repo_id,
+        revision=body.revision,
+        engine=body.engine,
+        gguf=body.gguf,
     )
     response.status_code = 202 if result.started else 200
     return result.status
@@ -211,6 +219,7 @@ async def setup_node(
     try:
         provisioner.validate_endpoint(hostname)
         provisioner.validate_setup_configuration(body.engine)
+        provisioner.resolve_artifact_selection(body.engine, body.artifact_id)
     except (EndpointValidationError, ProvisioningError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -309,6 +318,7 @@ async def setup_node(
                     managed=body.managed,
                     model=body.model,
                     engine=body.engine,
+                    artifact_id=body.artifact_id,
                     lifecycle_lease=lease,
                 )
             finally:

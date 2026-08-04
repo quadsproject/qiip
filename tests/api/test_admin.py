@@ -427,6 +427,7 @@ class TestSetupModelPassthrough:
             managed=True,
             model="org/model",
             engine=ANY,
+            artifact_id=None,
             lifecycle_lease=ANY,
         )
 
@@ -445,8 +446,33 @@ class TestSetupModelPassthrough:
             managed=True,
             model=None,
             engine=ANY,
+            artifact_id=None,
             lifecycle_lease=ANY,
         )
+
+    def test_unknown_llamacpp_artifact_fails_before_host_reservation(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        artifact_id = "a" * 64
+        mock_provisioner.resolve_artifact_selection.side_effect = ProvisioningError(
+            f"GGUF artifact {artifact_id!r} was not found"
+        )
+
+        response = client.post(
+            "/admin/nodes/setup",
+            json={
+                "hostname": "gpu01",
+                "engine": "llama_cpp",
+                "artifact_id": artifact_id,
+            },
+        )
+
+        assert response.status_code == 400
+        assert "was not found" in response.json()["detail"]
+        mock_provisioner.try_reserve_host.assert_not_awaited()
+        mock_provisioner.provision.assert_not_awaited()
 
 
 class TestTasksEndpoint:
@@ -902,6 +928,7 @@ class TestSetupEligibility:
             managed=managed,
             model=None,
             engine=ANY,
+            artifact_id=None,
             lifecycle_lease=ANY,
         )
 
@@ -976,11 +1003,13 @@ class TestSetupEligibility:
             managed: bool,
             model: str | None,
             engine: object = None,
+            artifact_id: str | None = None,
             lifecycle_lease: object,
         ) -> None:
             assert hostname == "gpu01"
             assert managed is True
             assert model is None
+            assert artifact_id is None
             assert lifecycle_lease is not None
             assert cleanup_complete
             assert test_registry.get(hostname) is None
@@ -1850,8 +1879,11 @@ class TestModelCatalog:
         assert response.status_code == 200
         assert response.json() == {
             "models": [],
+            "gguf_artifacts": [],
             "incomplete_count": 0,
             "unverifiable_count": 0,
+            "invalid_artifact_count": 0,
+            "cache_warning_count": 0,
         }
 
     def test_catalog_surfaces_degraded_cache_counts(
@@ -1867,6 +1899,8 @@ class TestModelCatalog:
                 models=[],
                 incomplete_count=2,
                 unverifiable_count=3,
+                invalid_artifact_count=4,
+                cache_warning_count=5,
             )
         )
         app.dependency_overrides[get_catalog_service] = lambda: mock_catalog
@@ -1877,6 +1911,9 @@ class TestModelCatalog:
         assert response.headers["X-Inference-Proxy-Data-Degraded"] == ("model-catalog")
         assert response.json() == {
             "models": [],
+            "gguf_artifacts": [],
             "incomplete_count": 2,
             "unverifiable_count": 3,
+            "invalid_artifact_count": 4,
+            "cache_warning_count": 5,
         }

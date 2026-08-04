@@ -21,7 +21,7 @@ from inference_proxy.config.settings import (
 from inference_proxy.main import create_app
 
 
-def _health_worker(*args: object) -> None:
+def _health_worker(*args: object, **_kwargs: object) -> None:
     stop_event = args[2]
     if not isinstance(stop_event, threading.Event):
         raise TypeError("health worker did not receive a threading.Event")
@@ -58,8 +58,9 @@ async def _main(cache_dir: Path) -> None:
         managed: bool = True,
         model: str | None = None,
         engine: str = "vllm",
+        artifact: object | None = None,
     ) -> None:
-        del hostname, managed, model, engine
+        del hostname, managed, model, engine, artifact
         started.set()
         await asyncio.Event().wait()
 

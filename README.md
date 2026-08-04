@@ -397,13 +397,36 @@ leak into the namespace reserved by vLLM itself.
 
 ### HuggingFace model downloads
 
-The administrative download API currently accepts a repository ID without a
-revision. Each request therefore resolves that repository's default revision
-at download time. Re-downloading the same `repo_id` later can produce different
-weights, configuration, or chat templates, and the current status record does
-not preserve the resolved commit SHA. Revision recording or pinning is a
-separate implementation change; operators who require reproducibility should
-record the repository commit externally.
+Every completed download records the immutable commit SHA returned by
+HuggingFace. A request may supply a branch, tag, or commit through `revision`;
+when it is omitted, the repository's default revision is resolved at download
+time and the resulting SHA is still preserved in the status response.
+
+Full vLLM snapshots use the default `engine: "vllm"`. A llama.cpp download
+must name the exact files and load entrypoint:
+
+```json
+{
+  "repo_id": "org/model-GGUF",
+  "revision": "main",
+  "engine": "llama_cpp",
+  "gguf": {
+    "files": ["model-Q4_K_M.gguf"],
+    "entrypoint": "model-Q4_K_M.gguf"
+  }
+}
+```
+
+After the snapshot completes, QIIP publishes an immutable manifest under the
+same NFS cache's `gguf/` tree. `/admin/models/catalog` keeps full vLLM models in
+`models` and returns these exact llama.cpp generations separately in
+`gguf_artifacts`. The current dashboard consumes only `models`; browser-based
+GGUF selection arrives with the recommendation UI work, while direct API setup
+can select an artifact by its `artifact_id`.
+
+Re-downloading a mutable branch after it advances creates a distinct artifact
+generation because identity uses the resolved SHA. QIIP never automatically
+deletes older artifact generations or their backing snapshots.
 
 ### Proxy (HTTP client)
 
@@ -557,10 +580,11 @@ uv run --frozen pytest tests/api/test_routes.py -v
 ```
 
 Coverage is measured over `inference_proxy` with branch tracking enabled. CI
-enforces a 91.5% combined statement-and-branch floor. The measured total was
-91.75% when the gate was introduced and may move as code is added or removed.
-The floor prevents new untested code from materially reducing coverage; it
-does not prove that covered behavior is asserted correctly.
+enforces a 92% combined statement-and-branch floor, raised from 91.5% when the
+exact-artifact work brought the measured total to 92.08%. The total may move as
+code is added or removed. The floor prevents new untested code from materially
+reducing coverage; it does not prove that covered behavior is asserted
+correctly.
 
 ### Lint and format
 

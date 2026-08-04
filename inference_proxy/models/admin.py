@@ -10,8 +10,9 @@ import re
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from inference_proxy.huggingface.artifacts import GGUFArtifact, GGUFDownloadSpec
 from inference_proxy.models.llmfit import ModelRecommendation, SystemInfo
 from inference_proxy.models.node import InferenceEngine
 
@@ -67,6 +68,7 @@ class SetupRequest(BaseModel):
     managed: bool = True
     model: str | None = Field(default=None, max_length=256)
     engine: InferenceEngine = InferenceEngine.VLLM
+    artifact_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @field_validator("hostname")
     @classmethod
@@ -77,6 +79,17 @@ class SetupRequest(BaseModel):
         if not re.fullmatch(r"[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?", v):
             raise ValueError("hostname contains invalid characters")
         return v
+
+    @model_validator(mode="after")
+    def validate_engine_selection(self) -> SetupRequest:
+        if self.engine == InferenceEngine.LLAMA_CPP:
+            if self.artifact_id is None:
+                raise ValueError("llama_cpp setup requires artifact_id")
+            if self.model is not None:
+                raise ValueError("llama_cpp setup uses artifact_id, not model")
+        elif self.artifact_id is not None:
+            raise ValueError("artifact_id is only valid for llama_cpp setup")
+        return self
 
 
 class SetupResponse(BaseModel):
@@ -155,10 +168,20 @@ class DownloadState(str, Enum):
 class DownloadRequest(BaseModel):
     """Request body for POST /admin/models/download."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     repo_id: str
-    allow_patterns: list[str] | None = None
+    revision: str | None = Field(default=None, min_length=1, max_length=256)
+    engine: InferenceEngine = InferenceEngine.VLLM
+    gguf: GGUFDownloadSpec | None = None
+
+    @model_validator(mode="after")
+    def validate_engine_download(self) -> DownloadRequest:
+        if self.engine == InferenceEngine.LLAMA_CPP and self.gguf is None:
+            raise ValueError("llama_cpp downloads require an exact gguf specification")
+        if self.engine == InferenceEngine.VLLM and self.gguf is not None:
+            raise ValueError("gguf is only valid for llama_cpp downloads")
+        return self
 
 
 class DownloadStatusResponse(BaseModel):
@@ -166,7 +189,13 @@ class DownloadStatusResponse(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    download_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     repo_id: str
+    requested_revision: str | None = None
+    resolved_revision: str | None = None
+    engine: InferenceEngine = InferenceEngine.VLLM
+    gguf: GGUFDownloadSpec | None = None
+    artifacts: tuple[GGUFArtifact, ...] = ()
     status: DownloadState
     started_at: datetime
     completed_at: datetime | None = None
