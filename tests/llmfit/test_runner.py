@@ -295,11 +295,16 @@ class TestRecommendProviderFilter:
 
         settings = LLMFitSettings(allowed_providers=["Meta"])
         runner = LLMFitRunner(ssh_client=mock_ssh_client, settings=settings)
-        mock_ssh_client.run.return_value = (FIXTURE_JSON, "", 0)
+        payload = json.loads(FIXTURE_JSON)
+        payload["models"][0]["gguf_sources"] = [
+            {"repo": "org/meta-model-GGUF", "provider": "publisher"}
+        ]
+        mock_ssh_client.run.return_value = (json.dumps(payload), "", 0)
         result = await runner.recommend("gpu-host-01")
 
         assert len(result.models) == 1
         assert result.models[0].provider == "Meta"
+        assert result.models[0].gguf_sources[0].repo == "org/meta-model-GGUF"
 
     @pytest.mark.asyncio
     async def test_filter_is_case_insensitive(self, mock_ssh_client: MagicMock) -> None:

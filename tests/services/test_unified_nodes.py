@@ -151,7 +151,7 @@ class TestEtcdNodeStates:
 
         n = svc.get_unified_nodes()[0]
         assert n.state == "unhealthy"
-        assert n.actions == ["teardown", "retry"]
+        assert n.actions == ["teardown"]
 
     def test_provisioning_state_and_actions(self) -> None:
         registry = NodeRegistry()

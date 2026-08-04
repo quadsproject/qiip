@@ -78,6 +78,15 @@ class TestDashboardTemplate:
         dashboard_pos = response.text.index("dashboard.js")
         assert config_pos < dashboard_pos
 
+    def test_setup_selection_js_loaded_before_dashboard_js(
+        self, client: TestClient
+    ) -> None:
+        """The shared setup selector is available before dashboard.js runs."""
+        response = client.get("/dashboard")
+        setup_pos = response.text.index("setup_selection.js")
+        dashboard_pos = response.text.index("dashboard.js")
+        assert setup_pos < dashboard_pos
+
     def test_fonts_loaded_before_dashboard_css(self, client: TestClient) -> None:
         """Google Fonts link appears before dashboard.css link in the HTML."""
         response = client.get("/dashboard")
@@ -96,6 +105,7 @@ class TestDashboardTableStructure:
             "Node ID",
             "GPU Vendor",
             "GPU Model",
+            "Engine",
             "Model",
             "Config",
             "State",
@@ -118,7 +128,7 @@ class TestDashboardTableStructure:
     def test_loading_row_colspan_matches_column_count(self, client: TestClient) -> None:
         """Loading placeholder colspan matches the number of column headers."""
         response = client.get("/dashboard")
-        assert 'colspan="8"' in response.text
+        assert 'colspan="9"' in response.text
 
 
 class TestDashboardPolling:
@@ -258,6 +268,13 @@ class TestSetupForm:
         response = client.get("/dashboard")
         assert 'id="setup-btn"' in response.text
 
+    def test_contains_engine_specific_setup_selectors(self, client: TestClient) -> None:
+        """Manual setup exposes mutually exclusive engine artifact selectors."""
+        response = client.get("/dashboard")
+        assert 'id="setup-engine-select"' in response.text
+        assert 'id="model-select"' in response.text
+        assert 'id="artifact-select"' in response.text
+
 
 class TestTasksPanel:
     """Provisioning tasks panel moved to per-node detail page."""
@@ -327,3 +344,22 @@ class TestNodeDetailPage:
         config_pos = response.text.index("config_download.js")
         detail_pos = response.text.index("node_detail.js")
         assert config_pos < detail_pos
+
+    def test_setup_selection_js_loaded_before_node_detail_js(
+        self, client: TestClient
+    ) -> None:
+        """The shared setup selector is available before node_detail.js runs."""
+        response = client.get("/dashboard/nodes/test-node")
+        setup_pos = response.text.index("setup_selection.js")
+        detail_pos = response.text.index("node_detail.js")
+        assert setup_pos < detail_pos
+
+    def test_node_detail_contains_engine_and_artifact_controls(
+        self, client: TestClient
+    ) -> None:
+        """Node detail renders engine identity and catalog-backed setup controls."""
+        response = client.get("/dashboard/nodes/test-node")
+        assert '<th scope="col">Engine</th>' in response.text
+        assert 'id="setup-engine-select"' in response.text
+        assert 'id="artifact-select"' in response.text
+        assert 'colspan="10"' in response.text

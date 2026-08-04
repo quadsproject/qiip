@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -55,7 +56,7 @@ from inference_proxy.models.admin import (
     TeardownResponse,
 )
 from inference_proxy.models.endpoint import EndpointValidationError
-from inference_proxy.models.node import InferenceEngine, NodeStatus
+from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     ProvisioningCapacityError,
@@ -111,6 +112,46 @@ _SETUP_RETRYABLE_STATUSES = frozenset(
 
 # Regex from SetupRequest.validate_hostname — reused for path-parameter validation
 _HOSTNAME_RE = re.compile(r"[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?")
+_SETUP_SELECTION_FIELDS = frozenset({"engine", "model", "artifact_id"})
+
+
+@dataclass(frozen=True, slots=True)
+class _SetupSelection:
+    """Effective engine-specific setup identity after retry inheritance."""
+
+    engine: InferenceEngine
+    model: str | None
+    artifact_id: str | None
+
+
+def _effective_setup_selection(
+    body: SetupRequest,
+    node: Node | None,
+    *,
+    fallback: _SetupSelection | None = None,
+) -> _SetupSelection:
+    """Resolve explicit setup input or inherit retry identity from a node.
+
+    The fallback preserves the identity observed before waiting for the host
+    lease if the stale record disappears while the lease is acquired.
+    """
+    explicit = bool(body.model_fields_set & _SETUP_SELECTION_FIELDS)
+    if explicit:
+        return _SetupSelection(body.engine, body.model, body.artifact_id)
+    if node is None:
+        return fallback or _SetupSelection(body.engine, body.model, body.artifact_id)
+    if node.engine is InferenceEngine.LLAMA_CPP:
+        return _SetupSelection(node.engine, None, node.artifact_id)
+    return _SetupSelection(node.engine, node.model or None, None)
+
+
+def _validate_setup_selection(
+    provisioner: NodeProvisioner,
+    selection: _SetupSelection,
+) -> None:
+    """Validate one effective setup selection before any destructive work."""
+    provisioner.validate_setup_configuration(selection.engine)
+    provisioner.resolve_artifact_selection(selection.engine, selection.artifact_id)
 
 
 def _validated_hostname(hostname: str) -> str:
@@ -216,11 +257,12 @@ async def setup_node(
     Includes dedup guard (D-08) and live QUADS re-validation (D-10/D-11).
     """
     hostname = canonical_hostname(body.hostname)
+    initial_node = registry.get(hostname)
+    selection = _effective_setup_selection(body, initial_node)
 
     try:
         provisioner.validate_endpoint(hostname)
-        provisioner.validate_setup_configuration(body.engine)
-        provisioner.resolve_artifact_selection(body.engine, body.artifact_id)
+        _validate_setup_selection(provisioner, selection)
     except (EndpointValidationError, ProvisioningError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -252,6 +294,7 @@ async def setup_node(
             )
 
         node = registry.get(hostname)
+        selection = _effective_setup_selection(body, node, fallback=selection)
         if node is not None and node.status in _SETUP_REJECTED_STATUSES:
             raise HTTPException(
                 status_code=409,
@@ -272,6 +315,11 @@ async def setup_node(
                         "requests to finish or complete teardown"
                     ),
                 )
+
+        try:
+            _validate_setup_selection(provisioner, selection)
+        except ProvisioningError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         if node is not None and node.status in _SETUP_RETRYABLE_STATUSES:
             try:
@@ -317,9 +365,9 @@ async def setup_node(
                 await provisioner.provision(
                     hostname,
                     managed=body.managed,
-                    model=body.model,
-                    engine=body.engine,
-                    artifact_id=body.artifact_id,
+                    model=selection.model,
+                    engine=selection.engine,
+                    artifact_id=selection.artifact_id,
                     lifecycle_lease=lease,
                 )
             finally:
@@ -335,8 +383,8 @@ async def setup_node(
                 background,
                 provisioning_hostname=hostname,
                 provisioning_identity=ProvisioningIdentity(
-                    engine=body.engine,
-                    artifact_id=body.artifact_id,
+                    engine=selection.engine,
+                    artifact_id=selection.artifact_id,
                 ),
             )
         except ProvisioningCapacityError as exc:

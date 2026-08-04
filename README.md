@@ -32,7 +32,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Health checking** -- background thread probes each node's `/health` endpoint; marks nodes unhealthy after repeated failures and recovers them automatically
 - **Graceful shutdown** -- Uvicorn drains in-flight requests before application resources close; its server timeout remains configurable
 - **Structured logging** -- JSON or pretty console output via structlog
-- **Operations dashboard** -- interactive web UI at `/dashboard` with real-time node table, detail pages, and provisioning status
+- **Operations dashboard** -- interactive web UI at `/dashboard` with real-time node and engine identity, catalog-backed setup controls, detail pages, and provisioning status
 - **QUADS integration** -- background polling of QUADS inventory and availability; unified view merging QUADS hosts with etcd-registered nodes
 - **QUADS schedule enforcement** -- automated teardown of managed nodes when QUADS reports an upcoming scheduling conflict
 - **End-to-end node provisioning** -- SSH-based pipeline: BMC power-on, NVIDIA GPU verification, driver and CUDA toolkit install, inference engine setup (vLLM or llama.cpp), NFS mount, firewall, health poll, and etcd registration
@@ -41,7 +41,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **BMC power management (Redfish)** -- query and control node power state; supports On, ForceOff, GracefulRestart, and ForceRestart
 - **Model catalog** -- scans shared NFS-mounted HuggingFace cache, verifies model completeness via tree manifests, exposed via `/admin/models/catalog`
 - **Background model downloads** -- concurrent HuggingFace downloads with status tracking; duplicate-safe and re-downloadable after completion or failure
-- **Hardware-aware model recommendations** -- runs llmfit via SSH on a target host to produce ranked recommendations with fit levels, throughput, and memory estimates; auto-installs the binary on first use
+- **Hardware-aware model recommendations** -- runs llmfit via SSH on a target host to produce ranked, runtime-normalized recommendations with fit levels, throughput, memory estimates, and typed GGUF sources; auto-installs the binary on first use
 - **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
 - **Admin authentication** -- HTTP Basic required on all `/admin/*` endpoints and `/dashboard*` pages; inference API remains public
 - **Backend endpoint allowlist** -- configurable hostname wildcard, CIDR network, and port allowlists; rejects non-matching registrations with loopback-only defaults
@@ -456,9 +456,19 @@ must name the exact files and load entrypoint:
 After the snapshot completes, QIIP publishes an immutable manifest under the
 same NFS cache's `gguf/` tree. `/admin/models/catalog` keeps full vLLM models in
 `models` and returns these exact llama.cpp generations separately in
-`gguf_artifacts`. The current dashboard consumes only `models`; browser-based
-GGUF selection arrives with the recommendation UI work, while direct API setup
-can select an artifact by its `artifact_id`.
+`gguf_artifacts`. The dashboard setup controls select either a full vLLM model
+or one exact GGUF `artifact_id`; the two engine-specific values are never sent
+together. Node retry requests omit both values so the server can retain the
+latest registered engine, model, and artifact identity under the host lifecycle
+lease.
+
+LLMFit recommendation runtimes are normalized to `vllm`, `llama_cpp`, `mlx`,
+or `unknown`. A llama.cpp recommendation can list typed `gguf_sources`, and the
+node-detail dashboard reports a published generation as available only when a
+source repository exactly matches an artifact's `repo_id`. LLMFit does not
+identify an exact file set, shard group, or entrypoint, so the browser never
+guesses a GGUF download request: it shows `No GGUF source`, `Not downloaded`,
+`Catalog unavailable`, or the number of matching generations instead.
 
 Re-downloading a mutable branch after it advances creates a distinct artifact
 generation because identity uses the resolved SHA. QIIP never automatically

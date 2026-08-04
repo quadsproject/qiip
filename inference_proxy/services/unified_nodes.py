@@ -22,7 +22,7 @@ from inference_proxy.routing.connection_tracker import ConnectionTracker
 _STATE_ACTIONS: dict[str, list[str]] = {
     "available": ["setup"],
     "healthy": ["teardown"],
-    "unhealthy": ["teardown", "retry"],
+    "unhealthy": ["teardown"],
     "provisioning": ["cancel"],
     "failed": ["setup", "teardown"],
     "draining": ["force_teardown"],
