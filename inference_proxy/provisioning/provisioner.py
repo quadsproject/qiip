@@ -105,9 +105,18 @@ class PreflightError(Exception):
         super().__init__(f"Pre-flight failed on {hostname}: {'; '.join(failures)}")
 
 
+@dataclass(frozen=True)
+class ProvisioningIdentity:
+    """Engine and immutable artifact selected for one provisioning operation."""
+
+    engine: InferenceEngine
+    artifact_id: str | None = None
+
+
 @dataclass
 class _ProvisioningTask:
     task: asyncio.Task[None]
+    identity: ProvisioningIdentity
     started: bool = False
 
 
@@ -584,6 +593,7 @@ class NodeProvisioner:
 
         current_step = "registering_node"
         value: bytes | None = None
+        artifact_id = artifact.artifact_id if artifact is not None else None
         try:
             # D-09: Register node as PROVISIONING before setup. Failure is
             # terminal: remote mutation must not start without an ownership
@@ -594,6 +604,7 @@ class NodeProvisioner:
                 status=NodeStatus.PROVISIONING,
                 model="",
                 engine=engine,
+                artifact_id=artifact_id,
                 last_heartbeat=datetime.now(UTC),
                 managed=managed,
             )
@@ -647,7 +658,11 @@ class NodeProvisioner:
             )
             self._log(hostname, "info", f"Registering node (model={model_name})")
             await self._register_node(
-                hostname, model_name, managed=managed, engine=engine
+                hostname,
+                model_name,
+                managed=managed,
+                engine=engine,
+                artifact_id=artifact_id,
             )
             await self._update_state(
                 hostname, ProvisioningStep.COMPLETE, started_at=provision_started_at
@@ -670,6 +685,7 @@ class NodeProvisioner:
                     status=NodeStatus.FAILED,
                     model="",
                     engine=engine,
+                    artifact_id=artifact_id,
                     last_heartbeat=datetime.now(UTC),
                     managed=managed,
                 )
@@ -881,6 +897,7 @@ class NodeProvisioner:
         *,
         managed: bool = True,
         engine: InferenceEngine = InferenceEngine.VLLM,
+        artifact_id: str | None = None,
     ) -> None:
         """Register node in etcd with correct fields (D-11, D-12)."""
         node = Node(
@@ -889,6 +906,7 @@ class NodeProvisioner:
             status=NodeStatus.HEALTHY,
             model=model,
             engine=engine,
+            artifact_id=artifact_id,
             last_heartbeat=datetime.now(UTC),
             managed=managed,
         )
@@ -939,6 +957,7 @@ class NodeProvisioner:
         coro: Coroutine[object, object, None],
         *,
         provisioning_hostname: str | None = None,
+        provisioning_identity: ProvisioningIdentity | None = None,
         task_name: str | None = None,
     ) -> asyncio.Task[None]:
         """Schedule and observe an owned background operation.
@@ -948,6 +967,12 @@ class NodeProvisioner:
         work omit ``provisioning_hostname`` and remain admissible when the
         provisioning limit is full.
         """
+        if (provisioning_hostname is None) != (provisioning_identity is None):
+            raise ValueError(
+                "provisioning_hostname and provisioning_identity must be "
+                "supplied together"
+            )
+
         if provisioning_hostname is not None:
             current = self._provisioning_tasks.get(provisioning_hostname)
             if current is not None and not current.task.done():
@@ -990,7 +1015,9 @@ class NodeProvisioner:
         self._background_tasks.add(task)
 
         if provisioning_hostname is not None:
-            record = _ProvisioningTask(task)
+            if provisioning_identity is None:  # narrowed by the paired check above
+                raise RuntimeError("provisioning identity was not initialized")
+            record = _ProvisioningTask(task, provisioning_identity)
             self._provisioning_tasks[provisioning_hostname] = record
 
         def _task_done(done_task: asyncio.Task[None]) -> None:
@@ -1036,8 +1063,10 @@ class NodeProvisioner:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def cancel_active_provision(self, hostname: str) -> asyncio.Task[None] | None:
-        """Cancel and await the active provisioning task for *hostname*."""
+    async def cancel_active_provision(
+        self, hostname: str
+    ) -> ProvisioningIdentity | None:
+        """Cancel *hostname* provisioning and return its serving identity."""
         record = self._provisioning_tasks.get(hostname)
         if record is None or record.task.done():
             return None
@@ -1062,7 +1091,7 @@ class NodeProvisioner:
                 failed_step="cancelled",
                 error="Provisioning cancelled by teardown",
             )
-        return task
+        return record.identity
 
     async def _drain_wait(self, hostname: str) -> None:
         """Wait for active connections to reach zero or timeout (D-08, D-09)."""
@@ -1083,6 +1112,8 @@ class NodeProvisioner:
         hostname: str,
         *,
         force: bool = False,
+        provisioning_identity: ProvisioningIdentity | None = None,
+        recovery_engine: InferenceEngine | None = None,
         lifecycle_lease: HostLifecycleLease | None = None,
     ) -> None:
         """Teardown *hostname* under the shared host lifecycle coordinator."""
@@ -1093,25 +1124,69 @@ class NodeProvisioner:
             raise ValueError("lifecycle lease does not own this host")
 
         try:
-            await self._teardown(hostname, force=force)
+            engine = self._resolve_teardown_engine(
+                hostname,
+                force=force,
+                provisioning_identity=provisioning_identity,
+                recovery_engine=recovery_engine,
+            )
+            await self._teardown(hostname, force=force, engine=engine)
         finally:
             lease.release()
 
-    def _detect_engine(self, hostname: str) -> InferenceEngine:
-        """Detect the engine from the registry for teardown dispatch."""
+    def _resolve_teardown_engine(
+        self,
+        hostname: str,
+        *,
+        force: bool,
+        provisioning_identity: ProvisioningIdentity | None,
+        recovery_engine: InferenceEngine | None,
+    ) -> InferenceEngine:
+        """Resolve one authoritative engine without silently guessing vLLM."""
+        node = None
         if self._registry is not None:
             node = self._registry.get(hostname)
-            if node is not None:
-                return node.engine
-        return InferenceEngine.VLLM
+        if provisioning_identity is not None:
+            if recovery_engine is not None:
+                raise ProvisioningError(
+                    "recovery_engine cannot override an active provisioning identity"
+                )
+            if node is not None and node.engine != provisioning_identity.engine:
+                logger.warning(
+                    "teardown_identity_prefers_cancelled_provision",
+                    hostname=hostname,
+                    cancelled_engine=provisioning_identity.engine,
+                    registry_engine=node.engine,
+                )
+            return provisioning_identity.engine
+        if node is not None:
+            if recovery_engine is not None:
+                raise ProvisioningError(
+                    "recovery_engine cannot override a registered node identity"
+                )
+            return node.engine
+        if recovery_engine is not None:
+            if not force:
+                raise ProvisioningError(
+                    "recovery_engine requires force=true when no node identity exists"
+                )
+            return recovery_engine
+        raise ProvisioningError(
+            f"Cannot determine the inference engine for unregistered host {hostname!r}"
+        )
 
-    async def _teardown(self, hostname: str, *, force: bool = False) -> None:
+    async def _teardown(
+        self,
+        hostname: str,
+        *,
+        force: bool = False,
+        engine: InferenceEngine,
+    ) -> None:
         """Teardown a provisioned node.
 
         Graceful: drain -> stop engine -> deregister.
         Force: kill -9 -> deregister.
         """
-        engine = self._detect_engine(hostname)
         teardown_started_at = datetime.now(UTC)
         logger.info("teardown_start", hostname=hostname, force=force, engine=engine)
         self._log_buffer.create(hostname)

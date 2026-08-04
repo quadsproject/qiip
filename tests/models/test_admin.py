@@ -40,6 +40,23 @@ class TestAdminNodeResponse:
         assert response.status == "healthy"
         assert response.active_connections == 2
         assert response.circuit_breaker_state == "closed"
+        assert response.engine is None
+        assert response.artifact_id is None
+
+    def test_registered_engine_and_artifact_are_typed(self) -> None:
+        response = AdminNodeResponse(
+            node_id="node-1",
+            endpoint="10.0.1.100:8000",
+            model="model.gguf",
+            status="healthy",
+            active_connections=0,
+            circuit_breaker_state="closed",
+            engine=InferenceEngine.LLAMA_CPP,
+            artifact_id="a" * 64,
+        )
+
+        assert response.engine is InferenceEngine.LLAMA_CPP
+        assert response.artifact_id == "a" * 64
 
     def test_admin_node_response_error_fields(self) -> None:
         """AdminNodeResponse accepts and defaults failed_step and error fields."""

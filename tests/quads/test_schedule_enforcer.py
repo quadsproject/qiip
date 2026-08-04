@@ -16,7 +16,7 @@ from inference_proxy.config.settings import LLMFitSettings, ProvisioningSettings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_from_etcd
 from inference_proxy.models.endpoint import EndpointPolicy
-from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.quads.client import QUADSClient, QUADSConnectionError
 from inference_proxy.quads.schedule_enforcer import ScheduleEnforcer
@@ -33,6 +33,8 @@ def _node(
     status: NodeStatus = NodeStatus.HEALTHY,
     *,
     managed: bool = True,
+    engine: InferenceEngine = InferenceEngine.VLLM,
+    artifact_id: str | None = None,
 ) -> Node:
     return Node(
         node_id=hostname,
@@ -41,6 +43,8 @@ def _node(
         model="meta-llama/Llama-3",
         last_heartbeat=datetime.now(tz=UTC),
         managed=managed,
+        engine=engine,
+        artifact_id=artifact_id,
     )
 
 
@@ -97,6 +101,67 @@ class TestEnforceOnce:
         await enforcer._enforce_once()
 
         provisioner.fire_background.assert_called_once()
+
+    async def test_registered_llamacpp_engine_reaches_teardown_dispatch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The non-HTTP enforcer path resolves engine identity from registry."""
+        registry = NodeRegistry()
+        registry.add(
+            _node(
+                "gpu01",
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact_id="a" * 64,
+            )
+        )
+        client = AsyncMock(spec=QUADSClient)
+        client.get_available.return_value = []
+        provisioner = NodeProvisioner(
+            ssh_client=MagicMock(),
+            etcd_client=MagicMock(),
+            settings=ProvisioningSettings(),
+            llmfit_settings=LLMFitSettings(),
+            endpoint_policy=_ENDPOINT_POLICY,
+            registry=registry,
+        )
+        observed: list[InferenceEngine] = []
+        tasks: list[asyncio.Task[None]] = []
+
+        async def teardown(
+            _hostname: str,
+            *,
+            force: bool = False,
+            engine: InferenceEngine,
+        ) -> None:
+            assert force is False
+            observed.append(engine)
+
+        original_fire = provisioner.fire_background
+
+        def capture_background(
+            coro: Coroutine[Any, Any, None],
+            *,
+            task_name: str | None = None,
+        ) -> asyncio.Task[None]:
+            task = original_fire(coro, task_name=task_name)
+            tasks.append(task)
+            return task
+
+        monkeypatch.setattr(provisioner, "_teardown", teardown)
+        monkeypatch.setattr(provisioner, "fire_background", capture_background)
+        enforcer = ScheduleEnforcer(
+            client=client,
+            registry=registry,
+            provisioner=provisioner,
+            lookahead_hours=24,
+            check_interval=300,
+        )
+
+        await enforcer._enforce_once()
+        await asyncio.wait_for(tasks[0], timeout=1)
+
+        assert observed == [InferenceEngine.LLAMA_CPP]
 
     async def test_no_action_for_available_node(self) -> None:
         enforcer, _, provisioner = _enforcer(
@@ -501,8 +566,14 @@ async def test_schedule_enforcer_uses_same_host_lifecycle_lock(
         provision_entered.set()
         await release_provision.wait()
 
-    async def teardown_body(hostname: str, *, force: bool = False) -> None:
+    async def teardown_body(
+        hostname: str,
+        *,
+        force: bool = False,
+        engine: InferenceEngine,
+    ) -> None:
         assert hostname == "gpu01"
+        assert engine is InferenceEngine.VLLM
         teardown_entered.set()
 
     monkeypatch.setattr(provisioner, "_provision", provision_body)

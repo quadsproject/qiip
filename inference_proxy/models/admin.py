@@ -34,7 +34,8 @@ class AdminNodeResponse(BaseModel):
     status: str
     active_connections: int
     circuit_breaker_state: str
-    engine: str = "vllm"
+    engine: InferenceEngine | None = None
+    artifact_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     state: str = ""
     actions: list[str] = []
     gpu_vendor: str | None = None

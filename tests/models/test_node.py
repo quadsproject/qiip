@@ -7,7 +7,12 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
-from inference_proxy.models.node import Node, NodeCapabilities, NodeStatus
+from inference_proxy.models.node import (
+    InferenceEngine,
+    Node,
+    NodeCapabilities,
+    NodeStatus,
+)
 
 
 class TestNodeStatusEnumValues:
@@ -39,6 +44,8 @@ class TestNodeMinimalCreation:
         assert node.last_heartbeat is None
         assert node.active_connections == 0
         assert node.managed is False
+        assert node.engine is InferenceEngine.VLLM
+        assert node.artifact_id is None
 
 
 class TestNodeFullCreation:
@@ -52,6 +59,8 @@ class TestNodeFullCreation:
             last_heartbeat=now,
             capabilities=NodeCapabilities(max_tokens=8192, gpu_memory="80GB"),
             active_connections=5,
+            engine=InferenceEngine.LLAMA_CPP,
+            artifact_id="a" * 64,
         )
         dumped = node.model_dump()
         roundtripped = Node.model_validate(dumped)
@@ -63,6 +72,12 @@ class TestNodeFullCreation:
         assert roundtripped.capabilities.max_tokens == 8192
         assert roundtripped.capabilities.gpu_memory == "80GB"
         assert roundtripped.active_connections == 5
+        assert roundtripped.engine is InferenceEngine.LLAMA_CPP
+        assert roundtripped.artifact_id == "a" * 64
+
+    def test_rejects_non_sha256_artifact_id(self) -> None:
+        with pytest.raises(ValidationError):
+            Node(node_id="node-1", endpoint="host:8000", artifact_id="latest")
 
 
 class TestNodeCapabilitiesDefaults:

@@ -40,6 +40,7 @@ from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     PreflightError,
     ProvisioningError,
+    ProvisioningIdentity,
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -119,6 +120,7 @@ async def test_shutdown_cancels_and_awaits_owned_tasks() -> None:
         task = provisioner.fire_background(
             owned_task(),
             provisioning_hostname="host1",
+            provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
         )
         await asyncio.wait_for(started.wait(), timeout=1)
         await asyncio.wait_for(provisioner.shutdown(), timeout=1)
@@ -879,7 +881,12 @@ class TestNodeRegistration:
                 "inference_proxy.provisioning.provisioner.node_to_etcd"
             ) as mock_serialize:
                 mock_serialize.return_value = ("/nodes/host1", b'{"model":"test"}')
-                await provisioner._register_node("host1", "test-model")
+                await provisioner._register_node(
+                    "host1",
+                    "test-model",
+                    engine=InferenceEngine.LLAMA_CPP,
+                    artifact_id="a" * 64,
+                )
 
                 # Verify Node was constructed correctly
                 call_args = mock_serialize.call_args
@@ -889,6 +896,8 @@ class TestNodeRegistration:
                 assert node.model == "test-model"
                 assert node.endpoint == "http://host1:8000"
                 assert node.last_heartbeat is not None
+                assert node.engine is InferenceEngine.LLAMA_CPP
+                assert node.artifact_id == "a" * 64
 
                 # Each managed registration gets a fresh lease before its PUT.
                 assert mock_to_thread.call_args_list == [
@@ -1053,6 +1062,51 @@ class TestProvisioningFailureAccuracy:
         assert state_payloads[-1]["current_step"] == "failed"
         assert state_payloads[-1]["failed_step"] == "uploading_scripts"
         assert json.loads(values["/nodes/host1"])["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_llamacpp_artifact_identity_survives_provision_failure(
+        self,
+    ) -> None:
+        """PROVISIONING and FAILED records retain the selected generation."""
+        etcd, values, _state_payloads = _recording_etcd()
+        ssh = MagicMock()
+        ssh.upload = AsyncMock(side_effect=RuntimeError("upload failed"))
+        provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
+        artifact = _artifact()
+
+        async def run_inline(
+            function: Callable[..., Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            return function(*args, **kwargs)
+
+        with (
+            patch.object(provisioner, "preflight", new_callable=AsyncMock),
+            patch(
+                "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                side_effect=run_inline,
+            ),
+            pytest.raises(RuntimeError, match="upload failed"),
+        ):
+            await provisioner._provision(
+                "host1",
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact=artifact,
+            )
+
+        initial_payload = next(
+            json.loads(call.args[1])
+            for call in etcd.put.call_args_list
+            if call.args[0] == "/nodes/host1"
+        )
+        failed_payload = json.loads(values["/nodes/host1"])
+        assert initial_payload["status"] == "provisioning"
+        assert initial_payload["engine"] == "llama_cpp"
+        assert initial_payload["artifact_id"] == artifact.artifact_id
+        assert failed_payload["status"] == "failed"
+        assert failed_payload["engine"] == "llama_cpp"
+        assert failed_payload["artifact_id"] == artifact.artifact_id
 
     @pytest.mark.asyncio
     async def test_setup_failure_records_emitted_step(self) -> None:
@@ -1706,6 +1760,84 @@ def _make_teardown_provisioner(
         ),
     )
     return provisioner, ssh, etcd, registry, tracker
+
+
+class TestTeardownIdentity:
+    @pytest.mark.asyncio
+    async def test_unregistered_host_without_recovery_identity_fails_closed(
+        self,
+    ) -> None:
+        ssh = MagicMock()
+        ssh.upload = AsyncMock()
+        provisioner = _make_provisioner(
+            ssh_client=ssh,
+            registry=NodeRegistry(),
+        )
+
+        with pytest.raises(ProvisioningError, match="Cannot determine"):
+            await provisioner.teardown("host1", force=True)
+
+        ssh.upload.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_explicit_force_recovery_supplies_missing_engine(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provisioner = _make_provisioner(registry=NodeRegistry())
+        teardown = AsyncMock()
+        monkeypatch.setattr(provisioner, "_teardown", teardown)
+
+        await provisioner.teardown(
+            "host1",
+            force=True,
+            recovery_engine=InferenceEngine.LLAMA_CPP,
+        )
+
+        teardown.assert_awaited_once_with(
+            "host1",
+            force=True,
+            engine=InferenceEngine.LLAMA_CPP,
+        )
+
+    @pytest.mark.parametrize(
+        ("registered", "provisioning_identity", "force", "message"),
+        [
+            (
+                False,
+                ProvisioningIdentity(InferenceEngine.VLLM),
+                True,
+                "active provisioning identity",
+            ),
+            (True, None, True, "registered node identity"),
+            (False, None, False, "requires force=true"),
+        ],
+    )
+    def test_recovery_identity_cannot_override_authoritative_state(
+        self,
+        registered: bool,
+        provisioning_identity: ProvisioningIdentity | None,
+        force: bool,
+        message: str,
+    ) -> None:
+        registry = NodeRegistry()
+        if registered:
+            registry.add(
+                Node(
+                    node_id="host1",
+                    endpoint="host1:8000",
+                    engine=InferenceEngine.VLLM,
+                )
+            )
+        provisioner = _make_provisioner(registry=registry)
+
+        with pytest.raises(ProvisioningError, match=message):
+            provisioner._resolve_teardown_engine(
+                "host1",
+                force=force,
+                provisioning_identity=provisioning_identity,
+                recovery_engine=InferenceEngine.LLAMA_CPP,
+            )
 
 
 class TestTeardownGraceful:

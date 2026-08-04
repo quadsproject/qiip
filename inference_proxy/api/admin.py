@@ -55,11 +55,12 @@ from inference_proxy.models.admin import (
     TeardownResponse,
 )
 from inference_proxy.models.endpoint import EndpointValidationError
-from inference_proxy.models.node import NodeStatus
+from inference_proxy.models.node import InferenceEngine, NodeStatus
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     ProvisioningCapacityError,
     ProvisioningError,
+    ProvisioningIdentity,
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -333,6 +334,10 @@ async def setup_node(
             task = provisioner.fire_background(
                 background,
                 provisioning_hostname=hostname,
+                provisioning_identity=ProvisioningIdentity(
+                    engine=body.engine,
+                    artifact_id=body.artifact_id,
+                ),
             )
         except ProvisioningCapacityError as exc:
             background.close()
@@ -411,30 +416,71 @@ async def stream_provisioning_logs(
 async def teardown_node(
     node_id: str,
     force: bool = False,
+    recovery_engine: InferenceEngine | None = None,
     registry: NodeRegistry = Depends(get_registry),
     provisioner: NodeProvisioner = Depends(get_provisioner),
 ) -> TeardownResponse:
     """Trigger teardown of a node (runs in background)."""
     node_id = canonical_hostname(node_id)
-    cancelled_provision = await provisioner.cancel_active_provision(node_id)
-    lease = await provisioner.try_reserve_host(node_id)
-    if lease is None:
-        if cancelled_provision is not None:
-            detail = (
-                f"Host '{node_id}' was re-reserved after provisioning "
-                "cancellation; wait for the current operation to finish and "
-                "retry teardown"
+    cancelled_identity: ProvisioningIdentity | None = None
+
+    if recovery_engine is not None:
+        if not force:
+            raise HTTPException(
+                status_code=400,
+                detail="recovery_engine requires force=true",
             )
-        else:
-            detail = f"Host lifecycle operation already in progress for '{node_id}'"
-        raise HTTPException(
-            status_code=409,
-            detail=detail,
-        )
+        if registry.get(node_id) is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="recovery_engine cannot override a registered node identity",
+            )
+        try:
+            provisioner.validate_endpoint(node_id)
+        except EndpointValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Recovery never cancels an active operation. A busy lease means an
+        # authoritative provisioning identity already exists or another host
+        # lifecycle operation is in progress.
+        lease = await provisioner.try_reserve_host(node_id)
+        if lease is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Host lifecycle operation already in progress for '{node_id}'",
+            )
+    else:
+        cancelled_identity = await provisioner.cancel_active_provision(node_id)
+        lease = await provisioner.try_reserve_host(node_id)
+        if lease is None:
+            if cancelled_identity is not None:
+                detail = (
+                    f"Host '{node_id}' was re-reserved after provisioning "
+                    "cancellation; wait for the current operation to finish and "
+                    "retry teardown"
+                )
+            else:
+                detail = f"Host lifecycle operation already in progress for '{node_id}'"
+            raise HTTPException(
+                status_code=409,
+                detail=detail,
+            )
 
     transferred = False
     try:
-        if registry.get(node_id) is None and cancelled_provision is None:
+        registered_node = registry.get(node_id)
+        if recovery_engine is not None and registered_node is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Node '{node_id}' registered while force recovery was waiting; "
+                    "retry teardown without recovery_engine"
+                ),
+            )
+        if (
+            registered_node is None
+            and cancelled_identity is None
+            and recovery_engine is None
+        ):
             raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
 
         async def _teardown_and_cleanup() -> None:
@@ -442,6 +488,8 @@ async def teardown_node(
                 await provisioner.teardown(
                     node_id,
                     force=force,
+                    provisioning_identity=cancelled_identity,
+                    recovery_engine=recovery_engine,
                     lifecycle_lease=lease,
                 )
             finally:

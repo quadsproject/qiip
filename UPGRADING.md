@@ -343,10 +343,13 @@ No failover marker is added when no backend attempt occurred, such as when no no
 
 Node records now accept and ignore unknown additive fields during
 deserialization. This permits mixed-version gateways to read records written by
-a newer peer without discarding the node. The `engine` value itself remains a
-closed enum: an unrecognized engine string makes the record invalid and the
-watcher excludes it, so introduce new engine values only with an ordered
-gateway rollout.
+a newer peer without discarding the node. Records now include nullable
+`artifact_id`: older gateways ignore this additive field, while records written
+before it existed load with `artifact_id: null`. The `engine` value itself
+remains a closed enum: an unrecognized engine string makes the record invalid
+and the watcher excludes it, so introduce new engine values only with an
+ordered gateway rollout. Do not rely on artifact identity until every gateway
+that may provision or display the node understands the field.
 
 ### Administrative API and browser interfaces
 
@@ -359,6 +362,8 @@ gateway rollout.
 | **Correctness fix** | A duplicate model-download POST returns 200 with the existing status; a newly accepted download returns 202. | Accept both success codes and inspect the returned download state. |
 | **Behavioral break** | Model downloads reject the removed `allow_patterns` field. llama.cpp downloads require an exact `gguf.files` and `gguf.entrypoint`; setup requires the resulting `artifact_id`. | Update direct administrative clients to the exact-artifact contract and handle 422 for obsolete request bodies. |
 | **New surface** | Download status records `download_id`, requested and resolved revisions, and published artifacts. The catalog returns validated GGUF generations in `gguf_artifacts`, separate from full vLLM `models`. | Persist the resolved SHA and artifact ID when reproducibility matters. Do not treat intentional partial GGUF snapshots as missing vLLM models. |
+| **Behavioral break** | `/admin/nodes[].engine` is now nullable. Registered nodes report `vllm` or `llama_cpp`; QUADS-only hosts report `null` instead of the previous fabricated `vllm` value. | Treat `null` as “not provisioned or no registered engine identity,” not as vLLM. Update clients whose schema requires a string. |
+| **New surface** | `/admin/nodes[]` now includes nullable `artifact_id`. Managed llama.cpp nodes report the exact published GGUF generation selected at setup; vLLM, older, manual, and QUADS-only records can report `null`. | Preserve the field when correlating a node with the GGUF catalog, but continue to handle `null` during rolling upgrades and for non-artifact-backed nodes. |
 | **Correctness fix** | Setup eligibility is status-aware and serialized by a per-host lifecycle lease. Live healthy or unhealthy nodes require explicit teardown; stale provisioning, failed, unknown, or zero-connection draining records can be cleaned before retry. | Handle actionable 400/409 responses rather than assuming every repeated setup request is accepted. |
 | **Correctness fix** | Recommendation targets must be registered or currently QUADS-available and must pass the endpoint allowlist. | Do not use the recommendation endpoint as an unrestricted SSH target. |
 | **Correctness fix** | `GracefulRestart` and `ForceRestart` always issue a Redfish reset even when the machine is already On. Only `On` and `ForceOff` are idempotent shortcuts. Malformed or unsupported BMC power states return a structured 502. | Do not use a restart action as a state probe; expect it to restart a running machine. |
@@ -394,6 +399,40 @@ Gateway shutdown cancels the async download wrapper without waiting indefinitely
 - Teardown cancels and awaits an active local provision task, then verifies vLLM termination. Closing the SSH operation cannot guarantee that a remote installer backgrounded by the shell also stopped; inspect package-manager locks and node state after cancelling during driver or package installation.
 - Failed teardown retains registration and PID evidence when shutdown cannot be verified. Do not delete those records merely to clear the dashboard; they are the information needed to finish cleanup safely.
 - A scheduling enforcer failure backs off rather than retrying every cycle. Alert on `schedule_enforcer_teardown_requires_operator`.
+
+### Recover an unregistered orphaned engine
+
+Normal teardown no longer guesses vLLM when neither an active provisioning task
+nor a registered node supplies engine identity. This closes the case where a
+cancelled llama.cpp provision was incorrectly dispatched through
+`stop-vllm.sh`. An unknown host now fails closed.
+
+Use the explicit recovery parameter only when etcd has no node record but an
+operator has independently verified that vLLM or llama.cpp remains on the host:
+
+```bash
+curl -X DELETE \
+  -u "$INFERENCE_PROXY_ADMIN__USERNAME:$INFERENCE_PROXY_ADMIN__PASSWORD" \
+  "https://gateway.example.com/admin/nodes/gpu01?force=true&recovery_engine=llama_cpp"
+```
+
+The request is rejected unless all of these conditions hold:
+
+1. `force=true` is present and `recovery_engine` is `vllm` or `llama_cpp`.
+2. The node has no registry entry before or after lifecycle-lease acquisition.
+3. The hostname passes `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_HOSTS`,
+   `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_NETWORKS`, and
+   `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_PORTS`.
+4. No provisioning, teardown, or other lifecycle operation owns the host lease.
+
+Recovery never cancels active provisioning. A 409 means the host became
+registered or another lifecycle operation owns it; inspect current state and
+retry the normal teardown path rather than overriding it. The supplied engine
+selects the stop-script family, so choosing incorrectly does not probe both
+engines and can leave the real process running. A 202 response means teardown
+was accepted in the background; follow
+`/admin/provisioning/{hostname}/logs` and confirm the process stopped before
+reprovisioning.
 
 ### Rollback
 

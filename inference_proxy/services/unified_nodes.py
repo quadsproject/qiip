@@ -97,6 +97,7 @@ class UnifiedNodeService:
             active_connections=self._tracker.get(node.node_id),
             circuit_breaker_state=breaker.state if breaker else "closed",
             engine=node.engine,
+            artifact_id=node.artifact_id,
             state=state,
             actions=list(_STATE_ACTIONS.get(state, [])),
             gpu_vendor=host.gpu_vendor if host else None,

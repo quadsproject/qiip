@@ -58,6 +58,8 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Chat playground](#chat-playground)
 - [API Endpoints](#api-endpoints)
   - [Administrative access](#administrative-access)
+  - [Node inventory identity](#node-inventory-identity)
+  - [Force-recover an unregistered engine](#force-recover-an-unregistered-engine)
   - [Error responses](#error-responses)
 - [Configuration](#configuration)
   - [Upgrade requirements](#upgrade-requirements)
@@ -192,13 +194,13 @@ HTTP Basic-protected administrative endpoints:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/admin/nodes` | Unified registered and QUADS node inventory |
+| `GET` | `/admin/nodes` | Unified registered and QUADS node inventory, including engine and artifact identity when known |
 | `GET` | `/admin/metrics` | Request counters by model and node |
 | `GET` | `/admin/models/catalog` | Verified models in the shared HuggingFace cache |
 | `POST` | `/admin/models/download` | Start or inspect a duplicate-safe model download |
 | `GET` | `/admin/models/downloads` | List tracked model-download states |
 | `POST` | `/admin/nodes/setup` | Start background node provisioning |
-| `DELETE` | `/admin/nodes/{node_id}` | Drain and tear down a node; supports the documented force option |
+| `DELETE` | `/admin/nodes/{node_id}` | Drain and tear down a node; supports force and the scoped recovery procedure below |
 | `GET` | `/admin/provisioning/tasks` | List provisioning task states |
 | `GET` | `/admin/provisioning/{hostname}/logs` | Stream provisioning logs over SSE |
 | `GET` | `/admin/quads/status` | QUADS integration and cache status |
@@ -231,6 +233,40 @@ boundary: cross-origin JSON requests and all DELETE requests require a browser
 preflight. Do not add form-encoded, multipart, or plain-text state-changing
 admin endpoints without adding explicit CSRF protection. Authentication also
 does not protect an already-authenticated browser from same-origin XSS.
+
+### Node inventory identity
+
+Each `/admin/nodes` item reports the inference `engine` and immutable
+`artifact_id` when QIIP knows them. Registered nodes report `engine` as
+`"vllm"` or `"llama_cpp"`. A llama.cpp node provisioned from the managed GGUF
+catalog also reports the selected 64-character artifact ID; vLLM and manually
+registered nodes normally report `artifact_id: null`.
+
+A host present only in QUADS has not been provisioned and therefore reports
+both `engine: null` and `artifact_id: null`. Do not interpret a null engine as
+vLLM. It means QIIP has no registered serving identity for that host.
+
+### Force-recover an unregistered engine
+
+Normal teardown obtains the engine from an active provisioning operation or
+the node's etcd registration and fails closed when neither exists. If etcd lost
+a node record while a known inference process remained on the host, an operator
+can supply the missing engine explicitly:
+
+```bash
+curl -X DELETE \
+  -u "$INFERENCE_PROXY_ADMIN__USERNAME:$INFERENCE_PROXY_ADMIN__PASSWORD" \
+  "http://gateway.example.com/admin/nodes/gpu01?force=true&recovery_engine=llama_cpp"
+```
+
+Use this recovery path only after verifying which engine is actually running.
+It is accepted only when `force=true`, the node is unregistered, the hostname
+passes the configured backend endpoint allowlist, and no host lifecycle
+operation holds the lease. QIIP rechecks registration after acquiring the
+lease and never cancels active provisioning on this path. A wrong
+`recovery_engine` selects the wrong stop script; it is not treated as an engine
+autodetection hint. A successful request returns 202 and runs teardown in the
+background, with progress available from the normal provisioning log stream.
 
 ### Error responses
 

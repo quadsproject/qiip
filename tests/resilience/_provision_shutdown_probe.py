@@ -19,6 +19,8 @@ from inference_proxy.config.settings import (
     Settings,
 )
 from inference_proxy.main import create_app
+from inference_proxy.models.node import InferenceEngine
+from inference_proxy.provisioning.provisioner import ProvisioningIdentity
 
 
 def _health_worker(*args: object, **_kwargs: object) -> None:
@@ -83,6 +85,7 @@ async def _main(cache_dir: Path) -> None:
                 task = provisioner.fire_background(
                     provisioner.provision("localhost"),
                     provisioning_hostname="localhost",
+                    provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
                 )
                 await asyncio.wait_for(started.wait(), timeout=1)
     finally:

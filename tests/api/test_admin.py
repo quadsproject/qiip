@@ -50,6 +50,7 @@ from inference_proxy.models.quads import QUADSHost
 from inference_proxy.provisioning.provisioner import (
     ProvisioningCapacityError,
     ProvisioningError,
+    ProvisioningIdentity,
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -142,6 +143,7 @@ class TestAdminNodesPopulated:
             "active_connections",
             "circuit_breaker_state",
             "engine",
+            "artifact_id",
             "state",
             "actions",
             "gpu_vendor",
@@ -215,6 +217,7 @@ class TestAdminNodesPopulated:
                 "active_connections": 0,
                 "circuit_breaker_state": "closed",
                 "engine": "vllm",
+                "artifact_id": None,
                 "state": "failed",
                 "actions": ["setup", "teardown"],
                 "gpu_vendor": None,
@@ -370,6 +373,9 @@ class TestSetupEndpoint:
     ) -> None:
         client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
         mock_provisioner.fire_background.assert_called_once()
+        assert mock_provisioner.fire_background.call_args.kwargs[
+            "provisioning_identity"
+        ] == ProvisioningIdentity(InferenceEngine.VLLM)
 
     def test_rejects_disallowed_endpoint_before_reserving_host(
         self,
@@ -540,6 +546,8 @@ class TestTeardownEndpoint:
         mock_provisioner.teardown.assert_awaited_once_with(
             "gpu01",
             force=True,
+            provisioning_identity=None,
+            recovery_engine=None,
             lifecycle_lease=ANY,
         )
 
@@ -861,8 +869,10 @@ class TestSetupDedupGuard:
             background: Coroutine[Any, Any, None],
             *,
             provisioning_hostname: str,
+            provisioning_identity: ProvisioningIdentity,
         ) -> NeverStartedTask:
             assert provisioning_hostname == "gpu01"
+            assert provisioning_identity == ProvisioningIdentity(InferenceEngine.VLLM)
             task.background = background
             return task
 
