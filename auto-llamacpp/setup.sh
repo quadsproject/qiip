@@ -134,14 +134,23 @@ enable_fit_params_unified_kv() {
 verify_fit_params_cli() {
     local binary="$1"
     if ! "$binary" \
+        --parallel 1 \
+        --kv-unified \
+        --gpu-layers all \
+        --verbosity 5 \
+        --version >/dev/null 2>&1; then
+        echo "FATAL: built llama-fit-params does not accept the managed metadata CLI" >&2
+        return 1
+    fi
+    if ! "$binary" \
         --ctx-size 4096 \
         --parallel 2 \
         --kv-unified \
         --gpu-layers all \
         --fit-print on \
-        --verbosity 4 \
+        --verbosity 0 \
         --version >/dev/null 2>&1; then
-        echo "FATAL: built llama-fit-params does not accept the managed planner CLI" >&2
+        echo "FATAL: built llama-fit-params does not accept the managed estimation CLI" >&2
         return 1
     fi
 }

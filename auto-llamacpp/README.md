@@ -121,6 +121,10 @@ trained length, then finds the largest slot count that keeps every layer on GPU
 and preserves the requested free-memory margin. The only concurrency ceiling is
 llama.cpp's 256-sequence limit. Configure the per-GPU free-memory target with
 `INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB` (default: 1024 MiB).
+The pinned helper emits model training context only through its normal fitting
+path at debug verbosity 5. QIIP accepts a nonzero fit status after that metadata
+is present because the all-layer probe can legitimately exceed an undersized
+GPU; missing or malformed training-context metadata still fails closed.
 
 Managed launch passes the selected `--ctx-size`, `--parallel`, unified-KV, and
 full-offload values explicitly and disables the server's second fitting pass.

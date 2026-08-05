@@ -457,10 +457,12 @@ EOF
 printf 'fit' >> "$AUTOLLAMACPP_TEST_LOG"
 printf ' <%s>' "$@" >> "$AUTOLLAMACPP_TEST_LOG"
 printf '\n' >> "$AUTOLLAMACPP_TEST_LOG"
-expected='--ctx-size 4096 --parallel 2 --kv-unified --gpu-layers all --fit-print on --verbosity 4 --version'
-if [ "$*" != "$expected" ]; then
-    exit 45
-fi
+metadata='--parallel 1 --kv-unified --gpu-layers all --verbosity 5 --version'
+estimate='--ctx-size 4096 --parallel 2 --kv-unified --gpu-layers all --fit-print on --verbosity 0 --version'
+case "$*" in
+    "$metadata"|"$estimate") ;;
+    *) exit 45 ;;
+esac
 echo 'version: 10242 (b10242)' >&2
 EOF
     cat > "$build_dir/bin/llama-quantize" <<'EOF'
@@ -554,8 +556,12 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     build = next(line for line in operations if line.startswith("cmake <--build>"))
     assert "<llama-server> <llama-fit-params> <llama-quantize>" in build
     assert (
+        "fit <--parallel> <1> <--kv-unified> <--gpu-layers> <all> "
+        "<--verbosity> <5> <--version>"
+    ) in operations
+    assert (
         "fit <--ctx-size> <4096> <--parallel> <2> <--kv-unified> "
-        "<--gpu-layers> <all> <--fit-print> <on> <--verbosity> <4> <--version>"
+        "<--gpu-layers> <all> <--fit-print> <on> <--verbosity> <0> <--version>"
     ) in operations
     assert (link_dir / "llama-server").resolve().is_file()
     assert (link_dir / "llama-fit-params").resolve().is_file()
@@ -589,6 +595,48 @@ install_llamacpp
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_model_context_probe_parses_metadata_before_fit_failure(
+    tmp_path: Path,
+) -> None:
+    fake_fit = tmp_path / "llama-fit-params"
+    _write_executable(
+        fake_fit,
+        """#!/bin/bash
+expected='--model /cache/model.gguf --parallel 1 --kv-unified --gpu-layers all --verbosity 5'
+[ "$*" = "$expected" ] || exit 44
+echo 'llama_model_loader: n_ctx_train = 262144' >&2
+echo 'failed to fit CLI arguments to free memory' >&2
+exit 1
+""",
+    )
+
+    result = _run_shell(
+        _source_start("GGUF_PATH=/cache/model.gguf; read_model_train_context"),
+        env={**os.environ, "AUTOLLAMACPP_FIT_BIN": str(fake_fit)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "262144\n"
+
+
+def test_model_context_probe_fails_when_metadata_is_missing(tmp_path: Path) -> None:
+    fake_fit = tmp_path / "llama-fit-params"
+    _write_executable(
+        fake_fit,
+        "#!/bin/bash\necho 'model load failed' >&2\nexit 7\n",
+    )
+
+    result = _run_shell(
+        _source_start("GGUF_PATH=/cache/model.gguf; read_model_train_context"),
+        env={**os.environ, "AUTOLLAMACPP_FIT_BIN": str(fake_fit)},
+    )
+
+    assert result.returncode != 0
+    assert "planner could not determine the model training context" in result.stderr
+    assert "llama-fit-params exited with status 7" in result.stderr
+    assert "model load failed" in result.stderr
 
 
 def test_fit_cli_patch_body_is_digest_verified() -> None:

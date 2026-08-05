@@ -239,22 +239,22 @@ read_managed_gpu_free_memory() {
 }
 
 read_model_train_context() {
-    local output train_context
-    if ! output=$("$LLAMACPP_FIT_BIN" \
+    local output status train_context
+    status=0
+    output=$("$LLAMACPP_FIT_BIN" \
         --model "$GGUF_PATH" \
         --parallel 1 \
         --kv-unified \
         --gpu-layers all \
-        --fit-print on \
-        --verbosity 4 2>&1); then
-        echo "FATAL: llama.cpp could not read model metadata for VRAM planning" >&2
-        printf '%s\n' "$output" >&2
-        return 1
-    fi
+        --verbosity 5 2>&1) || status=$?
     train_context=$(printf '%s\n' "$output" | sed -nE \
         's/.*n_ctx_train[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' | tail -n 1)
     if [[ ! "$train_context" =~ ^[1-9][0-9]*$ ]]; then
         echo "FATAL: llama.cpp planner could not determine the model training context" >&2
+        if [ "$status" -ne 0 ]; then
+            printf 'llama-fit-params exited with status %s\n' "$status" >&2
+        fi
+        printf '%s\n' "$output" >&2
         return 1
     fi
     printf '%s\n' "$train_context"
