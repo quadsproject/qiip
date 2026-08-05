@@ -1,4 +1,4 @@
-// Config generators for OpenCode CLI and Pi coding agent.
+// Config generators for OpenCode CLI, Pi coding agent, and OMP agent.
 // Generators are pure functions testable via Node.js.
 
 function generateOpenCodeConfig(baseUrl, modelId) {
@@ -41,9 +41,23 @@ function generatePiConfig(baseUrl, modelId) {
   };
 }
 
+function generateOmpConfig(baseUrl, modelId) {
+  var base = baseUrl.replace(/\/+$/, "");
+  return [
+    "providers:",
+    "  qiip:",
+    "    baseUrl: " + base + "/v1",
+    "    apiKey: none",
+    "    api: openai-completions",
+    "    models:",
+    "      - id: " + modelId,
+  ].join("\n");
+}
+
 function downloadConfigFile(data, filename) {
-  var json = JSON.stringify(data, null, 2);
-  var blob = new Blob([json], { type: "application/json" });
+  var isYaml = typeof data === "string";
+  var content = isYaml ? data : JSON.stringify(data, null, 2);
+  var blob = new Blob([content], { type: isYaml ? "text/yaml" : "application/json" });
   var url = URL.createObjectURL(blob);
   var a = document.createElement("a");
   a.href = url;
@@ -57,6 +71,7 @@ function downloadConfigFile(data, filename) {
 var CONFIG_FORMATS = [
   { label: "OpenCode CLI", generator: generateOpenCodeConfig, filename: "opencode.json" },
   { label: "Pi Agent", generator: generatePiConfig, filename: "models.json" },
+  { label: "OMP Agent", generator: generateOmpConfig, filename: "models.yaml" },
 ];
 
 function createConfigDropdown(baseUrl, modelId, positionFn, onToggle) {
