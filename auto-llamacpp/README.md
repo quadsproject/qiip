@@ -26,6 +26,9 @@ allowlist transformation, and compiles `llama-server`, `llama-fit-params`, and
 architecture. The supporting CPU backend uses `GGML_NATIVE=OFF`: managed
 inference is CUDA-only, and the portable CPU profile avoids coupling builds to
 host-specific compiler and assembler feature support.
+The build uses CMake's explicit Unix Makefiles generator with parallel jobs, so
+it depends only on the `make` package available from the standard RHEL
+repositories and does not require CodeReady Builder or `ninja-build`.
 
 Installations are immutable and build-identified under
 `/opt/llama.cpp/<version>-<identity>`. The three public binaries in

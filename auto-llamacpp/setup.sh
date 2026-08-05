@@ -157,8 +157,8 @@ install_llamacpp() {
         echo "FATAL: AUTOLLAMACPP_SOURCE_URL must be an HTTP(S) URL" >&2
         return 2
     fi
-    if ! command -v cmake >/dev/null || ! command -v ninja >/dev/null; then
-        echo "FATAL: cmake and ninja are required to build llama.cpp" >&2
+    if ! command -v cmake >/dev/null || ! command -v make >/dev/null; then
+        echo "FATAL: cmake and make are required to build llama.cpp" >&2
         return 1
     fi
     if [ ! -x "$CUDA_NVCC" ]; then
@@ -226,7 +226,7 @@ install_llamacpp() {
         # "fatal: not a git repository" lines and falls back to BUILD_NUMBER=0.
         # LLAMA_BUILD_NUMBER/COMMIT below override that fallback and are what
         # installed_llamacpp_version() matches against -- they are not decorative.
-        cmake -S "$source_dir" -B "$build_dir" -G Ninja \
+        cmake -S "$source_dir" -B "$build_dir" -G "Unix Makefiles" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_COMPILER="$CUDA_NVCC" \
             -DCMAKE_CUDA_ARCHITECTURES="$LLAMACPP_CUDA_ARCHITECTURES" \

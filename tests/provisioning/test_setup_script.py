@@ -728,7 +728,8 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
         "python3.12 python3.12-devel"
     )
     assert operations[1] == "dnf -y update --exclude=kernel*"
-    assert operations[2] == "dnf -y install dnf-plugins-core ninja-build"
+    assert operations[2] == "dnf -y install dnf-plugins-core"
+    assert "ninja" not in "\n".join(operations)
 
 
 @pytest.mark.parametrize("backend", ["firewalld", "iptables", "none"])

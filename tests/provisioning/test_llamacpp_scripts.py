@@ -471,7 +471,6 @@ EOF
 fi
 """,
     )
-    _write_executable(fake_bin / "ninja", "#!/bin/bash\nexit 0\n")
     _write_executable(fake_bin / "nvcc", "#!/bin/bash\nexit 0\n")
     _write_executable(
         fake_bin / "nvidia-smi",
@@ -541,6 +540,7 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     assert operations[0].startswith("wget <-q> <https://mirror.example/")
     assert operations[1] == "tar"
     configure = next(line for line in operations if line.startswith("cmake <-S>"))
+    assert "<-G> <Unix Makefiles>" in configure
     assert "<-DGGML_CUDA=ON>" in configure
     assert "<-DGGML_NATIVE=OFF>" in configure
     assert "<-DCMAKE_CUDA_ARCHITECTURES=native>" in configure
@@ -568,6 +568,27 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
         "58917efc78ca760a2a1dd162d84e6cf1930c5b62a8dd9710bb4579ca4f2d69dc"
     ) in marker_text
     assert "compute_capabilities=8.0,9.0" in marker_text
+
+
+def test_install_does_not_require_ninja(tmp_path: Path) -> None:
+    env, _operation_log, _link_dir = _build_fixture(tmp_path)
+
+    result = _run_shell(
+        _source_setup(
+            """
+command() {
+    if [ "${1:-}" = "-v" ] && [ "${2:-}" = "ninja" ]; then
+        return 1
+    fi
+    builtin command "$@"
+}
+install_llamacpp
+"""
+        ),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_fit_cli_patch_body_is_digest_verified() -> None:
