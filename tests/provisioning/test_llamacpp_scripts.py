@@ -80,11 +80,55 @@ def test_start_resolves_exact_artifact_and_preserves_alias(tmp_path: Path) -> No
     assert result.stdout.splitlines() == [str(model.resolve()), alias]
 
 
+def test_start_preserves_split_entrypoint_filename_and_siblings(
+    tmp_path: Path,
+) -> None:
+    snapshot = tmp_path / "hub" / "models--org--split-model" / "snapshots" / ("a" * 40)
+    blobs = tmp_path / "hub" / "models--org--split-model" / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir(parents=True)
+
+    shards: list[Path] = []
+    for index in (1, 2):
+        blob = blobs / hashlib.sha256(str(index).encode()).hexdigest()
+        blob.write_bytes(f"shard {index}".encode())
+        shard = snapshot / f"model-{index:05d}-of-00002.gguf"
+        shard.symlink_to(Path(os.path.relpath(blob, snapshot)))
+        shards.append(shard)
+
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
+        "AUTOLLAMACPP_GGUF_PATH": str(shards[0].relative_to(tmp_path)),
+        "AUTOLLAMACPP_MODEL_ALIAS": "org/split-model",
+    }
+    result = _run_shell(
+        _source_start(
+            "\n".join(
+                (
+                    "resolve_gguf_artifact",
+                    'sibling="$(dirname -- "$GGUF_PATH")/model-00002-of-00002.gguf"',
+                    'test -f "$sibling"',
+                    'printf "%s\\n%s\\n" "$GGUF_PATH" "$sibling"',
+                )
+            )
+        ),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [str(shards[0]), str(shards[1])]
+    assert shards[0].resolve() != shards[0]
+
+
 def test_managed_launch_uses_exact_artifact_and_explicit_alias(tmp_path: Path) -> None:
     """Exercise the public launch path without relying on the new helper name."""
     exact = tmp_path / "gguf" / "artifact -- id" / "files" / "model---q4_k_m.gguf"
     exact.parent.mkdir(parents=True)
-    exact.write_bytes(b"selected")
+    blob = tmp_path / "blobs" / hashlib.sha256(b"selected").hexdigest()
+    blob.parent.mkdir()
+    blob.write_bytes(b"selected")
+    exact.symlink_to(Path(os.path.relpath(blob, exact.parent)))
     decoy = tmp_path / "gguf" / "unrelated" / "wrong-q4_k_m.gguf"
     decoy.parent.mkdir(parents=True)
     decoy.write_bytes(b"wrong")
@@ -123,7 +167,7 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(tmp_path: Path) -
 
     assert result.returncode == 0, result.stderr
     args = args_file.read_text(encoding="utf-8").splitlines()
-    assert args[args.index("--model") + 1] == str(exact.resolve())
+    assert args[args.index("--model") + 1] == str(exact)
     assert args[args.index("--alias") + 1] == alias
 
 

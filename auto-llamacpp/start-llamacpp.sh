@@ -66,26 +66,32 @@ resolve_gguf_artifact() {
             return 1
             ;;
     esac
+    local candidate
     local mount_root
+    local resolved
     mount_root=$(readlink -f -- "$NFS_MOUNT_POINT") || {
         echo "FATAL: NFS mount is unavailable: ${NFS_MOUNT_POINT}" >&2
         return 1
     }
-    GGUF_PATH=$(readlink -f -- "${mount_root}/${GGUF_RELATIVE_PATH}") || {
+    candidate="${mount_root}/${GGUF_RELATIVE_PATH}"
+    resolved=$(readlink -f -- "$candidate") || {
         echo "FATAL: selected GGUF artifact is unavailable: ${GGUF_RELATIVE_PATH}" >&2
         return 1
     }
-    case "$GGUF_PATH" in
+    case "$resolved" in
         "${mount_root}"/*) ;;
         *)
             echo "FATAL: selected GGUF artifact escapes the NFS mount" >&2
             return 1
             ;;
     esac
-    if [ ! -f "$GGUF_PATH" ]; then
+    if [ ! -f "$resolved" ]; then
         echo "FATAL: selected GGUF artifact is not a regular file: ${GGUF_RELATIVE_PATH}" >&2
         return 1
     fi
+    # llama.cpp derives sibling split paths from the entrypoint filename. Keep
+    # the validated symlink path so the -00001-of-0000N.gguf suffix survives.
+    GGUF_PATH="$candidate"
 }
 
 configure_llamacpp_params() {

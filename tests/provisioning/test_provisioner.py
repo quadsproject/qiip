@@ -283,7 +283,7 @@ def test_published_artifact_resolves_through_managed_launcher(tmp_path: Path) ->
 
     expected_entrypoint = tmp_path / published.cache_relative_entrypoint
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == [str(expected_entrypoint.resolve()), repo_id]
+    assert result.stdout.splitlines() == [str(expected_entrypoint), repo_id]
     assert expected_entrypoint.is_symlink()
 
 
