@@ -22,13 +22,16 @@ Linux CUDA archives are not published for the pinned `b10242` release.
 `setup.sh` therefore downloads the pinned GitHub tag source archive, verifies
 its committed SHA-256 before extraction, and compiles `llama-server` and
 `llama-quantize` with `GGML_CUDA=ON` and the attached GPUs' native CUDA
-architecture.
+architecture. The supporting CPU backend uses `GGML_NATIVE=OFF`: managed
+inference is CUDA-only, and the portable CPU profile avoids coupling builds to
+host-specific compiler and assembler feature support.
 
 Installations are immutable and build-identified under
 `/opt/llama.cpp/<version>-<identity>`. The two public binaries in
 `/usr/local/bin` are replaced with same-directory atomic symlink renames only
 after the new build reports the configured version. Repeating setup with the
-same source digest and GPU capabilities reuses that installation.
+same source digest, build profile, and GPU capabilities reuses that
+installation.
 
 The full llama.cpp setup command has a separate two-hour default deadline
 (`INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT`) because it includes

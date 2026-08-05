@@ -409,7 +409,9 @@ for the NVIDIA GPU attached to the node. It has four gateway settings:
 Changing `LLAMACPP_VERSION` requires an explicitly configured matching digest.
 The node verifies the archive before extracting it, builds only
 `llama-server` and `llama-quantize`, and atomically publishes a versioned
-installation under `/opt/llama.cpp`. The source build requires a working
+installation under `/opt/llama.cpp`. CUDA kernels target the attached GPU; the
+supporting CPU backend uses a portable non-native profile so host assembler
+support cannot invalidate a CUDA build. The source build requires a working
 NVIDIA driver and CUDA compiler; QIIP-managed llama.cpp nodes do not fall back
 to CPU inference. See [auto-llamacpp](auto-llamacpp/README.md) for the direct
 script contract and build details.

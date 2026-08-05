@@ -48,6 +48,7 @@ LLAMACPP_SOURCE_URL="${AUTOLLAMACPP_SOURCE_URL:-https://github.com/ggml-org/llam
 LLAMACPP_INSTALL_ROOT="${AUTOLLAMACPP_INSTALL_ROOT:-/opt/llama.cpp}"
 LLAMACPP_LINK_DIR="${AUTOLLAMACPP_LINK_DIR:-/usr/local/bin}"
 LLAMACPP_CUDA_ARCHITECTURES="${AUTOLLAMACPP_CUDA_ARCHITECTURES:-native}"
+LLAMACPP_BUILD_PROFILE="cuda-portable-cpu-v1"
 CUDA_NVCC="${AUTOLLAMACPP_NVCC:-/usr/local/cuda/bin/nvcc}"
 
 unset AUTOVLLM_NFS_EXPORT AUTOVLLM_NFS_MOUNT_POINT
@@ -119,9 +120,10 @@ install_llamacpp() {
 
     local compute_capabilities build_identity install_dir marker
     compute_capabilities=$(cuda_compute_capabilities) || return
-    marker=$(printf 'version=%s\nsource_sha256=%s\ncompute_capabilities=%s\ncmake_cuda_architectures=%s\n' \
+    marker=$(printf 'version=%s\nsource_sha256=%s\nbuild_profile=%s\ncompute_capabilities=%s\ncmake_cuda_architectures=%s\n' \
         "$LLAMACPP_VERSION" \
         "$LLAMACPP_SHA256" \
+        "$LLAMACPP_BUILD_PROFILE" \
         "${compute_capabilities//$'\n'/,}" \
         "$LLAMACPP_CUDA_ARCHITECTURES")
     build_identity=$(printf '%s' "$marker" | sha256sum | cut -c1-16)
@@ -163,12 +165,17 @@ install_llamacpp() {
             "llama.cpp ${LLAMACPP_VERSION} source"
         tar xzf "$archive" -C "$source_dir" --strip-components=1
 
+        # Source tarballs have no .git, so cmake/build-info.cmake logs two harmless
+        # "fatal: not a git repository" lines and falls back to BUILD_NUMBER=0.
+        # LLAMA_BUILD_NUMBER/COMMIT below override that fallback and are what
+        # installed_llamacpp_version() matches against -- they are not decorative.
         cmake -S "$source_dir" -B "$build_dir" -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_COMPILER="$CUDA_NVCC" \
             -DCMAKE_CUDA_ARCHITECTURES="$LLAMACPP_CUDA_ARCHITECTURES" \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CUDA=ON \
+            -DGGML_NATIVE=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TOOLS=ON \

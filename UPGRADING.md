@@ -278,7 +278,9 @@ Managed setup and launch now require a verified NVIDIA GPU and never fall back
 to CPU inference. Direct use of the scripts retains the existing standalone CPU
 branch, but it is outside QIIP's managed-node support boundary. Validate a
 disposable node from each GPU family before fleet rollout because the build is
-specialized for the attached CUDA architecture.
+specialized for the attached CUDA architecture. The supporting CPU backend is
+built with `GGML_NATIVE=OFF` to avoid host-specific compiler/assembler feature
+mismatches; this fixed profile is part of the immutable build identity.
 
 ### 21. Use exact immutable GGUF artifacts
 

@@ -360,6 +360,7 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     assert operations[1] == "tar"
     configure = next(line for line in operations if line.startswith("cmake <-S>"))
     assert "<-DGGML_CUDA=ON>" in configure
+    assert "<-DGGML_NATIVE=OFF>" in configure
     assert "<-DCMAKE_CUDA_ARCHITECTURES=native>" in configure
     assert "<-DBUILD_SHARED_LIBS=OFF>" in configure
     assert "<-DLLAMA_BUILD_TESTS=OFF>" in configure
@@ -373,7 +374,9 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     assert (link_dir / "llama-server").resolve().is_file()
     assert (link_dir / "llama-quantize").resolve().is_file()
     marker = (link_dir / "llama-server").resolve().parents[1] / "BUILD-INFO"
-    assert "compute_capabilities=8.0,9.0" in marker.read_text()
+    marker_text = marker.read_text()
+    assert "build_profile=cuda-portable-cpu-v1" in marker_text
+    assert "compute_capabilities=8.0,9.0" in marker_text
 
 
 def test_install_is_idempotent_for_source_and_gpu_identity(tmp_path: Path) -> None:
@@ -385,6 +388,37 @@ def test_install_is_idempotent_for_source_and_gpu_identity(tmp_path: Path) -> No
     assert first.returncode == 0, first.stderr
     assert second.returncode == 0, second.stderr
     assert "already installed for CUDA capabilities 8.0,9.0" in second.stdout
+    assert (
+        sum(line.startswith("wget") for line in operation_log.read_text().splitlines())
+        == 1
+    )
+
+
+def test_portable_cpu_profile_invalidates_pre_profile_build(tmp_path: Path) -> None:
+    env, operation_log, link_dir = _build_fixture(tmp_path)
+    old_marker = "\n".join(
+        (
+            "version=b10242",
+            f"source_sha256={env['AUTOLLAMACPP_SHA256']}",
+            "compute_capabilities=8.0,9.0",
+            "cmake_cuda_architectures=native",
+        )
+    )
+    old_identity = hashlib.sha256(old_marker.encode()).hexdigest()[:16]
+    old_install = Path(env["AUTOLLAMACPP_INSTALL_ROOT"]) / f"b10242-{old_identity}"
+    old_bin = old_install / "bin"
+    old_bin.mkdir(parents=True)
+    _write_executable(
+        old_bin / "llama-server",
+        "#!/bin/bash\necho 'version: 10242 (b10242)' >&2\n",
+    )
+    _write_executable(old_bin / "llama-quantize", "#!/bin/bash\nexit 0\n")
+    (old_install / "BUILD-INFO").write_text(f"{old_marker}\n", encoding="utf-8")
+
+    result = _run_shell(_source_setup("install_llamacpp"), env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert (link_dir / "llama-server").resolve().parent != old_bin
     assert (
         sum(line.startswith("wget") for line in operation_log.read_text().splitlines())
         == 1
