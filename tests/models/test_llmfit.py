@@ -7,7 +7,13 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from inference_proxy.models.llmfit import LLMFitResult, SystemInfo
+from inference_proxy.models.llmfit import (
+    GGUFSource,
+    LLMFitResult,
+    ModelRecommendation,
+    RecommendationRuntime,
+    SystemInfo,
+)
 
 FIXTURE_JSON = json.dumps(
     {
@@ -73,6 +79,65 @@ class TestLLMFitResult:
         assert result.models[0].name == "llama-3.3-70b"
         assert result.models[0].score == 95.2
         assert result.models[1].fit_level == "good"
+
+
+class TestRecommendationRuntime:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (RecommendationRuntime.VLLM, RecommendationRuntime.VLLM),
+            ("vLLM", RecommendationRuntime.VLLM),
+            ("vllm", RecommendationRuntime.VLLM),
+            ("llama.cpp", RecommendationRuntime.LLAMA_CPP),
+            ("llamacpp", RecommendationRuntime.LLAMA_CPP),
+            ("llama_cpp", RecommendationRuntime.LLAMA_CPP),
+            ("MLX", RecommendationRuntime.MLX),
+            ("mlx", RecommendationRuntime.MLX),
+            ("", RecommendationRuntime.UNKNOWN),
+            ("future-runtime", RecommendationRuntime.UNKNOWN),
+            (None, RecommendationRuntime.UNKNOWN),
+        ],
+    )
+    def test_normalizes_llmfit_runtime_spelling(
+        self,
+        raw: object,
+        expected: RecommendationRuntime,
+    ) -> None:
+        recommendation = ModelRecommendation.model_validate(
+            {"name": "org/model", "runtime": raw}
+        )
+
+        assert recommendation.runtime is expected
+
+
+class TestGGUFSources:
+    def test_preserves_typed_sources(self) -> None:
+        recommendation = ModelRecommendation.model_validate(
+            {
+                "name": "model",
+                "runtime": "llama.cpp",
+                "gguf_sources": [
+                    {"repo": "org/model-GGUF", "provider": "publisher"},
+                ],
+            }
+        )
+
+        assert recommendation.gguf_sources == (
+            GGUFSource(repo="org/model-GGUF", provider="publisher"),
+        )
+        assert recommendation.model_dump(mode="json")["gguf_sources"] == [
+            {"repo": "org/model-GGUF", "provider": "publisher"},
+        ]
+
+    def test_source_without_repo_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ModelRecommendation.model_validate(
+                {
+                    "name": "model",
+                    "runtime": "llama.cpp",
+                    "gguf_sources": [{"provider": "publisher"}],
+                }
+            )
 
 
 class TestSystemInfoDefaults:

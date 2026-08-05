@@ -10,8 +10,11 @@ import pytest
 from inference_proxy.config.settings import LLMFitSettings, ProvisioningSettings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.endpoint import EndpointPolicy
-from inference_proxy.models.node import Node, NodeStatus
-from inference_proxy.provisioning.provisioner import NodeProvisioner
+from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
+from inference_proxy.provisioning.provisioner import (
+    NodeProvisioner,
+    ProvisioningIdentity,
+)
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 from inference_proxy.routing.connection_tracker import ConnectionTracker
 
@@ -76,15 +79,23 @@ async def test_same_host_provision_and_teardown_are_serialized(
         *,
         managed: bool = True,
         model: str | None = None,
+        engine: str = "vllm",
+        artifact: object | None = None,
     ) -> None:
         assert hostname == "gpu01"
         assert managed is True
         assert model is None
         await run_body("provision")
 
-    async def teardown_body(hostname: str, *, force: bool = False) -> None:
+    async def teardown_body(
+        hostname: str,
+        *,
+        force: bool = False,
+        engine: InferenceEngine,
+    ) -> None:
         assert hostname == "gpu01"
         assert force is False
+        assert engine is InferenceEngine.VLLM
         await run_body("teardown")
 
     monkeypatch.setattr(provisioner, "_provision", provision_body)
@@ -92,7 +103,10 @@ async def test_same_host_provision_and_teardown_are_serialized(
 
     operations = {
         "provision": lambda: provisioner.provision("gpu01"),
-        "teardown": lambda: provisioner.teardown("gpu01"),
+        "teardown": lambda: provisioner.teardown(
+            "gpu01",
+            provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
+        ),
     }
     second_operation = "teardown" if first_operation == "provision" else "provision"
 
@@ -141,13 +155,21 @@ async def test_different_hosts_can_run_lifecycle_operations_concurrently(
         *,
         managed: bool = True,
         model: str | None = None,
+        engine: str = "vllm",
+        artifact: object | None = None,
     ) -> None:
         assert hostname == "gpu01"
         provision_entered.set()
         await release.wait()
 
-    async def teardown_body(hostname: str, *, force: bool = False) -> None:
+    async def teardown_body(
+        hostname: str,
+        *,
+        force: bool = False,
+        engine: InferenceEngine,
+    ) -> None:
         assert hostname == "gpu02"
+        assert engine is InferenceEngine.VLLM
         teardown_entered.set()
         await release.wait()
 
@@ -155,7 +177,12 @@ async def test_different_hosts_can_run_lifecycle_operations_concurrently(
     monkeypatch.setattr(provisioner, "_teardown", teardown_body)
 
     provision_task = asyncio.create_task(provisioner.provision("gpu01"))
-    teardown_task = asyncio.create_task(provisioner.teardown("gpu02"))
+    teardown_task = asyncio.create_task(
+        provisioner.teardown(
+            "gpu02",
+            provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
+        )
+    )
     both_entered = asyncio.gather(
         provision_entered.wait(),
         teardown_entered.wait(),
@@ -182,6 +209,8 @@ async def test_reserved_lease_remains_busy_through_background_provision(
         *,
         managed: bool = True,
         model: str | None = None,
+        engine: str = "vllm",
+        artifact: object | None = None,
     ) -> None:
         provision_entered.set()
         await release.wait()

@@ -1,5 +1,7 @@
 // ponytail: vanilla fetch + DOM, no framework needed
 
+const setupSelection = createSetupSelectionController();
+
 function showToast(message, type) {
   const container = document.getElementById("toast-container");
   const toast = document.createElement("div");
@@ -18,7 +20,12 @@ const ACTION_CONFIG = {
   setup: {
     method: "POST",
     url: () => "/admin/nodes/setup",
-    body: (nodeId, node) => ({ hostname: nodeId, managed: node ? node.managed !== false : true }),
+    body: (nodeId, node) => {
+      const base = { hostname: nodeId, managed: node ? node.managed !== false : true };
+      return node && node.state !== "available"
+        ? base
+        : setupSelection.buildBody(base);
+    },
     confirm: false,
     confirmMsg: null,
     label: "Setup Node",
@@ -85,8 +92,14 @@ async function handleAction(action, nodeId, node) {
   inFlightNodes.add(nodeId);
   const options = { method: config.method };
   if (config.body) {
+    const body = config.body(nodeId, node);
+    if (!body) {
+      showToast(setupSelection.errorMessage(), "error");
+      inFlightNodes.delete(nodeId);
+      return;
+    }
     options.headers = { "Content-Type": "application/json" };
-    options.body = JSON.stringify(config.body(nodeId, node));
+    options.body = JSON.stringify(body);
   }
   try {
     const resp = await fetch(config.url(nodeId), options);
@@ -189,7 +202,7 @@ async function refreshDashboard() {
       tbody.textContent = "";
       const emptyRow = document.createElement("tr");
       const emptyCell = document.createElement("td");
-      emptyCell.colSpan = 8;
+      emptyCell.colSpan = 9;
       emptyCell.textContent = "No nodes found";
       emptyRow.appendChild(emptyCell);
       tbody.appendChild(emptyRow);
@@ -222,6 +235,10 @@ async function refreshDashboard() {
         const tdGpuModel = document.createElement("td");
         tdGpuModel.textContent = node.gpu_model || "—";
         tr.appendChild(tdGpuModel);
+
+        const tdEngine = document.createElement("td");
+        tdEngine.textContent = formatInferenceEngine(node.engine);
+        tr.appendChild(tdEngine);
 
         const tdModel = document.createElement("td");
         tdModel.textContent = node.state === "available" ? "—" : node.model;
@@ -311,7 +328,7 @@ async function refreshDashboard() {
           subRow.style.display = expanded ? "table-row" : "none";
 
           const subTd = document.createElement("td");
-          subTd.colSpan = 8;
+          subTd.colSpan = 9;
 
           const detail = document.createElement("div");
           detail.className = "error-detail";
@@ -385,7 +402,18 @@ function renderTaskDataWarning(nodesResponse, warningEl) {
   warningEl.className = "";
 }
 
+async function loadSetupCatalog() {
+  try {
+    const response = await fetch("/admin/models/catalog");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    setupSelection.setCatalog(await response.json());
+  } catch (_) {
+    setupSelection.setCatalogUnavailable();
+  }
+}
+
 document.addEventListener("DOMContentLoaded", function () {
+  loadSetupCatalog();
   refreshDashboard();
   setInterval(refreshDashboard, POLL_INTERVAL_MS);
 
@@ -425,10 +453,16 @@ document.addEventListener("DOMContentLoaded", function () {
     const standalone = document.getElementById("setup-standalone").checked;
     btn.disabled = true;
     try {
+      const body = setupSelection.buildBody({ hostname, managed: !standalone });
+      if (!body) {
+        showToast(setupSelection.errorMessage(), "error");
+        btn.disabled = false;
+        return;
+      }
       const resp = await fetch("/admin/nodes/setup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ hostname, managed: !standalone }),
+        body: JSON.stringify(body),
       });
       if (resp.ok) {
         showToast(`Setup started for ${hostname}`, "success");

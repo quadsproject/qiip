@@ -41,8 +41,13 @@ def test_node_detail_retry_preserves_managed(managed: bool) -> None:
     harness = f"""
 const fs = require("fs");
 const vm = require("vm");
+const path = require("path");
 const source = fs.readFileSync(process.argv[1], "utf8");
+const setupSelectionSource = fs.readFileSync(
+  path.join(path.dirname(process.argv[1]), "setup_selection.js"), "utf8"
+);
 let captured = null;
+const elements = new Map();
 
 function element() {{
   return {{
@@ -53,12 +58,17 @@ function element() {{
   }};
 }}
 
+function byId(id) {{
+  if (!elements.has(id)) elements.set(id, element());
+  return elements.get(id);
+}}
+
 const sandbox = {{
   console,
   NODE_ID: "gpu01",
   POLL_INTERVAL_MS: 10000,
   document: {{
-    getElementById() {{ return element(); }},
+    getElementById: byId,
     addEventListener() {{}},
     querySelectorAll() {{ return []; }},
     querySelector() {{ return element(); }},
@@ -78,11 +88,14 @@ const sandbox = {{
 }};
 
 vm.createContext(sandbox);
+vm.runInContext(setupSelectionSource, sandbox);
 vm.runInContext(source, sandbox);
 sandbox.showToast = function () {{}};
 
 (async function () {{
-  await sandbox.handleAction("retry", "gpu01", {{ managed: {json.dumps(managed)} }});
+  await sandbox.handleAction("retry", "gpu01", {{
+    managed: {json.dumps(managed)}, engine: "vllm", model: "org/model",
+  }});
   const body = JSON.parse(captured.options.body);
   process.stdout.write(JSON.stringify(body));
 }})().catch(function (error) {{
@@ -96,11 +109,81 @@ sandbox.showToast = function () {{}};
     assert body == {"hostname": "gpu01", "managed": managed}
 
 
+def test_failed_node_setup_leaves_retry_identity_to_server() -> None:
+    harness = r"""
+const fs = require("fs");
+const vm = require("vm");
+const path = require("path");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const setupSource = fs.readFileSync(
+  path.join(path.dirname(process.argv[1]), "setup_selection.js"), "utf8"
+);
+const elements = new Map();
+let captured = null;
+function element() {
+  return {
+    children: [], listeners: {}, style: {}, value: "", textContent: "",
+    addEventListener(name, callback) { this.listeners[name] = callback; },
+    appendChild(child) { this.children.push(child); return child; },
+    remove() {}, setAttribute() {},
+    classList: { add() {}, remove() {}, contains() { return false; } },
+  };
+}
+function byId(id) {
+  if (!elements.has(id)) elements.set(id, element());
+  return elements.get(id);
+}
+const sandbox = {
+  console, NODE_ID: "gpu01", POLL_INTERVAL_MS: 10000,
+  document: {
+    getElementById: byId, addEventListener() {}, querySelectorAll() { return []; },
+    querySelector() { return element(); }, createElement() { return element(); },
+    createTextNode(text) { return { textContent: text }; },
+  },
+  window: { confirm() { return true; } }, requestAnimationFrame() {},
+  setTimeout() { return 0; }, setInterval() { return 0; }, clearInterval() {},
+  EventSource: function () {},
+  fetch: async function (url, options) {
+    captured = { url, options };
+    return { ok: true, json: async function () { return {}; } };
+  },
+};
+vm.createContext(sandbox);
+vm.runInContext(setupSource, sandbox);
+vm.runInContext(source, sandbox);
+sandbox.showToast = function () {};
+sandbox.setupSelection.setPreferredNode({
+  engine: "llama_cpp", artifact_id: "a".repeat(64), model: "alias",
+});
+sandbox.setupSelection.setCatalog({
+  models: [], gguf_artifacts: [{
+    artifact_id: "a".repeat(64), repo_id: "org/model", model_alias: "alias",
+  }],
+});
+(async function () {
+  await sandbox.handleAction("setup", "gpu01", {
+    state: "failed", managed: true, engine: "llama_cpp",
+    artifact_id: "a".repeat(64),
+  });
+  process.stdout.write(captured.options.body);
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+
+    assert _run_node(_NODE_DETAIL_JS, harness) == {
+        "hostname": "gpu01",
+        "managed": True,
+    }
+
+
 def test_task_data_degradation_survives_poll_rewrite() -> None:
     harness = """
 const fs = require("fs");
 const vm = require("vm");
+const path = require("path");
 const source = fs.readFileSync(process.argv[1], "utf8");
+const setupSelectionSource = fs.readFileSync(
+  path.join(path.dirname(process.argv[1]), "setup_selection.js"), "utf8"
+);
 const elements = new Map();
 
 function element() {
@@ -150,6 +233,7 @@ const sandbox = {
 };
 
 vm.createContext(sandbox);
+vm.runInContext(setupSelectionSource, sandbox);
 vm.runInContext(source, sandbox);
 
 (async function () {
@@ -179,8 +263,13 @@ vm.runInContext(source, sandbox);
 _NODE_DETAIL_HARNESS = r"""
 const fs = require("fs");
 const vm = require("vm");
+const path = require("path");
 const source = fs.readFileSync(process.argv[1], "utf8");
+const setupSelectionSource = fs.readFileSync(
+  path.join(path.dirname(process.argv[1]), "setup_selection.js"), "utf8"
+);
 const elements = new Map();
+const allElements = [];
 const eventSources = [];
 const timers = [];
 let fakeNow = 0;
@@ -202,6 +291,7 @@ class Element {
     this.scrollHeight = 100;
     this.scrollTop = 0;
     this.clientHeight = 100;
+    allElements.push(this);
   }
   get textContent() { return this._textContent; }
   set textContent(value) {
@@ -269,6 +359,7 @@ const sandbox = {
 };
 
 vm.createContext(sandbox);
+vm.runInContext(setupSelectionSource, sandbox);
 vm.runInContext(source, sandbox);
 sandbox.showToast = function () {};
 
@@ -280,7 +371,7 @@ function runNextTimer() {
   return timer.delay;
 }
 
-function installDetailFetch(tasks, tasksOk) {
+function installDetailFetch(tasks, tasksOk, engine) {
   sandbox.fetch = async function (url) {
     if (url === "/admin/nodes") {
       return {
@@ -288,6 +379,7 @@ function installDetailFetch(tasks, tasksOk) {
         headers: { get() { return null; } },
         json: async function () { return [{
           node_id: "gpu01", state: "provisioning", model: "org/model",
+          engine: engine || null, artifact_id: null,
           endpoint: "gpu01:8000", active_connections: 0,
           circuit_breaker_state: "closed", actions: [],
         }]; },
@@ -501,7 +593,6 @@ sandbox.fetch = async function (url) {
   await sandbox.pollDownloadStatuses();
   process.stdout.write(JSON.stringify({
     requested,
-    catalogModels: sandbox.catalogModels,
     selectorValues: byId("model-select").children.map(function (child) { return child.value; }),
     selectorVisible: byId("model-select").style.display !== "none",
   }));
@@ -510,7 +601,6 @@ sandbox.fetch = async function (url) {
     )
 
     assert result["requested"].count("/admin/models/catalog") == 1
-    assert result["catalogModels"] == [{"repo_id": "org/model"}]
     assert result["selectorValues"] == ["org/model"]
     assert result["selectorVisible"] is True
 
@@ -528,7 +618,6 @@ sandbox.fetch = async function (url) {
 (async function () {
   await sandbox.fetchCatalog();
   process.stdout.write(JSON.stringify({
-    catalogModels: sandbox.catalogModels,
     selectorVisible: byId("model-select").style.display !== "none",
     statusVisible: byId("model-status").style.display !== "none",
     status: byId("model-status").textContent,
@@ -538,7 +627,6 @@ sandbox.fetch = async function (url) {
     )
 
     assert result == {
-        "catalogModels": [],
         "selectorVisible": False,
         "statusVisible": True,
         "status": (
@@ -547,6 +635,93 @@ sandbox.fetch = async function (url) {
             "cached models were hidden; re-download them."
         ),
     }
+
+
+def test_recommendations_render_runtime_source_and_exact_artifact_availability() -> (
+    None
+):
+    result = _run_node_detail_scenario(
+        r"""
+const requested = [];
+const model = function (name, runtime, sources) {
+  return {
+    name, runtime, gguf_sources: sources, category: "chat", score: 90,
+    fit_level: "good", estimated_tps: 12, memory_required_gb: 10,
+  };
+};
+sandbox.fetch = async function (url, options) {
+  requested.push({ url, method: options && options.method });
+  if (url === "/admin/nodes/gpu01/recommendations") {
+    return { ok: true, json: async function () { return {
+      system: { gpu_name: "GPU", gpu_vram_gb: 80, backend: "CUDA" },
+      models: [
+        model("no-source", "llama_cpp", []),
+        model("exact", "llama_cpp", [{
+          repo: "org/exact", provider: "<img src=x onerror=attack()>",
+        }]),
+        model("case-mismatch", "llama_cpp", [{ repo: "Org/Exact", provider: "safe" }]),
+        model("mlx-model", "mlx", []),
+        model("future-model", "unknown", []),
+        model("org/vllm", "vllm", []),
+      ],
+    }; } };
+  }
+  if (url === "/admin/models/catalog") {
+    return { ok: true, json: async function () { return {
+      models: [],
+      gguf_artifacts: [{
+        artifact_id: "artifact-exact", repo_id: "org/exact",
+        model_alias: "exact", resolved_revision: "abcdef0123456789",
+      }],
+    }; } };
+  }
+  if (url === "/admin/models/downloads") {
+    return { ok: true, json: async function () { return []; } };
+  }
+  throw new Error("unexpected URL " + url);
+};
+
+(async function () {
+  await sandbox.loadRecommendations();
+  process.stdout.write(JSON.stringify({
+    texts: allElements.map(function (element) { return element.textContent; }),
+    downloadButtons: allElements.filter(function (element) {
+      return element.tagName === "button" && element.textContent === "Download";
+    }).length,
+    downloadPosts: requested.filter(function (request) {
+      return request.url === "/admin/models/download" && request.method === "POST";
+    }).length,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert "llama.cpp" in result["texts"]
+    assert "MLX" in result["texts"]
+    assert "No GGUF source" in result["texts"]
+    assert "Available (1 generation)" in result["texts"]
+    assert "Not downloaded" in result["texts"]
+    assert "Unsupported" in result["texts"]
+    assert "Unknown runtime" in result["texts"]
+    assert "<img src=x onerror=attack()> — org/exact" in result["texts"]
+    assert result["downloadButtons"] == 1
+    assert result["downloadPosts"] == 0
+
+
+def test_node_detail_renders_registered_engine() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([], true, "llama_cpp");
+(async function () {
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    texts: allElements.map(function (element) { return element.textContent; }),
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert "llama.cpp" in result["texts"]
 
 
 def _power_controls_result(status_code: int) -> object:
@@ -609,6 +784,9 @@ const path = require("path");
 const source = fs.readFileSync(process.argv[1], "utf8");
 const configDownloadSource = fs.readFileSync(
   path.join(path.dirname(process.argv[1]), "config_download.js"), "utf8"
+);
+const setupSelectionSource = fs.readFileSync(
+  path.join(path.dirname(process.argv[1]), "setup_selection.js"), "utf8"
 );
 const elements = new Map();
 const allElements = [];
@@ -690,6 +868,7 @@ const sandbox = {
 
 vm.createContext(sandbox);
 vm.runInContext(configDownloadSource, sandbox);
+vm.runInContext(setupSelectionSource, sandbox);
 vm.runInContext(source, sandbox);
 sandbox.showToast = function () {};
 
@@ -701,7 +880,7 @@ function response(data, headers) {
   };
 }
 
-function node(id, state, actions) {
+function node(id, state, actions, engine) {
   return {
     node_id: id,
     state,
@@ -709,6 +888,7 @@ function node(id, state, actions) {
     managed: true,
     gpu_vendor: "NVIDIA",
     gpu_model: "GPU",
+    engine: engine || null,
     model: "org/model",
     failed_step: state === "failed" ? "health_poll" : null,
     error: state === "failed" ? "backend failed" : null,
@@ -759,6 +939,77 @@ sandbox.fetch = async function (url, options) {
     )
 
     assert result == {"replacementDisabled": True, "deleteCount": 1}
+
+
+def test_dashboard_renders_registered_and_unknown_engines() -> None:
+    result = _run_dashboard_scenario(
+        r"""
+sandbox.fetch = async function (url) {
+  if (url === "/admin/nodes") return response([
+    node("vllm-node", "healthy", [], "vllm"),
+    node("llama-node", "healthy", [], "llama_cpp"),
+    node("quads-only", "available", [], null),
+  ]);
+  if (url === "/admin/metrics") return response({ per_node: {} });
+  if (url === "/admin/quads/status") return response({ status: "connected" });
+  throw new Error("unexpected request " + url);
+};
+
+(async function () {
+  await sandbox.refreshDashboard();
+  const rows = byId("node-table-body").children;
+  process.stdout.write(JSON.stringify({
+    engines: rows.map(function (row) { return row.children[3].textContent; }),
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {"engines": ["vLLM", "llama.cpp", "—"]}
+
+
+def test_dashboard_quick_setup_sends_exact_selected_artifact() -> None:
+    result = _run_dashboard_scenario(
+        r"""
+let captured = null;
+vm.runInContext(`
+  setupSelection.setCatalog({
+    models: [{ repo_id: "org/vllm" }],
+    gguf_artifacts: [{
+      artifact_id: "a".repeat(64), repo_id: "org/model-GGUF",
+      model_alias: "model-q4", resolved_revision: "b".repeat(40),
+      entrypoint: "model-Q4_K_M.gguf",
+    }],
+  });
+  setupSelection.selectEngine("llama_cpp");
+  document.getElementById("artifact-select").value = "a".repeat(64);
+  document.getElementById("artifact-select").listeners.change();
+`, sandbox);
+sandbox.fetch = async function (url, options) {
+  captured = { url, options };
+  return response({});
+};
+(async function () {
+  await sandbox.handleAction(
+    "setup", "gpu01", node("gpu01", "available", ["setup"], null)
+  );
+  process.stdout.write(JSON.stringify({
+    url: captured.url,
+    body: JSON.parse(captured.options.body),
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "url": "/admin/nodes/setup",
+        "body": {
+            "hostname": "gpu01",
+            "managed": True,
+            "engine": "llama_cpp",
+            "artifact_id": "a" * 64,
+        },
+    }
 
 
 def test_dashboard_preserves_expanded_error_state_across_refresh() -> None:

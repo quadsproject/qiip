@@ -7,8 +7,8 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Open+Sans:wght@400;500;600;700&family=Poppins:wght@500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="{{ url_for('static', path='css/dashboard.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', path='css/chat.css') }}">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/chat.css') }}">
     <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
 </head>
 <body>
@@ -57,8 +57,8 @@
 
     <div id="toast-container"></div>
 
-    <script src="{{ url_for('static', path='vendor/marked-18.0.7/marked.umd.js') }}"></script>
-    <script src="{{ url_for('static', path='vendor/dompurify-3.4.12/purify.min.js') }}"></script>
-    <script src="{{ url_for('static', path='js/chat.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'vendor/marked-18.0.7/marked.umd.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'vendor/dompurify-3.4.12/purify.min.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/chat.js') }}"></script>
 </body>
 </html>

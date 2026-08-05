@@ -105,7 +105,7 @@ class TestRecommend:
         assert result.models[1].fit_level == "good"
         mock_ssh_client.run.assert_called_once_with(
             "gpu-host-01",
-            "/usr/local/bin/llmfit recommend --json --runtime vllm -n 30",
+            "/usr/local/bin/llmfit recommend --json -n 30",
             timeout=60.0,
         )
 
@@ -155,7 +155,7 @@ class TestFirstRecommendationInstall:
             install_url="https://downloads.example/llmfit-{version}.tar.gz",
         )
         runner = LLMFitRunner(mock_ssh_client, settings)
-        recommend_command = "/opt/llmfit recommend --json --runtime vllm -n 30"
+        recommend_command = "/opt/llmfit recommend --json -n 30"
         mock_ssh_client.run.side_effect = [
             RemoteCommandError("gpu-host-01", recommend_command, 127),
             ("", "", 0),
@@ -295,11 +295,16 @@ class TestRecommendProviderFilter:
 
         settings = LLMFitSettings(allowed_providers=["Meta"])
         runner = LLMFitRunner(ssh_client=mock_ssh_client, settings=settings)
-        mock_ssh_client.run.return_value = (FIXTURE_JSON, "", 0)
+        payload = json.loads(FIXTURE_JSON)
+        payload["models"][0]["gguf_sources"] = [
+            {"repo": "org/meta-model-GGUF", "provider": "publisher"}
+        ]
+        mock_ssh_client.run.return_value = (json.dumps(payload), "", 0)
         result = await runner.recommend("gpu-host-01")
 
         assert len(result.models) == 1
         assert result.models[0].provider == "Meta"
+        assert result.models[0].gguf_sources[0].repo == "org/meta-model-GGUF"
 
     @pytest.mark.asyncio
     async def test_filter_is_case_insensitive(self, mock_ssh_client: MagicMock) -> None:

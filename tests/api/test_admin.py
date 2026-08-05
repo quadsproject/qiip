@@ -17,7 +17,7 @@ import json
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import ANY, AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock, call
 
 import httpx
 import pytest
@@ -44,12 +44,18 @@ from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.llmfit.errors import LLMFitParseError, LLMFitTimeoutError
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
-from inference_proxy.models.llmfit import LLMFitResult, ModelRecommendation, SystemInfo
-from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.models.llmfit import (
+    GGUFSource,
+    LLMFitResult,
+    ModelRecommendation,
+    SystemInfo,
+)
+from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.models.quads import QUADSHost
 from inference_proxy.provisioning.provisioner import (
     ProvisioningCapacityError,
     ProvisioningError,
+    ProvisioningIdentity,
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -70,6 +76,8 @@ def _make_node(
     status: NodeStatus = NodeStatus.HEALTHY,
     model: str = "llama-3",
     managed: bool = True,
+    engine: InferenceEngine = InferenceEngine.VLLM,
+    artifact_id: str | None = None,
 ) -> Node:
     """Create a test node with sensible defaults."""
     return Node(
@@ -78,6 +86,8 @@ def _make_node(
         status=status,
         model=model,
         managed=managed,
+        engine=engine,
+        artifact_id=artifact_id,
     )
 
 
@@ -141,6 +151,8 @@ class TestAdminNodesPopulated:
             "status",
             "active_connections",
             "circuit_breaker_state",
+            "engine",
+            "artifact_id",
             "state",
             "actions",
             "gpu_vendor",
@@ -213,6 +225,8 @@ class TestAdminNodesPopulated:
                 "status": "failed",
                 "active_connections": 0,
                 "circuit_breaker_state": "closed",
+                "engine": "vllm",
+                "artifact_id": None,
                 "state": "failed",
                 "actions": ["setup", "teardown"],
                 "gpu_vendor": None,
@@ -357,6 +371,10 @@ class TestSetupEndpoint:
         response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
         assert response.status_code == 202
         assert response.json() == {"task_id": "gpu01"}
+        assert mock_provisioner.validate_setup_configuration.call_args_list == [
+            call(InferenceEngine.VLLM),
+            call(InferenceEngine.VLLM),
+        ]
 
     def test_calls_fire_background(
         self,
@@ -365,6 +383,9 @@ class TestSetupEndpoint:
     ) -> None:
         client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
         mock_provisioner.fire_background.assert_called_once()
+        assert mock_provisioner.fire_background.call_args.kwargs[
+            "provisioning_identity"
+        ] == ProvisioningIdentity(InferenceEngine.VLLM)
 
     def test_rejects_disallowed_endpoint_before_reserving_host(
         self,
@@ -421,6 +442,8 @@ class TestSetupModelPassthrough:
             "gpu01",
             managed=True,
             model="org/model",
+            engine=ANY,
+            artifact_id=None,
             lifecycle_lease=ANY,
         )
 
@@ -438,7 +461,266 @@ class TestSetupModelPassthrough:
             "gpu01",
             managed=True,
             model=None,
+            engine=ANY,
+            artifact_id=None,
             lifecycle_lease=ANY,
+        )
+
+    def test_unknown_llamacpp_artifact_fails_before_host_reservation(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        artifact_id = "a" * 64
+        mock_provisioner.resolve_artifact_selection.side_effect = ProvisioningError(
+            f"GGUF artifact {artifact_id!r} was not found"
+        )
+
+        response = client.post(
+            "/admin/nodes/setup",
+            json={
+                "hostname": "gpu01",
+                "engine": "llama_cpp",
+                "artifact_id": artifact_id,
+            },
+        )
+
+        assert response.status_code == 400
+        assert "was not found" in response.json()["detail"]
+        mock_provisioner.try_reserve_host.assert_not_awaited()
+        mock_provisioner.provision.assert_not_awaited()
+
+    def test_implicit_llamacpp_retry_inherits_persisted_artifact(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        artifact_id = "a" * 64
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                status=NodeStatus.FAILED,
+                model="published-alias",
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact_id=artifact_id,
+            )
+        )
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+        mock_provisioner.provision.assert_awaited_once_with(
+            "gpu01",
+            managed=True,
+            model=None,
+            engine=InferenceEngine.LLAMA_CPP,
+            artifact_id=artifact_id,
+            lifecycle_lease=ANY,
+        )
+        assert mock_provisioner.fire_background.call_args.kwargs[
+            "provisioning_identity"
+        ] == ProvisioningIdentity(InferenceEngine.LLAMA_CPP, artifact_id)
+
+    def test_implicit_vllm_retry_inherits_persisted_model(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                status=NodeStatus.FAILED,
+                model="org/persisted-model",
+            )
+        )
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+        assert mock_provisioner.provision.await_args.kwargs["model"] == (
+            "org/persisted-model"
+        )
+        assert mock_provisioner.provision.await_args.kwargs["engine"] is (
+            InferenceEngine.VLLM
+        )
+
+    def test_explicit_selection_overrides_persisted_identity(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                status=NodeStatus.FAILED,
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact_id="a" * 64,
+            )
+        )
+
+        response = client.post(
+            "/admin/nodes/setup",
+            json={
+                "hostname": "gpu01",
+                "engine": "vllm",
+                "model": "org/explicit-model",
+            },
+        )
+
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+        assert mock_provisioner.provision.await_args.kwargs["engine"] is (
+            InferenceEngine.VLLM
+        )
+        assert mock_provisioner.provision.await_args.kwargs["model"] == (
+            "org/explicit-model"
+        )
+        assert mock_provisioner.provision.await_args.kwargs["artifact_id"] is None
+
+    def test_any_explicit_selection_field_disables_all_retry_inheritance(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                status=NodeStatus.FAILED,
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact_id="a" * 64,
+            )
+        )
+
+        response = client.post(
+            "/admin/nodes/setup",
+            json={"hostname": "gpu01", "model": "org/explicit-model"},
+        )
+
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+        assert mock_provisioner.provision.await_args.kwargs["engine"] is (
+            InferenceEngine.VLLM
+        )
+        assert mock_provisioner.provision.await_args.kwargs["model"] == (
+            "org/explicit-model"
+        )
+        assert mock_provisioner.provision.await_args.kwargs["artifact_id"] is None
+
+    def test_legacy_llamacpp_retry_without_artifact_fails_before_reservation(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                status=NodeStatus.FAILED,
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact_id=None,
+            )
+        )
+
+        def resolve(engine: InferenceEngine, artifact_id: str | None) -> None:
+            if engine is InferenceEngine.LLAMA_CPP and artifact_id is None:
+                raise ProvisioningError(
+                    "Persisted llama_cpp retry requires an exact artifact_id"
+                )
+
+        mock_provisioner.resolve_artifact_selection.side_effect = resolve
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 400
+        assert "exact artifact_id" in response.json()["detail"]
+        mock_provisioner.try_reserve_host.assert_not_awaited()
+
+    def test_retry_retains_captured_identity_if_record_disappears_for_lease(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        artifact_id = "b" * 64
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                status=NodeStatus.FAILED,
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact_id=artifact_id,
+            )
+        )
+        lease = MagicMock(hostname="gpu01")
+
+        def reserve(_hostname: str) -> MagicMock:
+            test_registry.remove("gpu01")
+            return lease
+
+        mock_provisioner.try_reserve_host.side_effect = reserve
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+        assert mock_provisioner.provision.await_args.kwargs["engine"] is (
+            InferenceEngine.LLAMA_CPP
+        )
+        assert (
+            mock_provisioner.provision.await_args.kwargs["artifact_id"] == artifact_id
+        )
+
+    def test_retry_uses_newer_registration_identity_after_taking_lease(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        artifact_id = "c" * 64
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                status=NodeStatus.FAILED,
+                model="org/old-vllm-model",
+            )
+        )
+        lease = MagicMock(hostname="gpu01")
+
+        def reserve(_hostname: str) -> MagicMock:
+            test_registry.add(
+                _make_node(
+                    node_id="gpu01",
+                    status=NodeStatus.FAILED,
+                    model="new-llamacpp-alias",
+                    engine=InferenceEngine.LLAMA_CPP,
+                    artifact_id=artifact_id,
+                )
+            )
+            return lease
+
+        mock_provisioner.try_reserve_host.side_effect = reserve
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+        assert mock_provisioner.provision.await_args.kwargs["model"] is None
+        assert mock_provisioner.provision.await_args.kwargs["engine"] is (
+            InferenceEngine.LLAMA_CPP
+        )
+        assert (
+            mock_provisioner.provision.await_args.kwargs["artifact_id"] == artifact_id
         )
 
 
@@ -507,6 +789,8 @@ class TestTeardownEndpoint:
         mock_provisioner.teardown.assert_awaited_once_with(
             "gpu01",
             force=True,
+            provisioning_identity=None,
+            recovery_engine=None,
             lifecycle_lease=ANY,
         )
 
@@ -828,8 +1112,10 @@ class TestSetupDedupGuard:
             background: Coroutine[Any, Any, None],
             *,
             provisioning_hostname: str,
+            provisioning_identity: ProvisioningIdentity,
         ) -> NeverStartedTask:
             assert provisioning_hostname == "gpu01"
+            assert provisioning_identity == ProvisioningIdentity(InferenceEngine.VLLM)
             task.background = background
             return task
 
@@ -893,7 +1179,9 @@ class TestSetupEligibility:
         mock_provisioner.provision.assert_awaited_once_with(
             "gpu01",
             managed=managed,
-            model=None,
+            model="llama-3",
+            engine=ANY,
+            artifact_id=None,
             lifecycle_lease=ANY,
         )
 
@@ -967,11 +1255,14 @@ class TestSetupEligibility:
             *,
             managed: bool,
             model: str | None,
+            engine: object = None,
+            artifact_id: str | None = None,
             lifecycle_lease: object,
         ) -> None:
             assert hostname == "gpu01"
             assert managed is True
-            assert model is None
+            assert model == "llama-3"
+            assert artifact_id is None
             assert lifecycle_lease is not None
             assert cleanup_complete
             assert test_registry.get(hostname) is None
@@ -1439,6 +1730,12 @@ SAMPLE_RESULT = LLMFitResult(
             utilization_pct=68.2,
             category="General",
             runtime="vLLM",
+            gguf_sources=(
+                GGUFSource(
+                    repo="org/llama-3.3-70b-GGUF",
+                    provider="publisher",
+                ),
+            ),
         ),
         ModelRecommendation(
             name="qwen-2.5-72b-instruct",
@@ -1480,6 +1777,13 @@ class TestRecommendations:
         assert "system" in data
         assert data["system"]["gpu_name"] == "NVIDIA A100"
         assert len(data["models"]) == 2
+        assert data["models"][0]["runtime"] == "vllm"
+        assert data["models"][0]["gguf_sources"] == [
+            {
+                "repo": "org/llama-3.3-70b-GGUF",
+                "provider": "publisher",
+            }
+        ]
 
     def test_response_includes_hostname(
         self,
@@ -1841,8 +2145,11 @@ class TestModelCatalog:
         assert response.status_code == 200
         assert response.json() == {
             "models": [],
+            "gguf_artifacts": [],
             "incomplete_count": 0,
             "unverifiable_count": 0,
+            "invalid_artifact_count": 0,
+            "cache_warning_count": 0,
         }
 
     def test_catalog_surfaces_degraded_cache_counts(
@@ -1858,6 +2165,8 @@ class TestModelCatalog:
                 models=[],
                 incomplete_count=2,
                 unverifiable_count=3,
+                invalid_artifact_count=4,
+                cache_warning_count=5,
             )
         )
         app.dependency_overrides[get_catalog_service] = lambda: mock_catalog
@@ -1868,6 +2177,9 @@ class TestModelCatalog:
         assert response.headers["X-Inference-Proxy-Data-Degraded"] == ("model-catalog")
         assert response.json() == {
             "models": [],
+            "gguf_artifacts": [],
             "incomplete_count": 2,
             "unverifiable_count": 3,
+            "invalid_artifact_count": 4,
+            "cache_warning_count": 5,
         }

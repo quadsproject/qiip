@@ -1,15 +1,23 @@
 # QIIP (QUADS Idle Inference Proxy)
 
 [![CI](https://github.com/quadsproject/qiip/actions/workflows/ci.yml/badge.svg)](https://github.com/quadsproject/qiip/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/sadsfae/188b760b19592c8913101f598f7cb382/raw/qiip-coverage.json)](https://github.com/quadsproject/qiip/actions/workflows/ci.yml)
+[![vLLM](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/sadsfae/188b760b19592c8913101f598f7cb382/raw/qiip-vllm.json)](https://docs.vllm.ai/)
+[![llama.cpp](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/sadsfae/188b760b19592c8913101f598f7cb382/raw/qiip-llamacpp.json)](https://github.com/ggml-org/llama.cpp)
 
-A QUADS-native inference abstraction framework that fully automates installation, drivers, setup and presentation of disparate, free/idle GPU-equipped systems into a single unified usage interface and inference API.
+A QUADS-native inference abstraction framework that automates installation,
+drivers, setup, and presentation of disparate, free or idle NVIDIA GPU systems
+through one inference API. Setup requests explicitly choose either
+[vLLM](https://docs.vllm.ai/) or
+[llama.cpp](https://github.com/ggml-org/llama.cpp); QIIP then applies the
+engine-specific provisioning path.
 
-QIIP provides a gateway service that proxies OpenAI-compatible requests to [vLLM](https://docs.vllm.ai/) inference nodes running on idle QUADS lab servers or standalone, free GPU-equipped hardware.  It dynamically discovers backends via etcd, health-checks them, and routes requests with automatic failover — so clients see a single, reliable endpoint.
+QIIP provides a gateway service that proxies OpenAI-compatible requests to inference nodes on idle QUADS lab servers or standalone, free GPU-equipped hardware. It dynamically discovers backends via etcd, health-checks them, and routes requests with automatic failover so clients see a single, reliable endpoint. Both engines expose OpenAI-compatible HTTP APIs; the proxy layer is engine-agnostic and the engine choice is invisible to API consumers. See [auto-vllm/](auto-vllm/README.md) and [auto-llamacpp/](auto-llamacpp/README.md) for engine-specific provisioning details.
 
 ```
 Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
                            │           ──► vLLM Node B
-                           │           ──► vLLM Node C
+                           │           ──► llama.cpp Node C
                            ▼
                           etcd
                      (service registry)
@@ -17,30 +25,30 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 
 ## Features
 
-- **OpenAI-compatible API** — drop-in replacement for `/v1/chat/completions`, `/v1/completions`, and `/v1/models`
-- **Streaming support** — Server-Sent Events (SSE) for real-time token generation
-- **Chat playground** — browser-based chat UI at `/chat` with markdown rendering and model selection
-- **Service discovery** — watches etcd for node registration/deregistration in real time
-- **Least-connections load balancing** — routes to the node with the fewest in-flight requests
-- **Automatic failover** — retries transport, timeout, and 5xx failures on alternate healthy nodes before a response begins (configurable, default 3 attempts)
-- **Circuit breakers** — per-node circuit breakers trip after consecutive failures, preventing cascade
-- **Health checking** — background thread probes each node's `/health` endpoint; marks nodes unhealthy after repeated failures and recovers them automatically
-- **Graceful shutdown** — Uvicorn drains in-flight requests before application resources close; its server timeout remains configurable
-- **Structured logging** — JSON or pretty console output via structlog
-- **Operations dashboard** — interactive web UI at `/dashboard` with real-time node table, detail pages, and provisioning status
-- **QUADS integration** — background polling of QUADS inventory and availability; unified view merging QUADS hosts with etcd-registered nodes
-- **QUADS schedule enforcement** — automated teardown of managed nodes when QUADS reports an upcoming scheduling conflict
-- **End-to-end node provisioning** — SSH-based pipeline: BMC power-on, NVIDIA driver and CUDA toolkit install, vLLM setup, NFS mount, firewall, health poll, and etcd registration
-- **Node teardown** — graceful shutdown with connection draining, force teardown option, and provisioning task cancellation
-- **Provisioning log streaming** — live SSE stream of provisioning and vLLM logs viewable in the dashboard
-- **BMC power management (Redfish)** — query and control node power state; supports On, ForceOff, GracefulRestart, and ForceRestart
-- **Model catalog** — scans shared NFS-mounted HuggingFace cache, verifies model completeness via tree manifests, exposed via `/admin/models/catalog`
-- **Background model downloads** — concurrent HuggingFace downloads with status tracking; duplicate-safe and re-downloadable after completion or failure
-- **Hardware-aware model recommendations** — runs llmfit via SSH on a target host to produce ranked recommendations with fit levels, throughput, and memory estimates; auto-installs the binary on first use
-- **Request metrics** — per-model and per-node counters exposed via `/admin/metrics`
-- **Admin authentication** — HTTP Basic required on all `/admin/*` endpoints and `/dashboard*` pages; inference API remains public
-- **Backend endpoint allowlist** — configurable hostname wildcard, CIDR network, and port allowlists; rejects non-matching registrations with loopback-only defaults
-- **Client config downloads** — one-click download of OpenCode CLI and Pi coding agent configuration files from the dashboard and node detail pages; dashboard configs point at the proxy for load-balanced access, node detail configs point at individual vLLM endpoints
+- **OpenAI-compatible API** -- drop-in replacement for `/v1/chat/completions`, `/v1/completions`, and `/v1/models`
+- **Streaming support** -- Server-Sent Events (SSE) for real-time token generation
+- **Chat playground** -- browser-based chat UI at `/chat` with markdown rendering and model selection
+- **Service discovery** -- watches etcd for node registration/deregistration in real time
+- **Least-connections load balancing** -- routes to the node with the fewest in-flight requests
+- **Automatic failover** -- retries transport, timeout, and 5xx failures on alternate healthy nodes before a response begins (configurable, default 3 attempts)
+- **Circuit breakers** -- per-node circuit breakers trip after consecutive failures, preventing cascade
+- **Health checking** -- background thread probes each node's `/health` endpoint; marks nodes unhealthy after repeated failures and recovers them automatically
+- **Graceful shutdown** -- Uvicorn drains in-flight requests before application resources close; its server timeout remains configurable
+- **Structured logging** -- JSON or pretty console output via structlog
+- **Operations dashboard** -- interactive web UI at `/dashboard` with real-time node and engine identity, catalog-backed setup controls, detail pages, and provisioning status
+- **QUADS integration** -- background polling of QUADS inventory and availability; unified view merging QUADS hosts with etcd-registered nodes
+- **QUADS schedule enforcement** -- automated teardown of managed nodes when QUADS reports an upcoming scheduling conflict
+- **End-to-end node provisioning** -- SSH-based pipeline: BMC power-on, NVIDIA GPU verification, driver and CUDA toolkit install, inference engine setup (vLLM or llama.cpp), NFS mount, firewall, health poll, and etcd registration
+- **Node teardown** -- graceful shutdown with connection draining, force teardown option, and provisioning task cancellation
+- **Provisioning log streaming** -- live SSE stream of provisioning and inference engine logs viewable in the dashboard
+- **BMC power management (Redfish)** -- query and control node power state; supports On, ForceOff, GracefulRestart, and ForceRestart
+- **Model catalog** -- scans shared NFS-mounted HuggingFace cache, verifies model completeness via tree manifests, exposed via `/admin/models/catalog`
+- **Background model downloads** -- concurrent HuggingFace downloads with status tracking; duplicate-safe and re-downloadable after completion or failure
+- **Hardware-aware model recommendations** -- runs llmfit via SSH on a target host to produce ranked, runtime-normalized recommendations with fit levels, throughput, memory estimates, and typed GGUF sources; auto-installs the binary on first use
+- **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
+- **Admin authentication** -- HTTP Basic required on all `/admin/*` endpoints and `/dashboard*` pages; inference API remains public
+- **Backend endpoint allowlist** -- configurable hostname wildcard, CIDR network, and port allowlists; rejects non-matching registrations with loopback-only defaults
+- **Client config downloads** -- one-click download of OpenCode CLI and Pi coding agent configuration files from the dashboard and node detail pages; dashboard configs point at the proxy for load-balanced access, node detail configs point at individual backend endpoints
 
 ## Table of Contents
 
@@ -53,6 +61,8 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Chat playground](#chat-playground)
 - [API Endpoints](#api-endpoints)
   - [Administrative access](#administrative-access)
+  - [Node inventory identity](#node-inventory-identity)
+  - [Force-recover an unregistered engine](#force-recover-an-unregistered-engine)
   - [Error responses](#error-responses)
 - [Configuration](#configuration)
   - [Upgrade requirements](#upgrade-requirements)
@@ -86,7 +96,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 
 An etcd v3 service is required for persistent discovery, registration, and
 provisioning state, but a temporary outage does not prevent the gateway from
-starting. At least one healthy registered vLLM node is required to serve
+starting. At least one healthy registered inference node (vLLM or llama.cpp) is required to serve
 inference; health, discovery, dashboard, and provisioning functionality can
 start with an empty registry.
 
@@ -113,7 +123,7 @@ unavailable. Its discovery workers reconnect to etcd in the background, and
 inference requests become routable after a healthy node is registered.
 
 The administrative API and dashboard use HTTP Basic authentication, which sends
-base64-encoded credentials—not encryption—on every request. A trusted work LAN
+base64-encoded credentials --not encryption --on every request. A trusted work LAN
 may use HTTP; use a TLS terminator whenever that network path is not trusted.
 
 ### Verify it's running
@@ -187,13 +197,13 @@ HTTP Basic-protected administrative endpoints:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/admin/nodes` | Unified registered and QUADS node inventory |
+| `GET` | `/admin/nodes` | Unified registered and QUADS node inventory, including engine and artifact identity when known |
 | `GET` | `/admin/metrics` | Request counters by model and node |
 | `GET` | `/admin/models/catalog` | Verified models in the shared HuggingFace cache |
 | `POST` | `/admin/models/download` | Start or inspect a duplicate-safe model download |
 | `GET` | `/admin/models/downloads` | List tracked model-download states |
 | `POST` | `/admin/nodes/setup` | Start background node provisioning |
-| `DELETE` | `/admin/nodes/{node_id}` | Drain and tear down a node; supports the documented force option |
+| `DELETE` | `/admin/nodes/{node_id}` | Drain and tear down a node; supports force and the scoped recovery procedure below |
 | `GET` | `/admin/provisioning/tasks` | List provisioning task states |
 | `GET` | `/admin/provisioning/{hostname}/logs` | Stream provisioning logs over SSE |
 | `GET` | `/admin/quads/status` | QUADS integration and cache status |
@@ -227,6 +237,40 @@ preflight. Do not add form-encoded, multipart, or plain-text state-changing
 admin endpoints without adding explicit CSRF protection. Authentication also
 does not protect an already-authenticated browser from same-origin XSS.
 
+### Node inventory identity
+
+Each `/admin/nodes` item reports the inference `engine` and immutable
+`artifact_id` when QIIP knows them. Registered nodes report `engine` as
+`"vllm"` or `"llama_cpp"`. A llama.cpp node provisioned from the managed GGUF
+catalog also reports the selected 64-character artifact ID; vLLM and manually
+registered nodes normally report `artifact_id: null`.
+
+A host present only in QUADS has not been provisioned and therefore reports
+both `engine: null` and `artifact_id: null`. Do not interpret a null engine as
+vLLM. It means QIIP has no registered serving identity for that host.
+
+### Force-recover an unregistered engine
+
+Normal teardown obtains the engine from an active provisioning operation or
+the node's etcd registration and fails closed when neither exists. If etcd lost
+a node record while a known inference process remained on the host, an operator
+can supply the missing engine explicitly:
+
+```bash
+curl -X DELETE \
+  -u "$INFERENCE_PROXY_ADMIN__USERNAME:$INFERENCE_PROXY_ADMIN__PASSWORD" \
+  "http://gateway.example.com/admin/nodes/gpu01?force=true&recovery_engine=llama_cpp"
+```
+
+Use this recovery path only after verifying which engine is actually running.
+It is accepted only when `force=true`, the node is unregistered, the hostname
+passes the configured backend endpoint allowlist, and no host lifecycle
+operation holds the lease. QIIP rechecks registration after acquiring the
+lease and never cancels active provisioning on this path. A wrong
+`recovery_engine` selects the wrong stop script; it is not treated as an engine
+autodetection hint. A successful request returns 202 and runs teardown in the
+background, with progress available from the normal provisioning log stream.
+
 ### Error responses
 
 Inference-proxy errors follow the OpenAI error format. Upstream 4xx responses
@@ -234,7 +278,7 @@ are passed through without changing their JSON shape.
 
 | Code | Meaning |
 |------|---------|
-| 404 | Model not found — no node serves the requested model |
+| 404 | Model not found -- no node serves the requested model |
 | 502 | Backend connection failed |
 | 503 | No healthy nodes available, or model temporarily unavailable |
 | 504 | Backend request timed out |
@@ -352,6 +396,44 @@ Provisioning resource and retention controls:
 | `INFERENCE_PROXY_PROVISIONING__LOG_MAX_ENTRY_BYTES` | `16384` | Maximum bytes in one retained log message |
 | `INFERENCE_PROXY_PROVISIONING__LOG_MAX_COMPLETED_HOSTS` | `64` | Completed host-operation buffers retained, oldest first |
 
+Managed llama.cpp provisioning builds a verified source tag with CUDA enabled
+for the NVIDIA GPU attached to the node. It has five gateway settings:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION` | `b10242` | Pinned llama.cpp build tag |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256` | committed digest | SHA-256 of the source archive selected by the version |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` | GitHub tag archive | Validated HTTP(S) URL template containing exactly one `{version}` placeholder |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT` | `7200` | Total wall-clock deadline for the llama.cpp setup command, including the CUDA source build (seconds) |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB` | `512` | Free VRAM margin per GPU enforced by the llama.cpp capacity planner (MiB) |
+
+Changing `LLAMACPP_VERSION` requires an explicitly configured matching digest.
+The node verifies the archive before extracting it, builds `llama-server`,
+`llama-fit-params`, and `llama-quantize`, and atomically publishes a versioned
+installation under `/opt/llama.cpp`. CUDA kernels target the attached GPU; the
+supporting CPU backend uses a portable non-native profile so host assembler
+support cannot invalidate a CUDA build. The source build requires a working
+NVIDIA driver and CUDA compiler; QIIP-managed llama.cpp nodes do not fall back
+to CPU inference.
+
+Managed launch uses llama.cpp's own memory estimator to maximize the guaranteed
+context per request up to the model's trained length, then maximize concurrency
+up to llama.cpp's 256-sequence limit. It sizes one unified KV pool to at least
+`context_per_slot * slots`, so every selected slot has capacity for the reported
+context instead of sharing one model-length pool across a fixed four slots.
+The planner prefers F16 K/V cache storage. If F16 cannot fully offload even one
+request at the 4,096-token floor while retaining the configured reserve, it
+replans with Q8_0 for both K and V and enables Flash Attention. Managed mode
+never falls below Q8_0 automatically.
+After `/health` succeeds, QIIP requires the runtime to match that plan, keep the
+configured free-VRAM margin, use the selected KV types and unified cache, and
+offload every model layer to GPU before registering the node healthy. The
+provisioning log records the simultaneous per-slot guarantee, llama.cpp
+per-request ceiling, aggregate context, slot count, KV types, layer offload,
+configured margin, and post-load GPU memory. See
+[auto-llamacpp](auto-llamacpp/README.md) for the direct script contract and
+build details.
+
 LLMFit has one version setting: `INFERENCE_PROXY_LLMFIT__VERSION`.
 
 The default NVIDIA driver and LLMFit versions each ship with a verified
@@ -360,10 +442,23 @@ SHA-256. Changing either version requires configuring its matching digest via
 `INFERENCE_PROXY_LLMFIT__SHA256`; provisioning fails before SSH or installation
 when a custom version has no explicit digest.
 
-The gateway cache path and node cache mount may differ, but provisioning uses
-one declared backing export: `INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT`. It is
-optional for proxy-only deployments and required before a node setup operation
-can acquire a host lease or start SSH work.
+The gateway cache path and node cache mount may differ. Provisioning uses one
+declared backing export and, for llama.cpp, the gateway path that corresponds
+to the root of that export:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INFERENCE_PROXY_HUGGINGFACE__CACHE_DIR` | required | Gateway-local Hugging Face Hub cache directory |
+| `INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT` | none | NFS export mounted on provisioned nodes |
+| `INFERENCE_PROXY_HUGGINGFACE__SHARED_ROOT` | none | Gateway-local root of that same export; required for llama.cpp setup and must contain `CACHE_DIR` |
+| `INFERENCE_PROXY_HUGGINGFACE__API_TOKEN` | none | Optional token for gated Hugging Face repositories |
+
+For example, a gateway with shared root `/mnt/scratch`, Hub cache
+`/mnt/scratch/hub`, and node mount `/srv/hf-cache` sends a native snapshot path
+beginning with `hub/` to the node. `NFS_EXPORT` remains optional for proxy-only
+deployments and is required before any node setup can acquire a host lease or
+start SSH work. `SHARED_ROOT` is needed only for llama.cpp setup; catalog
+browsing and vLLM setup do not need that path translation.
 
 Node-side launch tuning uses the `AUTOVLLM_*` namespace. The retired
 `VLLM_TENSOR_PARALLEL`, `VLLM_GPU_MEM_UTIL`, `VLLM_MAX_MODEL_LEN`,
@@ -374,20 +469,65 @@ leak into the namespace reserved by vLLM itself.
 
 ### HuggingFace model downloads
 
-The administrative download API currently accepts a repository ID without a
-revision. Each request therefore resolves that repository's default revision
-at download time. Re-downloading the same `repo_id` later can produce different
-weights, configuration, or chat templates, and the current status record does
-not preserve the resolved commit SHA. Revision recording or pinning is a
-separate implementation change; operators who require reproducibility should
-record the repository commit externally.
+Every completed download records the immutable commit SHA returned by
+HuggingFace. A request may supply a branch, tag, or commit through `revision`;
+when it is omitted, the repository's default revision is resolved at download
+time and the resulting SHA is still preserved in the status response.
+
+Full vLLM snapshots use the default `engine: "vllm"`. A llama.cpp download
+must name the exact files and load entrypoint:
+
+```json
+{
+  "repo_id": "org/model-GGUF",
+  "revision": "main",
+  "engine": "llama_cpp",
+  "gguf": {
+    "files": ["model-Q4_K_M.gguf"],
+    "entrypoint": "model-Q4_K_M.gguf"
+  }
+}
+```
+
+QIIP discovers GGUF generations directly from native Hugging Face snapshot
+directories. It writes no parallel `gguf/` tree: every standalone `.gguf` is
+one generation, while a complete llama.cpp split family is one generation with
+shard 1 as its entrypoint. Existing snapshots downloaded outside QIIP therefore
+become selectable without copying model data or publishing a manifest.
+
+`/admin/models/catalog` keeps full vLLM models in `models` and returns exact
+llama.cpp generations separately in `gguf_artifacts`. A GGUF can be discoverable
+even when its repository contributes to `incomplete_count` or
+`unverifiable_count`; those counters describe Hugging Face cache metadata and
+are not suppressed merely because a valid GGUF exists.
+
+The dashboard setup controls select either a full vLLM model or one exact GGUF
+`artifact_id`; the two engine-specific values are never sent together. No GGUF
+artifact is selected by default, so the operator must choose the intended
+entrypoint or quantization. Node retry requests omit both values so the server
+can retain the latest registered engine, model, and artifact identity under the
+host lifecycle lease.
+
+LLMFit recommendation runtimes are normalized to `vllm`, `llama_cpp`, `mlx`,
+or `unknown`. A llama.cpp recommendation can list typed `gguf_sources`, and the
+node-detail dashboard reports a discovered generation as available only when a
+source repository exactly matches an artifact's `repo_id`. LLMFit does not
+identify an exact file set, shard group, or entrypoint, so the browser never
+guesses a GGUF download request: it shows `No GGUF source`, `Not downloaded`,
+`Catalog unavailable`, or the number of matching generations instead.
+
+Re-downloading a mutable branch after it advances creates a distinct artifact
+generation because identity uses the resolved SHA. QIIP never automatically
+deletes snapshots. A persisted artifact ID resolves only while its native
+snapshot and exact GGUF file family remain in the shared cache, so coordinate
+retention with every running or restartable node that records that ID.
 
 ### Proxy (HTTP client)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `INFERENCE_PROXY_PROXY__CONNECT_TIMEOUT` | `5.0` | TCP connect timeout (seconds) |
-| `INFERENCE_PROXY_PROXY__READ_TIMEOUT` | `120.0` | Read timeout — high for LLM first-token latency |
+| `INFERENCE_PROXY_PROXY__READ_TIMEOUT` | `120.0` | Read timeout -- high for LLM first-token latency |
 | `INFERENCE_PROXY_PROXY__WRITE_TIMEOUT` | `10.0` | Write timeout (seconds) |
 | `INFERENCE_PROXY_PROXY__POOL_TIMEOUT` | `10.0` | Connection pool acquisition timeout |
 | `INFERENCE_PROXY_PROXY__MAX_CONNECTIONS` | `100` | Max total connections in pool |
@@ -503,9 +643,9 @@ inference_proxy/
 
 ### Background threads
 
-- **etcd watcher** — watches the configured key prefix for node PUT/DELETE events; updates the registry in real time
-- **Health checker** — probes each registered node's `/health` endpoint, transitions liveness state, maintains managed-node leases after valid evidence, and removes idle draining ghosts
-- **QUADS poller and schedule enforcer** — refresh QUADS inventory and tear down managed nodes before scheduling conflicts, with bounded retry backoff
+- **etcd watcher** -- watches the configured key prefix for node PUT/DELETE events; updates the registry in real time
+- **Health checker** -- probes each registered node's `/health` endpoint, transitions liveness state, maintains managed-node leases after valid evidence, and removes idle draining ghosts
+- **QUADS poller and schedule enforcer** -- refresh QUADS inventory and tear down managed nodes before scheduling conflicts, with bounded retry backoff
 
 ## Development
 
@@ -515,7 +655,7 @@ inference_proxy/
 # Install all dependencies (including dev)
 uv sync --locked --all-groups
 
-# Activate the virtual environment (optional — uv run handles this)
+# Activate the virtual environment (optional -- uv run handles this)
 source .venv/bin/activate
 ```
 
@@ -534,10 +674,22 @@ uv run --frozen pytest tests/api/test_routes.py -v
 ```
 
 Coverage is measured over `inference_proxy` with branch tracking enabled. CI
-enforces a 91% combined statement-and-branch floor. The measured total was
-91.75% when the gate was introduced and may move as code is added or removed.
-The floor prevents new untested code from materially reducing coverage; it
-does not prove that covered behavior is asserted correctly.
+enforces a 92% combined statement-and-branch floor, raised from 91.5% when the
+exact-artifact work brought the measured total to 92.08%. The total may move as
+code is added or removed. The floor prevents new untested code from materially
+reducing coverage; it does not prove that covered behavior is asserted
+correctly.
+
+### CI badges
+
+After `Quality` passes on `main`, a separate non-blocking job publishes the
+coverage, vLLM, and llama.cpp badges to the configured Gist. `GIST_SECRET` must
+be a fine-grained personal access token with only the **Gists: write** user
+permission. Prefer a service identity, record the token's expiration, and
+replace the repository secret before it expires. To change the publishing
+identity, create and pre-seed a Gist under the new owner, then update the Gist
+ID in `.github/workflows/ci.yml` and all three README badge URLs together.
+Verify that the three raw JSON URLs return HTTP 200 before merging that change.
 
 ### Lint and format
 

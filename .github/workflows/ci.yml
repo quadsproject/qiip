@@ -18,6 +18,11 @@ jobs:
     name: Quality
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      coverage: ${{ steps.badges.outputs.coverage }}
+      coverage_color: ${{ steps.badges.outputs.cov_color }}
+      vllm_version: ${{ steps.badges.outputs.vllm }}
+      llamacpp_version: ${{ steps.badges.outputs.llamacpp }}
 
     steps:
       - name: Check out repository
@@ -63,7 +68,7 @@ jobs:
           uv sync --project auto-vllm --frozen --no-dev --no-install-project --no-build --python 3.12 --python-platform x86_64-manylinux_2_34 --dry-run
 
       - name: Check node scripts
-        run: shellcheck auto-vllm/*.sh
+        run: shellcheck auto-vllm/*.sh auto-llamacpp/*.sh common/*.sh
 
       - name: Type check
         run: uv run --frozen mypy inference_proxy tests
@@ -72,6 +77,65 @@ jobs:
         run: |
           uv run --frozen coverage run -m pytest
           uv run --frozen coverage report
+
+      - name: Extract badge values
+        id: badges
+        run: |
+          uv run --frozen coverage json -o /tmp/cov.json
+          python3 -c "
+          import json
+          pct = round(json.load(open('/tmp/cov.json'))['totals']['percent_covered'], 1)
+          color = 'brightgreen' if pct >= 95 else 'green' if pct >= 90 else 'yellowgreen' if pct >= 80 else 'red'
+          print(f'coverage={pct}')
+          print(f'cov_color={color}')
+          " >> "$GITHUB_OUTPUT"
+
+          vllm=$(grep -oP 'vllm==\K[^"]+' auto-vllm/pyproject.toml)
+          echo "vllm=$vllm" >> "$GITHUB_OUTPUT"
+
+          llamacpp=$(grep -oP 'DEFAULT_LLAMACPP_VERSION = "\K[^"]+' inference_proxy/config/settings.py)
+          echo "llamacpp=$llamacpp" >> "$GITHUB_OUTPUT"
+
+  publish-badges:
+    name: Publish badges
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Update coverage badge
+        continue-on-error: true
+        uses: schneegans/dynamic-badges-action@e9a478b16159b4d31420099ba146cdc50f134483 # v1.7.0
+        with:
+          auth: ${{ secrets.GIST_SECRET }}
+          gistID: 188b760b19592c8913101f598f7cb382
+          filename: qiip-coverage.json
+          label: coverage
+          message: "${{ needs.quality.outputs.coverage }}%"
+          color: ${{ needs.quality.outputs.coverage_color }}
+
+      - name: Update vLLM badge
+        continue-on-error: true
+        uses: schneegans/dynamic-badges-action@e9a478b16159b4d31420099ba146cdc50f134483 # v1.7.0
+        with:
+          auth: ${{ secrets.GIST_SECRET }}
+          gistID: 188b760b19592c8913101f598f7cb382
+          filename: qiip-vllm.json
+          label: vLLM
+          message: "v${{ needs.quality.outputs.vllm_version }}"
+          color: blue
+
+      - name: Update llama.cpp badge
+        continue-on-error: true
+        uses: schneegans/dynamic-badges-action@e9a478b16159b4d31420099ba146cdc50f134483 # v1.7.0
+        with:
+          auth: ${{ secrets.GIST_SECRET }}
+          gistID: 188b760b19592c8913101f598f7cb382
+          filename: qiip-llamacpp.json
+          label: llama.cpp
+          message: "${{ needs.quality.outputs.llamacpp_version }}"
+          color: blue
 
   compatibility:
     name: Python 3.13

@@ -1,7 +1,7 @@
 """Node provisioning orchestrator.
 
 Runs the full provisioning sequence on a remote host: setup.sh,
-start-vllm.sh, health poll, etcd registration.
+engine start script, health poll, etcd registration.
 
 Per D-15: Concrete class, no protocol/interface.
 """
@@ -17,7 +17,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from ipaddress import ip_address
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 import httpx
@@ -27,8 +27,13 @@ from inference_proxy.config.settings import LLMFitSettings, ProvisioningSettings
 from inference_proxy.discovery.etcd_client import EtcdClient
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_to_etcd
+from inference_proxy.huggingface.artifacts import (
+    GGUFArtifactError,
+    GGUFArtifactIndex,
+    ResolvedGGUFArtifact,
+)
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
-from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.provisioning.host_lifecycle import (
     HostLifecycleCoordinator,
     HostLifecycleLease,
@@ -52,6 +57,58 @@ logger = structlog.get_logger()
 
 STEP_PATTERN = re.compile(r"\[STEP:(\w+):(START|OK|FAIL|WARN)\]")
 MODEL_PATTERN = re.compile(r"#\s*Model:\s+(.+)")
+LLAMACPP_CONTEXT_PATTERN = re.compile(
+    r"initializing, n_slots = (?P<slots>\d+), "
+    r"n_ctx_slot = (?P<context>\d+), "
+    r"kv_unified = '(?P<unified>true|false)'"
+)
+LLAMACPP_AGGREGATE_CONTEXT_PATTERN = re.compile(
+    r"llama_context:\s+n_ctx\s*=\s*(?P<context>\d+)"
+)
+LLAMACPP_PLAN_PATTERN = re.compile(
+    r"qiip_fit_plan: context_per_slot=(?P<context>\d+) "
+    r"slots=(?P<slots>\d+) "
+    r"aggregate_context=(?P<aggregate>\d+) "
+    r"fit_target_mib=(?P<target>\d+) "
+    r"cache_type_k=(?P<cache_type_k>f16|q8_0) "
+    r"cache_type_v=(?P<cache_type_v>f16|q8_0) "
+    r"flash_attn=(?P<flash_attn>auto|on)"
+)
+LLAMACPP_KV_CACHE_PATTERN = re.compile(
+    r"llama_kv_cache[^:]*:\s+size\s*=.*?"
+    r"K \((?P<cache_type_k>[a-z0-9_]+)\):.*?"
+    r"V \((?P<cache_type_v>[a-z0-9_]+)\):"
+)
+LLAMACPP_OFFLOAD_PATTERN = re.compile(
+    r"offloaded (?P<loaded>\d+)/(?P<total>\d+) layers to GPU"
+)
+LLAMACPP_CONTEXT_OVERFLOW_PATTERN = re.compile(
+    r"n_ctx_seq \((?P<context>\d+)\) > n_ctx_train \((?P<train>\d+)\) "
+    r"-- possible training context overflow"
+)
+LLAMACPP_SLOT_CAP_PATTERN = re.compile(
+    r"the slot context \((?P<context>\d+)\) exceeds the training context "
+    r"of the model \((?P<train>\d+)\) - capping"
+)
+LLAMACPP_FIT_FAILURE_PATTERN = re.compile(r"failed to fit params to free device memory")
+_ENGINE_BUNDLE_FILES = {
+    InferenceEngine.VLLM: {
+        ".uv-version",
+        "pyproject.toml",
+        "setup.sh",
+        "start-vllm.sh",
+        "stop-vllm.sh",
+        "uv.lock",
+        "uv-x86_64-unknown-linux-gnu.tar.gz.sha256",
+        "vllm-process.sh",
+    },
+    InferenceEngine.LLAMA_CPP: {
+        "llamacpp-process.sh",
+        "setup.sh",
+        "start-llamacpp.sh",
+        "stop-llamacpp.sh",
+    },
+}
 
 
 class ProvisioningError(Exception):
@@ -82,14 +139,143 @@ class PreflightError(Exception):
         super().__init__(f"Pre-flight failed on {hostname}: {'; '.join(failures)}")
 
 
+@dataclass(frozen=True)
+class ProvisioningIdentity:
+    """Engine and immutable artifact selected for one provisioning operation."""
+
+    engine: InferenceEngine
+    artifact_id: str | None = None
+
+
+@dataclass(frozen=True)
+class LlamaCppRuntimeFit:
+    """Effective llama.cpp sizing parsed from the completed startup log."""
+
+    context_per_slot: int
+    slot_context_limit: int
+    slots: int
+    aggregate_context: int
+    fit_target_mib: int
+    cache_type_k: str
+    cache_type_v: str
+    flash_attn: str
+    kv_unified: bool
+    gpu_layers: int
+    total_layers: int
+
+
+def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
+    """Validate and return the final managed llama.cpp fit evidence."""
+    if LLAMACPP_FIT_FAILURE_PATTERN.search(log_text):
+        raise ProvisioningError("llama.cpp reported a runtime fitting failure")
+    plans = list(LLAMACPP_PLAN_PATTERN.finditer(log_text))
+    if not plans:
+        raise ProvisioningError("llama.cpp startup log has no QIIP VRAM plan")
+    contexts = list(LLAMACPP_CONTEXT_PATTERN.finditer(log_text))
+    if not contexts:
+        raise ProvisioningError("llama.cpp startup log has no effective context record")
+    aggregate_contexts = list(LLAMACPP_AGGREGATE_CONTEXT_PATTERN.finditer(log_text))
+    if not aggregate_contexts:
+        raise ProvisioningError("llama.cpp startup log has no aggregate context record")
+    offloads = list(LLAMACPP_OFFLOAD_PATTERN.finditer(log_text))
+    if not offloads:
+        raise ProvisioningError("llama.cpp startup log has no GPU offload record")
+    cache_records = list(LLAMACPP_KV_CACHE_PATTERN.finditer(log_text))
+    if not cache_records:
+        raise ProvisioningError("llama.cpp startup log has no KV cache type record")
+
+    plan = plans[-1].groupdict()
+    context = contexts[-1].groupdict()
+    aggregate_context = int(aggregate_contexts[-1].group("context"))
+    offload = offloads[-1].groupdict()
+    cache_record = cache_records[-1].groupdict()
+    fit = LlamaCppRuntimeFit(
+        context_per_slot=int(plan["context"]),
+        slot_context_limit=int(context["context"]),
+        slots=int(plan["slots"]),
+        aggregate_context=int(plan["aggregate"]),
+        fit_target_mib=int(plan["target"]),
+        cache_type_k=plan["cache_type_k"],
+        cache_type_v=plan["cache_type_v"],
+        flash_attn=plan["flash_attn"],
+        kv_unified=context["unified"] == "true",
+        gpu_layers=int(offload["loaded"]),
+        total_layers=int(offload["total"]),
+    )
+    if (
+        fit.context_per_slot < 1
+        or fit.slot_context_limit < fit.context_per_slot
+        or fit.slot_context_limit > fit.aggregate_context
+        or fit.slots < 1
+        or fit.fit_target_mib < 1
+    ):
+        raise ProvisioningError("llama.cpp reported an invalid effective context")
+    if int(context["slots"]) != fit.slots:
+        raise ProvisioningError(
+            "llama.cpp runtime slot count differs from its VRAM plan"
+        )
+    requested_context = fit.context_per_slot * fit.slots
+    if not requested_context <= fit.aggregate_context < requested_context + 256:
+        raise ProvisioningError("llama.cpp VRAM plan has invalid aggregate context")
+    if aggregate_context != fit.aggregate_context:
+        raise ProvisioningError(
+            "llama.cpp runtime aggregate context differs from its VRAM plan"
+        )
+    if fit.cache_type_k != fit.cache_type_v:
+        raise ProvisioningError("llama.cpp managed startup requires matching K/V types")
+    expected_flash_attn = "auto" if fit.cache_type_k == "f16" else "on"
+    if fit.flash_attn != expected_flash_attn:
+        raise ProvisioningError(
+            "llama.cpp managed cache type has an invalid Flash Attention policy"
+        )
+    if cache_record != {
+        "cache_type_k": fit.cache_type_k,
+        "cache_type_v": fit.cache_type_v,
+    }:
+        raise ProvisioningError(
+            "llama.cpp runtime KV cache types differ from its VRAM plan"
+        )
+    overflows = list(LLAMACPP_CONTEXT_OVERFLOW_PATTERN.finditer(log_text))
+    caps = list(LLAMACPP_SLOT_CAP_PATTERN.finditer(log_text))
+    if fit.aggregate_context > fit.slot_context_limit:
+        if not overflows or not caps:
+            raise ProvisioningError(
+                "llama.cpp startup log is missing expected unified-KV "
+                "context-sharing warnings"
+            )
+        overflow = overflows[-1].groupdict()
+        cap = caps[-1].groupdict()
+        expected = {
+            "context": str(fit.aggregate_context),
+            "train": str(fit.slot_context_limit),
+        }
+        if overflow != expected or cap != expected:
+            raise ProvisioningError(
+                "llama.cpp unified-KV context-sharing warnings differ from runtime"
+            )
+    elif overflows or caps:
+        raise ProvisioningError(
+            "llama.cpp reported unexpected unified-KV context-sharing warnings"
+        )
+    if not fit.kv_unified:
+        raise ProvisioningError("llama.cpp managed startup requires unified KV cache")
+    if fit.total_layers < 1 or fit.gpu_layers != fit.total_layers:
+        raise ProvisioningError(
+            "llama.cpp did not fully offload the model to GPU "
+            f"({fit.gpu_layers}/{fit.total_layers} layers)"
+        )
+    return fit
+
+
 @dataclass
 class _ProvisioningTask:
     task: asyncio.Task[None]
+    identity: ProvisioningIdentity
     started: bool = False
 
 
 class NodeProvisioner:
-    """Orchestrates full provisioning of a vLLM node on a remote host.
+    """Orchestrates full provisioning of an inference node on a remote host.
 
     Accepts SSHClient, EtcdClient, ProvisioningSettings, and EndpointPolicy
     via constructor injection (DIP).
@@ -110,6 +296,7 @@ class NodeProvisioner:
         lifecycle_coordinator: HostLifecycleCoordinator | None = None,
         hf_token: str | None = None,
         nfs_export: str | None = None,
+        artifact_index: GGUFArtifactIndex | None = None,
     ) -> None:
         self._ssh_client = ssh_client
         self._etcd_client = etcd_client
@@ -130,6 +317,7 @@ class NodeProvisioner:
         self._lifecycle = lifecycle_coordinator or HostLifecycleCoordinator()
         self._hf_token = hf_token
         self._nfs_export = nfs_export
+        self._artifact_index = artifact_index
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._provisioning_tasks: dict[str, _ProvisioningTask] = {}
 
@@ -160,9 +348,51 @@ class NodeProvisioner:
                 f"endpoint {candidate!r}: {exc}; {allowlist_hint}"
             ) from exc
 
-    def validate_setup_configuration(self) -> None:
+    def validate_setup_configuration(
+        self, engine: InferenceEngine = InferenceEngine.VLLM
+    ) -> None:
         """Require settings used only by the node-provisioning workflow."""
         self._required_nfs_export()
+        self._required_script_bundles(engine)
+
+    async def resolve_artifact_selection(
+        self,
+        engine: InferenceEngine,
+        artifact_id: str | None,
+    ) -> ResolvedGGUFArtifact | None:
+        """Resolve the exact llama.cpp artifact or reject the engine contract."""
+        if engine == InferenceEngine.VLLM:
+            if artifact_id is not None:
+                raise ProvisioningError(
+                    "artifact_id is only valid for llama_cpp provisioning"
+                )
+            return None
+        if artifact_id is None:
+            raise ProvisioningError("llama_cpp provisioning requires artifact_id")
+        artifact_index = self._required_llamacpp_shared_root()
+        try:
+            artifact = await asyncio.to_thread(artifact_index.get, artifact_id)
+        except GGUFArtifactError as exc:
+            raise ProvisioningError(
+                f"GGUF artifact {artifact_id!r} is invalid: {exc}"
+            ) from exc
+        if artifact is None:
+            raise ProvisioningError(f"GGUF artifact {artifact_id!r} was not found")
+        return artifact
+
+    def _required_llamacpp_shared_root(self) -> GGUFArtifactIndex:
+        """Require a valid shared-root mapping for llama.cpp provisioning."""
+        if self._artifact_index is None:
+            raise ProvisioningError("GGUF artifact discovery is not configured")
+        try:
+            self._artifact_index.validate_shared_root()
+        except GGUFArtifactError as exc:
+            raise ProvisioningError(
+                "llama_cpp provisioning requires "
+                "INFERENCE_PROXY_HUGGINGFACE__SHARED_ROOT containing the "
+                f"configured cache_dir: {exc}"
+            ) from exc
+        return self._artifact_index
 
     def _required_nfs_export(self) -> str:
         """Return the canonical NFS export or reject node provisioning."""
@@ -174,9 +404,36 @@ class NodeProvisioner:
             )
         return self._nfs_export
 
-    def _setup_script_env(self) -> dict[str, str]:
+    def _engine_scripts_dir(self, engine: InferenceEngine) -> Path:
+        """Resolve an engine bundle beside the configured vLLM bundle."""
+        if engine == InferenceEngine.VLLM:
+            return self._settings.scripts_dir
+        return self._settings.scripts_dir.parent / "auto-llamacpp"
+
+    def _common_scripts_dir(self) -> Path:
+        return self._settings.scripts_dir.parent / "common"
+
+    def _required_script_bundles(self, engine: InferenceEngine) -> tuple[Path, Path]:
+        """Return complete engine/common bundles or fail before remote work."""
+        engine_dir = self._engine_scripts_dir(engine)
+        common_dir = self._common_scripts_dir()
+        required = {
+            *(engine_dir / name for name in _ENGINE_BUNDLE_FILES[engine]),
+            common_dir / "setup-base.sh",
+        }
+        missing = sorted(str(path) for path in required if not path.is_file())
+        if missing:
+            raise ProvisioningError(
+                "Provisioning script bundle is incomplete; missing: "
+                + ", ".join(missing)
+            )
+        return engine_dir, common_dir
+
+    def _setup_script_env(
+        self, engine: InferenceEngine = InferenceEngine.VLLM
+    ) -> dict[str, str]:
         """Return the exact environment accepted by setup.sh."""
-        return {
+        env = {
             "AUTOVLLM_NFS_EXPORT": self._required_nfs_export(),
             "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
             "AUTOVLLM_NVIDIA_DRIVER_VERSION": self._settings.nvidia_driver_version,
@@ -185,15 +442,42 @@ class NodeProvisioner:
             "AUTOVLLM_LLMFIT_VERSION": self._llmfit_version,
             "AUTOVLLM_LLMFIT_SHA256": self._llmfit_sha256,
         }
+        if engine == InferenceEngine.LLAMA_CPP:
+            env["AUTOLLAMACPP_VERSION"] = self._settings.llamacpp_version
+            env["AUTOLLAMACPP_SHA256"] = self._settings.llamacpp_sha256
+            env["AUTOLLAMACPP_SOURCE_URL"] = (
+                self._settings.llamacpp_source_download_url()
+            )
+        return env
 
-    def _start_script_env(self, model: str | None) -> dict[str, str]:
-        """Return the exact environment accepted by start-vllm.sh."""
-        env = {
-            "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
-            "AUTOVLLM_API_PORT": str(self._settings.vllm_port),
-        }
-        if model is not None:
-            env["AUTOVLLM_MODEL"] = model
+    def _start_script_env(
+        self,
+        model: str | None,
+        engine: InferenceEngine = InferenceEngine.VLLM,
+        artifact: ResolvedGGUFArtifact | None = None,
+    ) -> dict[str, str]:
+        """Return the exact environment accepted by the engine start script."""
+        if engine == InferenceEngine.LLAMA_CPP:
+            env = {
+                "AUTOLLAMACPP_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
+                "AUTOLLAMACPP_PORT": str(self._settings.vllm_port),
+                "AUTOLLAMACPP_REQUIRE_CUDA": "1",
+                "AUTOLLAMACPP_MANAGED": "1",
+                "AUTOLLAMACPP_FIT_TARGET_MIB": str(
+                    self._settings.llamacpp_fit_target_mib
+                ),
+            }
+            if artifact is None:
+                raise ProvisioningError("llama_cpp start requires a GGUF artifact")
+            env["AUTOLLAMACPP_GGUF_PATH"] = artifact.node_relative_entrypoint
+            env["AUTOLLAMACPP_MODEL_ALIAS"] = artifact.model_alias
+        else:
+            env = {
+                "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
+                "AUTOVLLM_API_PORT": str(self._settings.vllm_port),
+            }
+            if model is not None:
+                env["AUTOVLLM_MODEL"] = model
         if self._hf_token:
             env["HF_TOKEN"] = self._hf_token
         return env
@@ -204,9 +488,11 @@ class NodeProvisioner:
         *,
         env: dict[str, str] | None = None,
         args: tuple[str, ...] = (),
+        scripts_dir: str | None = None,
     ) -> str:
         """Build one uniformly quoted remote script command."""
-        script_path = str(PurePosixPath(self._settings.scripts_dir.name, script_name))
+        dir_name = scripts_dir or self._settings.scripts_dir.name
+        script_path = str(PurePosixPath(dir_name, script_name))
         command = shlex.join(("bash", script_path, *args))
         if not env:
             return command
@@ -394,14 +680,17 @@ class NodeProvisioner:
         *,
         managed: bool = True,
         model: str | None = None,
+        engine: InferenceEngine = InferenceEngine.VLLM,
+        artifact_id: str | None = None,
         lifecycle_lease: HostLifecycleLease | None = None,
     ) -> None:
         """Provision *hostname* under the shared host lifecycle coordinator."""
         # Validate before acquiring the lifecycle lease or touching the host.
         # The API also calls this synchronously so configuration errors become
         # immediate 400 responses instead of failed background operations.
-        self.validate_setup_configuration()
+        self.validate_setup_configuration(engine)
         self.validate_endpoint(hostname)
+        artifact = await self.resolve_artifact_selection(engine, artifact_id)
         lease = lifecycle_lease
         if lease is None:
             lease = await self._lifecycle.acquire(hostname)
@@ -409,7 +698,13 @@ class NodeProvisioner:
             raise ValueError("lifecycle lease does not own this host")
 
         try:
-            await self._provision(hostname, managed=managed, model=model)
+            await self._provision(
+                hostname,
+                managed=managed,
+                model=model,
+                engine=engine,
+                artifact=artifact,
+            )
         except asyncio.CancelledError:
             self._log(hostname, "error", "Provisioning cancelled by teardown")
             await self._update_state(
@@ -424,7 +719,13 @@ class NodeProvisioner:
             lease.release()
 
     async def _provision(
-        self, hostname: str, *, managed: bool = True, model: str | None = None
+        self,
+        hostname: str,
+        *,
+        managed: bool = True,
+        model: str | None = None,
+        engine: InferenceEngine = InferenceEngine.VLLM,
+        artifact: ResolvedGGUFArtifact | None = None,
     ) -> None:
         """Run full provisioning sequence on *hostname*.
 
@@ -463,6 +764,7 @@ class NodeProvisioner:
 
         current_step = "registering_node"
         value: bytes | None = None
+        artifact_id = artifact.artifact_id if artifact is not None else None
         try:
             # D-09: Register node as PROVISIONING before setup. Failure is
             # terminal: remote mutation must not start without an ownership
@@ -472,6 +774,8 @@ class NodeProvisioner:
                 endpoint=self.validate_endpoint(hostname),
                 status=NodeStatus.PROVISIONING,
                 model="",
+                engine=engine,
+                artifact_id=artifact_id,
                 last_heartbeat=datetime.now(UTC),
                 managed=managed,
             )
@@ -484,7 +788,7 @@ class NodeProvisioner:
                 started_at=provision_started_at,
             )
             self._log(hostname, "info", "Uploading provisioning scripts")
-            await self._upload_scripts(hostname)
+            await self._upload_scripts(hostname, engine=engine)
             self._log(hostname, "info", "Running setup.sh")
 
             def set_current_step(step: str) -> None:
@@ -495,29 +799,45 @@ class NodeProvisioner:
                 hostname,
                 started_at=provision_started_at,
                 on_step=set_current_step,
+                engine=engine,
             )
             current_step = "gpu_verify"
             await self._verify_gpu(hostname)
-            current_step = "starting_vllm"
+            current_step = "starting_engine"
+            if engine == InferenceEngine.LLAMA_CPP:
+                starting_step = ProvisioningStep.STARTING_LLAMACPP
+            else:
+                starting_step = ProvisioningStep.STARTING_VLLM
             await self._update_state(
                 hostname,
-                ProvisioningStep.STARTING_VLLM,
+                starting_step,
                 started_at=provision_started_at,
             )
-            self._log(hostname, "info", "Running start-vllm.sh")
-            model_name = await self._run_start_vllm(hostname, model=model)
+            self._log(hostname, "info", f"Starting {engine} inference engine")
+            model_name = await self._run_start_vllm(
+                hostname, model=model, engine=engine, artifact=artifact
+            )
             current_step = "health_poll"
             await self._update_state(
                 hostname, ProvisioningStep.HEALTH_POLL, started_at=provision_started_at
             )
-            self._log(hostname, "info", "Waiting for vLLM health endpoint")
-            await self._poll_health(hostname)
+            self._log(hostname, "info", "Waiting for health endpoint")
+            await self._poll_health(hostname, engine=engine)
+            if engine == InferenceEngine.LLAMA_CPP:
+                current_step = "llamacpp_runtime_verify"
+                await self._verify_llamacpp_runtime(hostname)
             current_step = "registering"
             await self._update_state(
                 hostname, ProvisioningStep.REGISTERING, started_at=provision_started_at
             )
             self._log(hostname, "info", f"Registering node (model={model_name})")
-            await self._register_node(hostname, model_name, managed=managed)
+            await self._register_node(
+                hostname,
+                model_name,
+                managed=managed,
+                engine=engine,
+                artifact_id=artifact_id,
+            )
             await self._update_state(
                 hostname, ProvisioningStep.COMPLETE, started_at=provision_started_at
             )
@@ -538,6 +858,8 @@ class NodeProvisioner:
                     endpoint=self.validate_endpoint(hostname),
                     status=NodeStatus.FAILED,
                     model="",
+                    engine=engine,
+                    artifact_id=artifact_id,
                     last_heartbeat=datetime.now(UTC),
                     managed=managed,
                 )
@@ -563,9 +885,13 @@ class NodeProvisioner:
 
         logger.info("provisioning_complete", hostname=hostname)
 
-    async def _upload_scripts(self, hostname: str) -> None:
+    async def _upload_scripts(
+        self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
+    ) -> None:
         """Copy provisioning scripts to the remote host via SCP."""
-        await self._ssh_client.upload(hostname, self._settings.scripts_dir)
+        scripts_dir, common_dir = self._required_script_bundles(engine)
+        await self._ssh_client.upload(hostname, scripts_dir)
+        await self._ssh_client.upload(hostname, common_dir)
 
     async def _run_setup(
         self,
@@ -573,12 +899,23 @@ class NodeProvisioner:
         *,
         started_at: datetime,
         on_step: Callable[[str], None],
+        engine: InferenceEngine = InferenceEngine.VLLM,
     ) -> None:
         """Run setup.sh and parse step markers from stdout (D-05, D-06)."""
-        async for stream, line in self._ssh_client.run_streaming(
-            hostname,
-            self._script_command("setup.sh", env=self._setup_script_env()),
-        ):
+        command = self._script_command(
+            "setup.sh",
+            env=self._setup_script_env(engine),
+            scripts_dir=self._engine_scripts_dir(engine).name,
+        )
+        if engine == InferenceEngine.LLAMA_CPP:
+            output = self._ssh_client.run_streaming(
+                hostname,
+                command,
+                total_timeout=self._settings.llamacpp_setup_timeout,
+            )
+        else:
+            output = self._ssh_client.run_streaming(hostname, command)
+        async for stream, line in output:
             if stream == "stdout":
                 match = STEP_PATTERN.search(line)
                 if match:
@@ -624,10 +961,103 @@ class NodeProvisioner:
             raise ProvisioningError(f"No GPUs detected on {hostname} after setup")
         self._log(hostname, "info", f"Detected {len(gpu_lines)} GPU(s)")
 
-    async def _run_start_vllm(self, hostname: str, *, model: str | None = None) -> str:
-        """Run start-vllm.sh and extract model name from stdout."""
+    async def _stop_failed_llamacpp_start(self, hostname: str) -> None:
+        """Best-effort cleanup after post-health llama.cpp verification fails."""
         command = self._script_command(
-            "start-vllm.sh", env=self._start_script_env(model)
+            "stop-llamacpp.sh",
+            scripts_dir=self._engine_scripts_dir(InferenceEngine.LLAMA_CPP).name,
+        )
+        try:
+            await self._ssh_run_command(hostname, command)
+        except Exception as exc:
+            logger.warning(
+                "llamacpp_verification_cleanup_failed",
+                hostname=hostname,
+                error=str(exc),
+                exc_info=True,
+            )
+            self._log(
+                hostname,
+                "warning",
+                "llama.cpp runtime verification failed and the stop script "
+                f"also failed: {exc}",
+            )
+
+    async def _verify_llamacpp_runtime(self, hostname: str) -> None:
+        """Fail closed unless the healthy server proves the managed fit contract."""
+        try:
+            log_text = await self._ssh_run_command(
+                hostname, "cat -- /var/log/llamacpp-serve.log"
+            )
+            fit = _parse_llamacpp_runtime_fit(log_text)
+            memory_text = await self._ssh_run_command(
+                hostname,
+                "nvidia-smi --query-gpu=memory.used,memory.free "
+                "--format=csv,noheader,nounits",
+            )
+            memory_rows: list[tuple[int, int]] = []
+            try:
+                for line in memory_text.splitlines():
+                    if not line.strip():
+                        continue
+                    used_text, free_text = line.split(",", maxsplit=1)
+                    memory_rows.append((int(used_text.strip()), int(free_text.strip())))
+            except ValueError as exc:
+                raise ProvisioningError(
+                    "could not parse post-load NVIDIA memory telemetry"
+                ) from exc
+            if not memory_rows:
+                raise ProvisioningError(
+                    "post-load NVIDIA memory telemetry returned no GPUs"
+                )
+            if fit.fit_target_mib != self._settings.llamacpp_fit_target_mib:
+                raise ProvisioningError(
+                    "llama.cpp runtime fit target differs from gateway configuration"
+                )
+            if any(row[1] < fit.fit_target_mib for row in memory_rows):
+                raise ProvisioningError(
+                    "llama.cpp post-load free VRAM is below the configured fit target"
+                )
+
+            used = ",".join(str(row[0]) for row in memory_rows)
+            free = ",".join(str(row[1]) for row in memory_rows)
+            self._log(
+                hostname,
+                "info",
+                "llama.cpp fitted: "
+                f"context_per_slot={fit.context_per_slot} "
+                f"slot_context_limit={fit.slot_context_limit} "
+                f"slots={fit.slots} "
+                f"aggregate_context={fit.aggregate_context} "
+                f"kv_unified={str(fit.kv_unified).lower()} "
+                f"cache_type_k={fit.cache_type_k} "
+                f"cache_type_v={fit.cache_type_v} "
+                f"flash_attn={fit.flash_attn} "
+                f"gpu_layers={fit.gpu_layers}/{fit.total_layers} "
+                f"fit_target_mib={self._settings.llamacpp_fit_target_mib} "
+                f"gpu_used_mib={used} gpu_free_mib={free}",
+            )
+        except Exception:
+            await self._stop_failed_llamacpp_start(hostname)
+            raise
+
+    async def _run_start_vllm(
+        self,
+        hostname: str,
+        *,
+        model: str | None = None,
+        engine: InferenceEngine = InferenceEngine.VLLM,
+        artifact: ResolvedGGUFArtifact | None = None,
+    ) -> str:
+        """Run the engine start script and extract model name from stdout."""
+        if engine == InferenceEngine.LLAMA_CPP:
+            script = "start-llamacpp.sh"
+        else:
+            script = "start-vllm.sh"
+        command = self._script_command(
+            script,
+            env=self._start_script_env(model, engine, artifact),
+            scripts_dir=self._engine_scripts_dir(engine).name,
         )
         model_name: str | None = None
         async for stream, line in self._ssh_client.run_streaming(hostname, command):
@@ -643,27 +1073,40 @@ class NodeProvisioner:
 
         if model_name is None:
             raise ProvisioningError(
-                f"model name not found in start-vllm.sh output on {hostname}"
+                f"model name not found in {script} output on {hostname}"
             )
-        return model_name
+        if artifact is not None and model_name != artifact.model_alias:
+            raise ProvisioningError(
+                f"{script} reported model {model_name!r}, expected selected "
+                f"artifact alias {artifact.model_alias!r}"
+            )
+        return artifact.model_alias if artifact is not None else model_name
 
-    async def _tail_vllm_log(self, hostname: str) -> None:
-        """Tail vLLM log and feed lines into the provisioning log buffer."""
+    async def _tail_vllm_log(
+        self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
+    ) -> None:
+        """Tail engine log and feed lines into the provisioning log buffer."""
+        if engine == InferenceEngine.LLAMA_CPP:
+            log_path = "/var/log/llamacpp-serve.log"
+        else:
+            log_path = "/var/log/vllm-serve.log"
         try:
             async for _stream, line in self._ssh_client.run_streaming(
-                hostname, "tail -n +1 -f /var/log/vllm-serve.log"
+                hostname, f"tail -n +1 -f {log_path}"
             ):
-                self._log(hostname, "info", line, stream="vllm")
+                self._log(hostname, "info", line, stream=engine)
         except (SSHConnectionError, RemoteCommandError, asyncio.CancelledError):
             pass
 
-    async def _poll_health(self, hostname: str) -> None:
+    async def _poll_health(
+        self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
+    ) -> None:
         """Poll /health endpoint until 200 OK or timeout (D-10, D-09).
 
-        Tails /var/log/vllm-serve.log concurrently so vLLM startup output
-        appears in the live log pane while waiting.
+        Tails the engine log concurrently so startup output appears in
+        the live log pane while waiting.
         """
-        tail_task = asyncio.create_task(self._tail_vllm_log(hostname))
+        tail_task = asyncio.create_task(self._tail_vllm_log(hostname, engine))
 
         url = f"http://{hostname}:{self._settings.vllm_port}/health"
         deadline = (
@@ -702,7 +1145,13 @@ class NodeProvisioner:
                 await tail_task
 
     async def _register_node(
-        self, hostname: str, model: str, *, managed: bool = True
+        self,
+        hostname: str,
+        model: str,
+        *,
+        managed: bool = True,
+        engine: InferenceEngine = InferenceEngine.VLLM,
+        artifact_id: str | None = None,
     ) -> None:
         """Register node in etcd with correct fields (D-11, D-12)."""
         node = Node(
@@ -710,6 +1159,8 @@ class NodeProvisioner:
             endpoint=self.validate_endpoint(hostname),
             status=NodeStatus.HEALTHY,
             model=model,
+            engine=engine,
+            artifact_id=artifact_id,
             last_heartbeat=datetime.now(UTC),
             managed=managed,
         )
@@ -760,6 +1211,7 @@ class NodeProvisioner:
         coro: Coroutine[object, object, None],
         *,
         provisioning_hostname: str | None = None,
+        provisioning_identity: ProvisioningIdentity | None = None,
         task_name: str | None = None,
     ) -> asyncio.Task[None]:
         """Schedule and observe an owned background operation.
@@ -769,6 +1221,12 @@ class NodeProvisioner:
         work omit ``provisioning_hostname`` and remain admissible when the
         provisioning limit is full.
         """
+        if (provisioning_hostname is None) != (provisioning_identity is None):
+            raise ValueError(
+                "provisioning_hostname and provisioning_identity must be "
+                "supplied together"
+            )
+
         if provisioning_hostname is not None:
             current = self._provisioning_tasks.get(provisioning_hostname)
             if current is not None and not current.task.done():
@@ -811,7 +1269,9 @@ class NodeProvisioner:
         self._background_tasks.add(task)
 
         if provisioning_hostname is not None:
-            record = _ProvisioningTask(task)
+            if provisioning_identity is None:  # narrowed by the paired check above
+                raise RuntimeError("provisioning identity was not initialized")
+            record = _ProvisioningTask(task, provisioning_identity)
             self._provisioning_tasks[provisioning_hostname] = record
 
         def _task_done(done_task: asyncio.Task[None]) -> None:
@@ -857,8 +1317,10 @@ class NodeProvisioner:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def cancel_active_provision(self, hostname: str) -> asyncio.Task[None] | None:
-        """Cancel and await the active provisioning task for *hostname*."""
+    async def cancel_active_provision(
+        self, hostname: str
+    ) -> ProvisioningIdentity | None:
+        """Cancel *hostname* provisioning and return its serving identity."""
         record = self._provisioning_tasks.get(hostname)
         if record is None or record.task.done():
             return None
@@ -883,7 +1345,7 @@ class NodeProvisioner:
                 failed_step="cancelled",
                 error="Provisioning cancelled by teardown",
             )
-        return task
+        return record.identity
 
     async def _drain_wait(self, hostname: str) -> None:
         """Wait for active connections to reach zero or timeout (D-08, D-09)."""
@@ -904,6 +1366,8 @@ class NodeProvisioner:
         hostname: str,
         *,
         force: bool = False,
+        provisioning_identity: ProvisioningIdentity | None = None,
+        recovery_engine: InferenceEngine | None = None,
         lifecycle_lease: HostLifecycleLease | None = None,
     ) -> None:
         """Teardown *hostname* under the shared host lifecycle coordinator."""
@@ -914,18 +1378,71 @@ class NodeProvisioner:
             raise ValueError("lifecycle lease does not own this host")
 
         try:
-            await self._teardown(hostname, force=force)
+            engine = self._resolve_teardown_engine(
+                hostname,
+                force=force,
+                provisioning_identity=provisioning_identity,
+                recovery_engine=recovery_engine,
+            )
+            await self._teardown(hostname, force=force, engine=engine)
         finally:
             lease.release()
 
-    async def _teardown(self, hostname: str, *, force: bool = False) -> None:
+    def _resolve_teardown_engine(
+        self,
+        hostname: str,
+        *,
+        force: bool,
+        provisioning_identity: ProvisioningIdentity | None,
+        recovery_engine: InferenceEngine | None,
+    ) -> InferenceEngine:
+        """Resolve one authoritative engine without silently guessing vLLM."""
+        node = None
+        if self._registry is not None:
+            node = self._registry.get(hostname)
+        if provisioning_identity is not None:
+            if recovery_engine is not None:
+                raise ProvisioningError(
+                    "recovery_engine cannot override an active provisioning identity"
+                )
+            if node is not None and node.engine != provisioning_identity.engine:
+                logger.warning(
+                    "teardown_identity_prefers_cancelled_provision",
+                    hostname=hostname,
+                    cancelled_engine=provisioning_identity.engine,
+                    registry_engine=node.engine,
+                )
+            return provisioning_identity.engine
+        if node is not None:
+            if recovery_engine is not None:
+                raise ProvisioningError(
+                    "recovery_engine cannot override a registered node identity"
+                )
+            return node.engine
+        if recovery_engine is not None:
+            if not force:
+                raise ProvisioningError(
+                    "recovery_engine requires force=true when no node identity exists"
+                )
+            return recovery_engine
+        raise ProvisioningError(
+            f"Cannot determine the inference engine for unregistered host {hostname!r}"
+        )
+
+    async def _teardown(
+        self,
+        hostname: str,
+        *,
+        force: bool = False,
+        engine: InferenceEngine,
+    ) -> None:
         """Teardown a provisioned node.
 
-        Graceful: drain -> kill vllm -> deregister.
+        Graceful: drain -> stop engine -> deregister.
         Force: kill -9 -> deregister.
         """
         teardown_started_at = datetime.now(UTC)
-        logger.info("teardown_start", hostname=hostname, force=force)
+        logger.info("teardown_start", hostname=hostname, force=force, engine=engine)
         self._log_buffer.create(hostname)
         self._log(hostname, "info", f"Teardown started (force={force})")
 
@@ -940,15 +1457,19 @@ class NodeProvisioner:
                 await self._drain_wait(hostname)
                 self._log(hostname, "info", "Drain complete")
 
+            if engine == InferenceEngine.LLAMA_CPP:
+                stopping_step = ProvisioningStep.STOPPING_LLAMACPP
+            else:
+                stopping_step = ProvisioningStep.STOPPING_VLLM
             await self._update_state(
-                hostname, ProvisioningStep.STOPPING_VLLM, started_at=teardown_started_at
+                hostname, stopping_step, started_at=teardown_started_at
             )
-            self._log(hostname, "info", "Stopping vLLM process")
+            self._log(hostname, "info", f"Stopping {engine} process")
             # Existing nodes may predate stop-vllm.sh, and a cancelled setup
             # may not have reached its upload step. Refresh the bundle before
             # invoking the verified stop path.
             try:
-                await self._upload_scripts(hostname)
+                await self._upload_scripts(hostname, engine=engine)
             except Exception as exc:
                 # The refresh is upgrade compatibility, not a teardown
                 # precondition. The existing remote copy may still work; if
@@ -966,8 +1487,14 @@ class NodeProvisioner:
                     "Could not refresh teardown scripts; attempting the "
                     "existing remote stop script",
                 )
+            if engine == InferenceEngine.LLAMA_CPP:
+                stop_script = "stop-llamacpp.sh"
+            else:
+                stop_script = "stop-vllm.sh"
             stop_command = self._script_command(
-                "stop-vllm.sh", args=("--force",) if force else ()
+                stop_script,
+                args=("--force",) if force else (),
+                scripts_dir=self._engine_scripts_dir(engine).name,
             )
             await self._ssh_run_command(hostname, stop_command)
 

@@ -331,6 +331,53 @@ class TestSSHClientConcurrentStreaming:
 
     @pytest.mark.asyncio
     @patch("inference_proxy.provisioning.ssh_client.asyncssh")
+    async def test_run_streaming_accepts_one_operation_total_timeout(
+        self, mock_asyncssh: MagicMock
+    ) -> None:
+        async def chatter() -> AsyncIterator[str]:
+            while True:
+                await asyncio.sleep(0.005)
+                yield "progress\n"
+
+        async def stderr() -> AsyncIterator[str]:
+            if False:  # pragma: no cover - defines an empty async generator
+                yield ""
+
+        _setup_streaming_process(
+            mock_asyncssh,
+            stdout=chatter(),
+            stderr=stderr(),
+        )
+        client = SSHClient(
+            _make_settings(
+                streaming_command_timeout=1.0,
+                streaming_inactivity_timeout=0.02,
+            )
+        )
+
+        async def assert_override_timeout() -> None:
+            with pytest.raises(TimeoutError) as caught:
+                async for _ in client.run_streaming(
+                    "host1", "long-setup", total_timeout=0.04
+                ):
+                    pass
+            assert getattr(caught.value, "deadline", None) == "total"
+            assert getattr(caught.value, "timeout", None) == 0.04
+
+        try:
+            await asyncio.wait_for(assert_override_timeout(), timeout=0.25)
+        except TimeoutError:
+            pytest.fail("test safety deadline fired before the override deadline")
+
+    @pytest.mark.asyncio
+    async def test_run_streaming_rejects_nonpositive_total_timeout(self) -> None:
+        client = SSHClient(_make_settings())
+
+        with pytest.raises(ValueError, match="greater than zero"):
+            await anext(client.run_streaming("host1", "setup", total_timeout=0))
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.provisioning.ssh_client.asyncssh")
     async def test_total_timeout_does_not_cancel_output_consumer(
         self, mock_asyncssh: MagicMock
     ) -> None:

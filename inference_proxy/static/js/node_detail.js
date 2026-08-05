@@ -1,5 +1,17 @@
 // ponytail: vanilla fetch + DOM, same pattern as dashboard.js
 
+var setupSelection = createSetupSelectionController();
+
+function setupActionBody(id, node) {
+  var base = {
+    hostname: id,
+    managed: node ? node.managed !== false : true,
+  };
+  return node && node.state !== "available"
+    ? base
+    : setupSelection.buildBody(base);
+}
+
 function showToast(message, type) {
   var container = document.getElementById("toast-container");
   var toast = document.createElement("div");
@@ -34,7 +46,7 @@ function renderStatusMessage(container, message, className) {
 var ACTION_CONFIG = {
   setup: {
     method: "POST", url: function () { return "/admin/nodes/setup"; },
-    body: function (id) { var b = { hostname: id }; var m = getSelectedModel(); if (m) b.model = m; return b; }, confirm: false,
+    body: setupActionBody, confirm: false,
     label: "Setup Node", css: "btn-setup",
     successMsg: function (id) { return "Setup started for " + id; },
   },
@@ -47,7 +59,9 @@ var ACTION_CONFIG = {
   },
   retry: {
     method: "POST", url: function () { return "/admin/nodes/setup"; },
-    body: function (id, node) { var b = { hostname: id, managed: node ? node.managed !== false : true }; var m = getSelectedModel(); if (m) b.model = m; return b; }, confirm: false,
+    body: function (id, node) {
+      return { hostname: id, managed: node ? node.managed !== false : true };
+    }, confirm: false,
     label: "Retry", css: "btn-retry",
     successMsg: function (id) { return "Retry started for " + id; },
   },
@@ -73,8 +87,13 @@ async function handleAction(action, nodeId, node) {
   if (config.confirm && !window.confirm(config.confirmMsg(nodeId))) return;
   var options = { method: config.method };
   if (config.body) {
+    var body = config.body(nodeId, node);
+    if (!body) {
+      showToast(setupSelection.errorMessage(), "error");
+      return;
+    }
     options.headers = { "Content-Type": "application/json" };
-    options.body = JSON.stringify(config.body(nodeId, node));
+    options.body = JSON.stringify(body);
   }
   try {
     var resp = await fetch(config.url(nodeId), options);
@@ -170,10 +189,11 @@ async function refreshDetail() {
     var node = nodes.find(function (n) { return n.node_id === NODE_ID; });
     if (!node) {
       stateEl.textContent = "Node not found";
-      renderTableMessage(infoBody, 9, "Node not found in registry");
+      renderTableMessage(infoBody, 10, "Node not found in registry");
       document.getElementById("config-download-panel").style.display = "none";
     } else {
       stateEl.textContent = node.state;
+      setupSelection.setPreferredNode(node);
 
       infoBody.textContent = "";
       var tr = document.createElement("tr");
@@ -182,6 +202,7 @@ async function refreshDetail() {
       var tdGM = document.createElement("td"); tdGM.textContent = node.gpu_model || "—"; tr.appendChild(tdGM);
       var tdEp = document.createElement("td"); tdEp.textContent = node.state === "available" ? "—" : node.endpoint; tr.appendChild(tdEp);
       var tdMo = document.createElement("td"); tdMo.textContent = node.state === "available" ? "—" : node.model; tr.appendChild(tdMo);
+      var tdEn = document.createElement("td"); tdEn.textContent = formatInferenceEngine(node.engine); tr.appendChild(tdEn);
 
       var tdSt = document.createElement("td");
       var sb = document.createElement("span"); sb.className = "badge badge-" + node.state; sb.textContent = node.state;
@@ -198,7 +219,7 @@ async function refreshDetail() {
 
       var tdAc = document.createElement("td");
       var enabledActions = node.actions || [];
-      if (catalogModels.length === 0) {
+      if (!setupSelection.isValid()) {
         enabledActions = enabledActions.filter(function (a) { return a !== "setup"; });
       }
       tdAc.appendChild(createActionsDropdown(node.node_id, enabledActions, node));
@@ -475,6 +496,14 @@ function renderDownloadCell(td, modelName, catalogSet, downloadMap) {
   }
 }
 
+function renderAvailabilityText(td, message, className) {
+  td.textContent = "";
+  var badge = document.createElement("span");
+  badge.className = "badge " + (className || "badge-unknown");
+  badge.textContent = message;
+  td.appendChild(badge);
+}
+
 async function triggerDownload(repoId, td) {
   // ponytail: optimistic UI — show Downloading immediately, don't wait for poll (Pitfall 2)
   td.textContent = "";
@@ -519,10 +548,15 @@ async function pollDownloadStatuses() {
     var catalogChanged = false;
     for (var i = 0; i < downloads.length; i++) {
       var download = downloads[i];
-      downloadMap[download.repo_id] = download;
-      if (download.status === "complete" && !catalogSetCache.has(download.repo_id)) {
-        catalogSetCache.add(download.repo_id);
-        catalogChanged = true;
+      var isVllm = !download.engine || download.engine === "vllm";
+      if (isVllm) downloadMap[download.repo_id] = download;
+      if (download.status === "complete") {
+        if (isVllm && !catalogSetCache.has(download.repo_id)) {
+          catalogSetCache.add(download.repo_id);
+          catalogChanged = true;
+        } else if (!isVllm) {
+          catalogChanged = true;
+        }
       }
     }
 
@@ -583,19 +617,28 @@ async function loadRecommendations() {
 
     // ponytail: fetch catalog + downloads in parallel, graceful degradation per D-01/Pitfall 1
     var catalogSet = new Set();
+    var catalogArtifacts = [];
+    var catalogAvailable = false;
     var downloadMap = {};
     try {
       var catalogResp = await fetch("/admin/models/catalog");
       if (catalogResp.ok) {
         var catalogData = await catalogResp.json();
         catalogSet = new Set(catalogData.models.map(function (m) { return m.repo_id; }));
+        catalogArtifacts = catalogData.gguf_artifacts || [];
+        catalogAvailable = true;
+        setupSelection.setCatalog(catalogData);
       }
-    } catch (_) { /* catalog unavailable — all models show Download button */ }
+    } catch (_) { /* availability cells distinguish an unavailable catalog */ }
     try {
       var dlResp = await fetch("/admin/models/downloads");
       if (dlResp.ok) {
         var dlArray = await dlResp.json();
-        for (var d = 0; d < dlArray.length; d++) downloadMap[dlArray[d].repo_id] = dlArray[d];
+        for (var d = 0; d < dlArray.length; d++) {
+          if (!dlArray[d].engine || dlArray[d].engine === "vllm") {
+            downloadMap[dlArray[d].repo_id] = dlArray[d];
+          }
+        }
       }
     } catch (_) { /* downloads unavailable — no status overlay */ }
     catalogSetCache = catalogSet;
@@ -630,7 +673,7 @@ async function loadRecommendations() {
       var tbl = document.createElement("table");
       var thead = document.createElement("thead");
       var headRow = document.createElement("tr");
-      var headers = ["Model", "Category", "Score", "Fit", "Est. tok/s", "Memory", "Download"];
+      var headers = ["Model", "Engine", "Source", "Category", "Score", "Fit", "Est. tok/s", "Memory", "Availability"];
       for (var h = 0; h < headers.length; h++) {
         var th = document.createElement("th"); th.textContent = headers[h]; headRow.appendChild(th);
       }
@@ -644,6 +687,13 @@ async function loadRecommendations() {
         var row = document.createElement("tr");
 
         var tdName = document.createElement("td"); tdName.textContent = m.name; row.appendChild(tdName);
+        var tdEngine = document.createElement("td"); tdEngine.textContent = formatRecommendationRuntime(m.runtime); row.appendChild(tdEngine);
+        var sources = m.gguf_sources || [];
+        var tdSource = document.createElement("td");
+        tdSource.textContent = sources.length ? sources.map(function (source) {
+          return (source.provider ? source.provider + " — " : "") + source.repo;
+        }).join(", ") : "—";
+        row.appendChild(tdSource);
         var tdCat = document.createElement("td"); tdCat.textContent = m.category || "—"; row.appendChild(tdCat);
         var tdScore = document.createElement("td"); tdScore.textContent = m.score.toFixed(1) + "%"; row.appendChild(tdScore);
         var tdFit = document.createElement("td");
@@ -652,9 +702,36 @@ async function loadRecommendations() {
         var tdTps = document.createElement("td"); tdTps.textContent = m.estimated_tps.toFixed(1); row.appendChild(tdTps);
         var tdMem = document.createElement("td"); tdMem.textContent = m.memory_required_gb.toFixed(1) + " GB"; row.appendChild(tdMem);
 
-        var tdDl = document.createElement("td");
-        renderDownloadCell(tdDl, m.name, catalogSet, downloadMap);
-        row.appendChild(tdDl);
+        var tdAvailability = document.createElement("td");
+        if (m.runtime === "vllm") {
+          renderDownloadCell(tdAvailability, m.name, catalogSet, downloadMap);
+        } else if (m.runtime === "llama_cpp") {
+          if (sources.length === 0) {
+            renderAvailabilityText(tdAvailability, "No GGUF source", "badge-unknown");
+          } else if (!catalogAvailable) {
+            renderAvailabilityText(tdAvailability, "Catalog unavailable", "badge-failed");
+          } else {
+            var sourceRepos = new Set(sources.map(function (source) { return source.repo; }));
+            var matchingArtifacts = catalogArtifacts.filter(function (artifact) {
+              return sourceRepos.has(artifact.repo_id);
+            });
+            if (matchingArtifacts.length === 0) {
+              renderAvailabilityText(tdAvailability, "Not downloaded", "badge-unknown");
+            } else {
+              renderAvailabilityText(
+                tdAvailability,
+                "Available (" + matchingArtifacts.length +
+                  (matchingArtifacts.length === 1 ? " generation)" : " generations)"),
+                "badge-complete"
+              );
+            }
+          }
+        } else if (m.runtime === "unknown") {
+          renderAvailabilityText(tdAvailability, "Unknown runtime", "badge-unknown");
+        } else {
+          renderAvailabilityText(tdAvailability, "Unsupported", "badge-unknown");
+        }
+        row.appendChild(tdAvailability);
 
         tbody.appendChild(row);
       }
@@ -807,57 +884,19 @@ async function refreshPowerState() {
   renderPowerButtons();
 }
 
-// ponytail: model catalog state for setup config card
-var catalogModels = [];
-
-function getSelectedModel() {
-  var el = document.getElementById("model-select");
-  return el ? el.value : "";
-}
-
 async function fetchCatalog() {
-  var sel = document.getElementById("model-select");
-  var status = document.getElementById("model-status");
-  var incompleteCount = 0;
-  var unverifiableCount = 0;
   try {
     var resp = await fetch("/admin/models/catalog");
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     var data = await resp.json();
-    catalogModels = data.models || [];
-    incompleteCount = data.incomplete_count || 0;
-    unverifiableCount = data.unverifiable_count || 0;
+    setupSelection.setCatalog(data);
   } catch (_) {
-    catalogModels = [];
-  }
-  var warnings = [];
-  if (unverifiableCount > 0) {
-    warnings.push(unverifiableCount + " cached model" + (unverifiableCount === 1 ? " lacks" : "s lack") + " manifest metadata and " + (unverifiableCount === 1 ? "was" : "were") + " hidden; re-download " + (unverifiableCount === 1 ? "it" : "them") + " to migrate the cache.");
-  }
-  if (incompleteCount > 0) {
-    warnings.push(incompleteCount + " incomplete cached model" + (incompleteCount === 1 ? " was" : "s were") + " hidden; re-download " + (incompleteCount === 1 ? "it" : "them") + ".");
-  }
-  if (catalogModels.length === 0) {
-    sel.style.display = "none";
-    status.style.display = "inline";
-    status.textContent = warnings.length > 0 ? "No verified models. " + warnings.join(" ") : "No models downloaded";
-  } else {
-    sel.style.display = "";
-    status.style.display = warnings.length > 0 ? "inline" : "none";
-    status.textContent = warnings.join(" ");
-    sel.textContent = "";
-    for (var i = 0; i < catalogModels.length; i++) {
-      var opt = document.createElement("option");
-      opt.value = catalogModels[i].repo_id;
-      opt.textContent = catalogModels[i].repo_id;
-      sel.appendChild(opt);
-    }
+    setupSelection.setCatalogUnavailable();
   }
 }
 
 document.addEventListener("DOMContentLoaded", function () {
-  fetchCatalog();
-  refreshDetail();
+  fetchCatalog().then(refreshDetail);
   refreshPowerState();
   setInterval(refreshDetail, POLL_INTERVAL_MS);
 });

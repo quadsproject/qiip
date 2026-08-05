@@ -8,12 +8,17 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import structlog
 from huggingface_hub import CachedRepoInfo, scan_cache_dir, snapshot_download
-from huggingface_hub.errors import IncompleteSnapshotError, LocalEntryNotFoundError
-from pydantic import BaseModel
+from huggingface_hub.errors import (
+    IncompleteSnapshotError,
+    LocalEntryNotFoundError,
+)
+from pydantic import BaseModel, Field
+
+from inference_proxy.huggingface.artifacts import GGUFArtifact, GGUFArtifactIndex
 
 logger = structlog.get_logger()
 
@@ -28,11 +33,19 @@ class ModelCatalogResponse(BaseModel):
     """Response payload for the model catalog endpoint."""
 
     models: list[CatalogEntry]
+    gguf_artifacts: list[GGUFArtifact] = Field(default_factory=list)
     incomplete_count: int = 0
     unverifiable_count: int = 0
+    invalid_artifact_count: int = 0
+    cache_warning_count: int = 0
 
 
 _SnapshotState = Literal["complete", "incomplete", "unverifiable"]
+
+
+class _SnapshotCheck(NamedTuple):
+    state: _SnapshotState
+    resolved_revision: str | None = None
 
 
 class ModelCatalogService:
@@ -42,8 +55,13 @@ class ModelCatalogService:
     filesystem scan does not stall the event loop.
     """
 
-    def __init__(self, cache_dir: str) -> None:
+    def __init__(
+        self,
+        cache_dir: str,
+        artifact_index: GGUFArtifactIndex | None = None,
+    ) -> None:
         self._cache_dir = cache_dir
+        self._artifact_index = artifact_index or GGUFArtifactIndex(cache_dir)
 
     async def list_models(self) -> ModelCatalogResponse:
         """Return complete models and counts for hidden cache entries."""
@@ -51,33 +69,46 @@ class ModelCatalogService:
 
     def _scan_catalog(self) -> ModelCatalogResponse:
         cache_info = scan_cache_dir(self._cache_dir)
+        artifact_scan = self._artifact_index.scan(cache_info)
+        artifacts = list(artifact_scan.artifacts)
         models: list[CatalogEntry] = []
         incomplete_count = 0
         unverifiable_count = 0
-        for repo in cache_info.repos:
+        cache_warning_count = len(cache_info.warnings)
+        for repo in sorted(cache_info.repos, key=lambda item: item.repo_id):
             if repo.repo_type != "model":
                 continue
-            state = self._snapshot_state(repo)
-            if state == "complete":
+            check = self._snapshot_state(repo)
+            if check.state == "complete":
                 models.append(CatalogEntry(repo_id=repo.repo_id))
-            elif state == "incomplete":
+            elif check.state == "incomplete":
                 incomplete_count += 1
             else:
                 unverifiable_count += 1
 
-        if incomplete_count or unverifiable_count:
+        if (
+            incomplete_count
+            or unverifiable_count
+            or artifact_scan.invalid_count
+            or cache_warning_count
+        ):
             logger.warning(
                 "catalog scan skipped models",
                 incomplete_count=incomplete_count,
                 unverifiable_count=unverifiable_count,
+                invalid_artifact_count=artifact_scan.invalid_count,
+                cache_warning_count=cache_warning_count,
             )
         return ModelCatalogResponse(
             models=models,
+            gguf_artifacts=artifacts,
             incomplete_count=incomplete_count,
             unverifiable_count=unverifiable_count,
+            invalid_artifact_count=artifact_scan.invalid_count,
+            cache_warning_count=cache_warning_count,
         )
 
-    def _snapshot_state(self, repo: CachedRepoInfo) -> _SnapshotState:
+    def _snapshot_state(self, repo: CachedRepoInfo) -> _SnapshotCheck:
         try:
             # The local-only path checks the cached tree manifest and rejects
             # snapshots with missing files. This also catches failed-download
@@ -88,10 +119,10 @@ class ModelCatalogService:
                 cache_dir=self._cache_dir,
                 local_files_only=True,
             )
-        except IncompleteSnapshotError:
-            return "incomplete"
+        except IncompleteSnapshotError as exc:
+            return _SnapshotCheck("incomplete", Path(exc.snapshot_path).name)
         except LocalEntryNotFoundError:
-            return "unverifiable"
+            return _SnapshotCheck("unverifiable")
 
         if not isinstance(snapshot_path, str):
             raise TypeError("snapshot_download returned a dry-run result unexpectedly")
@@ -101,4 +132,6 @@ class ModelCatalogService:
         # safer position and exposes these separately for operator migration.
         commit = Path(snapshot_path).name
         manifest = repo.repo_path / "trees" / f"{commit}.json"
-        return "complete" if manifest.is_file() else "unverifiable"
+        if manifest.is_file():
+            return _SnapshotCheck("complete", commit)
+        return _SnapshotCheck("unverifiable", commit)

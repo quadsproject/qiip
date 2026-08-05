@@ -14,7 +14,12 @@ from structlog.testing import capture_logs
 
 from inference_proxy.discovery.serializer import node_from_etcd, node_to_etcd
 from inference_proxy.models.endpoint import EndpointPolicy
-from inference_proxy.models.node import Node, NodeCapabilities, NodeStatus
+from inference_proxy.models.node import (
+    InferenceEngine,
+    Node,
+    NodeCapabilities,
+    NodeStatus,
+)
 
 _ENDPOINT_POLICY = EndpointPolicy.from_values(
     allowed_hosts=[],
@@ -51,6 +56,7 @@ class TestNodeFromEtcdValidFullJson:
         assert node.capabilities.max_tokens == 4096
         assert node.capabilities.gpu_memory == "24GB"
         assert node.active_connections == 3
+        assert node.artifact_id is None
 
 
 class TestNodeFromEtcdMinimalJson:
@@ -260,6 +266,8 @@ class TestNodeToEtcdRoundtrip:
             last_heartbeat=now,
             capabilities=NodeCapabilities(max_tokens=8192, gpu_memory="80GB"),
             active_connections=5,
+            engine=InferenceEngine.LLAMA_CPP,
+            artifact_id="b" * 64,
         )
         prefix = "/nodes/"
 
@@ -277,6 +285,8 @@ class TestNodeToEtcdRoundtrip:
         assert restored.capabilities.max_tokens == original.capabilities.max_tokens
         assert restored.capabilities.gpu_memory == original.capabilities.gpu_memory
         assert restored.active_connections == original.active_connections
+        assert restored.engine is InferenceEngine.LLAMA_CPP
+        assert restored.artifact_id == "b" * 64
 
 
 def test_endpoint_roundtrip_preserves_canonical_form() -> None:

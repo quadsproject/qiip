@@ -7,8 +7,13 @@ provisioning sequence: setup.sh -> start-vllm.sh -> health poll -> register.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import shlex
+import shutil
+import subprocess
+import threading
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,13 +30,22 @@ from inference_proxy.config.settings import (
     RoutingSettings,
 )
 from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.huggingface.artifacts import (
+    GGUFArtifact,
+    GGUFArtifactError,
+    GGUFArtifactIndex,
+    GGUFDownloadSpec,
+    ResolvedGGUFArtifact,
+)
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
-from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     PreflightError,
     ProvisioningError,
+    ProvisioningIdentity,
+    _parse_llamacpp_runtime_fit,
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -47,6 +61,90 @@ _TEST_ENDPOINT_POLICY = EndpointPolicy.from_values(
 )
 
 
+def _artifact(alias: str = "org/model--with---separators") -> ResolvedGGUFArtifact:
+    return ResolvedGGUFArtifact(
+        artifact=GGUFArtifact(
+            artifact_id="a" * 64,
+            repo_id=alias,
+            resolved_revision="b" * 40,
+            files=("model -- Q4.gguf",),
+            entrypoint="model -- Q4.gguf",
+            model_alias=alias,
+            file_sizes={"model -- Q4.gguf": 7},
+        ),
+        node_relative_entrypoint="hub/models--org--model/snapshots/"
+        + "b" * 40
+        + "/model -- Q4.gguf",
+    )
+
+
+def _llamacpp_fit_log(
+    *,
+    context_per_slot: int = 24576,
+    slot_context_limit: int | None = None,
+    slots: int = 4,
+    runtime_slots: int | None = None,
+    aggregate_context: int | None = None,
+    runtime_aggregate_context: int | None = None,
+    fit_target_mib: int = 512,
+    cache_type_k: str = "f16",
+    cache_type_v: str | None = None,
+    flash_attn: str | None = None,
+    runtime_cache_type_k: str | None = None,
+    runtime_cache_type_v: str | None = None,
+    kv_unified: bool = True,
+    gpu_layers: int = 37,
+    total_layers: int = 37,
+    context_sharing_warnings: bool = True,
+) -> str:
+    if cache_type_v is None:
+        cache_type_v = cache_type_k
+    if flash_attn is None:
+        flash_attn = "auto" if cache_type_k == "f16" else "on"
+    if runtime_cache_type_k is None:
+        runtime_cache_type_k = cache_type_k
+    if runtime_cache_type_v is None:
+        runtime_cache_type_v = cache_type_v
+    if slot_context_limit is None:
+        slot_context_limit = context_per_slot
+    if runtime_slots is None:
+        runtime_slots = slots
+    if aggregate_context is None:
+        aggregate_context = context_per_slot * slots
+    if runtime_aggregate_context is None:
+        runtime_aggregate_context = aggregate_context
+    lines = [
+        "qiip_fit_plan: "
+        f"context_per_slot={context_per_slot} slots={slots} "
+        f"aggregate_context={aggregate_context} "
+        f"fit_target_mib={fit_target_mib} "
+        f"cache_type_k={cache_type_k} cache_type_v={cache_type_v} "
+        f"flash_attn={flash_attn}",
+        f"llama_model_load: offloaded {gpu_layers}/{total_layers} layers to GPU",
+        "llama_kv_cache: size = 1024.00 MiB "
+        f"(98304 cells, 37 layers, 4/1 seqs), K ({runtime_cache_type_k}): "
+        f"512.00 MiB, V ({runtime_cache_type_v}): 512.00 MiB",
+        f"llama_context: n_ctx = {runtime_aggregate_context}",
+    ]
+    if context_sharing_warnings and aggregate_context > slot_context_limit:
+        lines.extend(
+            (
+                "llama_context: n_ctx_seq "
+                f"({aggregate_context}) > n_ctx_train ({slot_context_limit}) "
+                "-- possible training context overflow",
+                "srv init: the slot context "
+                f"({aggregate_context}) exceeds the training context of the model "
+                f"({slot_context_limit}) - capping",
+            )
+        )
+    lines.append(
+        "srv init: initializing, "
+        f"n_slots = {runtime_slots}, n_ctx_slot = {slot_context_limit}, "
+        f"kv_unified = '{str(kv_unified).lower()}'"
+    )
+    return "\n".join(lines)
+
+
 def _make_provisioner(
     *,
     ssh_client: MagicMock | None = None,
@@ -60,6 +158,7 @@ def _make_provisioner(
     endpoint_policy: EndpointPolicy = _TEST_ENDPOINT_POLICY,
     nfs_export: str | None = "nfs.example:/exports/huggingface",
     hf_token: str | None = None,
+    artifact_index: GGUFArtifactIndex | None = None,
 ) -> NodeProvisioner:
     """Build a NodeProvisioner with mock dependencies."""
     return NodeProvisioner(
@@ -75,6 +174,7 @@ def _make_provisioner(
         redfish_client=redfish_client,
         hf_token=hf_token,
         nfs_export=nfs_export,
+        artifact_index=artifact_index,
     )
 
 
@@ -97,6 +197,7 @@ async def test_shutdown_cancels_and_awaits_owned_tasks() -> None:
         task = provisioner.fire_background(
             owned_task(),
             provisioning_hostname="host1",
+            provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
         )
         await asyncio.wait_for(started.wait(), timeout=1)
         await asyncio.wait_for(provisioner.shutdown(), timeout=1)
@@ -139,6 +240,7 @@ def test_script_env_prefix_exact() -> None:
             nfs_mount_point="/srv/hf cache",
             nvidia_driver_version="999.1",
             nvidia_driver_sha256="b" * 64,
+            llamacpp_fit_target_mib=1536,
         ),
         llmfit_settings=LLMFitSettings(version="8.7.6", sha256="c" * 64),
         nfs_export="nfs.example:/exports/hf cache",
@@ -160,6 +262,34 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_MODEL": "org/model",
         "HF_TOKEN": "hf secret",
     }
+    llama_setup = provisioner._setup_script_env(InferenceEngine.LLAMA_CPP)
+    assert llama_setup == {
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
+        "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_NVIDIA_DRIVER_VERSION": "999.1",
+        "AUTOVLLM_NVIDIA_DRIVER_SHA256": "b" * 64,
+        "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_LLMFIT_VERSION": "8.7.6",
+        "AUTOVLLM_LLMFIT_SHA256": "c" * 64,
+        "AUTOLLAMACPP_VERSION": "b10242",
+        "AUTOLLAMACPP_SHA256": (
+            "b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3"
+        ),
+        "AUTOLLAMACPP_SOURCE_URL": (
+            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b10242.tar.gz"
+        ),
+    }
+    artifact = _artifact()
+    assert provisioner._start_script_env(None, InferenceEngine.LLAMA_CPP, artifact) == {
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOLLAMACPP_PORT": "8123",
+        "AUTOLLAMACPP_REQUIRE_CUDA": "1",
+        "AUTOLLAMACPP_MANAGED": "1",
+        "AUTOLLAMACPP_FIT_TARGET_MIB": "1536",
+        "AUTOLLAMACPP_GGUF_PATH": artifact.node_relative_entrypoint,
+        "AUTOLLAMACPP_MODEL_ALIAS": artifact.model_alias,
+        "HF_TOKEN": "hf secret",
+    }
     assert shlex.split(
         provisioner._script_command("setup.sh", env=provisioner._setup_script_env())
     ) == [
@@ -173,6 +303,129 @@ def test_script_env_prefix_exact() -> None:
         "bash",
         "auto-vllm/setup.sh",
     ]
+
+
+@pytest.mark.asyncio
+async def test_native_artifact_resolves_through_managed_launcher(
+    tmp_path: Path,
+) -> None:
+    """Compose discovery, setup selection, environment, and node resolution."""
+    repo_id = "org/model-with-separators-GGUF"
+    revision = "c" * 40
+    files = (
+        "quant/model -- q4-00001-of-00002.gguf",
+        "quant/model -- q4-00002-of-00002.gguf",
+    )
+    shared_root = tmp_path / "gateway shared root"
+    cache_dir = shared_root / "hub"
+    node_mount = tmp_path / "node mount"
+
+    def populate_cache(root: Path) -> None:
+        repo = root / "hub" / f"models--{repo_id.replace('/', '--')}"
+        snapshot = repo / "snapshots" / revision
+        blobs = repo / "blobs"
+        blobs.mkdir(parents=True)
+        for relative in files:
+            content = relative.encode()
+            blob = blobs / hashlib.sha256(content).hexdigest()
+            blob.write_bytes(content)
+            source = snapshot / relative
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.symlink_to(Path(os.path.relpath(blob, source.parent)))
+        refs = repo / "refs"
+        refs.mkdir()
+        (refs / "main").write_text(revision, encoding="utf-8")
+
+    populate_cache(shared_root)
+    populate_cache(node_mount)
+    artifact_index = GGUFArtifactIndex(
+        cache_dir,
+        shared_root=shared_root,
+    )
+    published = artifact_index.artifact_from_download(
+        repo_id=repo_id,
+        resolved_revision=revision,
+        snapshot_path=(
+            cache_dir / f"models--{repo_id.replace('/', '--')}" / "snapshots" / revision
+        ),
+        spec=GGUFDownloadSpec(files=files, entrypoint=files[0]),
+    )
+    provisioner = _make_provisioner(
+        settings=ProvisioningSettings(nfs_mount_point=str(node_mount)),
+        artifact_index=artifact_index,
+    )
+
+    selected = await provisioner.resolve_artifact_selection(
+        InferenceEngine.LLAMA_CPP, published.artifact_id
+    )
+    assert selected is not None
+    assert selected.artifact == published
+    env = {
+        **os.environ,
+        **provisioner._start_script_env(None, InferenceEngine.LLAMA_CPP, selected),
+    }
+    start_script = (
+        Path(__file__).resolve().parents[2] / "auto-llamacpp" / "start-llamacpp.sh"
+    )
+    command = "\n".join(
+        (
+            f"source {shlex.quote(str(start_script))}",
+            "resolve_gguf_artifact",
+            'printf "%s\\n%s\\n" "$GGUF_PATH" "$MODEL_ALIAS"',
+        )
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", command],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    expected_entrypoint = node_mount / selected.node_relative_entrypoint
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [str(expected_entrypoint), repo_id]
+    assert expected_entrypoint.is_symlink()
+
+
+@pytest.mark.asyncio
+async def test_artifact_resolution_does_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared_root = tmp_path / "shared root"
+    cache_dir = shared_root / "hub"
+    cache_dir.mkdir(parents=True)
+    artifact_index = GGUFArtifactIndex(cache_dir, shared_root=shared_root)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_get(_artifact_id: str) -> ResolvedGGUFArtifact:
+        started.set()
+        if not release.wait(timeout=0.5):
+            raise AssertionError("artifact lookup blocked the event loop")
+        return _artifact()
+
+    monkeypatch.setattr(artifact_index, "get", blocking_get)
+    provisioner = _make_provisioner(artifact_index=artifact_index)
+    resolution = asyncio.create_task(
+        provisioner.resolve_artifact_selection(
+            InferenceEngine.LLAMA_CPP,
+            "a" * 64,
+        )
+    )
+    try:
+        deadline = asyncio.get_running_loop().time() + 0.2
+        while not started.is_set() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.001)
+        assert started.is_set()
+        assert not resolution.done()
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+
+    assert await asyncio.wait_for(resolution, timeout=0.2) == _artifact()
 
 
 def test_env_prefix_quoting() -> None:
@@ -234,6 +487,79 @@ async def test_missing_nfs_export_fails_before_remote_work() -> None:
     ssh.upload.assert_not_called()
     ssh.run_streaming.assert_not_called()
     etcd.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_missing_engine_bundle_fails_before_remote_work(tmp_path: Path) -> None:
+    ssh = MagicMock()
+    provisioner = _make_provisioner(
+        ssh_client=ssh,
+        settings=ProvisioningSettings(scripts_dir=tmp_path / "auto-vllm"),
+    )
+
+    with patch.object(provisioner, "_provision", new_callable=AsyncMock) as body:
+        with pytest.raises(ProvisioningError, match="bundle is incomplete"):
+            await provisioner.provision("host1", engine=InferenceEngine.LLAMA_CPP)
+        body.assert_not_awaited()
+
+    ssh.upload.assert_not_called()
+    ssh.run_streaming.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_bundle_uses_configured_sibling_root(tmp_path: Path) -> None:
+    bundle_root = tmp_path / "bundle -- root with spaces"
+    vllm_dir = bundle_root / "renamed vllm bundle"
+    llama_dir = bundle_root / "auto-llamacpp"
+    common_dir = bundle_root / "common"
+    shutil.copytree(Path("auto-vllm"), vllm_dir)
+    shutil.copytree(Path("auto-llamacpp"), llama_dir)
+    shutil.copytree(Path("common"), common_dir)
+    ssh = MagicMock()
+    ssh.upload = AsyncMock()
+    provisioner = _make_provisioner(
+        ssh_client=ssh,
+        settings=ProvisioningSettings(scripts_dir=vllm_dir),
+    )
+
+    await provisioner._upload_scripts("host1", InferenceEngine.LLAMA_CPP)
+
+    assert [item.args for item in ssh.upload.await_args_list] == [
+        ("host1", llama_dir),
+        ("host1", common_dir),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_setup_uses_its_extended_total_timeout() -> None:
+    seen: list[tuple[str, str, float | None]] = []
+
+    async def mock_streaming(
+        host: str,
+        command: str,
+        *,
+        total_timeout: float | None = None,
+    ) -> AsyncIterator[tuple[str, str]]:
+        seen.append((host, command, total_timeout))
+        yield ("stdout", "[STEP:llamacpp_install:OK]")
+
+    ssh = MagicMock()
+    ssh.run_streaming = mock_streaming
+    provisioner = _make_provisioner(
+        ssh_client=ssh,
+        settings=ProvisioningSettings(llamacpp_setup_timeout=4321),
+    )
+
+    await provisioner._run_setup(
+        "host1",
+        started_at=datetime.now(UTC),
+        on_step=lambda _step: None,
+        engine=InferenceEngine.LLAMA_CPP,
+    )
+
+    assert seen[0][0] == "host1"
+    assert "auto-llamacpp/setup.sh" in seen[0][1]
+    assert seen[0][2] == 4321
 
 
 async def _async_iter(
@@ -377,6 +703,80 @@ class TestProvisionEndpointPolicy:
         ssh.upload.assert_not_awaited()
         ssh.run_streaming.assert_not_called()
         etcd.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_without_artifact_fails_before_remote_work() -> None:
+    ssh = MagicMock()
+    etcd = MagicMock()
+    provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
+
+    with patch.object(provisioner, "_provision", new_callable=AsyncMock) as body:
+        with pytest.raises(ProvisioningError, match="requires artifact_id"):
+            await provisioner.provision("host1", engine=InferenceEngine.LLAMA_CPP)
+        body.assert_not_awaited()
+
+    ssh.upload.assert_not_called()
+    ssh.run_streaming.assert_not_called()
+    etcd.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_shared_root_is_required_before_remote_work(
+    tmp_path: Path,
+) -> None:
+    ssh = MagicMock()
+    etcd = MagicMock()
+    cache_dir = tmp_path / "hub"
+    cache_dir.mkdir()
+    provisioner = _make_provisioner(
+        ssh_client=ssh,
+        etcd_client=etcd,
+        artifact_index=GGUFArtifactIndex(cache_dir),
+    )
+
+    with patch.object(provisioner, "_provision", new_callable=AsyncMock) as body:
+        with pytest.raises(ProvisioningError, match="HUGGINGFACE__SHARED_ROOT"):
+            await provisioner.provision(
+                "host1",
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact_id="a" * 64,
+            )
+        body.assert_not_awaited()
+
+    ssh.upload.assert_not_called()
+    ssh.run_streaming.assert_not_called()
+    etcd.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_artifact_selection_rejects_cross_engine_and_lookup_failures(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ProvisioningError, match="only valid for llama_cpp"):
+        await _make_provisioner().resolve_artifact_selection(
+            InferenceEngine.VLLM, "a" * 64
+        )
+
+    with pytest.raises(ProvisioningError, match="discovery is not configured"):
+        await _make_provisioner().resolve_artifact_selection(
+            InferenceEngine.LLAMA_CPP, "a" * 64
+        )
+
+    artifact_index = MagicMock(spec=GGUFArtifactIndex)
+    artifact_index.validate_shared_root.return_value = tmp_path
+    artifact_index.get.return_value = None
+    provisioner = _make_provisioner(artifact_index=artifact_index)
+    with pytest.raises(ProvisioningError, match="was not found"):
+        await provisioner.resolve_artifact_selection(
+            InferenceEngine.LLAMA_CPP, "b" * 64
+        )
+
+    artifact_index.get.side_effect = GGUFArtifactError("broken cache entry")
+    with pytest.raises(ProvisioningError, match="invalid: broken cache entry"):
+        await provisioner.resolve_artifact_selection(
+            InferenceEngine.LLAMA_CPP, "c" * 64
+        )
 
 
 class TestScriptUpload:
@@ -539,6 +939,26 @@ class TestModelExtraction:
             await provisioner._run_start_vllm("host1")
 
     @pytest.mark.asyncio
+    async def test_llamacpp_reported_alias_must_match_selected_artifact(self) -> None:
+        ssh = MagicMock()
+
+        async def mock_streaming(
+            host: str,
+            command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
+            yield ("stdout", "# Model:              wrong/model")
+
+        ssh.run_streaming = mock_streaming
+        provisioner = _make_provisioner(ssh_client=ssh)
+
+        with pytest.raises(ProvisioningError, match="expected selected artifact"):
+            await provisioner._run_start_vllm(
+                "host1",
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact=_artifact(),
+            )
+
+    @pytest.mark.asyncio
     async def test_includes_model_in_start_environment(self) -> None:
         """The model uses the same ordered start environment as other inputs."""
         ssh = MagicMock()
@@ -660,7 +1080,12 @@ class TestNodeRegistration:
                 "inference_proxy.provisioning.provisioner.node_to_etcd"
             ) as mock_serialize:
                 mock_serialize.return_value = ("/nodes/host1", b'{"model":"test"}')
-                await provisioner._register_node("host1", "test-model")
+                await provisioner._register_node(
+                    "host1",
+                    "test-model",
+                    engine=InferenceEngine.LLAMA_CPP,
+                    artifact_id="a" * 64,
+                )
 
                 # Verify Node was constructed correctly
                 call_args = mock_serialize.call_args
@@ -670,6 +1095,8 @@ class TestNodeRegistration:
                 assert node.model == "test-model"
                 assert node.endpoint == "http://host1:8000"
                 assert node.last_heartbeat is not None
+                assert node.engine is InferenceEngine.LLAMA_CPP
+                assert node.artifact_id == "a" * 64
 
                 # Each managed registration gets a fresh lease before its PUT.
                 assert mock_to_thread.call_args_list == [
@@ -834,6 +1261,51 @@ class TestProvisioningFailureAccuracy:
         assert state_payloads[-1]["current_step"] == "failed"
         assert state_payloads[-1]["failed_step"] == "uploading_scripts"
         assert json.loads(values["/nodes/host1"])["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_llamacpp_artifact_identity_survives_provision_failure(
+        self,
+    ) -> None:
+        """PROVISIONING and FAILED records retain the selected generation."""
+        etcd, values, _state_payloads = _recording_etcd()
+        ssh = MagicMock()
+        ssh.upload = AsyncMock(side_effect=RuntimeError("upload failed"))
+        provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
+        artifact = _artifact()
+
+        async def run_inline(
+            function: Callable[..., Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            return function(*args, **kwargs)
+
+        with (
+            patch.object(provisioner, "preflight", new_callable=AsyncMock),
+            patch(
+                "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                side_effect=run_inline,
+            ),
+            pytest.raises(RuntimeError, match="upload failed"),
+        ):
+            await provisioner._provision(
+                "host1",
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact=artifact,
+            )
+
+        initial_payload = next(
+            json.loads(call.args[1])
+            for call in etcd.put.call_args_list
+            if call.args[0] == "/nodes/host1"
+        )
+        failed_payload = json.loads(values["/nodes/host1"])
+        assert initial_payload["status"] == "provisioning"
+        assert initial_payload["engine"] == "llama_cpp"
+        assert initial_payload["artifact_id"] == artifact.artifact_id
+        assert failed_payload["status"] == "failed"
+        assert failed_payload["engine"] == "llama_cpp"
+        assert failed_payload["artifact_id"] == artifact.artifact_id
 
     @pytest.mark.asyncio
     async def test_setup_failure_records_emitted_step(self) -> None:
@@ -1071,6 +1543,286 @@ class TestPreflight:
                 assert len(exc_info.value.failures) >= 1
 
 
+class TestLlamaCppRuntimeFit:
+    def test_parses_final_runtime_records(self) -> None:
+        log_text = "\n".join(
+            (
+                _llamacpp_fit_log(context_per_slot=4096, gpu_layers=1),
+                _llamacpp_fit_log(
+                    context_per_slot=24577,
+                    slots=4,
+                    gpu_layers=37,
+                    total_layers=37,
+                ),
+            )
+        )
+
+        fit = _parse_llamacpp_runtime_fit(log_text)
+
+        assert fit.context_per_slot == 24577
+        assert fit.slot_context_limit == 24577
+        assert fit.slots == 4
+        assert fit.aggregate_context == 98308
+        assert fit.fit_target_mib == 512
+        assert fit.cache_type_k == "f16"
+        assert fit.cache_type_v == "f16"
+        assert fit.flash_attn == "auto"
+        assert fit.kv_unified is True
+        assert fit.gpu_layers == 37
+        assert fit.total_layers == 37
+
+    def test_accepts_expected_full_context_unified_kv_warnings(self) -> None:
+        fit = _parse_llamacpp_runtime_fit(
+            _llamacpp_fit_log(
+                context_per_slot=128000,
+                slot_context_limit=128000,
+                slots=8,
+                aggregate_context=1024000,
+            )
+        )
+
+        assert fit.context_per_slot == 128000
+        assert fit.slot_context_limit == 128000
+        assert fit.slots == 8
+        assert fit.aggregate_context == 1024000
+
+    def test_accepts_q8_kv_cache_runtime_evidence(self) -> None:
+        fit = _parse_llamacpp_runtime_fit(_llamacpp_fit_log(cache_type_k="q8_0"))
+
+        assert fit.cache_type_k == "q8_0"
+        assert fit.cache_type_v == "q8_0"
+        assert fit.flash_attn == "on"
+
+    @pytest.mark.parametrize(
+        ("log_text", "message"),
+        [
+            (
+                "llama_model_load: offloaded 37/37 layers to GPU\n"
+                "llama_context: n_ctx = 98304\n"
+                "srv init: initializing, n_slots = 4, n_ctx_slot = 24576, "
+                "kv_unified = 'true'",
+                "no QIIP VRAM plan",
+            ),
+            (
+                "qiip_fit_plan: context_per_slot=24576 slots=4 "
+                "aggregate_context=98304 fit_target_mib=512 "
+                "cache_type_k=f16 cache_type_v=f16 flash_attn=auto\n"
+                "llama_model_load: offloaded 37/37 layers to GPU\n"
+                "srv init: initializing, n_slots = 4, n_ctx_slot = 24576, "
+                "kv_unified = 'true'",
+                "no aggregate context record",
+            ),
+            (
+                "qiip_fit_plan: context_per_slot=24576 slots=4 "
+                "aggregate_context=98304 fit_target_mib=512 "
+                "cache_type_k=f16 cache_type_v=f16 flash_attn=auto\n"
+                "llama_context: n_ctx = 98304\n"
+                "llama_model_load: offloaded 37/37 layers to GPU",
+                "no effective context record",
+            ),
+            (
+                "qiip_fit_plan: context_per_slot=24576 slots=4 "
+                "aggregate_context=98304 fit_target_mib=512 "
+                "cache_type_k=f16 cache_type_v=f16 flash_attn=auto\n"
+                "llama_context: n_ctx = 98304\n"
+                "srv init: initializing, n_slots = 4, n_ctx_slot = 24576, "
+                "kv_unified = 'true'",
+                "no GPU offload record",
+            ),
+            (_llamacpp_fit_log(kv_unified=False), "requires unified KV cache"),
+            (_llamacpp_fit_log(context_per_slot=0), "invalid effective context"),
+            (
+                _llamacpp_fit_log(slot_context_limit=100000),
+                "invalid effective context",
+            ),
+            (
+                _llamacpp_fit_log(runtime_slots=3),
+                "runtime slot count differs",
+            ),
+            (
+                _llamacpp_fit_log(aggregate_context=98303),
+                "invalid aggregate context",
+            ),
+            (
+                _llamacpp_fit_log(runtime_aggregate_context=98000),
+                "runtime aggregate context differs",
+            ),
+            (
+                _llamacpp_fit_log(gpu_layers=36, total_layers=37),
+                "did not fully offload",
+            ),
+            (
+                _llamacpp_fit_log(gpu_layers=0, total_layers=0),
+                "did not fully offload",
+            ),
+            (
+                _llamacpp_fit_log(cache_type_k="q8_0", cache_type_v="f16"),
+                "requires matching K/V types",
+            ),
+            (
+                _llamacpp_fit_log(cache_type_k="q8_0", flash_attn="auto"),
+                "invalid Flash Attention policy",
+            ),
+            (
+                _llamacpp_fit_log(cache_type_k="q8_0", runtime_cache_type_k="f16"),
+                "runtime KV cache types differ",
+            ),
+            (
+                "\n".join(
+                    line
+                    for line in _llamacpp_fit_log().splitlines()
+                    if not line.startswith("llama_kv_cache")
+                ),
+                "no KV cache type record",
+            ),
+            (
+                _llamacpp_fit_log(context_sharing_warnings=False),
+                "missing expected unified-KV context-sharing warnings",
+            ),
+            (
+                _llamacpp_fit_log().replace(
+                    "n_ctx_train (24576)", "n_ctx_train (24575)", 1
+                ),
+                "context-sharing warnings differ from runtime",
+            ),
+            (
+                _llamacpp_fit_log()
+                + "\ncommon_fit_params: failed to fit params to free device memory",
+                "runtime fitting failure",
+            ),
+        ],
+    )
+    def test_rejects_missing_or_invalid_runtime_evidence(
+        self, log_text: str, message: str
+    ) -> None:
+        with pytest.raises(ProvisioningError, match=message):
+            _parse_llamacpp_runtime_fit(log_text)
+
+    @pytest.mark.asyncio
+    async def test_reports_parsed_fit_and_post_load_memory(self) -> None:
+        provisioner = _make_provisioner(
+            settings=ProvisioningSettings(llamacpp_fit_target_mib=1536)
+        )
+        with (
+            patch.object(
+                provisioner,
+                "_ssh_run_command",
+                new_callable=AsyncMock,
+                side_effect=[
+                    _llamacpp_fit_log(
+                        context_per_slot=24577,
+                        slot_context_limit=98308,
+                        fit_target_mib=1536,
+                    ),
+                    "20854, 2180\n20860, 2174",
+                ],
+            ) as run_command,
+            patch.object(provisioner, "_log") as log,
+        ):
+            await provisioner._verify_llamacpp_runtime("host1")
+
+        assert run_command.await_args_list == [
+            call("host1", "cat -- /var/log/llamacpp-serve.log"),
+            call(
+                "host1",
+                "nvidia-smi --query-gpu=memory.used,memory.free "
+                "--format=csv,noheader,nounits",
+            ),
+        ]
+        log.assert_called_once_with(
+            "host1",
+            "info",
+            "llama.cpp fitted: context_per_slot=24577 slot_context_limit=98308 "
+            "slots=4 aggregate_context=98308 kv_unified=true "
+            "cache_type_k=f16 cache_type_v=f16 flash_attn=auto "
+            "gpu_layers=37/37 fit_target_mib=1536 "
+            "gpu_used_mib=20854,20860 gpu_free_mib=2180,2174",
+        )
+
+    @pytest.mark.asyncio
+    async def test_below_target_post_load_memory_stops_llamacpp(self) -> None:
+        provisioner = _make_provisioner(
+            settings=ProvisioningSettings(llamacpp_fit_target_mib=1536)
+        )
+        run_command = AsyncMock(
+            side_effect=[
+                _llamacpp_fit_log(fit_target_mib=1536),
+                "21854, 1180",
+                "",
+            ]
+        )
+        with patch.object(provisioner, "_ssh_run_command", run_command):
+            with pytest.raises(ProvisioningError, match="below the configured"):
+                await provisioner._verify_llamacpp_runtime("host1")
+
+        assert run_command.await_args_list[-1] == call(
+            "host1", "bash auto-llamacpp/stop-llamacpp.sh"
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_runtime_contract_stops_llamacpp(self) -> None:
+        provisioner = _make_provisioner()
+        run_command = AsyncMock(
+            side_effect=[
+                _llamacpp_fit_log(gpu_layers=12, total_layers=37),
+                "",
+            ]
+        )
+        with patch.object(provisioner, "_ssh_run_command", run_command):
+            with pytest.raises(ProvisioningError, match="did not fully offload"):
+                await provisioner._verify_llamacpp_runtime("host1")
+
+        assert run_command.await_args_list == [
+            call("host1", "cat -- /var/log/llamacpp-serve.log"),
+            call("host1", "bash auto-llamacpp/stop-llamacpp.sh"),
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("memory_text", ["not-a-memory-record", "\n"])
+    async def test_invalid_memory_telemetry_stops_llamacpp(
+        self, memory_text: str
+    ) -> None:
+        provisioner = _make_provisioner()
+        run_command = AsyncMock(
+            side_effect=[
+                _llamacpp_fit_log(),
+                memory_text,
+                "",
+            ]
+        )
+        with patch.object(provisioner, "_ssh_run_command", run_command):
+            with pytest.raises(ProvisioningError, match="memory telemetry"):
+                await provisioner._verify_llamacpp_runtime("host1")
+
+        assert run_command.await_args_list[-1] == call(
+            "host1", "bash auto-llamacpp/stop-llamacpp.sh"
+        )
+
+    @pytest.mark.asyncio
+    async def test_cleanup_failure_preserves_runtime_contract_error(self) -> None:
+        provisioner = _make_provisioner()
+        cleanup_error = SSHConnectionError("host1", "connection lost")
+        run_command = AsyncMock(
+            side_effect=[
+                _llamacpp_fit_log(gpu_layers=12, total_layers=37),
+                cleanup_error,
+            ]
+        )
+        with (
+            patch.object(provisioner, "_ssh_run_command", run_command),
+            patch.object(provisioner, "_log") as log,
+            pytest.raises(ProvisioningError, match="did not fully offload"),
+        ):
+            await provisioner._verify_llamacpp_runtime("host1")
+
+        log.assert_called_once_with(
+            "host1",
+            "warning",
+            "llama.cpp runtime verification failed and the stop script also "
+            f"failed: {cleanup_error}",
+        )
+
+
 class TestVerifyGpu:
     """GPU verification after setup.sh installs the NVIDIA driver."""
 
@@ -1095,6 +1847,92 @@ class TestVerifyGpu:
             return_value="Tesla V100\nTesla V100",
         ):
             await provisioner._verify_gpu("host1")  # Should not raise
+
+    @pytest.mark.asyncio
+    async def test_llamacpp_provision_requires_gpu_before_engine_start(self) -> None:
+        """Managed llama.cpp never degrades into its standalone CPU branch."""
+        provisioner = _make_provisioner()
+        with (
+            patch.object(provisioner, "_update_state", new_callable=AsyncMock),
+            patch.object(provisioner, "_power_on_if_needed", new_callable=AsyncMock),
+            patch.object(provisioner, "preflight", new_callable=AsyncMock),
+            patch.object(provisioner, "_upload_scripts", new_callable=AsyncMock),
+            patch.object(provisioner, "_run_setup", new_callable=AsyncMock),
+            patch.object(
+                provisioner,
+                "_verify_gpu",
+                new_callable=AsyncMock,
+                side_effect=ProvisioningError("No GPUs detected"),
+            ) as verify_gpu,
+            patch.object(
+                provisioner, "_run_start_vllm", new_callable=AsyncMock
+            ) as start_engine,
+            patch(
+                "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            with pytest.raises(ProvisioningError, match="No GPUs detected"):
+                await provisioner._provision(
+                    "host1",
+                    model="org/model",
+                    engine=InferenceEngine.LLAMA_CPP,
+                )
+
+        verify_gpu.assert_awaited_once_with("host1")
+        start_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_llamacpp_runtime_fit_is_verified_after_health_before_register(
+        self,
+    ) -> None:
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        provisioner = _make_provisioner(etcd_client=etcd)
+        events: list[str] = []
+
+        with (
+            patch.object(provisioner, "_update_state", new_callable=AsyncMock),
+            patch.object(provisioner, "_power_on_if_needed", new_callable=AsyncMock),
+            patch.object(provisioner, "preflight", new_callable=AsyncMock),
+            patch.object(provisioner, "_upload_scripts", new_callable=AsyncMock),
+            patch.object(provisioner, "_run_setup", new_callable=AsyncMock),
+            patch.object(provisioner, "_verify_gpu", new_callable=AsyncMock),
+            patch.object(
+                provisioner,
+                "_run_start_vllm",
+                new_callable=AsyncMock,
+                return_value=_artifact().model_alias,
+            ),
+            patch.object(
+                provisioner, "_poll_health", new_callable=AsyncMock
+            ) as poll_health,
+            patch.object(
+                provisioner, "_verify_llamacpp_runtime", new_callable=AsyncMock
+            ) as verify_runtime,
+            patch.object(
+                provisioner, "_register_node", new_callable=AsyncMock
+            ) as register,
+            patch(
+                "inference_proxy.provisioning.provisioner.asyncio.to_thread",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            poll_health.side_effect = lambda *_args, **_kwargs: events.append("health")
+            verify_runtime.side_effect = lambda *_args, **_kwargs: events.append(
+                "runtime"
+            )
+            register.side_effect = lambda *_args, **_kwargs: events.append("register")
+
+            await provisioner._provision(
+                "host1",
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact=_artifact(),
+            )
+
+        assert events == ["health", "runtime", "register"]
 
 
 def _make_full_provisioner(etcd: MagicMock) -> tuple[NodeProvisioner, MagicMock]:
@@ -1454,6 +2292,84 @@ def _make_teardown_provisioner(
     return provisioner, ssh, etcd, registry, tracker
 
 
+class TestTeardownIdentity:
+    @pytest.mark.asyncio
+    async def test_unregistered_host_without_recovery_identity_fails_closed(
+        self,
+    ) -> None:
+        ssh = MagicMock()
+        ssh.upload = AsyncMock()
+        provisioner = _make_provisioner(
+            ssh_client=ssh,
+            registry=NodeRegistry(),
+        )
+
+        with pytest.raises(ProvisioningError, match="Cannot determine"):
+            await provisioner.teardown("host1", force=True)
+
+        ssh.upload.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_explicit_force_recovery_supplies_missing_engine(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provisioner = _make_provisioner(registry=NodeRegistry())
+        teardown = AsyncMock()
+        monkeypatch.setattr(provisioner, "_teardown", teardown)
+
+        await provisioner.teardown(
+            "host1",
+            force=True,
+            recovery_engine=InferenceEngine.LLAMA_CPP,
+        )
+
+        teardown.assert_awaited_once_with(
+            "host1",
+            force=True,
+            engine=InferenceEngine.LLAMA_CPP,
+        )
+
+    @pytest.mark.parametrize(
+        ("registered", "provisioning_identity", "force", "message"),
+        [
+            (
+                False,
+                ProvisioningIdentity(InferenceEngine.VLLM),
+                True,
+                "active provisioning identity",
+            ),
+            (True, None, True, "registered node identity"),
+            (False, None, False, "requires force=true"),
+        ],
+    )
+    def test_recovery_identity_cannot_override_authoritative_state(
+        self,
+        registered: bool,
+        provisioning_identity: ProvisioningIdentity | None,
+        force: bool,
+        message: str,
+    ) -> None:
+        registry = NodeRegistry()
+        if registered:
+            registry.add(
+                Node(
+                    node_id="host1",
+                    endpoint="host1:8000",
+                    engine=InferenceEngine.VLLM,
+                )
+            )
+        provisioner = _make_provisioner(registry=registry)
+
+        with pytest.raises(ProvisioningError, match=message):
+            provisioner._resolve_teardown_engine(
+                "host1",
+                force=force,
+                provisioning_identity=provisioning_identity,
+                recovery_engine=InferenceEngine.LLAMA_CPP,
+            )
+
+
 class TestTeardownGraceful:
     """D-01, D-08, D-11, D-12: Graceful teardown drains, stops, deregisters."""
 
@@ -1496,7 +2412,10 @@ class TestTeardownGraceful:
 
         async def mock_upload(host: str, local_path: Path) -> None:
             assert host == "host1"
-            assert local_path == provisioner._settings.scripts_dir
+            assert local_path in {
+                provisioner._settings.scripts_dir,
+                provisioner._settings.scripts_dir.parent / "common",
+            }
             operation_order.append("upload")
 
         async def mock_streaming(
@@ -1519,12 +2438,16 @@ class TestTeardownGraceful:
             await provisioner.teardown("host1")
 
         assert commands == ["bash auto-vllm/stop-vllm.sh"]
-        assert operation_order == ["upload", "stop"]
+        assert operation_order == ["upload", "upload", "stop"]
 
     @pytest.mark.asyncio
-    async def test_scripts_dir_respected_in_commands(self) -> None:
+    async def test_scripts_dir_respected_in_commands(self, tmp_path: Path) -> None:
         """E12: upload, setup, start, and stop share the configured bundle."""
-        scripts_dir = Path("bundles/provision scripts")
+        bundle_root = tmp_path / "bundles -- root"
+        scripts_dir = bundle_root / "provision scripts -- vllm"
+        shutil.copytree(Path("auto-vllm"), scripts_dir)
+        common_dir = bundle_root / "common"
+        shutil.copytree(Path("common"), common_dir)
         provisioner, ssh, _etcd, _registry, _tracker = _make_teardown_provisioner(
             scripts_dir=scripts_dir
         )
@@ -1551,10 +2474,13 @@ class TestTeardownGraceful:
         )
         await provisioner._run_start_vllm("host1", model="org/model")
 
-        assert ssh.upload.await_args_list[0].args == ("host1", scripts_dir)
+        assert [item.args for item in ssh.upload.await_args_list[:2]] == [
+            ("host1", scripts_dir),
+            ("host1", common_dir),
+        ]
         assert [shlex.split(command)[-1] for command in commands[:2]] == [
-            "provision scripts/setup.sh",
-            "provision scripts/start-vllm.sh",
+            "provision scripts -- vllm/setup.sh",
+            "provision scripts -- vllm/start-vllm.sh",
         ]
         assert all("auto-vllm/" not in command for command in commands)
 
@@ -1562,7 +2488,7 @@ class TestTeardownGraceful:
 
         assert shlex.split(commands[2]) == [
             "bash",
-            "provision scripts/stop-vllm.sh",
+            "provision scripts -- vllm/stop-vllm.sh",
             "--force",
         ]
         assert all("auto-vllm/" not in command for command in commands)

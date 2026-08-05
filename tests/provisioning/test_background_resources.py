@@ -14,10 +14,11 @@ from structlog.testing import capture_logs
 from inference_proxy.config.settings import LLMFitSettings, ProvisioningSettings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.endpoint import EndpointPolicy
-from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     ProvisioningCapacityError,
+    ProvisioningIdentity,
 )
 from inference_proxy.quads.client import QUADSClient
 from inference_proxy.quads.schedule_enforcer import ScheduleEnforcer
@@ -47,8 +48,42 @@ def _fire_background(
     return provisioner.fire_background(
         coro,
         provisioning_hostname=provisioning_hostname,
+        provisioning_identity=(
+            ProvisioningIdentity(InferenceEngine.VLLM)
+            if provisioning_hostname is not None
+            else None
+        ),
         task_name=task_name,
     )
+
+
+@pytest.mark.parametrize(
+    ("hostname", "identity"),
+    [
+        ("gpu01", None),
+        (None, ProvisioningIdentity(InferenceEngine.VLLM)),
+    ],
+)
+def test_provisioning_hostname_and_identity_are_required_together(
+    hostname: str | None,
+    identity: ProvisioningIdentity | None,
+) -> None:
+    """Host task ownership can never exist without exact serving identity."""
+    provisioner = _make_provisioner()
+
+    async def pending() -> None:
+        return None
+
+    background = pending()
+    try:
+        with pytest.raises(ValueError, match="must be supplied together"):
+            provisioner.fire_background(
+                background,
+                provisioning_hostname=hostname,
+                provisioning_identity=identity,
+            )
+    finally:
+        background.close()
 
 
 @pytest.mark.asyncio
@@ -64,6 +99,7 @@ async def test_provisioning_capacity_admits_exact_limit_then_rejects() -> None:
         provisioner.fire_background(
             blocked(),
             provisioning_hostname=f"gpu0{number}",
+            provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
         )
         for number in (1, 2)
     ]
@@ -74,6 +110,7 @@ async def test_provisioning_capacity_admits_exact_limit_then_rejects() -> None:
             rejected_task = provisioner.fire_background(
                 rejected,
                 provisioning_hostname="gpu03",
+                provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
             )
         except ProvisioningCapacityError as error:
             assert error.active == 2
@@ -101,6 +138,7 @@ async def test_capacity_is_released_when_provision_task_finishes() -> None:
     first = provisioner.fire_background(
         finish(),
         provisioning_hostname="gpu01",
+        provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
     )
     await asyncio.wait_for(first, timeout=1)
     await asyncio.sleep(0)  # let the ownership-removal callback run
@@ -108,6 +146,7 @@ async def test_capacity_is_released_when_provision_task_finishes() -> None:
     second = provisioner.fire_background(
         finish(),
         provisioning_hostname="gpu02",
+        provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
     )
     await asyncio.wait_for(second, timeout=1)
 
@@ -147,12 +186,14 @@ async def test_scheduling_failure_does_not_consume_capacity(
         provisioner.fire_background(
             rejected,
             provisioning_hostname="gpu01",
+            provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
         )
     rejected.close()
 
     admitted = provisioner.fire_background(
         finish(),
         provisioning_hostname="gpu02",
+        provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
     )
     await asyncio.wait_for(admitted, timeout=1)
 
@@ -173,6 +214,7 @@ async def test_full_provisioning_capacity_does_not_block_teardown() -> None:
     provision = provisioner.fire_background(
         blocked_provision(),
         provisioning_hostname="gpu01",
+        provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
     )
     teardown_task = _fire_background(
         provisioner,
@@ -201,6 +243,7 @@ async def test_failed_background_task_is_observed_once_with_context() -> None:
         task = provisioner.fire_background(
             fail(),
             provisioning_hostname="gpu01",
+            provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
         )
         with pytest.raises(RuntimeError, match="registration exploded"):
             await asyncio.wait_for(task, timeout=1)
@@ -253,6 +296,7 @@ async def test_shutdown_cancellation_emits_no_failure_or_callback_error() -> Non
             task = provisioner.fire_background(
                 blocked(),
                 provisioning_hostname="gpu01",
+                provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
             )
             await asyncio.wait_for(started.wait(), timeout=1)
             await asyncio.wait_for(provisioner.shutdown(), timeout=1)

@@ -141,6 +141,8 @@ class TestAdminBasicAuthentication:
             "gpu01",
             managed=False,
             model=None,
+            engine=ANY,
+            artifact_id=None,
             lifecycle_lease=ANY,
         )
 

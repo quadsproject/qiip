@@ -19,9 +19,11 @@ from inference_proxy.config.settings import (
     Settings,
 )
 from inference_proxy.main import create_app
+from inference_proxy.models.node import InferenceEngine
+from inference_proxy.provisioning.provisioner import ProvisioningIdentity
 
 
-def _health_worker(*args: object) -> None:
+def _health_worker(*args: object, **_kwargs: object) -> None:
     stop_event = args[2]
     if not isinstance(stop_event, threading.Event):
         raise TypeError("health worker did not receive a threading.Event")
@@ -53,9 +55,14 @@ async def _main(cache_dir: Path) -> None:
     started = asyncio.Event()
 
     async def blocked_provision(
-        hostname: str, *, managed: bool = True, model: str | None = None
+        hostname: str,
+        *,
+        managed: bool = True,
+        model: str | None = None,
+        engine: str = "vllm",
+        artifact: object | None = None,
     ) -> None:
-        del hostname, managed, model
+        del hostname, managed, model, engine, artifact
         started.set()
         await asyncio.Event().wait()
 
@@ -78,6 +85,7 @@ async def _main(cache_dir: Path) -> None:
                 task = provisioner.fire_background(
                     provisioner.provision("localhost"),
                     provisioning_hostname="localhost",
+                    provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
                 )
                 await asyncio.wait_for(started.wait(), timeout=1)
     finally:

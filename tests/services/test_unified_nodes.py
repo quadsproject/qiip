@@ -9,7 +9,7 @@ import pytest
 
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.admin import TaskStatusResponse
-from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.models.quads import QUADSHost
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 from inference_proxy.routing.connection_tracker import ConnectionTracker
@@ -37,6 +37,8 @@ def _node(
     model: str = "llama-3",
     *,
     managed: bool = True,
+    engine: InferenceEngine = InferenceEngine.VLLM,
+    artifact_id: str | None = None,
 ) -> Node:
     return Node(
         node_id=node_id,
@@ -44,6 +46,8 @@ def _node(
         status=status,
         model=model,
         managed=managed,
+        engine=engine,
+        artifact_id=artifact_id,
     )
 
 
@@ -93,6 +97,8 @@ class TestAvailableOnly:
         assert n.model == ""
         assert n.active_connections == 0
         assert n.circuit_breaker_state == "closed"
+        assert n.engine is None
+        assert n.artifact_id is None
 
     def test_available_host_gpu_fields(self) -> None:
         poller = _poller(
@@ -122,6 +128,21 @@ class TestEtcdNodeStates:
         assert n.gpu_vendor == "NVIDIA"
         assert n.gpu_model == "A100"
 
+    def test_registered_engine_and_artifact_are_preserved(self) -> None:
+        registry = NodeRegistry()
+        registry.add(
+            _node(
+                "gpu01",
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact_id="c" * 64,
+            )
+        )
+        svc = _service(registry=registry, poller=_poller())
+
+        node = svc.get_unified_nodes()[0]
+        assert node.engine is InferenceEngine.LLAMA_CPP
+        assert node.artifact_id == "c" * 64
+
     def test_unhealthy_state_and_actions(self) -> None:
         registry = NodeRegistry()
         registry.add(_node("gpu01", status=NodeStatus.UNHEALTHY))
@@ -130,7 +151,7 @@ class TestEtcdNodeStates:
 
         n = svc.get_unified_nodes()[0]
         assert n.state == "unhealthy"
-        assert n.actions == ["teardown", "retry"]
+        assert n.actions == ["teardown"]
 
     def test_provisioning_state_and_actions(self) -> None:
         registry = NodeRegistry()

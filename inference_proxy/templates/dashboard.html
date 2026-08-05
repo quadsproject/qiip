@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Open+Sans:wght@400;500;600;700&family=Poppins:wght@500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="{{ url_for('static', path='css/dashboard.css') }}">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
     <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
 </head>
 <body>
@@ -44,8 +44,12 @@
                 <div id="manual-setup-row" style="display: none;">
                     <form id="setup-form" class="setup-form">
                         <input type="text" id="setup-hostname" placeholder="Enter hostname" required>
+                        <label>Engine <select id="setup-engine-select" class="setup-select setup-engine-select"></select></label>
+                        <select id="model-select" class="setup-select setup-model-select" aria-label="vLLM model"></select>
+                        <select id="artifact-select" class="setup-select setup-artifact-select" aria-label="GGUF artifact" style="display:none"></select>
                         <label class="standalone-label"><input type="checkbox" id="setup-standalone"> Standalone (no QUADS)</label>
                         <button type="submit" id="setup-btn">Setup Node</button>
+                        <span id="model-status" style="color:var(--muted);font-size:0.875rem;display:none"></span>
                     </form>
                 </div>
                 <div class="table-wrap">
@@ -55,6 +59,7 @@
                                 <th scope="col">Node ID</th>
                                 <th scope="col">GPU Vendor</th>
                                 <th scope="col">GPU Model</th>
+                                <th scope="col">Engine</th>
                                 <th scope="col">Model</th>
                                 <th scope="col">Config</th>
                                 <th scope="col">State</th>
@@ -63,7 +68,7 @@
                             </tr>
                         </thead>
                         <tbody id="node-table-body">
-                            <tr><td colspan="8">Loading node data...</td></tr>
+                            <tr><td colspan="9">Loading node data...</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -78,7 +83,8 @@
     </footer>
 
     <script>const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};</script>
-    <script src="{{ url_for('static', path='js/config_download.js') }}"></script>
-    <script src="{{ url_for('static', path='js/dashboard.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/config_download.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/setup_selection.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/dashboard.js') }}"></script>
 </body>
 </html>

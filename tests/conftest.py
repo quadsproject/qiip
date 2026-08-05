@@ -172,6 +172,7 @@ def app(
         side_effect=lambda hostname: MagicMock(hostname=hostname)
     )
     mock_provisioner.connection_count = MagicMock(return_value=0)
+    mock_provisioner.resolve_artifact_selection = AsyncMock(return_value=None)
     mock_provisioner.cleanup_stale_node = AsyncMock()
     mock_provisioner.provision = AsyncMock()
     mock_provisioner.teardown = AsyncMock()
@@ -187,7 +188,6 @@ def app(
     application.dependency_overrides[get_catalog_service] = lambda: mock_catalog
     mock_download_service = MagicMock()
     mock_download_service.trigger_download = AsyncMock()
-    mock_download_service.get_status = MagicMock(return_value=None)
     mock_download_service.get_all_statuses = MagicMock(return_value=[])
     application.state.download_service = mock_download_service
     application.dependency_overrides[get_download_service] = lambda: (

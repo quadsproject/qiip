@@ -157,7 +157,7 @@ INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT=storage.example.com:/exports/huggingface
 INFERENCE_PROXY_PROVISIONING__NFS_MOUNT_POINT=/srv/hf-cache
 ```
 
-The gateway cache path and node mount path may differ; `NFS_EXPORT` is the declared mapping between them. Proxy-only deployments may omit the export. A node setup without it returns 400 before acquiring a lease or doing remote work.
+The gateway cache path and node mount path may differ; `NFS_EXPORT` is the declared mapping between them. Proxy-only deployments may omit the export. A node setup without it returns 400 before acquiring a lease or doing remote work. Managed llama.cpp also requires the gateway-local export root described in section 22 so its native Hub snapshot path can be translated to the node mount.
 
 ### 11. Rename node launch overrides to `AUTOVLLM_*`
 
@@ -209,12 +209,12 @@ The upgrade therefore changes the node runtime versions as well as the package t
 
 ### 15. Account for model catalog verification
 
-The model catalog lists only snapshots that HuggingFace's local-only resolution verifies as complete and that carry a tree manifest. Two counts explain hidden entries:
+The model catalog lists full vLLM models only when HuggingFace's local-only resolution verifies a complete snapshot with a tree manifest. Native GGUF discovery is independent: a valid standalone file or complete split family can appear in `gguf_artifacts` even when its repository increments one of these counts:
 
 - `incomplete_count`: a manifest exists but required files are missing.
 - `unverifiable_count`: the legacy cache entry has no tree manifest, so completeness cannot be proven.
 
-When either count is nonzero, `/admin/models/catalog` returns `X-Inference-Proxy-Data-Degraded: model-catalog`, and the dashboard explains that some cache entries are hidden. A pre-manifest cache can therefore appear empty even when model files exist. Re-download or otherwise migrate those snapshots so the current HuggingFace tooling creates verifiable metadata.
+When either count is nonzero, `/admin/models/catalog` returns `X-Inference-Proxy-Data-Degraded: model-catalog`, and the dashboard explains that some cache entries are hidden. A pre-manifest cache can therefore hide a vLLM model even while exposing its valid GGUF files. Re-download or otherwise migrate those snapshots so the current HuggingFace tooling creates verifiable metadata.
 
 Duplicate download requests now return 200 with the existing status; a newly started download returns 202. The download worker limit remains two concurrent downloads.
 
@@ -254,6 +254,189 @@ Redfish is disabled only when both BMC credentials are absent. Configuring only 
 
 Power endpoints accept DNS hostnames that pass the routing hostname allowlist; IP literals are rejected for BMC template expansion. Credentials are attached per request only after both the input hostname and rendered BMC destination validate. `REDFISH__VERIFY_SSL=false` remains the default for self-signed BMC certificates.
 
+### 20. Prepare managed llama.cpp nodes for verified CUDA source builds
+
+QIIP no longer attempts to download a Linux CUDA archive that upstream does not
+publish. Managed llama.cpp setup downloads the pinned tag source, verifies its
+SHA-256 before extraction, and builds CUDA-enabled `llama-server` and
+`llama-quantize` binaries on the node. The default setup deadline for this path
+is two hours:
+
+```dotenv
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION=b10242
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256=b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT=7200
+```
+
+Changing the version requires an explicitly configured matching digest. A
+custom source mirror is selected through the validated
+`INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` template. Ensure managed
+nodes can reach the selected source and NVIDIA package repositories and have
+enough local space for a CUDA build.
+
+Managed setup and launch now require a verified NVIDIA GPU and never fall back
+to CPU inference. Direct use of the scripts retains the existing standalone CPU
+branch, but it is outside QIIP's managed-node support boundary. Validate a
+disposable node from each GPU family before fleet rollout because the build is
+specialized for the attached CUDA architecture. The supporting CPU backend is
+built with `GGML_NATIVE=OFF` to avoid host-specific compiler/assembler feature
+mismatches; this fixed profile is part of the immutable build identity.
+
+### 21. Use exact immutable GGUF artifacts
+
+The short-lived `allow_patterns` field on `POST /admin/models/download` has
+been removed. It could select multiple unrelated files and could not identify
+one loadable split GGUF generation. Unknown request fields are now rejected,
+so callers still sending `allow_patterns` receive 422 rather than a silently
+different download.
+
+For llama.cpp, send `engine: "llama_cpp"` plus an exact `gguf` object containing
+the ordered repository-relative files and the entrypoint. Download status now
+includes a stable `download_id`, the requested revision, the resolved commit
+SHA, and the exact artifact identity. Setup requires that artifact's 64-character
+`artifact_id`; a missing, unknown, or invalid artifact is rejected before a
+host lease, QUADS lookup, SSH, driver installation, or CUDA source build.
+
+`AUTOLLAMACPP_MODEL` and `AUTOLLAMACPP_QUANTIZATION` no longer select files.
+Standalone launchers must provide `AUTOLLAMACPP_GGUF_PATH` and
+`AUTOLLAMACPP_MODEL_ALIAS`. The path is relative to the mounted shared-export
+root and must resolve beneath the configured NFS mount.
+
+Artifact identity uses the resolved commit SHA, exact ordered file set,
+entrypoint, and alias. Re-downloading a moving branch therefore creates a new
+immutable generation instead of replacing the old one. QIIP deliberately does
+not prune backing HuggingFace snapshots; coordinate retention only after
+confirming no running or restartable node depends on them.
+
+### 22. Map native GGUF snapshots from the shared export
+
+The short-lived `<CACHE_DIR>/gguf/<artifact-id>/` publication tree is no longer
+read or written. QIIP discovers standalone GGUF files and complete llama.cpp
+split families directly from native Hugging Face snapshot directories. Existing
+cache files therefore become selectable without republishing or moving model
+data.
+
+Before managed llama.cpp setup, configure the gateway-local root of the same
+export mounted on each node:
+
+```dotenv
+INFERENCE_PROXY_HUGGINGFACE__SHARED_ROOT=/mnt/scratch
+INFERENCE_PROXY_HUGGINGFACE__CACHE_DIR=/mnt/scratch/hub
+INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT=storage.example.com:/exports/hf-cache
+INFERENCE_PROXY_PROVISIONING__NFS_MOUNT_POINT=/srv/hf-cache
+```
+
+`CACHE_DIR` must resolve beneath `SHARED_ROOT`. In this example QIIP sends a
+node-relative path beginning with `hub/models--.../snapshots/...`, which the
+node resolves under `/srv/hf-cache`. Proxy-only and vLLM-only deployments may
+omit `SHARED_ROOT`; a llama.cpp setup without a valid mapping returns 400 before
+reserving the host or starting SSH work.
+
+Artifact IDs remain identical for R2-compatible single-file artifacts and
+complete split families whose files were already ordered from shard 1 through
+N with shard 1 as the entrypoint, because their identity tuple is unchanged.
+An older artifact containing several unrelated files, a noncanonical shard
+order, or an arbitrary entrypoint is intentionally not reconstructible. Remove
+any abandoned `<CACHE_DIR>/gguf` tree only after confirming that no out-of-tree
+tooling depends on it; QIIP does not use it.
+
+Deleting or partially pruning the backing snapshot makes its persisted
+`artifact_id` unresolvable. GGUF discovery is independent of Hugging Face tree
+manifest health, so a valid generation can appear in `gguf_artifacts` while the
+same repository still increments `incomplete_count` or `unverifiable_count`.
+Treat those counters as cache-health signals instead of assuming a visible GGUF
+suppresses them. The dashboard also no longer chooses the first artifact: select
+the exact entrypoint or quantization explicitly.
+
+### 23. Let managed llama.cpp fit context and concurrency to available VRAM
+
+Managed llama.cpp no longer assigns context, GPU layers, parallel slots, or
+batch size from GPU-name heuristics. It invokes the pinned `llama-fit-params`
+memory estimator and configures only the resulting plan. Set the free-memory
+target:
+
+```dotenv
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB=1024
+```
+
+The value is a positive MiB margin per GPU. The planner first maximizes the
+guaranteed context per request up to the model's trained length, reducing it in
+256-token steps only when one full-length request cannot fit. It then maximizes
+parallel slots up to llama.cpp's 256-sequence limit. The unified KV pool is
+sized to at least `context_per_slot * slots`, so the selected concurrency can
+serve every slot at the guaranteed context rather than sharing a single
+model-length pool.
+
+The build profile changes from `cuda-portable-cpu-v1` to
+`cuda-portable-cpu-v2-fit-concurrency` because managed nodes now install
+`llama-fit-params` and expose unified-KV estimation in its pinned CLI. The first
+setup after upgrade performs one new source build per existing GPU/build
+identity; later setup remains idempotent. The exact CLI transformation digest
+is recorded in `BUILD-INFO` and participates in that identity. Setup also
+smoke-tests every planner flag against the built helper before publishing it.
+
+QIIP still enforces its CUDA-only boundary: managed launch explicitly requests
+all GPU layers and disables a second server fitting pass. After `/health`
+succeeds, QIIP rejects the launch unless the runtime matches the plan, the KV
+cache is unified, every model layer was offloaded, and post-load free VRAM meets
+the configured target. Failed verification runs `stop-llamacpp.sh` before
+provisioning is marked failed.
+
+QIIP sets `AUTOLLAMACPP_MANAGED=1`. In that mode the launcher rejects
+`AUTOLLAMACPP_CTX_SIZE`, `AUTOLLAMACPP_GPU_LAYERS`,
+`AUTOLLAMACPP_PARALLEL`, `AUTOLLAMACPP_BATCH_SIZE`, and
+`AUTOLLAMACPP_EXTRA_ARGS`; remove those variables from managed hosts before
+retrying. Standalone script use retains them. Ambient `LLAMA_ARG_*` variables,
+including `LLAMA_ARG_CTX_SIZE`, continue to be cleared before launch.
+
+The provisioning log records `context_per_slot`, `slot_context_limit`, `slots`,
+`aggregate_context`, `kv_unified`, `gpu_layers`, the configured fit target, and
+post-load GPU memory from the node. Do not assume four slots: concurrency is now
+a property of the selected model, quantization, GPU topology, and free-memory
+target. `context_per_slot` is QIIP's simultaneous-capacity guarantee;
+`slot_context_limit` is llama.cpp's maximum for one request; and
+`aggregate_context` is the total unified KV pool. When the aggregate exceeds
+the model training context, b10242's `possible training context overflow` and
+slot-capping warnings are expected and validated. A fitter-failure warning is
+still fatal.
+
+Managed servers run at llama.cpp verbosity 4 for their entire lifetime because
+the pinned build exposes fit and offload evidence at the trace threshold. This
+can evict older setup messages sooner from the bounded dashboard log while QIIP
+tails startup, but the tail stops after `/health`, so later request traffic does
+not change that retained provisioning record. Increase
+`INFERENCE_PROXY_PROVISIONING__LOG_MAX_ENTRIES_PER_HOST` or
+`INFERENCE_PROXY_PROVISIONING__LOG_MAX_BYTES_PER_HOST` if measurement shows the
+default 1,000 entries or 1 MiB is insufficient. Runtime trace continues to
+accumulate in `/var/log/llamacpp-serve.log`; include it in the node's log-rotation
+policy.
+
+### 24. Allow Q8 KV rescue while retaining a configurable reserve
+
+The managed llama.cpp fit target remains configurable, but its default changes
+from 1,024 MiB to 512 MiB per GPU:
+
+```dotenv
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB=512
+```
+
+An explicitly configured value is unchanged during upgrade. Keep or raise the
+old 1,024 MiB value when GPUs are shared or other CUDA allocations need the
+additional headroom. The planner still fails closed when actual post-load free
+VRAM is below the configured value.
+
+Managed planning now prefers F16 K/V cache storage, as before, but retries the
+entire plan with Q8_0 for both K and V when F16 cannot fully offload one request
+at the 4,096-token floor. The Q8_0 attempt explicitly enables Flash Attention
+in both estimation and serving. QIIP does not fall back to Q4, mixed K/V types,
+or CPU layer spill. Models that cannot meet the minimum Q8_0 plan still fail
+setup. Q8_0 can change generation relative to F16; inspect the emitted cache
+types when comparing output across nodes.
+
+The startup record now includes `cache_type_k`, `cache_type_v`, and
+`flash_attn`. Post-health verification reads llama.cpp's allocated KV-cache
+record and rejects a runtime whose cache types differ from the plan.
+
 ## Artifact Sources and Mirror Policy
 
 There is no single global mirror switch. Each source has a different trust and configuration boundary.
@@ -263,6 +446,8 @@ There is no single global mirror switch. Each source has a different trust and c
 | NVIDIA `.run` installer used by `setup.sh` | Node-side `NVIDIA_DRIVER_URL`; the gateway does not forward a URL setting | `AUTOVLLM_NVIDIA_DRIVER_SHA256`, normally populated from `PROVISIONING__NVIDIA_DRIVER_SHA256` | Point the node-side variable at a mirror serving byte-identical content, or configure the matching custom digest with the custom version. |
 | LLMFit archive used by `setup.sh` | Node-side `LLMFIT_URL`; the gateway forwards version and digest but not this URL | `AUTOVLLM_LLMFIT_SHA256`, normally populated from `LLMFIT__SHA256` | Point the node-side variable at byte-identical mirrored content. When invoking setup through QIIP, arrange the variable in the node's SSH environment or customize the shipped bundle. |
 | On-demand LLMFit runner install | `INFERENCE_PROXY_LLMFIT__INSTALL_URL` | `INFERENCE_PROXY_LLMFIT__SHA256` | Set the validated HTTP(S) `{version}` URL template and matching digest. Configure this separately from the setup-script URL. |
+| llama.cpp source archive | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` with the pinned `LLAMACPP_VERSION` | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256`; verification happens before extraction or build | Point the validated `{version}` URL template at a mirror serving byte-identical tag archives, or configure the matching digest with a custom version. Managed nodes compile CUDA-enabled binaries locally because the pinned release has no Linux CUDA archive. |
+| HuggingFace model snapshots and GGUF files | Repository ID, optional requested revision, and exact GGUF file set in the administrative download request | Download status records the resolved immutable commit; native discovery binds that commit to one standalone GGUF or complete split family and an exact entrypoint | Pre-seed the standard HuggingFace cache on the declared NFS export. QIIP does not provide a separate model-hub mirror URL. A resolved commit records reproducibility but is not an independently configured content digest. |
 | uv bootstrap binary | Pinned GitHub release in `setup.sh` and `auto-vllm/.uv-version` | Vendored checksum from Astral's release assets | Air-gapped nodes may preinstall the exact pinned uv version at the expected path. Changing the download source requires a reviewed bundle change. |
 | vLLM, FlashInfer, and Python dependencies | `auto-vllm/pyproject.toml` plus `auto-vllm/uv.lock` | Registry artifact hashes for the full installable closure; source builds are refused | Regenerate and review the node project and lock for a custom index. Runtime `FLASHINFER_INDEX_URL` overrides are rejected. A pre-seeded uv cache may be used only when it satisfies the frozen lock. |
 | DNF and CUDA RPM packages | Node repository configuration; setup also enables NVIDIA's RHEL 9 CUDA repository | Repository metadata and RPM signatures | Manage mirrors through node repository policy or a reviewed setup-bundle customization. QIIP has no gateway-level DNF mirror setting. |
@@ -282,9 +467,20 @@ The node-only `NVIDIA_DRIVER_URL` and `LLMFIT_URL` variables are intentionally d
 | **Correctness fix** | Retryable non-streaming 5xx and transport failures now fail over to another eligible node and count against the circuit breaker. | Remove workarounds that manually retried every 5xx without considering the proxy's attempt budget. |
 | **Correctness fix** | Upstream 4xx responses pass through verbatim, are not retried, and do not carry the exhaustion marker. A 4xx is neutral circuit-breaker evidence: it neither increments failures nor clears earlier failures. | Expect upstream `error.type`, `error.code`, `param`, and other fields to survive unchanged. Remove wrapper-specific parsing workarounds. |
 | **Correctness fix** | Chat messages preserve tool calls, `content: null`, multimodal content parts, and additional OpenAI-compatible fields. Completion prompts preserve string, string-array, token-ID, and nested token-ID forms. | Remove client-side transformations that existed only to prevent the proxy from stripping these fields; retaining them can cause duplicate handling. |
+| **Behavioral break** | `/v1/models[].owned_by` now reports the registered node's engine (`vllm` or `llama_cpp`) instead of always reporting `vllm`. | Treat `owned_by` as backend metadata rather than a constant. Do not filter otherwise valid models solely because the value is not `vllm`. |
 | **Defined boundary** | After a streaming response has started, an upstream failure is not retried. The proxy emits an OpenAI-format error event followed by `[DONE]`. | Treat a mid-stream error as terminal and do not concatenate a second backend's output onto the partial response. |
 
 No failover marker is added when no backend attempt occurred, such as when no node serves the requested model. A non-retryable error returned after one attempt is also not marked as exhausted.
+
+Node records now accept and ignore unknown additive fields during
+deserialization. This permits mixed-version gateways to read records written by
+a newer peer without discarding the node. Records now include nullable
+`artifact_id`: older gateways ignore this additive field, while records written
+before it existed load with `artifact_id: null`. The `engine` value itself
+remains a closed enum: an unrecognized engine string makes the record invalid
+and the watcher excludes it, so introduce new engine values only with an
+ordered gateway rollout. Do not rely on artifact identity until every gateway
+that may provision or display the node understands the field.
 
 ### Administrative API and browser interfaces
 
@@ -295,6 +491,17 @@ No failover marker is added when no backend attempt occurred, such as when no no
 | **New surface** | Setup returns 429 when the configurable provisioning limit is full, including the active count and limit in `detail`. | Retry after another setup completes; teardown remains available and should not be blocked behind setup retries. |
 | **New surface** | `/admin/nodes` and `/admin/models/catalog` can return `X-Inference-Proxy-Data-Degraded` with `provisioning-tasks` or `model-catalog`. | Surface the degraded state instead of treating missing task fields or an empty catalog as authoritative. |
 | **Correctness fix** | A duplicate model-download POST returns 200 with the existing status; a newly accepted download returns 202. | Accept both success codes and inspect the returned download state. |
+| **Behavioral break** | Model downloads reject the removed `allow_patterns` field. llama.cpp downloads require an exact `gguf.files` and `gguf.entrypoint`; setup requires the resulting `artifact_id`. | Update direct administrative clients to the exact-artifact contract and handle 422 for obsolete request bodies. |
+| **New surface** | Download status records `download_id`, requested and resolved revisions, and exact artifacts. The catalog returns validated GGUF generations in `gguf_artifacts`, separate from full vLLM `models`. | Persist the resolved SHA and artifact ID when reproducibility matters. Keep the backing native snapshot while any node depends on that ID. |
+| **Behavioral break** | GGUF artifacts are discovered from native Hugging Face snapshots instead of the removed `<CACHE_DIR>/gguf` publication tree. Valid GGUFs remain visible even when their repository is incomplete or unverifiable, and the dashboard does not select the first artifact automatically. | Configure `HUGGINGFACE__SHARED_ROOT` before managed llama.cpp setup, preserve native snapshots referenced by nodes, inspect cache-health counters separately from `gguf_artifacts`, and select the exact GGUF entrypoint explicitly. |
+| **Behavioral break** | Managed llama.cpp setup uses the pinned estimator to maximize per-request context and then concurrency, sizes unified KV for every selected slot, and rejects manual context, GPU-layer, parallel, batch, and extra-argument overrides. A healthy endpoint is not registered until the runtime matches the plan, retains the configured VRAM margin, uses unified KV, and fully offloads the model. | Remove managed-host `AUTOLLAMACPP_*` sizing overrides, tune only `PROVISIONING__LLAMACPP_FIT_TARGET_MIB`, and use the emitted context, aggregate-context, and slot values when setting workload limits. |
+| **Behavioral break** | The managed llama.cpp free-VRAM target defaults to 512 MiB instead of 1,024 MiB. When F16 K/V cannot meet the minimum full-offload plan, QIIP retries with matching Q8_0 K/V and Flash Attention; it never falls below Q8_0 automatically. | Keep an explicit 1,024 MiB or larger target for shared GPUs. Monitor the emitted cache types and post-load free memory; select a smaller model when the Q8_0 minimum still fails. |
+| **Behavioral break** | `/admin/nodes[].engine` is now nullable. Registered nodes report `vllm` or `llama_cpp`; QUADS-only hosts report `null` instead of the previous fabricated `vllm` value. | Treat `null` as “not provisioned or no registered engine identity,” not as vLLM. Update clients whose schema requires a string. |
+| **New surface** | `/admin/nodes[]` now includes nullable `artifact_id`. Managed llama.cpp nodes report the exact discovered GGUF generation selected at setup; vLLM, older, manual, and QUADS-only records can report `null`. | Preserve the field when correlating a node with the GGUF catalog, but continue to handle `null` during rolling upgrades and for non-artifact-backed nodes. |
+| **Behavioral break** | Recommendation `runtime` values are normalized to `vllm`, `llama_cpp`, `mlx`, or `unknown` instead of preserving LLMFit spellings such as `vLLM` and `llama.cpp`. | Compare against the canonical values. Treat this recommendation vocabulary as distinct from the provisionable `InferenceEngine` enum: `mlx` and `unknown` cannot be selected for setup. |
+| **New surface** | Recommendations can include typed `gguf_sources` entries with `repo` and `provider`. The dashboard joins `gguf_sources[].repo` to catalog `gguf_artifacts[].repo_id` exactly and case-sensitively. | Preserve the additive source list. Do not infer an exact GGUF download from it because LLMFit does not supply the required files, shard grouping, or entrypoint. |
+| **Behavioral break** | Unhealthy nodes no longer advertise `retry` in `/admin/nodes[].actions`; setup already rejected that state. | Tear down an unhealthy registered node before starting setup instead of presenting a retry action that the API will refuse. |
+| **New surface** | Dashboard setup controls choose a catalog-backed vLLM model or exact GGUF artifact, and fleet and detail tables display registered engine identity. Retrying an existing failed node leaves selection implicit so the server retains its latest identity under the lifecycle lease. Sending any one of `engine`, `model`, or `artifact_id` instead makes the entire selection explicit; omitted peers use request defaults rather than registered-node identity. | Refresh the catalog before setup and resolve degraded catalog warnings. For an identity-preserving retry, omit all three selection fields. For an override, send the complete engine-specific selection rather than relying on field-level inheritance. |
 | **Correctness fix** | Setup eligibility is status-aware and serialized by a per-host lifecycle lease. Live healthy or unhealthy nodes require explicit teardown; stale provisioning, failed, unknown, or zero-connection draining records can be cleaned before retry. | Handle actionable 400/409 responses rather than assuming every repeated setup request is accepted. |
 | **Correctness fix** | Recommendation targets must be registered or currently QUADS-available and must pass the endpoint allowlist. | Do not use the recommendation endpoint as an unrestricted SSH target. |
 | **Correctness fix** | `GracefulRestart` and `ForceRestart` always issue a Redfish reset even when the machine is already On. Only `On` and `ForceOff` are idempotent shortcuts. Malformed or unsupported BMC power states return a structured 502. | Do not use a restart action as a state probe; expect it to restart a running machine. |
@@ -313,10 +520,11 @@ Do not recreate expired keys manually with `managed: true` unless the external w
 
 ### Empty or degraded model catalog
 
-1. Request `/admin/models/catalog` with headers and inspect `incomplete_count`, `unverifiable_count`, and `X-Inference-Proxy-Data-Degraded`.
+1. Request `/admin/models/catalog` with headers and inspect `incomplete_count`, `unverifiable_count`, `invalid_artifact_count`, `cache_warning_count`, and `X-Inference-Proxy-Data-Degraded`.
 2. For incomplete snapshots, restart the download and verify the download status reaches completion.
 3. For unverifiable legacy snapshots, re-download with the current HuggingFace tooling so tree-manifest metadata is created.
-4. Refresh the catalog and verify both degraded counts are zero before provisioning a node with one of those models.
+4. For invalid GGUF candidates, preserve the backing snapshot for diagnosis and re-run the exact download rather than editing cache links manually.
+5. Refresh the catalog and verify the selected GGUF remains visible. Investigate any nonzero invalid, incomplete, unverifiable, or cache-warning count independently; one valid GGUF does not suppress unrelated cache-health signals.
 
 The catalog intentionally hides entries it cannot prove complete. Do not work around this by advertising the directory name directly; vLLM can otherwise start a long re-download or fail during model load while setup reports only a health-poll timeout.
 
@@ -329,6 +537,40 @@ Gateway shutdown cancels the async download wrapper without waiting indefinitely
 - Teardown cancels and awaits an active local provision task, then verifies vLLM termination. Closing the SSH operation cannot guarantee that a remote installer backgrounded by the shell also stopped; inspect package-manager locks and node state after cancelling during driver or package installation.
 - Failed teardown retains registration and PID evidence when shutdown cannot be verified. Do not delete those records merely to clear the dashboard; they are the information needed to finish cleanup safely.
 - A scheduling enforcer failure backs off rather than retrying every cycle. Alert on `schedule_enforcer_teardown_requires_operator`.
+
+### Recover an unregistered orphaned engine
+
+Normal teardown no longer guesses vLLM when neither an active provisioning task
+nor a registered node supplies engine identity. This closes the case where a
+cancelled llama.cpp provision was incorrectly dispatched through
+`stop-vllm.sh`. An unknown host now fails closed.
+
+Use the explicit recovery parameter only when etcd has no node record but an
+operator has independently verified that vLLM or llama.cpp remains on the host:
+
+```bash
+curl -X DELETE \
+  -u "$INFERENCE_PROXY_ADMIN__USERNAME:$INFERENCE_PROXY_ADMIN__PASSWORD" \
+  "https://gateway.example.com/admin/nodes/gpu01?force=true&recovery_engine=llama_cpp"
+```
+
+The request is rejected unless all of these conditions hold:
+
+1. `force=true` is present and `recovery_engine` is `vllm` or `llama_cpp`.
+2. The node has no registry entry before or after lifecycle-lease acquisition.
+3. The hostname passes `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_HOSTS`,
+   `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_NETWORKS`, and
+   `INFERENCE_PROXY_ROUTING__ALLOWED_ENDPOINT_PORTS`.
+4. No provisioning, teardown, or other lifecycle operation owns the host lease.
+
+Recovery never cancels active provisioning. A 409 means the host became
+registered or another lifecycle operation owns it; inspect current state and
+retry the normal teardown path rather than overriding it. The supplied engine
+selects the stop-script family, so choosing incorrectly does not probe both
+engines and can leave the real process running. A 202 response means teardown
+was accepted in the background; follow
+`/admin/provisioning/{hostname}/logs` and confirm the process stopped before
+reprovisioning.
 
 ### Rollback
 

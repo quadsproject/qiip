@@ -7,7 +7,40 @@ compatibility when llmfit adds new fields (T-25-01).
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict
+from enum import StrEnum
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class RecommendationRuntime(StrEnum):
+    """Canonical runtime vocabulary reported by llmfit recommendations.
+
+    This is deliberately distinct from ``InferenceEngine``: recommendation
+    output can name runtimes that QIIP does not provision.
+    """
+
+    VLLM = "vllm"
+    LLAMA_CPP = "llama_cpp"
+    MLX = "mlx"
+    UNKNOWN = "unknown"
+
+
+_RUNTIME_ALIASES = {
+    "vllm": RecommendationRuntime.VLLM,
+    "llama.cpp": RecommendationRuntime.LLAMA_CPP,
+    "llamacpp": RecommendationRuntime.LLAMA_CPP,
+    "llama_cpp": RecommendationRuntime.LLAMA_CPP,
+    "mlx": RecommendationRuntime.MLX,
+}
+
+
+class GGUFSource(BaseModel):
+    """One GGUF repository candidate reported by llmfit."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    repo: str = Field(min_length=1)
+    provider: str
 
 
 class SystemInfo(BaseModel):
@@ -43,7 +76,21 @@ class ModelRecommendation(BaseModel):
     context_length: int = 0
     utilization_pct: float = 0.0
     category: str = ""
-    runtime: str = ""
+    runtime: RecommendationRuntime = RecommendationRuntime.UNKNOWN
+    gguf_sources: tuple[GGUFSource, ...] = ()
+
+    @field_validator("runtime", mode="before")
+    @classmethod
+    def normalize_runtime(cls, value: object) -> RecommendationRuntime:
+        """Normalize llmfit spellings without making unknown runtimes fatal."""
+        if isinstance(value, RecommendationRuntime):
+            return value
+        if not isinstance(value, str):
+            return RecommendationRuntime.UNKNOWN
+        return _RUNTIME_ALIASES.get(
+            value.strip().lower(),
+            RecommendationRuntime.UNKNOWN,
+        )
 
 
 class LLMFitResult(BaseModel):

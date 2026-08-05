@@ -260,6 +260,26 @@ h1 {
   box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
 }
 
+.setup-select {
+  padding: 0.5rem 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 0.8125rem;
+  font-family: 'IBM Plex Mono', monospace;
+}
+
+.setup-select:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+
+.setup-engine-select { min-width: 6.5rem; }
+.setup-model-select { width: 100%; max-width: 25rem; }
+.setup-artifact-select { width: 100%; max-width: 37.5rem; }
+
 .setup-form button {
   padding: 0.5rem 1rem;
   background: var(--primary);

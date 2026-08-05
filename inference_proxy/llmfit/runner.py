@@ -1,8 +1,7 @@
 """LLMFit remote execution via SSH.
 
-Runs ``llmfit recommend --json --runtime vllm -n 30`` on a remote host
-and returns a typed ``LLMFitResult``.  SSH transport is injected via
-constructor (DIP).
+Runs ``llmfit recommend --json -n 30`` on a remote host and returns a
+typed ``LLMFitResult``.  SSH transport is injected via constructor (DIP).
 """
 
 from __future__ import annotations
@@ -62,8 +61,6 @@ class LLMFitRunner:
                 self._settings.binary_path,
                 "recommend",
                 "--json",
-                "--runtime",
-                "vllm",
                 "-n",
                 "30",
             )

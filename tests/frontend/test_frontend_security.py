@@ -11,8 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from inference_proxy.api.chat import templates as chat_templates
-from inference_proxy.api.dashboard import templates as dashboard_templates
+from inference_proxy.api.templating import templates
 
 _ROOT = Path(__file__).resolve().parents[2]
 _STATIC = _ROOT / "inference_proxy/static"
@@ -44,9 +43,7 @@ def _node() -> str:
 
 
 def test_chat_uses_pinned_local_frontend_dependencies() -> None:
-    rendered = chat_templates.get_template("chat.html").render(
-        request=_TemplateRequest()
-    )
+    rendered = templates.get_template("chat.html").render(request=_TemplateRequest())
 
     assert not re.search(r'<script[^>]+src=["\']https?://', rendered)
     for relative_path, expected_digest in _VENDORED_ASSETS.items():
@@ -276,7 +273,7 @@ def test_javascript_has_one_sanitized_html_sink() -> None:
 
 
 def test_node_detail_page_survives_backslash_in_hostname() -> None:
-    rendered = dashboard_templates.get_template("node_detail.html").render(
+    rendered = templates.get_template("node_detail.html").render(
         request=_TemplateRequest(),
         node_id="host01\\",
         poll_interval=10,
