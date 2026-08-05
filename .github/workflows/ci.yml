@@ -78,18 +78,13 @@ jobs:
         id: badges
         run: |
           uv run --frozen coverage json -o /tmp/cov.json
-          cov=$(python3 -c "import json; print(round(json.load(open('/tmp/cov.json'))['totals']['percent_covered'], 1))")
-          echo "coverage=$cov" >> "$GITHUB_OUTPUT"
-
-          if [ "$(echo "$cov >= 95" | bc -l)" -eq 1 ]; then
-            echo "cov_color=brightgreen" >> "$GITHUB_OUTPUT"
-          elif [ "$(echo "$cov >= 90" | bc -l)" -eq 1 ]; then
-            echo "cov_color=green" >> "$GITHUB_OUTPUT"
-          elif [ "$(echo "$cov >= 80" | bc -l)" -eq 1 ]; then
-            echo "cov_color=yellowgreen" >> "$GITHUB_OUTPUT"
-          else
-            echo "cov_color=red" >> "$GITHUB_OUTPUT"
-          fi
+          python3 -c "
+          import json
+          pct = round(json.load(open('/tmp/cov.json'))['totals']['percent_covered'], 1)
+          color = 'brightgreen' if pct >= 95 else 'green' if pct >= 90 else 'yellowgreen' if pct >= 80 else 'red'
+          print(f'coverage={pct}')
+          print(f'cov_color={color}')
+          " >> "$GITHUB_OUTPUT"
 
           vllm=$(grep -oP 'vllm==\K[^"]+' auto-vllm/pyproject.toml)
           echo "vllm=$vllm" >> "$GITHUB_OUTPUT"
