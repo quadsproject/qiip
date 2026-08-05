@@ -65,10 +65,25 @@ if [[ " $* " != *' --kv-unified '* ]] || [[ " $* " != *' --gpu-layers all '* ]];
     exit 44
 fi
 context={train_context}
+cache_type_k=''
+cache_type_v=''
+flash_attn=''
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
         --ctx-size)
             context="$2"
+            shift 2
+            ;;
+        --cache-type-k)
+            cache_type_k="$2"
+            shift 2
+            ;;
+        --cache-type-v)
+            cache_type_v="$2"
+            shift 2
+            ;;
+        --flash-attn)
+            flash_attn="$2"
             shift 2
             ;;
         *)
@@ -76,9 +91,19 @@ while [[ "$#" -gt 0 ]]; do
             ;;
     esac
 done
+if [ -n "$cache_type_k" ]; then
+    case "$cache_type_k/$cache_type_v/$flash_attn" in
+        f16/f16/auto|q8_0/q8_0/on) ;;
+        *) exit 46 ;;
+    esac
+fi
 echo 'llama_model_loader: n_ctx_train = {train_context}' >&2
 context_mib=$((context * 1500 / {train_context}))
-printf 'CUDA0 8500 %s 200\n' "$context_mib"
+model_mib=8500
+if [ "${{AUTOLLAMACPP_TEST_FORCE_Q8:-0}}" = 1 ] && [ "$cache_type_k" = f16 ]; then
+    model_mib=50000
+fi
+printf 'CUDA0 %s %s 200\n' "$model_mib" "$context_mib"
 printf 'Host 0 0 100\n'
 """,
     )
@@ -148,7 +173,17 @@ def test_start_preserves_split_entrypoint_filename_and_siblings(
     assert shards[0].resolve() != shards[0]
 
 
-def test_managed_launch_uses_exact_artifact_and_explicit_alias(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("force_q8", "expected_cache_type", "expected_flash_attn"),
+    [(False, "f16", "auto"), (True, "q8_0", "on")],
+)
+def test_managed_launch_uses_exact_artifact_and_explicit_alias(
+    tmp_path: Path,
+    *,
+    force_q8: bool,
+    expected_cache_type: str,
+    expected_flash_attn: str,
+) -> None:
     """Exercise the public launch path without relying on the new helper name."""
     exact = tmp_path / "gguf" / "artifact -- id" / "files" / "model---q4_k_m.gguf"
     exact.parent.mkdir(parents=True)
@@ -191,6 +226,7 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(tmp_path: Path) -
         "AUTOLLAMACPP_PID_FILE": str(tmp_path / "llama.pid"),
         "AUTOLLAMACPP_LOG_FILE": str(tmp_path / "llama.log"),
         "AUTOLLAMACPP_TEST_ARGS": str(args_file),
+        "AUTOLLAMACPP_TEST_FORCE_Q8": "1" if force_q8 else "0",
     }
     command = "\n".join(
         (
@@ -214,22 +250,27 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(tmp_path: Path) -
     assert args[args.index("--parallel") + 1] == "8"
     assert args[args.index("--gpu-layers") + 1] == "all"
     assert "--kv-unified" in args
+    assert args[args.index("--cache-type-k") + 1] == expected_cache_type
+    assert args[args.index("--cache-type-v") + 1] == expected_cache_type
+    assert args[args.index("--flash-attn") + 1] == expected_flash_attn
     assert args[args.index("--verbosity") + 1] == "4"
     assert "--verbose" not in args
     assert not ({"-b", "--batch-size"} & set(args))
-    assert "--flash-attn" not in args
     assert "--cont-batching" not in args
     assert (tmp_path / "llama.log").read_text(encoding="utf-8") == (
         "qiip_fit_plan: context_per_slot=128000 slots=8 "
-        "aggregate_context=1024000 fit_target_mib=1536\n"
+        "aggregate_context=1024000 fit_target_mib=1536 "
+        f"cache_type_k={expected_cache_type} "
+        f"cache_type_v={expected_cache_type} "
+        f"flash_attn={expected_flash_attn}\n"
     )
 
 
 @pytest.mark.parametrize(
     ("train_context", "free_mib", "expected"),
     [
-        (8192, 10500, "4096 1 4096"),
-        (128000, 1000000, "128000 256 32768000"),
+        (8192, 10500, "4096 1 4096 f16"),
+        (128000, 1000000, "128000 256 32768000 f16"),
     ],
 )
 def test_managed_planner_reduces_context_only_when_needed_and_uses_library_limit(
@@ -253,8 +294,9 @@ def test_managed_planner_reduces_context_only_when_needed_and_uses_library_limit
                     "GPU_COUNT=1",
                     "GGUF_PATH=/cache/model.gguf",
                     "plan_managed_configuration",
-                    'printf "%s %s %s\\n" "$MANAGED_CONTEXT_PER_SLOT" '
-                    '"$MANAGED_PARALLEL" "$MANAGED_AGGREGATE_CONTEXT"',
+                    'printf "%s %s %s %s\\n" "$MANAGED_CONTEXT_PER_SLOT" '
+                    '"$MANAGED_PARALLEL" "$MANAGED_AGGREGATE_CONTEXT" '
+                    '"$MANAGED_CACHE_TYPE_K"',
                 )
             )
         ),
@@ -268,6 +310,125 @@ def test_managed_planner_reduces_context_only_when_needed_and_uses_library_limit
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[-1] == expected
+
+
+def test_managed_planner_falls_back_to_q8_only_when_f16_cannot_fit(
+    tmp_path: Path,
+) -> None:
+    fake_fit = tmp_path / "llama-fit-params"
+    fake_tools = tmp_path / "bin"
+    call_log = tmp_path / "fit-calls"
+    fake_tools.mkdir()
+    _write_executable(
+        fake_fit,
+        """#!/bin/bash
+printf '%s\n' "$*" >> "$AUTOLLAMACPP_TEST_CALLS"
+if [[ " $* " != *' --ctx-size '* ]]; then
+    echo 'llama_model_loader: n_ctx_train = 8192' >&2
+    exit 1
+fi
+context=0
+cache_type=''
+flash_attn=''
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --ctx-size) context="$2"; shift 2 ;;
+        --cache-type-k) cache_type="$2"; shift 2 ;;
+        --cache-type-v)
+            [ "$2" = "$cache_type" ] || exit 45
+            shift 2
+            ;;
+        --flash-attn) flash_attn="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+case "$cache_type/$flash_attn" in
+    f16/auto) context_mib=$((context * 800 / 8192)) ;;
+    q8_0/on) context_mib=$((context * 200 / 8192)) ;;
+    *) exit 46 ;;
+esac
+printf 'CUDA0 9000 %s 200\n' "$context_mib"
+printf 'Host 0 0 100\n'
+""",
+    )
+    _write_executable(
+        fake_tools / "nvidia-smi",
+        "#!/bin/bash\nprintf '10000\n'\n",
+    )
+    result = _run_shell(
+        _source_start(
+            "\n".join(
+                (
+                    "GPU_COUNT=1",
+                    "GGUF_PATH=/cache/model.gguf",
+                    "plan_managed_configuration",
+                    'printf "%s %s %s %s %s %s\\n" '
+                    '"$MANAGED_CONTEXT_PER_SLOT" "$MANAGED_PARALLEL" '
+                    '"$MANAGED_AGGREGATE_CONTEXT" "$MANAGED_CACHE_TYPE_K" '
+                    '"$MANAGED_CACHE_TYPE_V" "$MANAGED_FLASH_ATTN"',
+                )
+            )
+        ),
+        env={
+            **os.environ,
+            "PATH": f"{fake_tools}:/usr/bin:/bin",
+            "AUTOLLAMACPP_FIT_BIN": str(fake_fit),
+            "AUTOLLAMACPP_FIT_TARGET_MIB": "512",
+            "AUTOLLAMACPP_TEST_CALLS": str(call_log),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "retrying with Q8_0 KV cache" in result.stdout
+    assert result.stdout.splitlines()[-1] == "8192 1 8192 q8_0 q8_0 on"
+    calls = call_log.read_text(encoding="utf-8")
+    assert "--cache-type-k f16 --cache-type-v f16 --flash-attn auto" in calls
+    assert "--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on" in calls
+    assert "q4" not in calls
+
+
+def test_managed_planner_fails_after_q8_without_lower_precision(
+    tmp_path: Path,
+) -> None:
+    fake_fit = tmp_path / "llama-fit-params"
+    fake_tools = tmp_path / "bin"
+    call_log = tmp_path / "fit-calls"
+    fake_tools.mkdir()
+    _write_executable(
+        fake_fit,
+        """#!/bin/bash
+printf '%s\n' "$*" >> "$AUTOLLAMACPP_TEST_CALLS"
+if [[ " $* " != *' --ctx-size '* ]]; then
+    echo 'llama_model_loader: n_ctx_train = 8192' >&2
+    exit 1
+fi
+printf 'CUDA0 50000 1000 500\n'
+printf 'Host 0 0 100\n'
+""",
+    )
+    _write_executable(
+        fake_tools / "nvidia-smi",
+        "#!/bin/bash\nprintf '10000\n'\n",
+    )
+    result = _run_shell(
+        _source_start(
+            "GPU_COUNT=1\nGGUF_PATH=/cache/model.gguf\nplan_managed_configuration"
+        ),
+        env={
+            **os.environ,
+            "PATH": f"{fake_tools}:/usr/bin:/bin",
+            "AUTOLLAMACPP_FIT_BIN": str(fake_fit),
+            "AUTOLLAMACPP_FIT_TARGET_MIB": "512",
+            "AUTOLLAMACPP_TEST_CALLS": str(call_log),
+        },
+    )
+
+    assert result.returncode != 0
+    assert "even with Q8_0 KV cache" in result.stderr
+    calls = call_log.read_text(encoding="utf-8")
+    assert "--cache-type-k f16" in calls
+    assert "--cache-type-k q8_0" in calls
+    assert "q4" not in calls
 
 
 def test_managed_planner_names_missing_cuda_estimates(tmp_path: Path) -> None:
@@ -450,6 +611,13 @@ if [[ "${1:-}" == '--build' ]]; then
     mkdir -p "$build_dir/bin"
     cat > "$build_dir/bin/llama-server" <<'EOF'
 #!/bin/bash
+if [ "$*" != '--version' ]; then
+    printf 'server' >> "$AUTOLLAMACPP_TEST_LOG"
+    printf ' <%s>' "$@" >> "$AUTOLLAMACPP_TEST_LOG"
+    printf '\n' >> "$AUTOLLAMACPP_TEST_LOG"
+    expected='--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --version'
+    [ "$*" = "$expected" ] || exit 46
+fi
 echo 'version: 10242 (b10242)' >&2
 EOF
     cat > "$build_dir/bin/llama-fit-params" <<'EOF'
@@ -458,7 +626,7 @@ printf 'fit' >> "$AUTOLLAMACPP_TEST_LOG"
 printf ' <%s>' "$@" >> "$AUTOLLAMACPP_TEST_LOG"
 printf '\n' >> "$AUTOLLAMACPP_TEST_LOG"
 metadata='--parallel 1 --kv-unified --gpu-layers all --verbosity 5 --version'
-estimate='--ctx-size 4096 --parallel 2 --kv-unified --gpu-layers all --fit-print on --verbosity 0 --version'
+estimate='--ctx-size 4096 --parallel 2 --kv-unified --gpu-layers all --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --fit-print on --verbosity 0 --version'
 case "$*" in
     "$metadata"|"$estimate") ;;
     *) exit 45 ;;
@@ -561,7 +729,13 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     ) in operations
     assert (
         "fit <--ctx-size> <4096> <--parallel> <2> <--kv-unified> "
-        "<--gpu-layers> <all> <--fit-print> <on> <--verbosity> <0> <--version>"
+        "<--gpu-layers> <all> <--cache-type-k> <q8_0> "
+        "<--cache-type-v> <q8_0> <--flash-attn> <on> "
+        "<--fit-print> <on> <--verbosity> <0> <--version>"
+    ) in operations
+    assert (
+        "server <--cache-type-k> <q8_0> <--cache-type-v> <q8_0> "
+        "<--flash-attn> <on> <--version>"
     ) in operations
     assert (link_dir / "llama-server").resolve().is_file()
     assert (link_dir / "llama-fit-params").resolve().is_file()

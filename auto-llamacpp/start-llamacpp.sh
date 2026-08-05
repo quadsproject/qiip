@@ -11,7 +11,7 @@ PARALLEL_OVERRIDE="${AUTOLLAMACPP_PARALLEL:-}"
 BATCH_SIZE_OVERRIDE="${AUTOLLAMACPP_BATCH_SIZE:-}"
 EXTRA_ARGS_OVERRIDE="${AUTOLLAMACPP_EXTRA_ARGS:-}"
 MANAGED="${AUTOLLAMACPP_MANAGED:-0}"
-FIT_TARGET_MIB="${AUTOLLAMACPP_FIT_TARGET_MIB:-1024}"
+FIT_TARGET_MIB="${AUTOLLAMACPP_FIT_TARGET_MIB:-512}"
 SCRIPT_DIR="${AUTOLLAMACPP_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 LLAMACPP_BIN="${AUTOLLAMACPP_BIN:-/usr/local/bin/llama-server}"
 LLAMACPP_FIT_BIN="${AUTOLLAMACPP_FIT_BIN:-/usr/local/bin/llama-fit-params}"
@@ -25,9 +25,14 @@ REQUIRE_CUDA="${AUTOLLAMACPP_REQUIRE_CUDA:-1}"
 LLAMACPP_MAX_SEQUENCES=256
 LLAMACPP_CONTEXT_ALIGNMENT=256
 LLAMACPP_ESTIMATE_ROUNDING_MIB=4
+LLAMACPP_PRIMARY_CACHE_TYPE=f16
+LLAMACPP_FALLBACK_CACHE_TYPE=q8_0
 MANAGED_CONTEXT_PER_SLOT=0
 MANAGED_PARALLEL=0
 MANAGED_AGGREGATE_CONTEXT=0
+MANAGED_CACHE_TYPE_K="$LLAMACPP_PRIMARY_CACHE_TYPE"
+MANAGED_CACHE_TYPE_V="$LLAMACPP_PRIMARY_CACHE_TYPE"
+MANAGED_FLASH_ATTN=auto
 MANAGED_GPU_FREE_MIB=()
 
 # shellcheck source=auto-llamacpp/llamacpp-process.sh
@@ -277,6 +282,9 @@ managed_candidate_fits() {
         --parallel "$slots" \
         --kv-unified \
         --gpu-layers all \
+        --cache-type-k "$MANAGED_CACHE_TYPE_K" \
+        --cache-type-v "$MANAGED_CACHE_TYPE_V" \
+        --flash-attn "$MANAGED_FLASH_ATTN" \
         --fit-print on \
         --verbosity 0 2>&1); then
         echo "FATAL: llama.cpp failed to estimate VRAM for ${slots} slots" >&2
@@ -323,32 +331,47 @@ managed_candidate_fits() {
     return 0
 }
 
-plan_managed_configuration() {
-    local train_context min_context low high mid best_context
-    local best_slots probe upper status
+select_managed_cache_policy() {
+    case "$1" in
+        "$LLAMACPP_PRIMARY_CACHE_TYPE")
+            MANAGED_CACHE_TYPE_K="$LLAMACPP_PRIMARY_CACHE_TYPE"
+            MANAGED_CACHE_TYPE_V="$LLAMACPP_PRIMARY_CACHE_TYPE"
+            MANAGED_FLASH_ATTN=auto
+            ;;
+        "$LLAMACPP_FALLBACK_CACHE_TYPE")
+            MANAGED_CACHE_TYPE_K="$LLAMACPP_FALLBACK_CACHE_TYPE"
+            MANAGED_CACHE_TYPE_V="$LLAMACPP_FALLBACK_CACHE_TYPE"
+            # b10242 requires Flash Attention for a quantized V cache. Make
+            # that dependency explicit so estimation and serving cannot
+            # resolve AUTO differently.
+            MANAGED_FLASH_ATTN=on
+            ;;
+        *)
+            echo "FATAL: unsupported managed KV cache type: $1" >&2
+            return 2
+            ;;
+    esac
+}
 
-    echo "Planning llama.cpp context and concurrency from free VRAM"
-    read_managed_gpu_free_memory
-    train_context=$(read_model_train_context)
+plan_managed_cache_policy() {
+    local train_context="$1"
+    local min_context="$2"
+    local low high mid best_context
+    local best_slots probe upper status
 
     status=0
     managed_candidate_fits "$train_context" 1 || status=$?
     if [ "$status" -eq 0 ]; then
         best_context="$train_context"
     elif [ "$status" -eq 2 ]; then
-        return 1
+        return 2
     else
-        min_context=4096
-        if [ "$train_context" -lt "$min_context" ]; then
-            min_context="$train_context"
-        fi
         status=0
         managed_candidate_fits "$min_context" 1 || status=$?
         if [ "$status" -eq 2 ]; then
-            return 1
+            return 2
         fi
         if [ "$status" -ne 0 ]; then
-            echo "FATAL: the model cannot fully offload with ${min_context} context tokens and ${FIT_TARGET_MIB} MiB free per GPU" >&2
             return 1
         fi
 
@@ -361,7 +384,7 @@ plan_managed_configuration() {
             managed_candidate_fits "$((mid * LLAMACPP_CONTEXT_ALIGNMENT))" 1 \
                 || status=$?
             if [ "$status" -eq 2 ]; then
-                return 1
+                return 2
             elif [ "$status" -eq 0 ]; then
                 best_context=$((mid * LLAMACPP_CONTEXT_ALIGNMENT))
                 low=$((mid + 1))
@@ -378,7 +401,7 @@ plan_managed_configuration() {
         status=0
         managed_candidate_fits "$best_context" "$probe" || status=$?
         if [ "$status" -eq 2 ]; then
-            return 1
+            return 2
         elif [ "$status" -eq 0 ]; then
             best_slots="$probe"
             if [ "$probe" -eq "$LLAMACPP_MAX_SEQUENCES" ]; then
@@ -402,7 +425,7 @@ plan_managed_configuration() {
             status=0
             managed_candidate_fits "$best_context" "$mid" || status=$?
             if [ "$status" -eq 2 ]; then
-                return 1
+                return 2
             elif [ "$status" -eq 0 ]; then
                 best_slots="$mid"
                 low=$((mid + 1))
@@ -416,7 +439,41 @@ plan_managed_configuration() {
     MANAGED_PARALLEL="$best_slots"
     MANAGED_AGGREGATE_CONTEXT=$(managed_aggregate_context \
         "$MANAGED_CONTEXT_PER_SLOT" "$MANAGED_PARALLEL")
-    echo "Selected ${MANAGED_PARALLEL} slots x ${MANAGED_CONTEXT_PER_SLOT} tokens (${MANAGED_AGGREGATE_CONTEXT} aggregate)"
+    return 0
+}
+
+plan_managed_configuration() {
+    local train_context min_context status
+
+    echo "Planning llama.cpp context and concurrency from free VRAM"
+    read_managed_gpu_free_memory
+    train_context=$(read_model_train_context)
+    min_context=4096
+    if [ "$train_context" -lt "$min_context" ]; then
+        min_context="$train_context"
+    fi
+
+    select_managed_cache_policy "$LLAMACPP_PRIMARY_CACHE_TYPE"
+    status=0
+    plan_managed_cache_policy "$train_context" "$min_context" || status=$?
+    if [ "$status" -eq 2 ]; then
+        return 1
+    fi
+    if [ "$status" -ne 0 ]; then
+        echo "F16 KV cache cannot meet the ${FIT_TARGET_MIB} MiB free-VRAM target at ${min_context} context tokens; retrying with Q8_0 KV cache"
+        select_managed_cache_policy "$LLAMACPP_FALLBACK_CACHE_TYPE"
+        status=0
+        plan_managed_cache_policy "$train_context" "$min_context" || status=$?
+        if [ "$status" -eq 2 ]; then
+            return 1
+        fi
+        if [ "$status" -ne 0 ]; then
+            echo "FATAL: the model cannot fully offload with ${min_context} context tokens and ${FIT_TARGET_MIB} MiB free per GPU, even with Q8_0 KV cache" >&2
+            return 1
+        fi
+    fi
+
+    echo "Selected ${MANAGED_PARALLEL} slots x ${MANAGED_CONTEXT_PER_SLOT} tokens (${MANAGED_AGGREGATE_CONTEXT} aggregate) with ${MANAGED_CACHE_TYPE_K}/${MANAGED_CACHE_TYPE_V} KV cache"
 }
 
 verify_llamacpp_started() {
@@ -457,6 +514,8 @@ run_llamacpp() {
 # Context Per Slot:   ${MANAGED_CONTEXT_PER_SLOT} tokens
 # Parallel Slots:     ${MANAGED_PARALLEL}
 # Aggregate Context:  ${MANAGED_AGGREGATE_CONTEXT} tokens
+# KV Cache:           K=${MANAGED_CACHE_TYPE_K}, V=${MANAGED_CACHE_TYPE_V}
+# Flash Attention:    ${MANAGED_FLASH_ATTN}
 # ================================================
 
 EOF
@@ -477,11 +536,14 @@ EOF
     fi
 
     if [ "$MANAGED" = "1" ]; then
-        printf 'qiip_fit_plan: context_per_slot=%s slots=%s aggregate_context=%s fit_target_mib=%s\n' \
+        printf 'qiip_fit_plan: context_per_slot=%s slots=%s aggregate_context=%s fit_target_mib=%s cache_type_k=%s cache_type_v=%s flash_attn=%s\n' \
             "$MANAGED_CONTEXT_PER_SLOT" \
             "$MANAGED_PARALLEL" \
             "$MANAGED_AGGREGATE_CONTEXT" \
-            "$FIT_TARGET_MIB" > "$LLAMACPP_LOG_FILE"
+            "$FIT_TARGET_MIB" \
+            "$MANAGED_CACHE_TYPE_K" \
+            "$MANAGED_CACHE_TYPE_V" \
+            "$MANAGED_FLASH_ATTN" > "$LLAMACPP_LOG_FILE"
         # llama.cpp's auto parallel value is a fixed four, not a VRAM fit. The
         # planner uses llama-fit-params to select the largest full-context slot
         # count that preserves the requested free-memory margin. A unified KV
@@ -497,6 +559,9 @@ EOF
             --parallel "$MANAGED_PARALLEL" \
             --kv-unified \
             --gpu-layers all \
+            --cache-type-k "$MANAGED_CACHE_TYPE_K" \
+            --cache-type-v "$MANAGED_CACHE_TYPE_V" \
+            --flash-attn "$MANAGED_FLASH_ATTN" \
             --fit off \
             --verbosity 4 \
             --metrics \

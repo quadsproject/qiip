@@ -405,7 +405,7 @@ for the NVIDIA GPU attached to the node. It has five gateway settings:
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256` | committed digest | SHA-256 of the source archive selected by the version |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` | GitHub tag archive | Validated HTTP(S) URL template containing exactly one `{version}` placeholder |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT` | `7200` | Total wall-clock deadline for the llama.cpp setup command, including the CUDA source build (seconds) |
-| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB` | `1024` | Free VRAM margin per GPU enforced by the llama.cpp capacity planner (MiB) |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB` | `512` | Free VRAM margin per GPU enforced by the llama.cpp capacity planner (MiB) |
 
 Changing `LLAMACPP_VERSION` requires an explicitly configured matching digest.
 The node verifies the archive before extracting it, builds `llama-server`,
@@ -421,12 +421,16 @@ context per request up to the model's trained length, then maximize concurrency
 up to llama.cpp's 256-sequence limit. It sizes one unified KV pool to at least
 `context_per_slot * slots`, so every selected slot has capacity for the reported
 context instead of sharing one model-length pool across a fixed four slots.
+The planner prefers F16 K/V cache storage. If F16 cannot fully offload even one
+request at the 4,096-token floor while retaining the configured reserve, it
+replans with Q8_0 for both K and V and enables Flash Attention. Managed mode
+never falls below Q8_0 automatically.
 After `/health` succeeds, QIIP requires the runtime to match that plan, keep the
-configured free-VRAM margin, use unified KV, and offload every model layer to
-GPU before registering the node healthy. The provisioning log records the
-simultaneous per-slot guarantee, llama.cpp per-request ceiling, aggregate
-context, slot count, layer offload, configured margin, and post-load GPU
-memory. See
+configured free-VRAM margin, use the selected KV types and unified cache, and
+offload every model layer to GPU before registering the node healthy. The
+provisioning log records the simultaneous per-slot guarantee, llama.cpp
+per-request ceiling, aggregate context, slot count, KV types, layer offload,
+configured margin, and post-load GPU memory. See
 [auto-llamacpp](auto-llamacpp/README.md) for the direct script contract and
 build details.
 

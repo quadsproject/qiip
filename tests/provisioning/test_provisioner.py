@@ -86,12 +86,25 @@ def _llamacpp_fit_log(
     runtime_slots: int | None = None,
     aggregate_context: int | None = None,
     runtime_aggregate_context: int | None = None,
-    fit_target_mib: int = 1024,
+    fit_target_mib: int = 512,
+    cache_type_k: str = "f16",
+    cache_type_v: str | None = None,
+    flash_attn: str | None = None,
+    runtime_cache_type_k: str | None = None,
+    runtime_cache_type_v: str | None = None,
     kv_unified: bool = True,
     gpu_layers: int = 37,
     total_layers: int = 37,
     context_sharing_warnings: bool = True,
 ) -> str:
+    if cache_type_v is None:
+        cache_type_v = cache_type_k
+    if flash_attn is None:
+        flash_attn = "auto" if cache_type_k == "f16" else "on"
+    if runtime_cache_type_k is None:
+        runtime_cache_type_k = cache_type_k
+    if runtime_cache_type_v is None:
+        runtime_cache_type_v = cache_type_v
     if slot_context_limit is None:
         slot_context_limit = context_per_slot
     if runtime_slots is None:
@@ -104,8 +117,13 @@ def _llamacpp_fit_log(
         "qiip_fit_plan: "
         f"context_per_slot={context_per_slot} slots={slots} "
         f"aggregate_context={aggregate_context} "
-        f"fit_target_mib={fit_target_mib}",
+        f"fit_target_mib={fit_target_mib} "
+        f"cache_type_k={cache_type_k} cache_type_v={cache_type_v} "
+        f"flash_attn={flash_attn}",
         f"llama_model_load: offloaded {gpu_layers}/{total_layers} layers to GPU",
+        "llama_kv_cache: size = 1024.00 MiB "
+        f"(98304 cells, 37 layers, 4/1 seqs), K ({runtime_cache_type_k}): "
+        f"512.00 MiB, V ({runtime_cache_type_v}): 512.00 MiB",
         f"llama_context: n_ctx = {runtime_aggregate_context}",
     ]
     if context_sharing_warnings and aggregate_context > slot_context_limit:
@@ -1545,7 +1563,10 @@ class TestLlamaCppRuntimeFit:
         assert fit.slot_context_limit == 24577
         assert fit.slots == 4
         assert fit.aggregate_context == 98308
-        assert fit.fit_target_mib == 1024
+        assert fit.fit_target_mib == 512
+        assert fit.cache_type_k == "f16"
+        assert fit.cache_type_v == "f16"
+        assert fit.flash_attn == "auto"
         assert fit.kv_unified is True
         assert fit.gpu_layers == 37
         assert fit.total_layers == 37
@@ -1565,6 +1586,13 @@ class TestLlamaCppRuntimeFit:
         assert fit.slots == 8
         assert fit.aggregate_context == 1024000
 
+    def test_accepts_q8_kv_cache_runtime_evidence(self) -> None:
+        fit = _parse_llamacpp_runtime_fit(_llamacpp_fit_log(cache_type_k="q8_0"))
+
+        assert fit.cache_type_k == "q8_0"
+        assert fit.cache_type_v == "q8_0"
+        assert fit.flash_attn == "on"
+
     @pytest.mark.parametrize(
         ("log_text", "message"),
         [
@@ -1577,7 +1605,8 @@ class TestLlamaCppRuntimeFit:
             ),
             (
                 "qiip_fit_plan: context_per_slot=24576 slots=4 "
-                "aggregate_context=98304 fit_target_mib=1024\n"
+                "aggregate_context=98304 fit_target_mib=512 "
+                "cache_type_k=f16 cache_type_v=f16 flash_attn=auto\n"
                 "llama_model_load: offloaded 37/37 layers to GPU\n"
                 "srv init: initializing, n_slots = 4, n_ctx_slot = 24576, "
                 "kv_unified = 'true'",
@@ -1585,14 +1614,16 @@ class TestLlamaCppRuntimeFit:
             ),
             (
                 "qiip_fit_plan: context_per_slot=24576 slots=4 "
-                "aggregate_context=98304 fit_target_mib=1024\n"
+                "aggregate_context=98304 fit_target_mib=512 "
+                "cache_type_k=f16 cache_type_v=f16 flash_attn=auto\n"
                 "llama_context: n_ctx = 98304\n"
                 "llama_model_load: offloaded 37/37 layers to GPU",
                 "no effective context record",
             ),
             (
                 "qiip_fit_plan: context_per_slot=24576 slots=4 "
-                "aggregate_context=98304 fit_target_mib=1024\n"
+                "aggregate_context=98304 fit_target_mib=512 "
+                "cache_type_k=f16 cache_type_v=f16 flash_attn=auto\n"
                 "llama_context: n_ctx = 98304\n"
                 "srv init: initializing, n_slots = 4, n_ctx_slot = 24576, "
                 "kv_unified = 'true'",
@@ -1623,6 +1654,26 @@ class TestLlamaCppRuntimeFit:
             (
                 _llamacpp_fit_log(gpu_layers=0, total_layers=0),
                 "did not fully offload",
+            ),
+            (
+                _llamacpp_fit_log(cache_type_k="q8_0", cache_type_v="f16"),
+                "requires matching K/V types",
+            ),
+            (
+                _llamacpp_fit_log(cache_type_k="q8_0", flash_attn="auto"),
+                "invalid Flash Attention policy",
+            ),
+            (
+                _llamacpp_fit_log(cache_type_k="q8_0", runtime_cache_type_k="f16"),
+                "runtime KV cache types differ",
+            ),
+            (
+                "\n".join(
+                    line
+                    for line in _llamacpp_fit_log().splitlines()
+                    if not line.startswith("llama_kv_cache")
+                ),
+                "no KV cache type record",
             ),
             (
                 _llamacpp_fit_log(context_sharing_warnings=False),
@@ -1683,6 +1734,7 @@ class TestLlamaCppRuntimeFit:
             "info",
             "llama.cpp fitted: context_per_slot=24577 slot_context_limit=98308 "
             "slots=4 aggregate_context=98308 kv_unified=true "
+            "cache_type_k=f16 cache_type_v=f16 flash_attn=auto "
             "gpu_layers=37/37 fit_target_mib=1536 "
             "gpu_used_mib=20854,20860 gpu_free_mib=2180,2174",
         )

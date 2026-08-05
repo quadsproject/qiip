@@ -411,6 +411,32 @@ default 1,000 entries or 1 MiB is insufficient. Runtime trace continues to
 accumulate in `/var/log/llamacpp-serve.log`; include it in the node's log-rotation
 policy.
 
+### 24. Allow Q8 KV rescue while retaining a configurable reserve
+
+The managed llama.cpp fit target remains configurable, but its default changes
+from 1,024 MiB to 512 MiB per GPU:
+
+```dotenv
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB=512
+```
+
+An explicitly configured value is unchanged during upgrade. Keep or raise the
+old 1,024 MiB value when GPUs are shared or other CUDA allocations need the
+additional headroom. The planner still fails closed when actual post-load free
+VRAM is below the configured value.
+
+Managed planning now prefers F16 K/V cache storage, as before, but retries the
+entire plan with Q8_0 for both K and V when F16 cannot fully offload one request
+at the 4,096-token floor. The Q8_0 attempt explicitly enables Flash Attention
+in both estimation and serving. QIIP does not fall back to Q4, mixed K/V types,
+or CPU layer spill. Models that cannot meet the minimum Q8_0 plan still fail
+setup. Q8_0 can change generation relative to F16; inspect the emitted cache
+types when comparing output across nodes.
+
+The startup record now includes `cache_type_k`, `cache_type_v`, and
+`flash_attn`. Post-health verification reads llama.cpp's allocated KV-cache
+record and rejects a runtime whose cache types differ from the plan.
+
 ## Artifact Sources and Mirror Policy
 
 There is no single global mirror switch. Each source has a different trust and configuration boundary.
@@ -469,6 +495,7 @@ that may provision or display the node understands the field.
 | **New surface** | Download status records `download_id`, requested and resolved revisions, and exact artifacts. The catalog returns validated GGUF generations in `gguf_artifacts`, separate from full vLLM `models`. | Persist the resolved SHA and artifact ID when reproducibility matters. Keep the backing native snapshot while any node depends on that ID. |
 | **Behavioral break** | GGUF artifacts are discovered from native Hugging Face snapshots instead of the removed `<CACHE_DIR>/gguf` publication tree. Valid GGUFs remain visible even when their repository is incomplete or unverifiable, and the dashboard does not select the first artifact automatically. | Configure `HUGGINGFACE__SHARED_ROOT` before managed llama.cpp setup, preserve native snapshots referenced by nodes, inspect cache-health counters separately from `gguf_artifacts`, and select the exact GGUF entrypoint explicitly. |
 | **Behavioral break** | Managed llama.cpp setup uses the pinned estimator to maximize per-request context and then concurrency, sizes unified KV for every selected slot, and rejects manual context, GPU-layer, parallel, batch, and extra-argument overrides. A healthy endpoint is not registered until the runtime matches the plan, retains the configured VRAM margin, uses unified KV, and fully offloads the model. | Remove managed-host `AUTOLLAMACPP_*` sizing overrides, tune only `PROVISIONING__LLAMACPP_FIT_TARGET_MIB`, and use the emitted context, aggregate-context, and slot values when setting workload limits. |
+| **Behavioral break** | The managed llama.cpp free-VRAM target defaults to 512 MiB instead of 1,024 MiB. When F16 K/V cannot meet the minimum full-offload plan, QIIP retries with matching Q8_0 K/V and Flash Attention; it never falls below Q8_0 automatically. | Keep an explicit 1,024 MiB or larger target for shared GPUs. Monitor the emitted cache types and post-load free memory; select a smaller model when the Q8_0 minimum still fails. |
 | **Behavioral break** | `/admin/nodes[].engine` is now nullable. Registered nodes report `vllm` or `llama_cpp`; QUADS-only hosts report `null` instead of the previous fabricated `vllm` value. | Treat `null` as “not provisioned or no registered engine identity,” not as vLLM. Update clients whose schema requires a string. |
 | **New surface** | `/admin/nodes[]` now includes nullable `artifact_id`. Managed llama.cpp nodes report the exact discovered GGUF generation selected at setup; vLLM, older, manual, and QUADS-only records can report `null`. | Preserve the field when correlating a node with the GGUF catalog, but continue to handle `null` during rolling upgrades and for non-artifact-backed nodes. |
 | **Behavioral break** | Recommendation `runtime` values are normalized to `vllm`, `llama_cpp`, `mlx`, or `unknown` instead of preserving LLMFit spellings such as `vLLM` and `llama.cpp`. | Compare against the canonical values. Treat this recommendation vocabulary as distinct from the provisionable `InferenceEngine` enum: `mlx` and `unknown` cannot be selected for setup. |

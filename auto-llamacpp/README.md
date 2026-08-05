@@ -120,7 +120,19 @@ planner first maximizes guaranteed per-request context up to the model's
 trained length, then finds the largest slot count that keeps every layer on GPU
 and preserves the requested free-memory margin. The only concurrency ceiling is
 llama.cpp's 256-sequence limit. Configure the per-GPU free-memory target with
-`INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB` (default: 1024 MiB).
+`INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB` (default: 512 MiB).
+The reserve remains operator-configurable because shared GPUs and workloads
+with additional CUDA allocations may require more headroom.
+
+The managed planner first estimates F16 for both K and V. If that policy cannot
+fully offload one request at the 4,096-token floor while preserving the reserve,
+it retries the complete plan with Q8_0 for both K and V. Q8_0 V requires Flash
+Attention in b10242, so the fallback passes `--flash-attn on` to both the
+estimator and server; the F16 policy retains `auto`. QIIP does not automatically
+select Q4 or mixed cache types. If Q8_0 cannot meet the minimum plan, setup fails
+instead of accepting lower KV precision or CPU layer spill. Q8_0 can change
+generation relative to F16, which is why it is a capacity fallback rather than
+the default for every model.
 The pinned helper emits model training context only through its normal fitting
 path at debug verbosity 5. QIIP accepts a nonzero fit status after that metadata
 is present because the all-layer probe can legitimately exceed an undersized
@@ -132,7 +144,9 @@ The aggregate context is at least `context_per_slot * slots`; idle slots leave
 their share available to active requests, while all slots can simultaneously
 reach the guaranteed context. QIIP waits for `/health`, then refuses healthy
 registration unless the runtime matches the plan, KV is unified, every model
-layer was offloaded to GPU, and actual free VRAM still meets the target.
+registration unless the runtime matches the plan, the selected K/V types are
+present in the allocated unified KV cache, every model layer was offloaded to
+GPU, and actual free VRAM still meets the target.
 
 With unified KV, llama.cpp internally reports `n_ctx_seq` as the aggregate
 pool. When that exceeds the model training context, b10242 emits its expected

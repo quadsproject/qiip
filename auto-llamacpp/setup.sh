@@ -147,10 +147,25 @@ verify_fit_params_cli() {
         --parallel 2 \
         --kv-unified \
         --gpu-layers all \
+        --cache-type-k q8_0 \
+        --cache-type-v q8_0 \
+        --flash-attn on \
         --fit-print on \
         --verbosity 0 \
         --version >/dev/null 2>&1; then
         echo "FATAL: built llama-fit-params does not accept the managed estimation CLI" >&2
+        return 1
+    fi
+}
+
+verify_managed_server_cli() {
+    local binary="$1"
+    if ! "$binary" \
+        --cache-type-k q8_0 \
+        --cache-type-v q8_0 \
+        --flash-attn on \
+        --version >/dev/null 2>&1; then
+        echo "FATAL: built llama-server does not accept the managed Q8 KV CLI" >&2
         return 1
     fi
 }
@@ -266,6 +281,7 @@ install_llamacpp() {
             echo "FATAL: built llama-server did not report ${LLAMACPP_VERSION}" >&2
             exit 1
         fi
+        verify_managed_server_cli "$server_bin"
         verify_fit_params_cli "$fit_bin"
 
         printf '%s\n' "$marker" > "${work_dir}/BUILD-INFO"

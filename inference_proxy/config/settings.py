@@ -221,7 +221,7 @@ class ProvisioningSettings(BaseModel):
     llamacpp_sha256: str = DEFAULT_LLAMACPP_SHA256
     llamacpp_source_url: str = DEFAULT_LLAMACPP_SOURCE_URL
     llamacpp_setup_timeout: float = Field(default=7200.0, gt=0)
-    llamacpp_fit_target_mib: int = Field(default=1024, ge=1)
+    llamacpp_fit_target_mib: int = Field(default=512, ge=1)
 
     @field_validator("nvidia_driver_sha256")
     @classmethod

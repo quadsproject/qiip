@@ -69,7 +69,15 @@ LLAMACPP_PLAN_PATTERN = re.compile(
     r"qiip_fit_plan: context_per_slot=(?P<context>\d+) "
     r"slots=(?P<slots>\d+) "
     r"aggregate_context=(?P<aggregate>\d+) "
-    r"fit_target_mib=(?P<target>\d+)"
+    r"fit_target_mib=(?P<target>\d+) "
+    r"cache_type_k=(?P<cache_type_k>f16|q8_0) "
+    r"cache_type_v=(?P<cache_type_v>f16|q8_0) "
+    r"flash_attn=(?P<flash_attn>auto|on)"
+)
+LLAMACPP_KV_CACHE_PATTERN = re.compile(
+    r"llama_kv_cache[^:]*:\s+size\s*=.*?"
+    r"K \((?P<cache_type_k>[a-z0-9_]+)\):.*?"
+    r"V \((?P<cache_type_v>[a-z0-9_]+)\):"
 )
 LLAMACPP_OFFLOAD_PATTERN = re.compile(
     r"offloaded (?P<loaded>\d+)/(?P<total>\d+) layers to GPU"
@@ -148,6 +156,9 @@ class LlamaCppRuntimeFit:
     slots: int
     aggregate_context: int
     fit_target_mib: int
+    cache_type_k: str
+    cache_type_v: str
+    flash_attn: str
     kv_unified: bool
     gpu_layers: int
     total_layers: int
@@ -169,17 +180,24 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
     offloads = list(LLAMACPP_OFFLOAD_PATTERN.finditer(log_text))
     if not offloads:
         raise ProvisioningError("llama.cpp startup log has no GPU offload record")
+    cache_records = list(LLAMACPP_KV_CACHE_PATTERN.finditer(log_text))
+    if not cache_records:
+        raise ProvisioningError("llama.cpp startup log has no KV cache type record")
 
     plan = plans[-1].groupdict()
     context = contexts[-1].groupdict()
     aggregate_context = int(aggregate_contexts[-1].group("context"))
     offload = offloads[-1].groupdict()
+    cache_record = cache_records[-1].groupdict()
     fit = LlamaCppRuntimeFit(
         context_per_slot=int(plan["context"]),
         slot_context_limit=int(context["context"]),
         slots=int(plan["slots"]),
         aggregate_context=int(plan["aggregate"]),
         fit_target_mib=int(plan["target"]),
+        cache_type_k=plan["cache_type_k"],
+        cache_type_v=plan["cache_type_v"],
+        flash_attn=plan["flash_attn"],
         kv_unified=context["unified"] == "true",
         gpu_layers=int(offload["loaded"]),
         total_layers=int(offload["total"]),
@@ -202,6 +220,20 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
     if aggregate_context != fit.aggregate_context:
         raise ProvisioningError(
             "llama.cpp runtime aggregate context differs from its VRAM plan"
+        )
+    if fit.cache_type_k != fit.cache_type_v:
+        raise ProvisioningError("llama.cpp managed startup requires matching K/V types")
+    expected_flash_attn = "auto" if fit.cache_type_k == "f16" else "on"
+    if fit.flash_attn != expected_flash_attn:
+        raise ProvisioningError(
+            "llama.cpp managed cache type has an invalid Flash Attention policy"
+        )
+    if cache_record != {
+        "cache_type_k": fit.cache_type_k,
+        "cache_type_v": fit.cache_type_v,
+    }:
+        raise ProvisioningError(
+            "llama.cpp runtime KV cache types differ from its VRAM plan"
         )
     overflows = list(LLAMACPP_CONTEXT_OVERFLOW_PATTERN.finditer(log_text))
     caps = list(LLAMACPP_SLOT_CAP_PATTERN.finditer(log_text))
@@ -998,6 +1030,9 @@ class NodeProvisioner:
                 f"slots={fit.slots} "
                 f"aggregate_context={fit.aggregate_context} "
                 f"kv_unified={str(fit.kv_unified).lower()} "
+                f"cache_type_k={fit.cache_type_k} "
+                f"cache_type_v={fit.cache_type_v} "
+                f"flash_attn={fit.flash_attn} "
                 f"gpu_layers={fit.gpu_layers}/{fit.total_layers} "
                 f"fit_target_mib={self._settings.llamacpp_fit_target_mib} "
                 f"gpu_used_mib={used} gpu_free_mib={free}",
