@@ -635,6 +635,17 @@ code is added or removed. The floor prevents new untested code from materially
 reducing coverage; it does not prove that covered behavior is asserted
 correctly.
 
+### CI badges
+
+After `Quality` passes on `main`, a separate non-blocking job publishes the
+coverage, vLLM, and llama.cpp badges to the configured Gist. `GIST_SECRET` must
+be a fine-grained personal access token with only the **Gists: write** user
+permission. Prefer a service identity, record the token's expiration, and
+replace the repository secret before it expires. To change the publishing
+identity, create and pre-seed a Gist under the new owner, then update the Gist
+ID in `.github/workflows/ci.yml` and all three README badge URLs together.
+Verify that the three raw JSON URLs return HTTP 200 before merging that change.
+
 ### Lint and format
 
 ```bash
