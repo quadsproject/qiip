@@ -20,18 +20,19 @@ deployment target.
 
 Linux CUDA archives are not published for the pinned `b10242` release.
 `setup.sh` therefore downloads the pinned GitHub tag source archive, verifies
-its committed SHA-256 before extraction, and compiles `llama-server` and
+its committed SHA-256 before extraction, applies one digest-pinned CLI
+allowlist transformation, and compiles `llama-server`, `llama-fit-params`, and
 `llama-quantize` with `GGML_CUDA=ON` and the attached GPUs' native CUDA
 architecture. The supporting CPU backend uses `GGML_NATIVE=OFF`: managed
 inference is CUDA-only, and the portable CPU profile avoids coupling builds to
 host-specific compiler and assembler feature support.
 
 Installations are immutable and build-identified under
-`/opt/llama.cpp/<version>-<identity>`. The two public binaries in
+`/opt/llama.cpp/<version>-<identity>`. The three public binaries in
 `/usr/local/bin` are replaced with same-directory atomic symlink renames only
 after the new build reports the configured version. Repeating setup with the
-same source digest, build profile, and GPU capabilities reuses that
-installation.
+same source digest, transformation digest, build profile, and GPU capabilities
+reuses that installation.
 
 The full llama.cpp setup command has a separate two-hour default deadline
 (`INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT`) because it includes
@@ -109,8 +110,54 @@ The launcher clears inherited `LLAMA_ARG_*` variables before invoking
 default. A standalone user deliberately exercising the retained CPU path must
 opt out explicitly with `AUTOLLAMACPP_REQUIRE_CUDA=0`.
 
-Context size is divided across parallel slots. If `AUTOLLAMACPP_CTX_SIZE=8192`
-and `AUTOLLAMACPP_PARALLEL=4`, each slot gets 2048 tokens.
+The sizing overrides above are for standalone use. QIIP sets
+`AUTOLLAMACPP_MANAGED=1`, rejects all five sizing and extra-argument overrides,
+and invokes the installed `llama-fit-params` estimator before launch. The
+planner first maximizes guaranteed per-request context up to the model's
+trained length, then finds the largest slot count that keeps every layer on GPU
+and preserves the requested free-memory margin. The only concurrency ceiling is
+llama.cpp's 256-sequence limit. Configure the per-GPU free-memory target with
+`INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB` (default: 1024 MiB).
+
+Managed launch passes the selected `--ctx-size`, `--parallel`, unified-KV, and
+full-offload values explicitly and disables the server's second fitting pass.
+The aggregate context is at least `context_per_slot * slots`; idle slots leave
+their share available to active requests, while all slots can simultaneously
+reach the guaranteed context. QIIP waits for `/health`, then refuses healthy
+registration unless the runtime matches the plan, KV is unified, every model
+layer was offloaded to GPU, and actual free VRAM still meets the target.
+
+With unified KV, llama.cpp internally reports `n_ctx_seq` as the aggregate
+pool. When that exceeds the model training context, b10242 emits its expected
+`possible training context overflow` and slot-capping warnings, then caps each
+request to the training context. QIIP validates those exact records as benign;
+it still rejects `failed to fit params to free device memory`. The provisioning
+record distinguishes `context_per_slot` (capacity guaranteed simultaneously to
+every selected slot), `slot_context_limit` (llama.cpp's maximum for one
+request), and `aggregate_context` (the unified pool).
+
+The pinned b10242 estimator already implements unified-KV memory accounting but
+does not expose that option in the `llama-fit-params` CLI allowlist. The
+versioned `cuda-portable-cpu-v2-fit-concurrency` build profile exposes the
+existing option so estimation and serving use the same KV mode. Its exact
+transformation digest is part of `BUILD-INFO` and the installation identity,
+and setup exercises every planner option against the built helper before
+publication. A changed transformation or incompatible future source fails the
+build closed.
+
+Trace verbosity 4 is required for the pinned build's context and offload evidence
+and remains enabled for the lifetime of the server. QIIP tails that log into the
+bounded provisioning buffer only until `/health` succeeds, so startup trace can
+evict earlier setup entries but later request traffic cannot. If measurement
+shows the startup record exceeds the defaults, raise
+`INFERENCE_PROXY_PROVISIONING__LOG_MAX_ENTRIES_PER_HOST` or
+`INFERENCE_PROXY_PROVISIONING__LOG_MAX_BYTES_PER_HOST`. Runtime trace continues
+to accumulate in `/var/log/llamacpp-serve.log`; include that file in the node's
+normal log-rotation policy.
+
+Standalone context size is divided across its configured parallel slots. If
+`AUTOLLAMACPP_CTX_SIZE=8192` and `AUTOLLAMACPP_PARALLEL=4`, each slot gets 2048
+tokens.
 
 ### GGUF model storage
 

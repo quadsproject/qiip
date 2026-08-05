@@ -348,6 +348,69 @@ Treat those counters as cache-health signals instead of assuming a visible GGUF
 suppresses them. The dashboard also no longer chooses the first artifact: select
 the exact entrypoint or quantization explicitly.
 
+### 23. Let managed llama.cpp fit context and concurrency to available VRAM
+
+Managed llama.cpp no longer assigns context, GPU layers, parallel slots, or
+batch size from GPU-name heuristics. It invokes the pinned `llama-fit-params`
+memory estimator and configures only the resulting plan. Set the free-memory
+target:
+
+```dotenv
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB=1024
+```
+
+The value is a positive MiB margin per GPU. The planner first maximizes the
+guaranteed context per request up to the model's trained length, reducing it in
+256-token steps only when one full-length request cannot fit. It then maximizes
+parallel slots up to llama.cpp's 256-sequence limit. The unified KV pool is
+sized to at least `context_per_slot * slots`, so the selected concurrency can
+serve every slot at the guaranteed context rather than sharing a single
+model-length pool.
+
+The build profile changes from `cuda-portable-cpu-v1` to
+`cuda-portable-cpu-v2-fit-concurrency` because managed nodes now install
+`llama-fit-params` and expose unified-KV estimation in its pinned CLI. The first
+setup after upgrade performs one new source build per existing GPU/build
+identity; later setup remains idempotent. The exact CLI transformation digest
+is recorded in `BUILD-INFO` and participates in that identity. Setup also
+smoke-tests every planner flag against the built helper before publishing it.
+
+QIIP still enforces its CUDA-only boundary: managed launch explicitly requests
+all GPU layers and disables a second server fitting pass. After `/health`
+succeeds, QIIP rejects the launch unless the runtime matches the plan, the KV
+cache is unified, every model layer was offloaded, and post-load free VRAM meets
+the configured target. Failed verification runs `stop-llamacpp.sh` before
+provisioning is marked failed.
+
+QIIP sets `AUTOLLAMACPP_MANAGED=1`. In that mode the launcher rejects
+`AUTOLLAMACPP_CTX_SIZE`, `AUTOLLAMACPP_GPU_LAYERS`,
+`AUTOLLAMACPP_PARALLEL`, `AUTOLLAMACPP_BATCH_SIZE`, and
+`AUTOLLAMACPP_EXTRA_ARGS`; remove those variables from managed hosts before
+retrying. Standalone script use retains them. Ambient `LLAMA_ARG_*` variables,
+including `LLAMA_ARG_CTX_SIZE`, continue to be cleared before launch.
+
+The provisioning log records `context_per_slot`, `slot_context_limit`, `slots`,
+`aggregate_context`, `kv_unified`, `gpu_layers`, the configured fit target, and
+post-load GPU memory from the node. Do not assume four slots: concurrency is now
+a property of the selected model, quantization, GPU topology, and free-memory
+target. `context_per_slot` is QIIP's simultaneous-capacity guarantee;
+`slot_context_limit` is llama.cpp's maximum for one request; and
+`aggregate_context` is the total unified KV pool. When the aggregate exceeds
+the model training context, b10242's `possible training context overflow` and
+slot-capping warnings are expected and validated. A fitter-failure warning is
+still fatal.
+
+Managed servers run at llama.cpp verbosity 4 for their entire lifetime because
+the pinned build exposes fit and offload evidence at the trace threshold. This
+can evict older setup messages sooner from the bounded dashboard log while QIIP
+tails startup, but the tail stops after `/health`, so later request traffic does
+not change that retained provisioning record. Increase
+`INFERENCE_PROXY_PROVISIONING__LOG_MAX_ENTRIES_PER_HOST` or
+`INFERENCE_PROXY_PROVISIONING__LOG_MAX_BYTES_PER_HOST` if measurement shows the
+default 1,000 entries or 1 MiB is insufficient. Runtime trace continues to
+accumulate in `/var/log/llamacpp-serve.log`; include it in the node's log-rotation
+policy.
+
 ## Artifact Sources and Mirror Policy
 
 There is no single global mirror switch. Each source has a different trust and configuration boundary.
@@ -405,6 +468,7 @@ that may provision or display the node understands the field.
 | **Behavioral break** | Model downloads reject the removed `allow_patterns` field. llama.cpp downloads require an exact `gguf.files` and `gguf.entrypoint`; setup requires the resulting `artifact_id`. | Update direct administrative clients to the exact-artifact contract and handle 422 for obsolete request bodies. |
 | **New surface** | Download status records `download_id`, requested and resolved revisions, and exact artifacts. The catalog returns validated GGUF generations in `gguf_artifacts`, separate from full vLLM `models`. | Persist the resolved SHA and artifact ID when reproducibility matters. Keep the backing native snapshot while any node depends on that ID. |
 | **Behavioral break** | GGUF artifacts are discovered from native Hugging Face snapshots instead of the removed `<CACHE_DIR>/gguf` publication tree. Valid GGUFs remain visible even when their repository is incomplete or unverifiable, and the dashboard does not select the first artifact automatically. | Configure `HUGGINGFACE__SHARED_ROOT` before managed llama.cpp setup, preserve native snapshots referenced by nodes, inspect cache-health counters separately from `gguf_artifacts`, and select the exact GGUF entrypoint explicitly. |
+| **Behavioral break** | Managed llama.cpp setup uses the pinned estimator to maximize per-request context and then concurrency, sizes unified KV for every selected slot, and rejects manual context, GPU-layer, parallel, batch, and extra-argument overrides. A healthy endpoint is not registered until the runtime matches the plan, retains the configured VRAM margin, uses unified KV, and fully offloads the model. | Remove managed-host `AUTOLLAMACPP_*` sizing overrides, tune only `PROVISIONING__LLAMACPP_FIT_TARGET_MIB`, and use the emitted context, aggregate-context, and slot values when setting workload limits. |
 | **Behavioral break** | `/admin/nodes[].engine` is now nullable. Registered nodes report `vllm` or `llama_cpp`; QUADS-only hosts report `null` instead of the previous fabricated `vllm` value. | Treat `null` as “not provisioned or no registered engine identity,” not as vLLM. Update clients whose schema requires a string. |
 | **New surface** | `/admin/nodes[]` now includes nullable `artifact_id`. Managed llama.cpp nodes report the exact discovered GGUF generation selected at setup; vLLM, older, manual, and QUADS-only records can report `null`. | Preserve the field when correlating a node with the GGUF catalog, but continue to handle `null` during rolling upgrades and for non-artifact-backed nodes. |
 | **Behavioral break** | Recommendation `runtime` values are normalized to `vllm`, `llama_cpp`, `mlx`, or `unknown` instead of preserving LLMFit spellings such as `vLLM` and `llama.cpp`. | Compare against the canonical values. Treat this recommendation vocabulary as distinct from the provisionable `InferenceEngine` enum: `mlx` and `unknown` cannot be selected for setup. |

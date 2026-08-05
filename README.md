@@ -397,7 +397,7 @@ Provisioning resource and retention controls:
 | `INFERENCE_PROXY_PROVISIONING__LOG_MAX_COMPLETED_HOSTS` | `64` | Completed host-operation buffers retained, oldest first |
 
 Managed llama.cpp provisioning builds a verified source tag with CUDA enabled
-for the NVIDIA GPU attached to the node. It has four gateway settings:
+for the NVIDIA GPU attached to the node. It has five gateway settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -405,16 +405,30 @@ for the NVIDIA GPU attached to the node. It has four gateway settings:
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256` | committed digest | SHA-256 of the source archive selected by the version |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` | GitHub tag archive | Validated HTTP(S) URL template containing exactly one `{version}` placeholder |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT` | `7200` | Total wall-clock deadline for the llama.cpp setup command, including the CUDA source build (seconds) |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB` | `1024` | Free VRAM margin per GPU enforced by the llama.cpp capacity planner (MiB) |
 
 Changing `LLAMACPP_VERSION` requires an explicitly configured matching digest.
-The node verifies the archive before extracting it, builds only
-`llama-server` and `llama-quantize`, and atomically publishes a versioned
+The node verifies the archive before extracting it, builds `llama-server`,
+`llama-fit-params`, and `llama-quantize`, and atomically publishes a versioned
 installation under `/opt/llama.cpp`. CUDA kernels target the attached GPU; the
 supporting CPU backend uses a portable non-native profile so host assembler
 support cannot invalidate a CUDA build. The source build requires a working
 NVIDIA driver and CUDA compiler; QIIP-managed llama.cpp nodes do not fall back
-to CPU inference. See [auto-llamacpp](auto-llamacpp/README.md) for the direct
-script contract and build details.
+to CPU inference.
+
+Managed launch uses llama.cpp's own memory estimator to maximize the guaranteed
+context per request up to the model's trained length, then maximize concurrency
+up to llama.cpp's 256-sequence limit. It sizes one unified KV pool to at least
+`context_per_slot * slots`, so every selected slot has capacity for the reported
+context instead of sharing one model-length pool across a fixed four slots.
+After `/health` succeeds, QIIP requires the runtime to match that plan, keep the
+configured free-VRAM margin, use unified KV, and offload every model layer to
+GPU before registering the node healthy. The provisioning log records the
+simultaneous per-slot guarantee, llama.cpp per-request ceiling, aggregate
+context, slot count, layer offload, configured margin, and post-load GPU
+memory. See
+[auto-llamacpp](auto-llamacpp/README.md) for the direct script contract and
+build details.
 
 LLMFit has one version setting: `INFERENCE_PROXY_LLMFIT__VERSION`.
 

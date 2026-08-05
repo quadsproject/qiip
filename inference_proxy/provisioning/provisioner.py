@@ -57,6 +57,32 @@ logger = structlog.get_logger()
 
 STEP_PATTERN = re.compile(r"\[STEP:(\w+):(START|OK|FAIL|WARN)\]")
 MODEL_PATTERN = re.compile(r"#\s*Model:\s+(.+)")
+LLAMACPP_CONTEXT_PATTERN = re.compile(
+    r"initializing, n_slots = (?P<slots>\d+), "
+    r"n_ctx_slot = (?P<context>\d+), "
+    r"kv_unified = '(?P<unified>true|false)'"
+)
+LLAMACPP_AGGREGATE_CONTEXT_PATTERN = re.compile(
+    r"llama_context:\s+n_ctx\s*=\s*(?P<context>\d+)"
+)
+LLAMACPP_PLAN_PATTERN = re.compile(
+    r"qiip_fit_plan: context_per_slot=(?P<context>\d+) "
+    r"slots=(?P<slots>\d+) "
+    r"aggregate_context=(?P<aggregate>\d+) "
+    r"fit_target_mib=(?P<target>\d+)"
+)
+LLAMACPP_OFFLOAD_PATTERN = re.compile(
+    r"offloaded (?P<loaded>\d+)/(?P<total>\d+) layers to GPU"
+)
+LLAMACPP_CONTEXT_OVERFLOW_PATTERN = re.compile(
+    r"n_ctx_seq \((?P<context>\d+)\) > n_ctx_train \((?P<train>\d+)\) "
+    r"-- possible training context overflow"
+)
+LLAMACPP_SLOT_CAP_PATTERN = re.compile(
+    r"the slot context \((?P<context>\d+)\) exceeds the training context "
+    r"of the model \((?P<train>\d+)\) - capping"
+)
+LLAMACPP_FIT_FAILURE_PATTERN = re.compile(r"failed to fit params to free device memory")
 _ENGINE_BUNDLE_FILES = {
     InferenceEngine.VLLM: {
         ".uv-version",
@@ -111,6 +137,102 @@ class ProvisioningIdentity:
 
     engine: InferenceEngine
     artifact_id: str | None = None
+
+
+@dataclass(frozen=True)
+class LlamaCppRuntimeFit:
+    """Effective llama.cpp sizing parsed from the completed startup log."""
+
+    context_per_slot: int
+    slot_context_limit: int
+    slots: int
+    aggregate_context: int
+    fit_target_mib: int
+    kv_unified: bool
+    gpu_layers: int
+    total_layers: int
+
+
+def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
+    """Validate and return the final managed llama.cpp fit evidence."""
+    if LLAMACPP_FIT_FAILURE_PATTERN.search(log_text):
+        raise ProvisioningError("llama.cpp reported a runtime fitting failure")
+    plans = list(LLAMACPP_PLAN_PATTERN.finditer(log_text))
+    if not plans:
+        raise ProvisioningError("llama.cpp startup log has no QIIP VRAM plan")
+    contexts = list(LLAMACPP_CONTEXT_PATTERN.finditer(log_text))
+    if not contexts:
+        raise ProvisioningError("llama.cpp startup log has no effective context record")
+    aggregate_contexts = list(LLAMACPP_AGGREGATE_CONTEXT_PATTERN.finditer(log_text))
+    if not aggregate_contexts:
+        raise ProvisioningError("llama.cpp startup log has no aggregate context record")
+    offloads = list(LLAMACPP_OFFLOAD_PATTERN.finditer(log_text))
+    if not offloads:
+        raise ProvisioningError("llama.cpp startup log has no GPU offload record")
+
+    plan = plans[-1].groupdict()
+    context = contexts[-1].groupdict()
+    aggregate_context = int(aggregate_contexts[-1].group("context"))
+    offload = offloads[-1].groupdict()
+    fit = LlamaCppRuntimeFit(
+        context_per_slot=int(plan["context"]),
+        slot_context_limit=int(context["context"]),
+        slots=int(plan["slots"]),
+        aggregate_context=int(plan["aggregate"]),
+        fit_target_mib=int(plan["target"]),
+        kv_unified=context["unified"] == "true",
+        gpu_layers=int(offload["loaded"]),
+        total_layers=int(offload["total"]),
+    )
+    if (
+        fit.context_per_slot < 1
+        or fit.slot_context_limit < fit.context_per_slot
+        or fit.slot_context_limit > fit.aggregate_context
+        or fit.slots < 1
+        or fit.fit_target_mib < 1
+    ):
+        raise ProvisioningError("llama.cpp reported an invalid effective context")
+    if int(context["slots"]) != fit.slots:
+        raise ProvisioningError(
+            "llama.cpp runtime slot count differs from its VRAM plan"
+        )
+    requested_context = fit.context_per_slot * fit.slots
+    if not requested_context <= fit.aggregate_context < requested_context + 256:
+        raise ProvisioningError("llama.cpp VRAM plan has invalid aggregate context")
+    if aggregate_context != fit.aggregate_context:
+        raise ProvisioningError(
+            "llama.cpp runtime aggregate context differs from its VRAM plan"
+        )
+    overflows = list(LLAMACPP_CONTEXT_OVERFLOW_PATTERN.finditer(log_text))
+    caps = list(LLAMACPP_SLOT_CAP_PATTERN.finditer(log_text))
+    if fit.aggregate_context > fit.slot_context_limit:
+        if not overflows or not caps:
+            raise ProvisioningError(
+                "llama.cpp startup log is missing expected unified-KV "
+                "context-sharing warnings"
+            )
+        overflow = overflows[-1].groupdict()
+        cap = caps[-1].groupdict()
+        expected = {
+            "context": str(fit.aggregate_context),
+            "train": str(fit.slot_context_limit),
+        }
+        if overflow != expected or cap != expected:
+            raise ProvisioningError(
+                "llama.cpp unified-KV context-sharing warnings differ from runtime"
+            )
+    elif overflows or caps:
+        raise ProvisioningError(
+            "llama.cpp reported unexpected unified-KV context-sharing warnings"
+        )
+    if not fit.kv_unified:
+        raise ProvisioningError("llama.cpp managed startup requires unified KV cache")
+    if fit.total_layers < 1 or fit.gpu_layers != fit.total_layers:
+        raise ProvisioningError(
+            "llama.cpp did not fully offload the model to GPU "
+            f"({fit.gpu_layers}/{fit.total_layers} layers)"
+        )
+    return fit
 
 
 @dataclass
@@ -308,6 +430,10 @@ class NodeProvisioner:
                 "AUTOLLAMACPP_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
                 "AUTOLLAMACPP_PORT": str(self._settings.vllm_port),
                 "AUTOLLAMACPP_REQUIRE_CUDA": "1",
+                "AUTOLLAMACPP_MANAGED": "1",
+                "AUTOLLAMACPP_FIT_TARGET_MIB": str(
+                    self._settings.llamacpp_fit_target_mib
+                ),
             }
             if artifact is None:
                 raise ProvisioningError("llama_cpp start requires a GGUF artifact")
@@ -665,6 +791,9 @@ class NodeProvisioner:
             )
             self._log(hostname, "info", "Waiting for health endpoint")
             await self._poll_health(hostname, engine=engine)
+            if engine == InferenceEngine.LLAMA_CPP:
+                current_step = "llamacpp_runtime_verify"
+                await self._verify_llamacpp_runtime(hostname)
             current_step = "registering"
             await self._update_state(
                 hostname, ProvisioningStep.REGISTERING, started_at=provision_started_at
@@ -799,6 +928,83 @@ class NodeProvisioner:
         if not gpu_lines:
             raise ProvisioningError(f"No GPUs detected on {hostname} after setup")
         self._log(hostname, "info", f"Detected {len(gpu_lines)} GPU(s)")
+
+    async def _stop_failed_llamacpp_start(self, hostname: str) -> None:
+        """Best-effort cleanup after post-health llama.cpp verification fails."""
+        command = self._script_command(
+            "stop-llamacpp.sh",
+            scripts_dir=self._engine_scripts_dir(InferenceEngine.LLAMA_CPP).name,
+        )
+        try:
+            await self._ssh_run_command(hostname, command)
+        except Exception as exc:
+            logger.warning(
+                "llamacpp_verification_cleanup_failed",
+                hostname=hostname,
+                error=str(exc),
+                exc_info=True,
+            )
+            self._log(
+                hostname,
+                "warning",
+                "llama.cpp runtime verification failed and the stop script "
+                f"also failed: {exc}",
+            )
+
+    async def _verify_llamacpp_runtime(self, hostname: str) -> None:
+        """Fail closed unless the healthy server proves the managed fit contract."""
+        try:
+            log_text = await self._ssh_run_command(
+                hostname, "cat -- /var/log/llamacpp-serve.log"
+            )
+            fit = _parse_llamacpp_runtime_fit(log_text)
+            memory_text = await self._ssh_run_command(
+                hostname,
+                "nvidia-smi --query-gpu=memory.used,memory.free "
+                "--format=csv,noheader,nounits",
+            )
+            memory_rows: list[tuple[int, int]] = []
+            try:
+                for line in memory_text.splitlines():
+                    if not line.strip():
+                        continue
+                    used_text, free_text = line.split(",", maxsplit=1)
+                    memory_rows.append((int(used_text.strip()), int(free_text.strip())))
+            except ValueError as exc:
+                raise ProvisioningError(
+                    "could not parse post-load NVIDIA memory telemetry"
+                ) from exc
+            if not memory_rows:
+                raise ProvisioningError(
+                    "post-load NVIDIA memory telemetry returned no GPUs"
+                )
+            if fit.fit_target_mib != self._settings.llamacpp_fit_target_mib:
+                raise ProvisioningError(
+                    "llama.cpp runtime fit target differs from gateway configuration"
+                )
+            if any(row[1] < fit.fit_target_mib for row in memory_rows):
+                raise ProvisioningError(
+                    "llama.cpp post-load free VRAM is below the configured fit target"
+                )
+
+            used = ",".join(str(row[0]) for row in memory_rows)
+            free = ",".join(str(row[1]) for row in memory_rows)
+            self._log(
+                hostname,
+                "info",
+                "llama.cpp fitted: "
+                f"context_per_slot={fit.context_per_slot} "
+                f"slot_context_limit={fit.slot_context_limit} "
+                f"slots={fit.slots} "
+                f"aggregate_context={fit.aggregate_context} "
+                f"kv_unified={str(fit.kv_unified).lower()} "
+                f"gpu_layers={fit.gpu_layers}/{fit.total_layers} "
+                f"fit_target_mib={self._settings.llamacpp_fit_target_mib} "
+                f"gpu_used_mib={used} gpu_free_mib={free}",
+            )
+        except Exception:
+            await self._stop_failed_llamacpp_start(hostname)
+            raise
 
     async def _run_start_vllm(
         self,

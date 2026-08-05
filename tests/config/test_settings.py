@@ -376,6 +376,7 @@ class TestArtifactDigestSettings:
         assert provisioning.llamacpp_version == DEFAULT_LLAMACPP_VERSION
         assert provisioning.llamacpp_sha256 == DEFAULT_LLAMACPP_SHA256
         assert provisioning.llamacpp_source_url == DEFAULT_LLAMACPP_SOURCE_URL
+        assert provisioning.llamacpp_fit_target_mib == 1024
         assert provisioning.llamacpp_source_download_url() == (
             "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b10242.tar.gz"
         )
@@ -494,6 +495,7 @@ class TestProvisioningResourceLimits:
             "log_max_bytes_per_host",
             "log_max_entry_bytes",
             "log_max_completed_hosts",
+            "llamacpp_fit_target_mib",
         ],
     )
     def test_provisioning_resource_limits_reject_zero(self, field: str) -> None:

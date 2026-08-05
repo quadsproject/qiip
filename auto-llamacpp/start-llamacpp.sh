@@ -10,8 +10,11 @@ CTX_SIZE_OVERRIDE="${AUTOLLAMACPP_CTX_SIZE:-}"
 PARALLEL_OVERRIDE="${AUTOLLAMACPP_PARALLEL:-}"
 BATCH_SIZE_OVERRIDE="${AUTOLLAMACPP_BATCH_SIZE:-}"
 EXTRA_ARGS_OVERRIDE="${AUTOLLAMACPP_EXTRA_ARGS:-}"
+MANAGED="${AUTOLLAMACPP_MANAGED:-0}"
+FIT_TARGET_MIB="${AUTOLLAMACPP_FIT_TARGET_MIB:-1024}"
 SCRIPT_DIR="${AUTOLLAMACPP_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 LLAMACPP_BIN="${AUTOLLAMACPP_BIN:-/usr/local/bin/llama-server}"
+LLAMACPP_FIT_BIN="${AUTOLLAMACPP_FIT_BIN:-/usr/local/bin/llama-fit-params}"
 LLAMACPP_INSTALL_ROOT="${AUTOLLAMACPP_INSTALL_ROOT:-/opt/llama.cpp}"
 PID_FILE="${AUTOLLAMACPP_PID_FILE:-/var/run/llamacpp.pid}"
 LLAMACPP_LOG_FILE="${AUTOLLAMACPP_LOG_FILE:-/var/log/llamacpp-serve.log}"
@@ -19,6 +22,13 @@ PROC_ROOT="${AUTOLLAMACPP_PROC_ROOT:-/proc}"
 STARTUP_GRACE_PERIOD="${AUTOLLAMACPP_STARTUP_GRACE_PERIOD:-2}"
 STARTUP_LOG_LINES="${AUTOLLAMACPP_STARTUP_LOG_LINES:-40}"
 REQUIRE_CUDA="${AUTOLLAMACPP_REQUIRE_CUDA:-1}"
+LLAMACPP_MAX_SEQUENCES=256
+LLAMACPP_CONTEXT_ALIGNMENT=256
+LLAMACPP_ESTIMATE_ROUNDING_MIB=4
+MANAGED_CONTEXT_PER_SLOT=0
+MANAGED_PARALLEL=0
+MANAGED_AGGREGATE_CONTEXT=0
+MANAGED_GPU_FREE_MIB=()
 
 # shellcheck source=auto-llamacpp/llamacpp-process.sh
 source "${SCRIPT_DIR}/llamacpp-process.sh"
@@ -95,6 +105,30 @@ resolve_gguf_artifact() {
 }
 
 configure_llamacpp_params() {
+    if [ "$MANAGED" = "1" ]; then
+        local override
+        for override in \
+            AUTOLLAMACPP_GPU_LAYERS \
+            AUTOLLAMACPP_CTX_SIZE \
+            AUTOLLAMACPP_PARALLEL \
+            AUTOLLAMACPP_BATCH_SIZE \
+            AUTOLLAMACPP_EXTRA_ARGS; do
+            if [ -n "${!override:-}" ]; then
+                echo "FATAL: ${override} is not supported for managed llama.cpp; VRAM fitting owns sizing" >&2
+                return 1
+            fi
+        done
+        if [[ ! "$FIT_TARGET_MIB" =~ ^[1-9][0-9]*$ ]]; then
+            echo "FATAL: AUTOLLAMACPP_FIT_TARGET_MIB must be a positive integer MiB value" >&2
+            return 1
+        fi
+        if [ ! -x "$LLAMACPP_FIT_BIN" ]; then
+            echo "FATAL: managed llama.cpp requires the VRAM planner at ${LLAMACPP_FIT_BIN}" >&2
+            return 1
+        fi
+        return 0
+    fi
+
     N_GPU_LAYERS="auto"
     CTX_SIZE=4096
     PARALLEL=4
@@ -147,7 +181,9 @@ clear_script_environment() {
     unset AUTOLLAMACPP_GGUF_PATH AUTOLLAMACPP_MODEL_ALIAS
     unset AUTOLLAMACPP_GPU_LAYERS AUTOLLAMACPP_CTX_SIZE AUTOLLAMACPP_PARALLEL
     unset AUTOLLAMACPP_BATCH_SIZE AUTOLLAMACPP_EXTRA_ARGS
-    unset AUTOLLAMACPP_SCRIPT_DIR AUTOLLAMACPP_BIN AUTOLLAMACPP_INSTALL_ROOT
+    unset AUTOLLAMACPP_MANAGED AUTOLLAMACPP_FIT_TARGET_MIB
+    unset AUTOLLAMACPP_SCRIPT_DIR AUTOLLAMACPP_BIN AUTOLLAMACPP_FIT_BIN
+    unset AUTOLLAMACPP_INSTALL_ROOT
     unset AUTOLLAMACPP_PID_FILE
     unset AUTOLLAMACPP_LOG_FILE AUTOLLAMACPP_PROC_ROOT
     unset AUTOLLAMACPP_STARTUP_GRACE_PERIOD AUTOLLAMACPP_STARTUP_LOG_LINES
@@ -161,6 +197,226 @@ clear_script_environment() {
     while IFS= read -r name; do
         unset "$name"
     done < <(compgen -A variable LLAMA_ARG_)
+}
+
+managed_aggregate_context() {
+    local context_per_slot="$1"
+    local slots="$2"
+    local requested=$((context_per_slot * slots))
+    printf '%d\n' "$((
+        (requested + LLAMACPP_CONTEXT_ALIGNMENT - 1)
+        / LLAMACPP_CONTEXT_ALIGNMENT
+        * LLAMACPP_CONTEXT_ALIGNMENT
+    ))"
+}
+
+read_managed_gpu_free_memory() {
+    local free_output row
+    if ! free_output=$(nvidia-smi \
+        --query-gpu=memory.free \
+        --format=csv,noheader,nounits); then
+        echo "FATAL: could not query free GPU memory for llama.cpp planning" >&2
+        return 1
+    fi
+
+    MANAGED_GPU_FREE_MIB=()
+    while IFS= read -r row; do
+        row="${row//[[:space:]]/}"
+        if [ -z "$row" ]; then
+            continue
+        fi
+        if [[ ! "$row" =~ ^[0-9]+$ ]]; then
+            echo "FATAL: nvidia-smi returned invalid free-memory telemetry: ${row}" >&2
+            return 1
+        fi
+        MANAGED_GPU_FREE_MIB+=("$row")
+    done <<< "$free_output"
+
+    if [ "${#MANAGED_GPU_FREE_MIB[@]}" -ne "$GPU_COUNT" ]; then
+        echo "FATAL: llama.cpp planner saw ${#MANAGED_GPU_FREE_MIB[@]} memory rows for ${GPU_COUNT} GPUs" >&2
+        return 1
+    fi
+}
+
+read_model_train_context() {
+    local output train_context
+    if ! output=$("$LLAMACPP_FIT_BIN" \
+        --model "$GGUF_PATH" \
+        --parallel 1 \
+        --kv-unified \
+        --gpu-layers all \
+        --fit-print on \
+        --verbosity 4 2>&1); then
+        echo "FATAL: llama.cpp could not read model metadata for VRAM planning" >&2
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
+    train_context=$(printf '%s\n' "$output" | sed -nE \
+        's/.*n_ctx_train[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' | tail -n 1)
+    if [[ ! "$train_context" =~ ^[1-9][0-9]*$ ]]; then
+        echo "FATAL: llama.cpp planner could not determine the model training context" >&2
+        return 1
+    fi
+    printf '%s\n' "$train_context"
+}
+
+managed_candidate_fits() {
+    local context_per_slot="$1"
+    local slots="$2"
+    local aggregate_context output row device model_mib context_mib compute_mib extra
+    local index required_mib
+    local -a estimated_mib=()
+
+    aggregate_context=$(managed_aggregate_context "$context_per_slot" "$slots")
+    if [ "$aggregate_context" -gt 4294967040 ]; then
+        return 1
+    fi
+    if ! output=$("$LLAMACPP_FIT_BIN" \
+        --model "$GGUF_PATH" \
+        --ctx-size "$aggregate_context" \
+        --parallel "$slots" \
+        --kv-unified \
+        --gpu-layers all \
+        --fit-print on \
+        --verbosity 0 2>&1); then
+        echo "FATAL: llama.cpp failed to estimate VRAM for ${slots} slots" >&2
+        printf '%s\n' "$output" >&2
+        return 2
+    fi
+
+    while IFS= read -r row; do
+        read -r device model_mib context_mib compute_mib extra <<< "$row"
+        if [[ ! "$device" =~ ^CUDA[0-9]+$ ]]; then
+            continue
+        fi
+        if [[ ! "$model_mib" =~ ^[0-9]+$ ]] \
+            || [[ ! "$context_mib" =~ ^[0-9]+$ ]] \
+            || [[ ! "$compute_mib" =~ ^[0-9]+$ ]] \
+            || [ -n "${extra:-}" ]; then
+            echo "FATAL: llama.cpp returned an invalid CUDA memory estimate: ${row}" >&2
+            return 2
+        fi
+        estimated_mib+=("$((model_mib + context_mib + compute_mib))")
+    done <<< "$output"
+
+    if [ "${#estimated_mib[@]}" -eq 0 ]; then
+        echo "FATAL: llama.cpp returned no CUDA device memory estimates" >&2
+        return 2
+    fi
+    if [ "${#estimated_mib[@]}" -ne "${#MANAGED_GPU_FREE_MIB[@]}" ]; then
+        echo "FATAL: llama.cpp returned ${#estimated_mib[@]} CUDA estimates for ${#MANAGED_GPU_FREE_MIB[@]} GPUs" >&2
+        return 2
+    fi
+    for index in "${!estimated_mib[@]}"; do
+        # Each of llama-fit-params' three MiB components is rounded down, so
+        # their sum can hide almost 3 MiB. Four adds the next whole MiB plus a
+        # one-MiB guard before applying the operator's free-VRAM target.
+        required_mib=$((
+            estimated_mib[index]
+            + FIT_TARGET_MIB
+            + LLAMACPP_ESTIMATE_ROUNDING_MIB
+        ))
+        if [ "$required_mib" -gt "${MANAGED_GPU_FREE_MIB[index]}" ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
+plan_managed_configuration() {
+    local train_context min_context low high mid best_context
+    local best_slots probe upper status
+
+    echo "Planning llama.cpp context and concurrency from free VRAM"
+    read_managed_gpu_free_memory
+    train_context=$(read_model_train_context)
+
+    status=0
+    managed_candidate_fits "$train_context" 1 || status=$?
+    if [ "$status" -eq 0 ]; then
+        best_context="$train_context"
+    elif [ "$status" -eq 2 ]; then
+        return 1
+    else
+        min_context=4096
+        if [ "$train_context" -lt "$min_context" ]; then
+            min_context="$train_context"
+        fi
+        status=0
+        managed_candidate_fits "$min_context" 1 || status=$?
+        if [ "$status" -eq 2 ]; then
+            return 1
+        fi
+        if [ "$status" -ne 0 ]; then
+            echo "FATAL: the model cannot fully offload with ${min_context} context tokens and ${FIT_TARGET_MIB} MiB free per GPU" >&2
+            return 1
+        fi
+
+        low=$((min_context / LLAMACPP_CONTEXT_ALIGNMENT))
+        high=$((train_context / LLAMACPP_CONTEXT_ALIGNMENT))
+        best_context="$min_context"
+        while [ "$low" -le "$high" ]; do
+            mid=$(((low + high) / 2))
+            status=0
+            managed_candidate_fits "$((mid * LLAMACPP_CONTEXT_ALIGNMENT))" 1 \
+                || status=$?
+            if [ "$status" -eq 2 ]; then
+                return 1
+            elif [ "$status" -eq 0 ]; then
+                best_context=$((mid * LLAMACPP_CONTEXT_ALIGNMENT))
+                low=$((mid + 1))
+            else
+                high=$((mid - 1))
+            fi
+        done
+    fi
+
+    best_slots=1
+    probe=2
+    upper=0
+    while [ "$probe" -le "$LLAMACPP_MAX_SEQUENCES" ]; do
+        status=0
+        managed_candidate_fits "$best_context" "$probe" || status=$?
+        if [ "$status" -eq 2 ]; then
+            return 1
+        elif [ "$status" -eq 0 ]; then
+            best_slots="$probe"
+            if [ "$probe" -eq "$LLAMACPP_MAX_SEQUENCES" ]; then
+                break
+            fi
+            probe=$((probe * 2))
+            if [ "$probe" -gt "$LLAMACPP_MAX_SEQUENCES" ]; then
+                probe="$LLAMACPP_MAX_SEQUENCES"
+            fi
+        else
+            upper=$((probe - 1))
+            break
+        fi
+    done
+
+    if [ "$upper" -gt "$best_slots" ]; then
+        low=$((best_slots + 1))
+        high="$upper"
+        while [ "$low" -le "$high" ]; do
+            mid=$(((low + high) / 2))
+            status=0
+            managed_candidate_fits "$best_context" "$mid" || status=$?
+            if [ "$status" -eq 2 ]; then
+                return 1
+            elif [ "$status" -eq 0 ]; then
+                best_slots="$mid"
+                low=$((mid + 1))
+            else
+                high=$((mid - 1))
+            fi
+        done
+    fi
+
+    MANAGED_CONTEXT_PER_SLOT="$best_context"
+    MANAGED_PARALLEL="$best_slots"
+    MANAGED_AGGREGATE_CONTEXT=$(managed_aggregate_context \
+        "$MANAGED_CONTEXT_PER_SLOT" "$MANAGED_PARALLEL")
+    echo "Selected ${MANAGED_PARALLEL} slots x ${MANAGED_CONTEXT_PER_SLOT} tokens (${MANAGED_AGGREGATE_CONTEXT} aggregate)"
 }
 
 verify_llamacpp_started() {
@@ -185,7 +441,27 @@ run_llamacpp() {
     bash "${SCRIPT_DIR}/stop-llamacpp.sh"
     clear_script_environment
 
-    cat <<EOF
+    if [ "$MANAGED" = "1" ]; then
+        plan_managed_configuration
+    fi
+
+    if [ "$MANAGED" = "1" ]; then
+        cat <<EOF
+
+# llama.cpp Managed Configuration
+# ================================================
+# GPU:                ${GPU_COUNT} x ${GPU_MODEL} (${GPU_VRAM_GB} GB)
+# Model:              ${MODEL_ALIAS}
+# GGUF:               ${GGUF_PATH}
+# VRAM Fit Target:    ${FIT_TARGET_MIB} MiB free per GPU
+# Context Per Slot:   ${MANAGED_CONTEXT_PER_SLOT} tokens
+# Parallel Slots:     ${MANAGED_PARALLEL}
+# Aggregate Context:  ${MANAGED_AGGREGATE_CONTEXT} tokens
+# ================================================
+
+EOF
+    else
+        cat <<EOF
 
 # llama.cpp Configuration
 # ================================================
@@ -198,23 +474,49 @@ run_llamacpp() {
 # ================================================
 
 EOF
+    fi
 
-    set -f
-    # shellcheck disable=SC2086
-    "$LLAMACPP_BIN" \
-        --model "$GGUF_PATH" \
-        --host 0.0.0.0 \
-        --port "$API_PORT" \
-        --alias "$MODEL_ALIAS" \
-        -ngl "$N_GPU_LAYERS" \
-        -c "$CTX_SIZE" \
-        --parallel "$PARALLEL" \
-        -b "$BATCH_SIZE" \
-        --flash-attn auto \
-        --cont-batching \
-        --metrics \
-        ${EXTRA_ARGS:-} \
-        > "$LLAMACPP_LOG_FILE" 2>&1 &
+    if [ "$MANAGED" = "1" ]; then
+        printf 'qiip_fit_plan: context_per_slot=%s slots=%s aggregate_context=%s fit_target_mib=%s\n' \
+            "$MANAGED_CONTEXT_PER_SLOT" \
+            "$MANAGED_PARALLEL" \
+            "$MANAGED_AGGREGATE_CONTEXT" \
+            "$FIT_TARGET_MIB" > "$LLAMACPP_LOG_FILE"
+        # llama.cpp's auto parallel value is a fixed four, not a VRAM fit. The
+        # planner uses llama-fit-params to select the largest full-context slot
+        # count that preserves the requested free-memory margin. A unified KV
+        # buffer sized to slots * context lets every slot reach model context.
+        # LLAMA_LOG_INFO sizing records require trace verbosity 4; --verbose
+        # would instead enable debug-level probe noise.
+        "$LLAMACPP_BIN" \
+            --model "$GGUF_PATH" \
+            --host 0.0.0.0 \
+            --port "$API_PORT" \
+            --alias "$MODEL_ALIAS" \
+            --ctx-size "$MANAGED_AGGREGATE_CONTEXT" \
+            --parallel "$MANAGED_PARALLEL" \
+            --kv-unified \
+            --gpu-layers all \
+            --fit off \
+            --verbosity 4 \
+            --metrics \
+            >> "$LLAMACPP_LOG_FILE" 2>&1 &
+    else
+        set -f
+        # shellcheck disable=SC2086
+        "$LLAMACPP_BIN" \
+            --model "$GGUF_PATH" \
+            --host 0.0.0.0 \
+            --port "$API_PORT" \
+            --alias "$MODEL_ALIAS" \
+            -ngl "$N_GPU_LAYERS" \
+            -c "$CTX_SIZE" \
+            --parallel "$PARALLEL" \
+            -b "$BATCH_SIZE" \
+            --metrics \
+            ${EXTRA_ARGS:-} \
+            > "$LLAMACPP_LOG_FILE" 2>&1 &
+    fi
 
     local pid=$!
     echo "$pid" > "$PID_FILE"

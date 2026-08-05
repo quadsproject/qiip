@@ -57,6 +57,33 @@ def _source_start(command: str) -> str:
     return f"source {start_script}\n{command}"
 
 
+def _write_fake_fit_planner(path: Path, *, train_context: int = 128000) -> None:
+    _write_executable(
+        path,
+        f"""#!/bin/bash
+if [[ " $* " != *' --kv-unified '* ]] || [[ " $* " != *' --gpu-layers all '* ]]; then
+    exit 44
+fi
+context={train_context}
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --ctx-size)
+            context="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+echo 'llama_model_loader: n_ctx_train = {train_context}' >&2
+context_mib=$((context * 1500 / {train_context}))
+printf 'CUDA0 8500 %s 200\n' "$context_mib"
+printf 'Host 0 0 100\n'
+""",
+    )
+
+
 def test_start_resolves_exact_artifact_and_preserves_alias(tmp_path: Path) -> None:
     model = tmp_path / "gguf" / "artifact -- id" / "files" / "model---Q4.gguf"
     model.parent.mkdir(parents=True)
@@ -134,21 +161,33 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(tmp_path: Path) -
     decoy.write_bytes(b"wrong")
     alias = "org/model--with---separators"
 
-    fake_bin = tmp_path / "fake llama-server"
+    fake_server = tmp_path / "fake llama-server"
+    fake_fit = tmp_path / "fake llama-fit-params"
+    fake_tools = tmp_path / "fake tools"
+    fake_tools.mkdir()
     args_file = tmp_path / "llama args"
     _write_executable(
-        fake_bin,
+        fake_server,
         '#!/bin/bash\nprintf \'%s\\n\' "$@" > "$AUTOLLAMACPP_TEST_ARGS"\n',
+    )
+    _write_fake_fit_planner(fake_fit)
+    _write_executable(
+        fake_tools / "nvidia-smi",
+        "#!/bin/bash\nprintf '22367\\n'\n",
     )
     script_bundle = tmp_path / "script bundle"
     script_bundle.mkdir()
     _write_executable(script_bundle / "stop-llamacpp.sh", "#!/bin/bash\nexit 0\n")
     env = {
         **os.environ,
+        "PATH": f"{fake_tools}:/usr/bin:/bin",
         "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
         "AUTOLLAMACPP_GGUF_PATH": str(exact.relative_to(tmp_path)),
         "AUTOLLAMACPP_MODEL_ALIAS": alias,
-        "AUTOLLAMACPP_BIN": str(fake_bin),
+        "AUTOLLAMACPP_MANAGED": "1",
+        "AUTOLLAMACPP_FIT_TARGET_MIB": "1536",
+        "AUTOLLAMACPP_BIN": str(fake_server),
+        "AUTOLLAMACPP_FIT_BIN": str(fake_fit),
         "AUTOLLAMACPP_PID_FILE": str(tmp_path / "llama.pid"),
         "AUTOLLAMACPP_LOG_FILE": str(tmp_path / "llama.log"),
         "AUTOLLAMACPP_TEST_ARGS": str(args_file),
@@ -157,7 +196,7 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(tmp_path: Path) -
         (
             f"SCRIPT_DIR={shlex.quote(str(script_bundle))}",
             'GPU_COUNT=1; GPU_MODEL="fixture"; GPU_VRAM_GB=80',
-            "N_GPU_LAYERS=99; CTX_SIZE=4096; PARALLEL=1; BATCH_SIZE=512",
+            "configure_llamacpp_params",
             'verify_llamacpp_started() { wait "$1"; }',
             "run_llamacpp",
         )
@@ -169,6 +208,128 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(tmp_path: Path) -
     args = args_file.read_text(encoding="utf-8").splitlines()
     assert args[args.index("--model") + 1] == str(exact)
     assert args[args.index("--alias") + 1] == alias
+    assert args[args.index("--fit") + 1] == "off"
+    assert "--fit-target" not in args
+    assert args[args.index("--ctx-size") + 1] == "1024000"
+    assert args[args.index("--parallel") + 1] == "8"
+    assert args[args.index("--gpu-layers") + 1] == "all"
+    assert "--kv-unified" in args
+    assert args[args.index("--verbosity") + 1] == "4"
+    assert "--verbose" not in args
+    assert not ({"-b", "--batch-size"} & set(args))
+    assert "--flash-attn" not in args
+    assert "--cont-batching" not in args
+    assert (tmp_path / "llama.log").read_text(encoding="utf-8") == (
+        "qiip_fit_plan: context_per_slot=128000 slots=8 "
+        "aggregate_context=1024000 fit_target_mib=1536\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("train_context", "free_mib", "expected"),
+    [
+        (8192, 10500, "4096 1 4096"),
+        (128000, 1000000, "128000 256 32768000"),
+    ],
+)
+def test_managed_planner_reduces_context_only_when_needed_and_uses_library_limit(
+    tmp_path: Path,
+    train_context: int,
+    free_mib: int,
+    expected: str,
+) -> None:
+    fake_fit = tmp_path / "llama-fit-params"
+    fake_tools = tmp_path / "bin"
+    fake_tools.mkdir()
+    _write_fake_fit_planner(fake_fit, train_context=train_context)
+    _write_executable(
+        fake_tools / "nvidia-smi",
+        f"#!/bin/bash\nprintf '{free_mib}\\n'\n",
+    )
+    result = _run_shell(
+        _source_start(
+            "\n".join(
+                (
+                    "GPU_COUNT=1",
+                    "GGUF_PATH=/cache/model.gguf",
+                    "plan_managed_configuration",
+                    'printf "%s %s %s\\n" "$MANAGED_CONTEXT_PER_SLOT" '
+                    '"$MANAGED_PARALLEL" "$MANAGED_AGGREGATE_CONTEXT"',
+                )
+            )
+        ),
+        env={
+            **os.environ,
+            "PATH": f"{fake_tools}:/usr/bin:/bin",
+            "AUTOLLAMACPP_FIT_BIN": str(fake_fit),
+            "AUTOLLAMACPP_FIT_TARGET_MIB": "1024",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[-1] == expected
+
+
+def test_managed_planner_names_missing_cuda_estimates(tmp_path: Path) -> None:
+    fake_fit = tmp_path / "llama-fit-params"
+    _write_executable(fake_fit, "#!/bin/bash\nprintf 'Vulkan0 10 20 30\\n'\n")
+
+    result = _run_shell(
+        _source_start(
+            "\n".join(
+                (
+                    "GGUF_PATH=/cache/model.gguf",
+                    "MANAGED_GPU_FREE_MIB=(4096)",
+                    "managed_candidate_fits 4096 1",
+                )
+            )
+        ),
+        env={**os.environ, "AUTOLLAMACPP_FIT_BIN": str(fake_fit)},
+    )
+
+    assert result.returncode != 0
+    assert "returned no CUDA device memory estimates" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "AUTOLLAMACPP_GPU_LAYERS",
+        "AUTOLLAMACPP_CTX_SIZE",
+        "AUTOLLAMACPP_PARALLEL",
+        "AUTOLLAMACPP_BATCH_SIZE",
+        "AUTOLLAMACPP_EXTRA_ARGS",
+    ],
+)
+def test_managed_start_rejects_manual_sizing_overrides(override: str) -> None:
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_MANAGED": "1",
+        override: "1",
+    }
+
+    result = _run_shell(
+        _source_start("configure_llamacpp_params"),
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert f"{override} is not supported for managed llama.cpp" in result.stderr
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "invalid"])
+def test_managed_start_requires_positive_fit_target(value: str) -> None:
+    result = _run_shell(
+        _source_start("configure_llamacpp_params"),
+        env={
+            **os.environ,
+            "AUTOLLAMACPP_MANAGED": "1",
+            "AUTOLLAMACPP_FIT_TARGET_MIB": value,
+        },
+    )
+
+    assert result.returncode != 0
+    assert "must be a positive integer MiB value" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -256,8 +417,9 @@ exit 2
 echo tar >> "$AUTOLLAMACPP_TEST_LOG"
 while [[ "$#" -gt 0 ]]; do
     if [[ "$1" == '-C' ]]; then
-        mkdir -p "$2"
+        mkdir -p "$2/common"
         printf 'fixture' > "$2/CMakeLists.txt"
+        printf '%s\n' ').set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));' > "$2/common/arg.cpp"
         exit 0
     fi
     shift
@@ -274,6 +436,15 @@ printf '\n' >> "$AUTOLLAMACPP_TEST_LOG"
 if [[ "${AUTOLLAMACPP_TEST_CMAKE_FAIL:-}" == 'configure' && "${1:-}" != '--build' ]]; then
     exit 42
 fi
+if [[ "${1:-}" != '--build' ]]; then
+    while [[ "$#" -gt 0 ]]; do
+        if [[ "$1" == '-S' ]]; then
+            grep -Fq 'LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_FIT_PARAMS' "$2/common/arg.cpp" || exit 43
+            break
+        fi
+        shift
+    done
+fi
 if [[ "${1:-}" == '--build' ]]; then
     build_dir="$2"
     mkdir -p "$build_dir/bin"
@@ -281,11 +452,22 @@ if [[ "${1:-}" == '--build' ]]; then
 #!/bin/bash
 echo 'version: 10242 (b10242)' >&2
 EOF
+    cat > "$build_dir/bin/llama-fit-params" <<'EOF'
+#!/bin/bash
+printf 'fit' >> "$AUTOLLAMACPP_TEST_LOG"
+printf ' <%s>' "$@" >> "$AUTOLLAMACPP_TEST_LOG"
+printf '\n' >> "$AUTOLLAMACPP_TEST_LOG"
+expected='--ctx-size 4096 --parallel 2 --kv-unified --gpu-layers all --fit-print on --verbosity 4 --version'
+if [ "$*" != "$expected" ]; then
+    exit 45
+fi
+echo 'version: 10242 (b10242)' >&2
+EOF
     cat > "$build_dir/bin/llama-quantize" <<'EOF'
 #!/bin/bash
 exit 0
 EOF
-    chmod +x "$build_dir/bin/llama-server" "$build_dir/bin/llama-quantize"
+    chmod +x "$build_dir/bin/llama-server" "$build_dir/bin/llama-fit-params" "$build_dir/bin/llama-quantize"
 fi
 """,
     )
@@ -370,13 +552,34 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     assert "<-DLLAMA_BUILD_NUMBER=10242>" in configure
     assert "<-DLLAMA_BUILD_COMMIT=b10242>" in configure
     build = next(line for line in operations if line.startswith("cmake <--build>"))
-    assert "<llama-server> <llama-quantize>" in build
+    assert "<llama-server> <llama-fit-params> <llama-quantize>" in build
+    assert (
+        "fit <--ctx-size> <4096> <--parallel> <2> <--kv-unified> "
+        "<--gpu-layers> <all> <--fit-print> <on> <--verbosity> <4> <--version>"
+    ) in operations
     assert (link_dir / "llama-server").resolve().is_file()
+    assert (link_dir / "llama-fit-params").resolve().is_file()
     assert (link_dir / "llama-quantize").resolve().is_file()
     marker = (link_dir / "llama-server").resolve().parents[1] / "BUILD-INFO"
     marker_text = marker.read_text()
-    assert "build_profile=cuda-portable-cpu-v1" in marker_text
+    assert "build_profile=cuda-portable-cpu-v2-fit-concurrency" in marker_text
+    assert (
+        "fit_cli_patch_sha256="
+        "58917efc78ca760a2a1dd162d84e6cf1930c5b62a8dd9710bb4579ca4f2d69dc"
+    ) in marker_text
     assert "compute_capabilities=8.0,9.0" in marker_text
+
+
+def test_fit_cli_patch_body_is_digest_verified() -> None:
+    result = _run_shell(
+        _source_setup(
+            'LLAMACPP_FIT_PATCH_TO="${LLAMACPP_FIT_PATCH_TO} changed"\n'
+            "verify_fit_params_patch_identity"
+        )
+    )
+
+    assert result.returncode != 0
+    assert "source transformation digest mismatch" in result.stderr
 
 
 def test_install_is_idempotent_for_source_and_gpu_identity(tmp_path: Path) -> None:
@@ -394,12 +597,13 @@ def test_install_is_idempotent_for_source_and_gpu_identity(tmp_path: Path) -> No
     )
 
 
-def test_portable_cpu_profile_invalidates_pre_profile_build(tmp_path: Path) -> None:
+def test_fit_concurrency_profile_invalidates_v1_build(tmp_path: Path) -> None:
     env, operation_log, link_dir = _build_fixture(tmp_path)
     old_marker = "\n".join(
         (
             "version=b10242",
             f"source_sha256={env['AUTOLLAMACPP_SHA256']}",
+            "build_profile=cuda-portable-cpu-v1",
             "compute_capabilities=8.0,9.0",
             "cmake_cuda_architectures=native",
         )
@@ -525,12 +729,13 @@ def test_standalone_start_can_explicitly_allow_cpu_only(tmp_path: Path) -> None:
     assert result.stdout == "0\n"
 
 
-def test_start_clears_llama_argument_namespace_and_uses_explicit_flash_attn() -> None:
+def test_start_clears_llama_argument_namespace_including_context_size() -> None:
     env = {
         **os.environ,
         "AUTOLLAMACPP_SCRIPT_DIR": str(SCRIPT_ROOT / "auto-llamacpp"),
         "LLAMA_ARG_MODEL": "attacker/model.gguf",
         "LLAMA_ARG_PORT": "9999",
+        "LLAMA_ARG_CTX_SIZE": "64",
     }
     result = _run_shell(
         f"source {shlex.quote(str(START_SCRIPT))}\n"
@@ -540,9 +745,6 @@ def test_start_clears_llama_argument_namespace_and_uses_explicit_flash_attn() ->
     )
 
     assert result.returncode == 0, result.stderr
-    source = START_SCRIPT.read_text()
-    assert "--flash-attn auto" in source
-    assert "        -fa \\" not in source
 
 
 def _write_process_record(
