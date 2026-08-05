@@ -249,7 +249,9 @@ Successful managed llama.cpp setup also reports `llamacpp_runtime`, containing
 the requested sizing policy, verified effective plan, device-indexed post-load
 GPU memory, and an ISO-8601 UTC observation time. Other nodes and older records
 report `llamacpp_runtime: null`; the memory values are a snapshot, not live
-telemetry.
+telemetry. Automatic policy records contain `sizing` and `fit_target_mib`.
+Gateway-authorized custom records additionally contain exact
+`context_per_slot`, `slots`, and `cache_type` values.
 
 A host present only in QUADS has not been provisioned and therefore reports
 both `engine: null` and `artifact_id: null`. Do not interpret a null engine as
@@ -431,6 +433,16 @@ The planner prefers F16 K/V cache storage. If F16 cannot fully offload even one
 request at the 4,096-token floor while retaining the configured reserve, it
 replans with Q8_0 for both K and V and enables Flash Attention. Managed mode
 never falls below Q8_0 automatically.
+
+Fresh managed setup uses that automatic policy and the globally configured
+free-VRAM target. The internal provisioning contract can also carry a complete,
+typed custom policy consisting of context per slot, slots, matching F16 or Q8_0
+K/V cache, and a per-GPU free-VRAM target. Custom launch still runs the pinned
+estimator once and fails before server startup unless the exact configuration
+fully offloads and preserves its target. Host-ambient sizing overrides remain
+unsupported; the custom contract is gateway-owned and is not a direct shell
+configuration surface.
+
 After `/health` succeeds, QIIP requires the runtime to match that plan, keep the
 configured free-VRAM margin, use the selected KV types and unified cache, and
 offload every model layer to GPU before registering the node healthy. The
@@ -515,7 +527,9 @@ The dashboard setup controls select either a full vLLM model or one exact GGUF
 artifact is selected by default, so the operator must choose the intended
 entrypoint or quantization. Node retry requests omit both values so the server
 can retain the latest registered engine, model, and artifact identity under the
-host lifecycle lease.
+host lifecycle lease. A llama.cpp retry also retains its requested sizing
+policy: automatic sizing is recomputed against current free VRAM, while custom
+sizing replays the complete exact request and must pass estimation again.
 
 LLMFit recommendation runtimes are normalized to `vllm`, `llama_cpp`, `mlx`,
 or `unknown`. A llama.cpp recommendation can list typed `gguf_sources`, and the

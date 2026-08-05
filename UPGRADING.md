@@ -389,6 +389,23 @@ QIIP sets `AUTOLLAMACPP_MANAGED=1`. In that mode the launcher rejects
 retrying. Standalone script use retains them. Ambient `LLAMA_ARG_*` variables,
 including `LLAMA_ARG_CTX_SIZE`, continue to be cleared before launch.
 
+The gateway now has a separate typed channel for an exact managed policy. It
+sets dedicated `AUTOLLAMACPP_MANAGED_*` values on the SSH command line rather
+than accepting ambient host configuration. A complete custom policy supplies
+context per slot, slot count, one matching F16 or Q8_0 K/V type, and the
+per-GPU free-memory target. The launcher independently validates the 256-token
+alignment, 1-256 slot bound, model training-context ceiling, and llama.cpp
+aggregate-context limit, then runs one exact estimate before launch. This
+partially supersedes the earlier statement that managed sizing cannot be
+specified: gateway-authorized typed sizing is supported, while the five
+standalone overrides and ambient `LLAMA_ARG_*` values remain rejected.
+
+Fresh setup remains automatic and uses the global fit target. An implicit retry
+of a registered llama.cpp node inherits its complete persisted request under
+the lifecycle lease. Automatic retry recomputes effective sizing from current
+free VRAM; custom retry replays the exact requested context, slots, cache type,
+and reserve and fails closed if they no longer fit.
+
 The provisioning log records `context_per_slot`, `slot_context_limit`, `slots`,
 `aggregate_context`, `kv_unified`, `gpu_layers`, the configured fit target, and
 post-load GPU memory from the node. Do not assume four slots: concurrency is now
@@ -511,6 +528,7 @@ until every gateway that may provision or display the node understands it.
 | **Behavioral break** | `/admin/nodes[].engine` is now nullable. Registered nodes report `vllm` or `llama_cpp`; QUADS-only hosts report `null` instead of the previous fabricated `vllm` value. | Treat `null` as “not provisioned or no registered engine identity,” not as vLLM. Update clients whose schema requires a string. |
 | **New surface** | `/admin/nodes[]` now includes nullable `artifact_id`. Managed llama.cpp nodes report the exact discovered GGUF generation selected at setup; vLLM, older, manual, and QUADS-only records can report `null`. | Preserve the field when correlating a node with the GGUF catalog, but continue to handle `null` during rolling upgrades and for non-artifact-backed nodes. |
 | **New surface** | `/admin/nodes[]` now includes nullable `llamacpp_runtime`. Successful managed llama.cpp setup records requested sizing, verified effective context/concurrency/cache/offload values, per-GPU post-load memory, and an ISO-8601 UTC observation time. The node-detail dashboard renders the same state as a read-only card. | Treat the GPU values as a timestamped post-load snapshot, not live telemetry. Handle `null` for older records, vLLM nodes, QUADS-only hosts, and llama.cpp nodes that have not completed setup on the new version. |
+| **New surface** | `llamacpp_runtime.requested` can represent either automatic sizing or a complete gateway-authorized custom policy with `context_per_slot`, `slots`, and `cache_type`. Identity-preserving llama.cpp retries inherit the persisted policy: automatic policy recomputes, while custom policy replays exact values and revalidates fit. Host-ambient sizing overrides remain rejected. | Continue to omit selection fields for an identity-preserving retry. Preserve the complete `requested` object in clients and do not treat gateway-authorized sizing as permission to set ambient `AUTOLLAMACPP_*` or `LLAMA_ARG_*` overrides. |
 | **Behavioral break** | Recommendation `runtime` values are normalized to `vllm`, `llama_cpp`, `mlx`, or `unknown` instead of preserving LLMFit spellings such as `vLLM` and `llama.cpp`. | Compare against the canonical values. Treat this recommendation vocabulary as distinct from the provisionable `InferenceEngine` enum: `mlx` and `unknown` cannot be selected for setup. |
 | **New surface** | Recommendations can include typed `gguf_sources` entries with `repo` and `provider`. The dashboard joins `gguf_sources[].repo` to catalog `gguf_artifacts[].repo_id` exactly and case-sensitively. | Preserve the additive source list. Do not infer an exact GGUF download from it because LLMFit does not supply the required files, shard grouping, or entrypoint. |
 | **Behavioral break** | Unhealthy nodes no longer advertise `retry` in `/admin/nodes[].actions`; setup already rejected that state. | Tear down an unhealthy registered node before starting setup instead of presenting a retry action that the API will refuse. |

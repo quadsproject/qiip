@@ -52,7 +52,10 @@ from inference_proxy.models.llmfit import (
 )
 from inference_proxy.models.node import (
     InferenceEngine,
+    LlamaCppCacheType,
+    LlamaCppRuntimeRequest,
     LlamaCppRuntimeState,
+    LlamaCppSizingMode,
     Node,
     NodeStatus,
 )
@@ -596,6 +599,46 @@ class TestSetupModelPassthrough:
             "provisioning_identity"
         ] == ProvisioningIdentity(InferenceEngine.LLAMA_CPP, artifact_id)
 
+    def test_implicit_llamacpp_retry_inherits_persisted_sizing_policy(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        artifact_id = "b" * 64
+        request = LlamaCppRuntimeRequest(
+            sizing=LlamaCppSizingMode.CUSTOM,
+            fit_target_mib=768,
+            context_per_slot=32768,
+            slots=3,
+            cache_type=LlamaCppCacheType.Q8_0,
+        )
+        runtime = _llamacpp_runtime().model_copy(update={"requested": request})
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                status=NodeStatus.FAILED,
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact_id=artifact_id,
+                llamacpp_runtime=runtime,
+            )
+        )
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+        mock_provisioner.provision.assert_awaited_once_with(
+            "gpu01",
+            managed=True,
+            model=None,
+            engine=InferenceEngine.LLAMA_CPP,
+            artifact_id=artifact_id,
+            llamacpp_request=request,
+            lifecycle_lease=ANY,
+        )
+
     def test_implicit_vllm_retry_inherits_persisted_model(
         self,
         client: TestClient,
@@ -724,12 +767,22 @@ class TestSetupModelPassthrough:
         mock_provisioner: MagicMock,
     ) -> None:
         artifact_id = "b" * 64
+        request = LlamaCppRuntimeRequest(
+            sizing=LlamaCppSizingMode.CUSTOM,
+            fit_target_mib=768,
+            context_per_slot=32768,
+            slots=3,
+            cache_type=LlamaCppCacheType.Q8_0,
+        )
         test_registry.add(
             _make_node(
                 node_id="gpu01",
                 status=NodeStatus.FAILED,
                 engine=InferenceEngine.LLAMA_CPP,
                 artifact_id=artifact_id,
+                llamacpp_runtime=_llamacpp_runtime().model_copy(
+                    update={"requested": request}
+                ),
             )
         )
         lease = MagicMock(hostname="gpu01")
@@ -750,6 +803,9 @@ class TestSetupModelPassthrough:
         )
         assert (
             mock_provisioner.provision.await_args.kwargs["artifact_id"] == artifact_id
+        )
+        assert mock_provisioner.provision.await_args.kwargs["llamacpp_request"] == (
+            request
         )
 
     def test_retry_uses_newer_registration_identity_after_taking_lease(

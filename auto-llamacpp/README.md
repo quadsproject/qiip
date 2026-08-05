@@ -124,6 +124,23 @@ llama.cpp's 256-sequence limit. Configure the per-GPU free-memory target with
 The reserve remains operator-configurable because shared GPUs and workloads
 with additional CUDA allocations may require more headroom.
 
+QIIP's gateway-owned managed contract also carries
+`AUTOLLAMACPP_MANAGED_SIZING=auto|custom`. Automatic sizing accepts no exact
+values. Custom sizing requires all three of
+`AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT`, `AUTOLLAMACPP_MANAGED_PARALLEL`, and
+`AUTOLLAMACPP_MANAGED_CACHE_TYPE`; the cache type is limited to `f16` or
+`q8_0`, applied equally to K and V, with Flash Attention derived from that
+choice. The gateway sends these typed values directly on the SSH command line,
+and the launcher removes them from the child environment after capture. They
+are an internal gateway-to-launcher protocol, not supported ambient host
+configuration.
+
+Custom mode validates a 256-token-aligned context no larger than the model's
+training context, 1-256 slots, and llama.cpp's aggregate-context ceiling. It
+runs the estimator once for the exact candidate and refuses to start unless
+every layer can remain on GPU while preserving the requested reserve. It never
+falls back to a different context, slot count, or cache type.
+
 The managed planner first estimates F16 for both K and V. If that policy cannot
 fully offload one request at the 4,096-token floor while preserving the reserve,
 it retries the complete plan with Q8_0 for both K and V. Q8_0 V requires Flash
@@ -154,12 +171,16 @@ registration unless the runtime matches the plan, the selected K/V types are
 present in the allocated unified KV cache, KV is unified, every model layer was
 offloaded to GPU, and actual free VRAM still meets the target.
 
-The `qiip_fit_plan` startup record includes `sizing=auto` and the model's
+The `qiip_fit_plan` startup record includes `sizing=auto|custom` and the model's
 `train_context` alongside the effective context, concurrency, reserve, and
 cache policy. After verification, QIIP stores the requested policy, effective
 configuration, device-indexed total/used/free VRAM, and an ISO-8601 UTC
 observation time in the node record. The node-detail dashboard presents this as
 a read-only post-load snapshot; it is not live GPU telemetry.
+
+An implicit retry inherits that persisted request. Automatic policy reruns the
+search against current free VRAM; custom policy reruns the exact estimate and
+launches only if every requested value still fits.
 
 With unified KV, llama.cpp internally reports `n_ctx_seq` as the aggregate
 pool. When that exceeds the model training context, b10242 emits its expected

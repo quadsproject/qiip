@@ -388,4 +388,5 @@ class TestNodeDetailPage:
         assert "<dl" in response.text
         assert 'id="llamacpp-runtime-min-free"' in response.text
         assert 'id="llamacpp-runtime-min-headroom"' in response.text
+        assert "runtime-summary" not in response.text
         assert 'id="llamacpp-runtime-gpus"' in response.text

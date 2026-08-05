@@ -64,6 +64,7 @@ def _write_fake_fit_planner(path: Path, *, train_context: int = 128000) -> None:
 if [[ " $* " != *' --kv-unified '* ]] || [[ " $* " != *' --gpu-layers all '* ]]; then
     exit 44
 fi
+[ -z "${{AUTOLLAMACPP_TEST_CALLS:-}}" ] || printf '%s\n' "$*" >> "$AUTOLLAMACPP_TEST_CALLS"
 context={train_context}
 cache_type_k=''
 cache_type_v=''
@@ -174,13 +175,35 @@ def test_start_preserves_split_entrypoint_filename_and_siblings(
 
 
 @pytest.mark.parametrize(
-    ("force_q8", "expected_cache_type", "expected_flash_attn"),
-    [(False, "f16", "auto"), (True, "q8_0", "on")],
+    (
+        "sizing",
+        "force_q8",
+        "requested_context",
+        "requested_slots",
+        "requested_cache_type",
+        "expected_context_per_slot",
+        "expected_slots",
+        "expected_aggregate_context",
+        "expected_cache_type",
+        "expected_flash_attn",
+    ),
+    [
+        ("auto", False, "", "", "", 128000, 8, 1024000, "f16", "auto"),
+        ("auto", True, "", "", "", 128000, 8, 1024000, "q8_0", "on"),
+        ("custom", False, "32768", "3", "q8_0", 32768, 3, 98304, "q8_0", "on"),
+    ],
 )
 def test_managed_launch_uses_exact_artifact_and_explicit_alias(
     tmp_path: Path,
     *,
+    sizing: str,
     force_q8: bool,
+    requested_context: str,
+    requested_slots: str,
+    requested_cache_type: str,
+    expected_context_per_slot: int,
+    expected_slots: int,
+    expected_aggregate_context: int,
     expected_cache_type: str,
     expected_flash_attn: str,
 ) -> None:
@@ -201,6 +224,7 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(
     fake_tools = tmp_path / "fake tools"
     fake_tools.mkdir()
     args_file = tmp_path / "llama args"
+    fit_calls = tmp_path / "fit calls"
     _write_executable(
         fake_server,
         '#!/bin/bash\nprintf \'%s\\n\' "$@" > "$AUTOLLAMACPP_TEST_ARGS"\n',
@@ -221,11 +245,16 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(
         "AUTOLLAMACPP_MODEL_ALIAS": alias,
         "AUTOLLAMACPP_MANAGED": "1",
         "AUTOLLAMACPP_FIT_TARGET_MIB": "1536",
+        "AUTOLLAMACPP_MANAGED_SIZING": sizing,
+        "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": requested_context,
+        "AUTOLLAMACPP_MANAGED_PARALLEL": requested_slots,
+        "AUTOLLAMACPP_MANAGED_CACHE_TYPE": requested_cache_type,
         "AUTOLLAMACPP_BIN": str(fake_server),
         "AUTOLLAMACPP_FIT_BIN": str(fake_fit),
         "AUTOLLAMACPP_PID_FILE": str(tmp_path / "llama.pid"),
         "AUTOLLAMACPP_LOG_FILE": str(tmp_path / "llama.log"),
         "AUTOLLAMACPP_TEST_ARGS": str(args_file),
+        "AUTOLLAMACPP_TEST_CALLS": str(fit_calls),
         "AUTOLLAMACPP_TEST_FORCE_Q8": "1" if force_q8 else "0",
     }
     command = "\n".join(
@@ -246,8 +275,8 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(
     assert args[args.index("--alias") + 1] == alias
     assert args[args.index("--fit") + 1] == "off"
     assert "--fit-target" not in args
-    assert args[args.index("--ctx-size") + 1] == "1024000"
-    assert args[args.index("--parallel") + 1] == "8"
+    assert args[args.index("--ctx-size") + 1] == str(expected_aggregate_context)
+    assert args[args.index("--parallel") + 1] == str(expected_slots)
     assert args[args.index("--gpu-layers") + 1] == "all"
     assert "--kv-unified" in args
     assert args[args.index("--cache-type-k") + 1] == expected_cache_type
@@ -258,13 +287,21 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(
     assert not ({"-b", "--batch-size"} & set(args))
     assert "--cont-batching" not in args
     assert (tmp_path / "llama.log").read_text(encoding="utf-8") == (
-        "qiip_fit_plan: sizing=auto train_context=128000 "
-        "context_per_slot=128000 slots=8 "
-        "aggregate_context=1024000 fit_target_mib=1536 "
+        f"qiip_fit_plan: sizing={sizing} train_context=128000 "
+        f"context_per_slot={expected_context_per_slot} slots={expected_slots} "
+        f"aggregate_context={expected_aggregate_context} fit_target_mib=1536 "
         f"cache_type_k={expected_cache_type} "
         f"cache_type_v={expected_cache_type} "
         f"flash_attn={expected_flash_attn}\n"
     )
+    candidate_calls = [
+        line
+        for line in fit_calls.read_text(encoding="utf-8").splitlines()
+        if "--ctx-size" in line
+    ]
+    if sizing == "custom":
+        assert len(candidate_calls) == 1
+        assert f"--ctx-size {expected_aggregate_context}" in candidate_calls[0]
 
 
 @pytest.mark.parametrize(
@@ -311,6 +348,40 @@ def test_managed_planner_reduces_context_only_when_needed_and_uses_library_limit
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[-1] == expected
+
+
+def test_custom_managed_context_cannot_exceed_model_training_context(
+    tmp_path: Path,
+) -> None:
+    fake_fit = tmp_path / "llama-fit-params"
+    fake_tools = tmp_path / "bin"
+    call_log = tmp_path / "fit-calls"
+    fake_tools.mkdir()
+    _write_fake_fit_planner(fake_fit, train_context=128000)
+    _write_executable(fake_tools / "nvidia-smi", "#!/bin/bash\nprintf '22367\n'\n")
+
+    result = _run_shell(
+        _source_start(
+            "GPU_COUNT=1\nGGUF_PATH=/cache/model.gguf\nplan_managed_configuration"
+        ),
+        env={
+            **os.environ,
+            "PATH": f"{fake_tools}:/usr/bin:/bin",
+            "AUTOLLAMACPP_FIT_BIN": str(fake_fit),
+            "AUTOLLAMACPP_MANAGED_SIZING": "custom",
+            "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "128256",
+            "AUTOLLAMACPP_MANAGED_PARALLEL": "1",
+            "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "f16",
+            "AUTOLLAMACPP_TEST_CALLS": str(call_log),
+        },
+    )
+
+    assert result.returncode != 0
+    assert "exceeds model training context 128000" in result.stderr
+    assert all(
+        "--ctx-size" not in line
+        for line in call_log.read_text(encoding="utf-8").splitlines()
+    )
 
 
 def test_managed_planner_falls_back_to_q8_only_when_f16_cannot_fit(
@@ -492,6 +563,80 @@ def test_managed_start_requires_positive_fit_target(value: str) -> None:
 
     assert result.returncode != 0
     assert "must be a positive integer MiB value" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("values", "message"),
+    [
+        ({"AUTOLLAMACPP_MANAGED_SIZING": "invalid"}, "must be auto or custom"),
+        (
+            {
+                "AUTOLLAMACPP_MANAGED_SIZING": "auto",
+                "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "4096",
+            },
+            "automatic managed sizing does not accept custom values",
+        ),
+        (
+            {"AUTOLLAMACPP_MANAGED_SIZING": "custom"},
+            "context_per_slot must be a positive 256-token increment",
+        ),
+        (
+            {
+                "AUTOLLAMACPP_MANAGED_SIZING": "custom",
+                "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "4097",
+                "AUTOLLAMACPP_MANAGED_PARALLEL": "1",
+                "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "f16",
+            },
+            "context_per_slot must be a positive 256-token increment",
+        ),
+        (
+            {
+                "AUTOLLAMACPP_MANAGED_SIZING": "custom",
+                "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "4096",
+                "AUTOLLAMACPP_MANAGED_PARALLEL": "257",
+                "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "f16",
+            },
+            "parallel slots must be between 1 and 256",
+        ),
+        (
+            {
+                "AUTOLLAMACPP_MANAGED_SIZING": "custom",
+                "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "4096",
+                "AUTOLLAMACPP_MANAGED_PARALLEL": "1",
+                "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "q4_0",
+            },
+            "KV cache type must be f16 or q8_0",
+        ),
+        (
+            {
+                "AUTOLLAMACPP_MANAGED_SIZING": "custom",
+                "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "16777216",
+                "AUTOLLAMACPP_MANAGED_PARALLEL": "256",
+                "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "f16",
+            },
+            "custom aggregate context exceeds 4294967040",
+        ),
+        (
+            {
+                "AUTOLLAMACPP_MANAGED_SIZING": "custom",
+                "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "18446744073709555712",
+                "AUTOLLAMACPP_MANAGED_PARALLEL": "1",
+                "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "f16",
+            },
+            "custom aggregate context exceeds 4294967040",
+        ),
+    ],
+)
+def test_managed_start_rejects_invalid_gateway_sizing_contract(
+    values: dict[str, str], message: str
+) -> None:
+    result = _run_shell(
+        _source_start("configure_llamacpp_params"),
+        env={**os.environ, "AUTOLLAMACPP_MANAGED": "1", **values},
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -980,11 +1125,20 @@ def test_start_clears_llama_argument_namespace_including_context_size() -> None:
         "LLAMA_ARG_MODEL": "attacker/model.gguf",
         "LLAMA_ARG_PORT": "9999",
         "LLAMA_ARG_CTX_SIZE": "64",
+        "AUTOLLAMACPP_MANAGED_SIZING": "custom",
+        "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "4096",
+        "AUTOLLAMACPP_MANAGED_PARALLEL": "2",
+        "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "f16",
     }
     result = _run_shell(
         f"source {shlex.quote(str(START_SCRIPT))}\n"
         "clear_script_environment\n"
-        "if compgen -A variable LLAMA_ARG_ >/dev/null; then exit 9; fi",
+        "if compgen -A variable LLAMA_ARG_ >/dev/null; then exit 9; fi\n"
+        "for name in AUTOLLAMACPP_MANAGED_SIZING "
+        "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT AUTOLLAMACPP_MANAGED_PARALLEL "
+        "AUTOLLAMACPP_MANAGED_CACHE_TYPE; do\n"
+        '    if [ -n "${!name+x}" ]; then exit 10; fi\n'
+        "done",
         env=env,
     )
 

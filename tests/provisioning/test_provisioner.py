@@ -120,8 +120,32 @@ def _runtime_state() -> LlamaCppRuntimeState:
     )
 
 
+def _auto_request(fit_target_mib: int = 512) -> LlamaCppRuntimeRequest:
+    return LlamaCppRuntimeRequest(
+        sizing=LlamaCppSizingMode.AUTO,
+        fit_target_mib=fit_target_mib,
+    )
+
+
+def _custom_request(
+    *,
+    fit_target_mib: int = 512,
+    context_per_slot: int = 24576,
+    slots: int = 4,
+    cache_type: LlamaCppCacheType = LlamaCppCacheType.F16,
+) -> LlamaCppRuntimeRequest:
+    return LlamaCppRuntimeRequest(
+        sizing=LlamaCppSizingMode.CUSTOM,
+        fit_target_mib=fit_target_mib,
+        context_per_slot=context_per_slot,
+        slots=slots,
+        cache_type=cache_type,
+    )
+
+
 def _llamacpp_fit_log(
     *,
+    sizing: str = "auto",
     context_per_slot: int = 24576,
     slot_context_limit: int | None = None,
     train_context: int | None = None,
@@ -160,7 +184,7 @@ def _llamacpp_fit_log(
         runtime_aggregate_context = aggregate_context
     lines = [
         "qiip_fit_plan: "
-        f"sizing=auto train_context={train_context} "
+        f"sizing={sizing} train_context={train_context} "
         f"context_per_slot={context_per_slot} slots={slots} "
         f"aggregate_context={aggregate_context} "
         f"fit_target_mib={fit_target_mib} "
@@ -332,6 +356,34 @@ def test_script_env_prefix_exact() -> None:
         "AUTOLLAMACPP_REQUIRE_CUDA": "1",
         "AUTOLLAMACPP_MANAGED": "1",
         "AUTOLLAMACPP_FIT_TARGET_MIB": "1536",
+        "AUTOLLAMACPP_MANAGED_SIZING": "auto",
+        "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "",
+        "AUTOLLAMACPP_MANAGED_PARALLEL": "",
+        "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "",
+        "AUTOLLAMACPP_GGUF_PATH": artifact.node_relative_entrypoint,
+        "AUTOLLAMACPP_MODEL_ALIAS": artifact.model_alias,
+        "HF_TOKEN": "hf secret",
+    }
+    assert provisioner._start_script_env(
+        None,
+        InferenceEngine.LLAMA_CPP,
+        artifact,
+        llamacpp_request=_custom_request(
+            fit_target_mib=768,
+            context_per_slot=32768,
+            slots=3,
+            cache_type=LlamaCppCacheType.Q8_0,
+        ),
+    ) == {
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOLLAMACPP_PORT": "8123",
+        "AUTOLLAMACPP_REQUIRE_CUDA": "1",
+        "AUTOLLAMACPP_MANAGED": "1",
+        "AUTOLLAMACPP_FIT_TARGET_MIB": "768",
+        "AUTOLLAMACPP_MANAGED_SIZING": "custom",
+        "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "32768",
+        "AUTOLLAMACPP_MANAGED_PARALLEL": "3",
+        "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "q8_0",
         "AUTOLLAMACPP_GGUF_PATH": artifact.node_relative_entrypoint,
         "AUTOLLAMACPP_MODEL_ALIAS": artifact.model_alias,
         "HF_TOKEN": "hf secret",
@@ -765,6 +817,57 @@ async def test_llamacpp_without_artifact_fails_before_remote_work() -> None:
     ssh.upload.assert_not_called()
     ssh.run_streaming.assert_not_called()
     etcd.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_custom_request_reaches_the_provisioning_body() -> None:
+    provisioner = _make_provisioner()
+    request = _custom_request(
+        fit_target_mib=768,
+        context_per_slot=32768,
+        slots=3,
+        cache_type=LlamaCppCacheType.Q8_0,
+    )
+    lease = MagicMock()
+    lease.belongs_to.return_value = True
+    with (
+        patch.object(
+            provisioner,
+            "resolve_artifact_selection",
+            new_callable=AsyncMock,
+            return_value=_artifact(),
+        ),
+        patch.object(provisioner, "_provision", new_callable=AsyncMock) as body,
+    ):
+        await provisioner.provision(
+            "host1",
+            engine=InferenceEngine.LLAMA_CPP,
+            artifact_id="a" * 64,
+            llamacpp_request=request,
+            lifecycle_lease=lease,
+        )
+
+    body.assert_awaited_once_with(
+        "host1",
+        managed=True,
+        model=None,
+        engine=InferenceEngine.LLAMA_CPP,
+        artifact=_artifact(),
+        llamacpp_request=request,
+    )
+    lease.release.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_vllm_rejects_llamacpp_sizing_before_remote_work() -> None:
+    provisioner = _make_provisioner()
+    with (
+        patch.object(provisioner, "_provision", new_callable=AsyncMock) as body,
+        pytest.raises(ProvisioningError, match="only valid for llama_cpp"),
+    ):
+        await provisioner.provision("host1", llamacpp_request=_auto_request())
+
+    body.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1793,7 +1896,7 @@ class TestLlamaCppRuntimeFit:
             patch.object(provisioner, "_log") as log,
         ):
             runtime = await provisioner._verify_llamacpp_runtime(
-                "host1", expected_fit_target_mib=1536
+                "host1", expected_request=_auto_request(1536)
             )
 
         assert run_command.await_args_list == [
@@ -1826,6 +1929,73 @@ class TestLlamaCppRuntimeFit:
         )
 
     @pytest.mark.asyncio
+    async def test_custom_request_is_verified_and_persisted_exactly(self) -> None:
+        provisioner = _make_provisioner()
+        request = _custom_request(
+            context_per_slot=32768,
+            slots=2,
+            cache_type=LlamaCppCacheType.Q8_0,
+        )
+        with patch.object(
+            provisioner,
+            "_ssh_run_command",
+            new_callable=AsyncMock,
+            side_effect=[
+                _llamacpp_fit_log(
+                    sizing="custom",
+                    context_per_slot=32768,
+                    slots=2,
+                    cache_type_k="q8_0",
+                ),
+                "0, 23034, 22000, 1034",
+            ],
+        ):
+            runtime = await provisioner._verify_llamacpp_runtime(
+                "host1", expected_request=request
+            )
+
+        assert runtime.requested == request
+        assert runtime.effective.context_per_slot == 32768
+        assert runtime.effective.slots == 2
+        assert runtime.effective.cache_type_k is LlamaCppCacheType.Q8_0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("log_text", "message"),
+        [
+            (_llamacpp_fit_log(), "sizing mode differs"),
+            (
+                _llamacpp_fit_log(sizing="custom", context_per_slot=32768),
+                "differs from its requested custom sizing",
+            ),
+            (
+                _llamacpp_fit_log(sizing="custom", slots=2),
+                "differs from its requested custom sizing",
+            ),
+            (
+                _llamacpp_fit_log(sizing="custom", cache_type_k="q8_0"),
+                "differs from its requested custom sizing",
+            ),
+        ],
+    )
+    async def test_custom_request_rejects_runtime_drift(
+        self, log_text: str, message: str
+    ) -> None:
+        provisioner = _make_provisioner()
+        run_command = AsyncMock(side_effect=[log_text, "0, 23034, 22000, 1034", ""])
+        with (
+            patch.object(provisioner, "_ssh_run_command", run_command),
+            pytest.raises(ProvisioningError, match=message),
+        ):
+            await provisioner._verify_llamacpp_runtime(
+                "host1", expected_request=_custom_request()
+            )
+
+        assert run_command.await_args_list[-1] == call(
+            "host1", "bash auto-llamacpp/stop-llamacpp.sh"
+        )
+
+    @pytest.mark.asyncio
     async def test_below_target_post_load_memory_stops_llamacpp(self) -> None:
         provisioner = _make_provisioner(
             settings=ProvisioningSettings(llamacpp_fit_target_mib=1536)
@@ -1840,7 +2010,7 @@ class TestLlamaCppRuntimeFit:
         with patch.object(provisioner, "_ssh_run_command", run_command):
             with pytest.raises(ProvisioningError, match="below the requested"):
                 await provisioner._verify_llamacpp_runtime(
-                    "host1", expected_fit_target_mib=1536
+                    "host1", expected_request=_auto_request(1536)
                 )
 
         assert run_command.await_args_list[-1] == call(
@@ -1860,7 +2030,7 @@ class TestLlamaCppRuntimeFit:
         with patch.object(provisioner, "_ssh_run_command", run_command):
             with pytest.raises(ProvisioningError, match="requested value"):
                 await provisioner._verify_llamacpp_runtime(
-                    "host1", expected_fit_target_mib=1024
+                    "host1", expected_request=_auto_request(1024)
                 )
 
         assert run_command.await_args_list[-1] == call(
@@ -1879,7 +2049,7 @@ class TestLlamaCppRuntimeFit:
         with patch.object(provisioner, "_ssh_run_command", run_command):
             with pytest.raises(ProvisioningError, match="did not fully offload"):
                 await provisioner._verify_llamacpp_runtime(
-                    "host1", expected_fit_target_mib=512
+                    "host1", expected_request=_auto_request()
                 )
 
         assert run_command.await_args_list == [
@@ -1910,7 +2080,7 @@ class TestLlamaCppRuntimeFit:
         with patch.object(provisioner, "_ssh_run_command", run_command):
             with pytest.raises(ProvisioningError, match="memory telemetry"):
                 await provisioner._verify_llamacpp_runtime(
-                    "host1", expected_fit_target_mib=512
+                    "host1", expected_request=_auto_request()
                 )
 
         assert run_command.await_args_list[-1] == call(
@@ -1933,7 +2103,7 @@ class TestLlamaCppRuntimeFit:
             pytest.raises(ProvisioningError, match="did not fully offload"),
         ):
             await provisioner._verify_llamacpp_runtime(
-                "host1", expected_fit_target_mib=512
+                "host1", expected_request=_auto_request()
             )
 
         log.assert_called_once_with(
@@ -2057,7 +2227,9 @@ class TestVerifyGpu:
             )
 
         assert events == ["health", "runtime", "register"]
-        verify_runtime.assert_awaited_once_with("host1", expected_fit_target_mib=512)
+        verify_runtime.assert_awaited_once_with(
+            "host1", expected_request=_auto_request()
+        )
         assert register.await_args is not None
         assert register.await_args.kwargs["llamacpp_runtime"] == runtime
 
