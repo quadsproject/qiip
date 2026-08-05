@@ -978,9 +978,12 @@ vm.runInContext(`
     gguf_artifacts: [{
       artifact_id: "a".repeat(64), repo_id: "org/model-GGUF",
       model_alias: "model-q4", resolved_revision: "b".repeat(40),
+      entrypoint: "model-Q4_K_M.gguf",
     }],
   });
   setupSelection.selectEngine("llama_cpp");
+  document.getElementById("artifact-select").value = "a".repeat(64);
+  document.getElementById("artifact-select").listeners.change();
 `, sandbox);
 sandbox.fetch = async function (url, options) {
   captured = { url, options };

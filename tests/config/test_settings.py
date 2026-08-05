@@ -748,6 +748,7 @@ class TestHuggingFaceSettings:
         settings = HuggingFaceSettings(cache_dir="/data/huggingface")
 
         assert settings.nfs_export is None
+        assert settings.shared_root is None
 
     def test_cache_paths_resolve_to_same_export(self) -> None:
         settings = Settings(
@@ -755,13 +756,15 @@ class TestHuggingFaceSettings:
                 username="operator", password=SecretStr("admin-secret")
             ),
             huggingface=HuggingFaceSettings(
-                cache_dir="/data/huggingface",
+                cache_dir="/data/huggingface/hub",
                 nfs_export="storage.example:/exports/huggingface",
+                shared_root="/data/huggingface",
             ),
             provisioning=ProvisioningSettings(nfs_mount_point="/srv/hf-cache"),
         )
 
-        assert settings.huggingface.cache_dir == "/data/huggingface"
+        assert settings.huggingface.cache_dir == "/data/huggingface/hub"
+        assert settings.huggingface.shared_root == "/data/huggingface"
         assert settings.provisioning.nfs_mount_point == "/srv/hf-cache"
         assert settings.huggingface.nfs_export == (
             "storage.example:/exports/huggingface"
@@ -771,6 +774,19 @@ class TestHuggingFaceSettings:
     def test_explicit_empty_nfs_export_rejected(self, value: str) -> None:
         with pytest.raises(ValidationError, match="nfs_export must not be empty"):
             HuggingFaceSettings(cache_dir="/data/huggingface", nfs_export=value)
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_explicit_empty_shared_root_rejected(self, value: str) -> None:
+        with pytest.raises(ValidationError, match="shared_root must not be empty"):
+            HuggingFaceSettings(cache_dir="/data/huggingface", shared_root=value)
+
+    def test_shared_root_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("INFERENCE_PROXY_HUGGINGFACE__CACHE_DIR", "/data/hf/hub")
+        monkeypatch.setenv("INFERENCE_PROXY_HUGGINGFACE__SHARED_ROOT", "/data/hf")
+
+        settings = Settings(_env_file=None)
+
+        assert settings.huggingface.shared_root == "/data/hf"
 
     def test_api_token_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("INFERENCE_PROXY_HUGGINGFACE__CACHE_DIR", "/data/hf")

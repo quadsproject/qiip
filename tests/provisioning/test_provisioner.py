@@ -7,11 +7,13 @@ provisioning sequence: setup.sh -> start-vllm.sh -> health poll -> register.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shlex
 import shutil
 import subprocess
+import threading
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,8 +32,10 @@ from inference_proxy.config.settings import (
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.huggingface.artifacts import (
     GGUFArtifact,
-    GGUFArtifactStore,
+    GGUFArtifactError,
+    GGUFArtifactIndex,
     GGUFDownloadSpec,
+    ResolvedGGUFArtifact,
 )
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
@@ -56,15 +60,20 @@ _TEST_ENDPOINT_POLICY = EndpointPolicy.from_values(
 )
 
 
-def _artifact(alias: str = "org/model--with---separators") -> GGUFArtifact:
-    return GGUFArtifact(
-        artifact_id="a" * 64,
-        repo_id=alias,
-        resolved_revision="b" * 40,
-        files=("model -- Q4.gguf",),
-        entrypoint="model -- Q4.gguf",
-        model_alias=alias,
-        file_sizes={"model -- Q4.gguf": 7},
+def _artifact(alias: str = "org/model--with---separators") -> ResolvedGGUFArtifact:
+    return ResolvedGGUFArtifact(
+        artifact=GGUFArtifact(
+            artifact_id="a" * 64,
+            repo_id=alias,
+            resolved_revision="b" * 40,
+            files=("model -- Q4.gguf",),
+            entrypoint="model -- Q4.gguf",
+            model_alias=alias,
+            file_sizes={"model -- Q4.gguf": 7},
+        ),
+        node_relative_entrypoint="hub/models--org--model/snapshots/"
+        + "b" * 40
+        + "/model -- Q4.gguf",
     )
 
 
@@ -81,7 +90,7 @@ def _make_provisioner(
     endpoint_policy: EndpointPolicy = _TEST_ENDPOINT_POLICY,
     nfs_export: str | None = "nfs.example:/exports/huggingface",
     hf_token: str | None = None,
-    artifact_store: GGUFArtifactStore | None = None,
+    artifact_index: GGUFArtifactIndex | None = None,
 ) -> NodeProvisioner:
     """Build a NodeProvisioner with mock dependencies."""
     return NodeProvisioner(
@@ -97,7 +106,7 @@ def _make_provisioner(
         redfish_client=redfish_client,
         hf_token=hf_token,
         nfs_export=nfs_export,
-        artifact_store=artifact_store,
+        artifact_index=artifact_index,
     )
 
 
@@ -206,7 +215,7 @@ def test_script_env_prefix_exact() -> None:
         "AUTOLLAMACPP_NFS_MOUNT_POINT": "/srv/hf cache",
         "AUTOLLAMACPP_PORT": "8123",
         "AUTOLLAMACPP_REQUIRE_CUDA": "1",
-        "AUTOLLAMACPP_GGUF_PATH": artifact.cache_relative_entrypoint,
+        "AUTOLLAMACPP_GGUF_PATH": artifact.node_relative_entrypoint,
         "AUTOLLAMACPP_MODEL_ALIAS": artifact.model_alias,
         "HF_TOKEN": "hf secret",
     }
@@ -225,38 +234,61 @@ def test_script_env_prefix_exact() -> None:
     ]
 
 
-def test_published_artifact_resolves_through_managed_launcher(tmp_path: Path) -> None:
-    """Compose publication, setup selection, environment, and node resolution."""
-    repo_id = "org/model--with---separators-GGUF"
+@pytest.mark.asyncio
+async def test_native_artifact_resolves_through_managed_launcher(
+    tmp_path: Path,
+) -> None:
+    """Compose discovery, setup selection, environment, and node resolution."""
+    repo_id = "org/model-with-separators-GGUF"
     revision = "c" * 40
     files = (
         "quant/model -- q4-00001-of-00002.gguf",
         "quant/model -- q4-00002-of-00002.gguf",
     )
-    snapshot = (
-        tmp_path / f"models--{repo_id.replace('/', '--')}" / "snapshots" / revision
-    )
-    for relative in files:
-        source = snapshot / relative
-        source.parent.mkdir(parents=True, exist_ok=True)
-        source.write_bytes(relative.encode())
+    shared_root = tmp_path / "gateway shared root"
+    cache_dir = shared_root / "hub"
+    node_mount = tmp_path / "node mount"
 
-    store = GGUFArtifactStore(tmp_path)
-    published = store.publish(
+    def populate_cache(root: Path) -> None:
+        repo = root / "hub" / f"models--{repo_id.replace('/', '--')}"
+        snapshot = repo / "snapshots" / revision
+        blobs = repo / "blobs"
+        blobs.mkdir(parents=True)
+        for relative in files:
+            content = relative.encode()
+            blob = blobs / hashlib.sha256(content).hexdigest()
+            blob.write_bytes(content)
+            source = snapshot / relative
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.symlink_to(Path(os.path.relpath(blob, source.parent)))
+        refs = repo / "refs"
+        refs.mkdir()
+        (refs / "main").write_text(revision, encoding="utf-8")
+
+    populate_cache(shared_root)
+    populate_cache(node_mount)
+    artifact_index = GGUFArtifactIndex(
+        cache_dir,
+        shared_root=shared_root,
+    )
+    published = artifact_index.artifact_from_download(
         repo_id=repo_id,
         resolved_revision=revision,
-        snapshot_path=snapshot,
+        snapshot_path=(
+            cache_dir / f"models--{repo_id.replace('/', '--')}" / "snapshots" / revision
+        ),
         spec=GGUFDownloadSpec(files=files, entrypoint=files[0]),
     )
     provisioner = _make_provisioner(
-        settings=ProvisioningSettings(nfs_mount_point=str(tmp_path)),
-        artifact_store=store,
+        settings=ProvisioningSettings(nfs_mount_point=str(node_mount)),
+        artifact_index=artifact_index,
     )
 
-    selected = provisioner.resolve_artifact_selection(
+    selected = await provisioner.resolve_artifact_selection(
         InferenceEngine.LLAMA_CPP, published.artifact_id
     )
-    assert selected == published
+    assert selected is not None
+    assert selected.artifact == published
     env = {
         **os.environ,
         **provisioner._start_script_env(None, InferenceEngine.LLAMA_CPP, selected),
@@ -281,10 +313,48 @@ def test_published_artifact_resolves_through_managed_launcher(tmp_path: Path) ->
         check=False,
     )
 
-    expected_entrypoint = tmp_path / published.cache_relative_entrypoint
+    expected_entrypoint = node_mount / selected.node_relative_entrypoint
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [str(expected_entrypoint), repo_id]
     assert expected_entrypoint.is_symlink()
+
+
+@pytest.mark.asyncio
+async def test_artifact_resolution_does_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shared_root = tmp_path / "shared root"
+    cache_dir = shared_root / "hub"
+    cache_dir.mkdir(parents=True)
+    artifact_index = GGUFArtifactIndex(cache_dir, shared_root=shared_root)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_get(_artifact_id: str) -> ResolvedGGUFArtifact:
+        started.set()
+        if not release.wait(timeout=0.5):
+            raise AssertionError("artifact lookup blocked the event loop")
+        return _artifact()
+
+    monkeypatch.setattr(artifact_index, "get", blocking_get)
+    provisioner = _make_provisioner(artifact_index=artifact_index)
+    resolution = asyncio.create_task(
+        provisioner.resolve_artifact_selection(
+            InferenceEngine.LLAMA_CPP,
+            "a" * 64,
+        )
+    )
+    try:
+        deadline = asyncio.get_running_loop().time() + 0.2
+        while not started.is_set() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.001)
+        assert started.is_set()
+        assert not resolution.done()
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+
+    assert await asyncio.wait_for(resolution, timeout=0.2) == _artifact()
 
 
 def test_env_prefix_quoting() -> None:
@@ -578,6 +648,64 @@ async def test_llamacpp_without_artifact_fails_before_remote_work() -> None:
     ssh.upload.assert_not_called()
     ssh.run_streaming.assert_not_called()
     etcd.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_shared_root_is_required_before_remote_work(
+    tmp_path: Path,
+) -> None:
+    ssh = MagicMock()
+    etcd = MagicMock()
+    cache_dir = tmp_path / "hub"
+    cache_dir.mkdir()
+    provisioner = _make_provisioner(
+        ssh_client=ssh,
+        etcd_client=etcd,
+        artifact_index=GGUFArtifactIndex(cache_dir),
+    )
+
+    with patch.object(provisioner, "_provision", new_callable=AsyncMock) as body:
+        with pytest.raises(ProvisioningError, match="HUGGINGFACE__SHARED_ROOT"):
+            await provisioner.provision(
+                "host1",
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact_id="a" * 64,
+            )
+        body.assert_not_awaited()
+
+    ssh.upload.assert_not_called()
+    ssh.run_streaming.assert_not_called()
+    etcd.put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_artifact_selection_rejects_cross_engine_and_lookup_failures(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ProvisioningError, match="only valid for llama_cpp"):
+        await _make_provisioner().resolve_artifact_selection(
+            InferenceEngine.VLLM, "a" * 64
+        )
+
+    with pytest.raises(ProvisioningError, match="discovery is not configured"):
+        await _make_provisioner().resolve_artifact_selection(
+            InferenceEngine.LLAMA_CPP, "a" * 64
+        )
+
+    artifact_index = MagicMock(spec=GGUFArtifactIndex)
+    artifact_index.validate_shared_root.return_value = tmp_path
+    artifact_index.get.return_value = None
+    provisioner = _make_provisioner(artifact_index=artifact_index)
+    with pytest.raises(ProvisioningError, match="was not found"):
+        await provisioner.resolve_artifact_selection(
+            InferenceEngine.LLAMA_CPP, "b" * 64
+        )
+
+    artifact_index.get.side_effect = GGUFArtifactError("broken cache entry")
+    with pytest.raises(ProvisioningError, match="invalid: broken cache entry"):
+        await provisioner.resolve_artifact_selection(
+            InferenceEngine.LLAMA_CPP, "c" * 64
+        )
 
 
 class TestScriptUpload:

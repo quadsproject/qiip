@@ -28,9 +28,9 @@ from inference_proxy.discovery.etcd_client import EtcdClient
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_to_etcd
 from inference_proxy.huggingface.artifacts import (
-    GGUFArtifact,
     GGUFArtifactError,
-    GGUFArtifactStore,
+    GGUFArtifactIndex,
+    ResolvedGGUFArtifact,
 )
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
 from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
@@ -142,7 +142,7 @@ class NodeProvisioner:
         lifecycle_coordinator: HostLifecycleCoordinator | None = None,
         hf_token: str | None = None,
         nfs_export: str | None = None,
-        artifact_store: GGUFArtifactStore | None = None,
+        artifact_index: GGUFArtifactIndex | None = None,
     ) -> None:
         self._ssh_client = ssh_client
         self._etcd_client = etcd_client
@@ -163,7 +163,7 @@ class NodeProvisioner:
         self._lifecycle = lifecycle_coordinator or HostLifecycleCoordinator()
         self._hf_token = hf_token
         self._nfs_export = nfs_export
-        self._artifact_store = artifact_store
+        self._artifact_index = artifact_index
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._provisioning_tasks: dict[str, _ProvisioningTask] = {}
 
@@ -201,11 +201,11 @@ class NodeProvisioner:
         self._required_nfs_export()
         self._required_script_bundles(engine)
 
-    def resolve_artifact_selection(
+    async def resolve_artifact_selection(
         self,
         engine: InferenceEngine,
         artifact_id: str | None,
-    ) -> GGUFArtifact | None:
+    ) -> ResolvedGGUFArtifact | None:
         """Resolve the exact llama.cpp artifact or reject the engine contract."""
         if engine == InferenceEngine.VLLM:
             if artifact_id is not None:
@@ -215,10 +215,9 @@ class NodeProvisioner:
             return None
         if artifact_id is None:
             raise ProvisioningError("llama_cpp provisioning requires artifact_id")
-        if self._artifact_store is None:
-            raise ProvisioningError("GGUF artifact storage is not configured")
+        artifact_index = self._required_llamacpp_shared_root()
         try:
-            artifact = self._artifact_store.get(artifact_id)
+            artifact = await asyncio.to_thread(artifact_index.get, artifact_id)
         except GGUFArtifactError as exc:
             raise ProvisioningError(
                 f"GGUF artifact {artifact_id!r} is invalid: {exc}"
@@ -226,6 +225,20 @@ class NodeProvisioner:
         if artifact is None:
             raise ProvisioningError(f"GGUF artifact {artifact_id!r} was not found")
         return artifact
+
+    def _required_llamacpp_shared_root(self) -> GGUFArtifactIndex:
+        """Require a valid shared-root mapping for llama.cpp provisioning."""
+        if self._artifact_index is None:
+            raise ProvisioningError("GGUF artifact discovery is not configured")
+        try:
+            self._artifact_index.validate_shared_root()
+        except GGUFArtifactError as exc:
+            raise ProvisioningError(
+                "llama_cpp provisioning requires "
+                "INFERENCE_PROXY_HUGGINGFACE__SHARED_ROOT containing the "
+                f"configured cache_dir: {exc}"
+            ) from exc
+        return self._artifact_index
 
     def _required_nfs_export(self) -> str:
         """Return the canonical NFS export or reject node provisioning."""
@@ -287,7 +300,7 @@ class NodeProvisioner:
         self,
         model: str | None,
         engine: InferenceEngine = InferenceEngine.VLLM,
-        artifact: GGUFArtifact | None = None,
+        artifact: ResolvedGGUFArtifact | None = None,
     ) -> dict[str, str]:
         """Return the exact environment accepted by the engine start script."""
         if engine == InferenceEngine.LLAMA_CPP:
@@ -298,7 +311,7 @@ class NodeProvisioner:
             }
             if artifact is None:
                 raise ProvisioningError("llama_cpp start requires a GGUF artifact")
-            env["AUTOLLAMACPP_GGUF_PATH"] = artifact.cache_relative_entrypoint
+            env["AUTOLLAMACPP_GGUF_PATH"] = artifact.node_relative_entrypoint
             env["AUTOLLAMACPP_MODEL_ALIAS"] = artifact.model_alias
         else:
             env = {
@@ -519,7 +532,7 @@ class NodeProvisioner:
         # immediate 400 responses instead of failed background operations.
         self.validate_setup_configuration(engine)
         self.validate_endpoint(hostname)
-        artifact = self.resolve_artifact_selection(engine, artifact_id)
+        artifact = await self.resolve_artifact_selection(engine, artifact_id)
         lease = lifecycle_lease
         if lease is None:
             lease = await self._lifecycle.acquire(hostname)
@@ -554,7 +567,7 @@ class NodeProvisioner:
         managed: bool = True,
         model: str | None = None,
         engine: InferenceEngine = InferenceEngine.VLLM,
-        artifact: GGUFArtifact | None = None,
+        artifact: ResolvedGGUFArtifact | None = None,
     ) -> None:
         """Run full provisioning sequence on *hostname*.
 
@@ -793,7 +806,7 @@ class NodeProvisioner:
         *,
         model: str | None = None,
         engine: InferenceEngine = InferenceEngine.VLLM,
-        artifact: GGUFArtifact | None = None,
+        artifact: ResolvedGGUFArtifact | None = None,
     ) -> str:
         """Run the engine start script and extract model name from stdout."""
         if engine == InferenceEngine.LLAMA_CPP:

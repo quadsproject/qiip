@@ -43,7 +43,7 @@ from inference_proxy.discovery.node_leases import NodeLeaseManager
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.discovery.serializer import node_from_etcd
 from inference_proxy.discovery.watcher import EtcdWatcher
-from inference_proxy.huggingface.artifacts import GGUFArtifactStore
+from inference_proxy.huggingface.artifacts import GGUFArtifactIndex
 from inference_proxy.huggingface.catalog import ModelCatalogService
 from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.llmfit.runner import LLMFitRunner
@@ -277,11 +277,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise RuntimeError(
                     f"HuggingFace cache directory does not exist: {cache_path}"
                 )
-            artifact_store = GGUFArtifactStore(cache_path)
-            app.state.artifact_store = artifact_store
+            artifact_index = GGUFArtifactIndex(
+                cache_path,
+                shared_root=resolved_settings.huggingface.shared_root,
+            )
+            app.state.artifact_index = artifact_index
             catalog_service = ModelCatalogService(
                 cache_dir=resolved_settings.huggingface.cache_dir,
-                artifact_store=artifact_store,
+                artifact_index=artifact_index,
             )
             app.state.catalog_service = catalog_service
 
@@ -293,7 +296,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             download_service = DownloadService(
                 cache_dir=resolved_settings.huggingface.cache_dir,
                 token=token,
-                artifact_store=artifact_store,
+                artifact_index=artifact_index,
             )
             app.state.download_service = download_service
             resources.push_async_callback(
@@ -364,7 +367,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 log_buffer=log_buffer,
                 hf_token=hf_token.get_secret_value() if hf_token else None,
                 nfs_export=resolved_settings.huggingface.nfs_export,
-                artifact_store=artifact_store,
+                artifact_index=artifact_index,
             )
             app.state.provisioner = provisioner
             resources.push_async_callback(

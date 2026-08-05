@@ -104,11 +104,13 @@ controller.setCatalog({
   gguf_artifacts: [{
     artifact_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     repo_id: "org/model-GGUF", resolved_revision: "b".repeat(40),
-    model_alias: "model-q4",
+    model_alias: "model-q4", entrypoint: "model-Q4_K_M.gguf",
   }],
 });
 const vllmBody = controller.buildBody({ hostname: "gpu01" });
 controller.selectEngine("llama_cpp");
+byId("artifact-select").value = "a".repeat(64);
+byId("artifact-select").listeners.change();
 const llamaBody = controller.buildBody({ hostname: "gpu01" });
 process.stdout.write(JSON.stringify({
   vllmBody,
@@ -138,7 +140,60 @@ process.stdout.write(JSON.stringify({
             {"value": "llama_cpp", "label": "llama.cpp"},
         ],
         "modelValues": ["org/vllm-model"],
-        "artifactValues": ["a" * 64],
+        "artifactValues": ["", "a" * 64],
+    }
+
+
+def test_llamacpp_requires_an_explicit_artifact_choice() -> None:
+    result = _run_scenario(
+        r"""
+controller.setCatalog({
+  models: [],
+  gguf_artifacts: [
+    {
+      artifact_id: "a".repeat(64), repo_id: "org/model-GGUF",
+      resolved_revision: "b".repeat(40), model_alias: "model",
+      entrypoint: "model-BF16.gguf",
+    },
+    {
+      artifact_id: "c".repeat(64), repo_id: "org/model-GGUF",
+      resolved_revision: "b".repeat(40), model_alias: "model",
+      entrypoint: "model-Q4_K_M.gguf",
+    },
+  ],
+});
+controller.selectEngine("llama_cpp");
+const before = {
+  selection: controller.getSelection(),
+  status: byId("model-status").textContent,
+  value: byId("artifact-select").value,
+  placeholderDisabled: byId("artifact-select").children[0].disabled,
+  labels: byId("artifact-select").children.map(function (child) {
+    return child.textContent;
+  }),
+};
+byId("artifact-select").value = "c".repeat(64);
+byId("artifact-select").listeners.change();
+process.stdout.write(JSON.stringify({
+  before,
+  after: controller.getSelection(),
+}));
+"""
+    )
+
+    assert result == {
+        "before": {
+            "selection": None,
+            "status": "Select a GGUF artifact.",
+            "value": "",
+            "placeholderDisabled": True,
+            "labels": [
+                "Select a GGUF artifact",
+                "model — model-BF16.gguf @bbbbbbbbbbbb",
+                "model — model-Q4_K_M.gguf @bbbbbbbbbbbb",
+            ],
+        },
+        "after": {"engine": "llama_cpp", "artifact_id": "c" * 64},
     }
 
 
@@ -158,6 +213,7 @@ const node = {{ engine: "llama_cpp", artifact_id: artifactId, model: "alias" }};
 const catalog = {{ models: [{{ repo_id: "org/vllm" }}], gguf_artifacts: [{{
   artifact_id: artifactId, repo_id: "org/model-GGUF",
   resolved_revision: "d".repeat(40), model_alias: "alias",
+  entrypoint: "model-Q4_K_M.gguf",
 }}] }};
 {order}
 process.stdout.write(JSON.stringify({{
@@ -184,6 +240,7 @@ controller.setCatalog({
   gguf_artifacts: [{
     artifact_id: "f".repeat(64), repo_id: "org/other-GGUF",
     resolved_revision: "a".repeat(40), model_alias: "other",
+    entrypoint: "other-Q4_K_M.gguf",
   }],
 });
 process.stdout.write(JSON.stringify({
@@ -220,8 +277,10 @@ def test_catalog_refresh_preserves_operator_selection(
 const catalog = {{
   models: [{{ repo_id: "org/old" }}, {{ repo_id: "org/new" }}],
   gguf_artifacts: [
-    {{ artifact_id: "a".repeat(64), repo_id: "org/a", model_alias: "a" }},
-    {{ artifact_id: "b".repeat(64), repo_id: "org/b", model_alias: "b" }},
+    {{ artifact_id: "a".repeat(64), repo_id: "org/a", model_alias: "a",
+       entrypoint: "a-Q4_K_M.gguf" }},
+    {{ artifact_id: "b".repeat(64), repo_id: "org/b", model_alias: "b",
+       entrypoint: "b-Q4_K_M.gguf" }},
   ],
 }};
 controller.setPreferredNode({{
@@ -254,9 +313,10 @@ controller.setCatalog({
     repo_id: "<img src=https://attacker.invalid/collect>",
     resolved_revision: "b".repeat(40),
     model_alias: "<script>attack()</script>",
+    entrypoint: "<b>model-Q4_K_M.gguf</b>",
   }],
 });
-const option = byId("artifact-select").children[0];
+const option = byId("artifact-select").children[1];
 process.stdout.write(JSON.stringify({
   label: option.textContent,
   childCount: option.children.length,
@@ -265,9 +325,6 @@ process.stdout.write(JSON.stringify({
     )
 
     assert result == {
-        "label": (
-            "<script>attack()</script> — "
-            "<img src=https://attacker.invalid/collect>@bbbbbbbbbbbb"
-        ),
+        "label": ("<script>attack()</script> — <b>model-Q4_K_M.gguf</b> @bbbbbbbbbbbb"),
         "childCount": 0,
     }

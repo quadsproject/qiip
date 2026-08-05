@@ -28,7 +28,7 @@ from huggingface_hub.errors import (
 
 from inference_proxy.huggingface.artifacts import (
     GGUFArtifact,
-    GGUFArtifactStore,
+    GGUFArtifactIndex,
     GGUFDownloadSpec,
 )
 from inference_proxy.models.admin import DownloadState, DownloadStatusResponse
@@ -79,11 +79,11 @@ class DownloadService:
         self,
         cache_dir: str,
         token: str | None,
-        artifact_store: GGUFArtifactStore | None = None,
+        artifact_index: GGUFArtifactIndex | None = None,
     ) -> None:
         self._cache_dir = cache_dir
         self._token = token
-        self._artifact_store = artifact_store or GGUFArtifactStore(cache_dir)
+        self._artifact_index = artifact_index or GGUFArtifactIndex(cache_dir)
         self._statuses: dict[str, DownloadStatusResponse] = {}
         self._lock = threading.Lock()
         # ponytail: lazy semaphore -- must be created inside a running event loop
@@ -180,7 +180,7 @@ class DownloadService:
             try:
                 resolved_revision, artifacts = await _run_in_daemon_thread(
                     partial(
-                        self._download_and_publish,
+                        self._download_and_index,
                         repo_id,
                         requested.requested_revision,
                         requested.gguf,
@@ -219,7 +219,7 @@ class DownloadService:
                 )
             log.info("download complete")
 
-    def _download_and_publish(
+    def _download_and_index(
         self,
         repo_id: str,
         revision: str | None,
@@ -262,7 +262,7 @@ class DownloadService:
             )
         if gguf is None:
             return resolved_revision, ()
-        artifact = self._artifact_store.publish(
+        artifact = self._artifact_index.artifact_from_download(
             repo_id=repo_id,
             resolved_revision=resolved_revision,
             snapshot_path=snapshot_path,

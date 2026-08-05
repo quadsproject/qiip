@@ -422,10 +422,23 @@ SHA-256. Changing either version requires configuring its matching digest via
 `INFERENCE_PROXY_LLMFIT__SHA256`; provisioning fails before SSH or installation
 when a custom version has no explicit digest.
 
-The gateway cache path and node cache mount may differ, but provisioning uses
-one declared backing export: `INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT`. It is
-optional for proxy-only deployments and required before a node setup operation
-can acquire a host lease or start SSH work.
+The gateway cache path and node cache mount may differ. Provisioning uses one
+declared backing export and, for llama.cpp, the gateway path that corresponds
+to the root of that export:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INFERENCE_PROXY_HUGGINGFACE__CACHE_DIR` | required | Gateway-local Hugging Face Hub cache directory |
+| `INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT` | none | NFS export mounted on provisioned nodes |
+| `INFERENCE_PROXY_HUGGINGFACE__SHARED_ROOT` | none | Gateway-local root of that same export; required for llama.cpp setup and must contain `CACHE_DIR` |
+| `INFERENCE_PROXY_HUGGINGFACE__API_TOKEN` | none | Optional token for gated Hugging Face repositories |
+
+For example, a gateway with shared root `/mnt/scratch`, Hub cache
+`/mnt/scratch/hub`, and node mount `/srv/hf-cache` sends a native snapshot path
+beginning with `hub/` to the node. `NFS_EXPORT` remains optional for proxy-only
+deployments and is required before any node setup can acquire a host lease or
+start SSH work. `SHARED_ROOT` is needed only for llama.cpp setup; catalog
+browsing and vLLM setup do not need that path translation.
 
 Node-side launch tuning uses the `AUTOVLLM_*` namespace. The retired
 `VLLM_TENSOR_PARALLEL`, `VLLM_GPU_MEM_UTIL`, `VLLM_MAX_MODEL_LEN`,
@@ -456,18 +469,28 @@ must name the exact files and load entrypoint:
 }
 ```
 
-After the snapshot completes, QIIP publishes an immutable manifest under the
-same NFS cache's `gguf/` tree. `/admin/models/catalog` keeps full vLLM models in
-`models` and returns these exact llama.cpp generations separately in
-`gguf_artifacts`. The dashboard setup controls select either a full vLLM model
-or one exact GGUF `artifact_id`; the two engine-specific values are never sent
-together. Node retry requests omit both values so the server can retain the
-latest registered engine, model, and artifact identity under the host lifecycle
-lease.
+QIIP discovers GGUF generations directly from native Hugging Face snapshot
+directories. It writes no parallel `gguf/` tree: every standalone `.gguf` is
+one generation, while a complete llama.cpp split family is one generation with
+shard 1 as its entrypoint. Existing snapshots downloaded outside QIIP therefore
+become selectable without copying model data or publishing a manifest.
+
+`/admin/models/catalog` keeps full vLLM models in `models` and returns exact
+llama.cpp generations separately in `gguf_artifacts`. A GGUF can be discoverable
+even when its repository contributes to `incomplete_count` or
+`unverifiable_count`; those counters describe Hugging Face cache metadata and
+are not suppressed merely because a valid GGUF exists.
+
+The dashboard setup controls select either a full vLLM model or one exact GGUF
+`artifact_id`; the two engine-specific values are never sent together. No GGUF
+artifact is selected by default, so the operator must choose the intended
+entrypoint or quantization. Node retry requests omit both values so the server
+can retain the latest registered engine, model, and artifact identity under the
+host lifecycle lease.
 
 LLMFit recommendation runtimes are normalized to `vllm`, `llama_cpp`, `mlx`,
 or `unknown`. A llama.cpp recommendation can list typed `gguf_sources`, and the
-node-detail dashboard reports a published generation as available only when a
+node-detail dashboard reports a discovered generation as available only when a
 source repository exactly matches an artifact's `repo_id`. LLMFit does not
 identify an exact file set, shard group, or entrypoint, so the browser never
 guesses a GGUF download request: it shows `No GGUF source`, `Not downloaded`,
@@ -475,7 +498,9 @@ guesses a GGUF download request: it shows `No GGUF source`, `Not downloaded`,
 
 Re-downloading a mutable branch after it advances creates a distinct artifact
 generation because identity uses the resolved SHA. QIIP never automatically
-deletes older artifact generations or their backing snapshots.
+deletes snapshots. A persisted artifact ID resolves only while its native
+snapshot and exact GGUF file family remain in the shared cache, so coordinate
+retention with every running or restartable node that records that ID.
 
 ### Proxy (HTTP client)
 

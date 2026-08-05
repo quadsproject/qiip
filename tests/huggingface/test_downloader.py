@@ -19,7 +19,7 @@ from huggingface_hub.errors import (
     RevisionNotFoundError,
 )
 
-from inference_proxy.huggingface.artifacts import GGUFArtifactStore, GGUFDownloadSpec
+from inference_proxy.huggingface.artifacts import GGUFDownloadSpec
 from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.models.admin import DownloadState, DownloadStatusResponse
 from inference_proxy.models.node import InferenceEngine
@@ -305,6 +305,7 @@ class TestExactGGUFDownload:
         snapshot = tmp_path / "models--org--model-GGUF" / "snapshots" / _REVISION
         snapshot.mkdir(parents=True)
         (snapshot / "model-q4.gguf").write_bytes(b"weights")
+        (snapshot / "model-q8.gguf").write_bytes(b"other weights")
         mock_sd.return_value = str(snapshot)
         svc = DownloadService(cache_dir=str(tmp_path), token="tok")
         spec = GGUFDownloadSpec(files=("model-q4.gguf",), entrypoint="model-q4.gguf")
@@ -323,7 +324,10 @@ class TestExactGGUFDownload:
         status = _status(svc, repo_id)
         assert status.resolved_revision == _REVISION
         assert len(status.artifacts) == 1
-        assert status.artifacts[0] == GGUFArtifactStore(tmp_path).scan().artifacts[0]
+        assert status.artifacts[0].repo_id == repo_id
+        assert status.artifacts[0].entrypoint == "model-q4.gguf"
+        assert status.artifacts[0].files == ("model-q4.gguf",)
+        assert not (tmp_path / "gguf").exists()
 
     @pytest.mark.asyncio
     @patch("inference_proxy.huggingface.downloader.snapshot_download")

@@ -49,8 +49,9 @@ function createSetupSelectionController(options) {
 
   function artifactLabel(artifact) {
     var alias = artifact.model_alias || artifact.repo_id;
+    var entrypoint = artifact.entrypoint || "unknown GGUF";
     var revision = (artifact.resolved_revision || "").slice(0, 12);
-    return alias + " — " + artifact.repo_id + (revision ? "@" + revision : "");
+    return alias + " — " + entrypoint + (revision ? " @" + revision : "");
   }
 
   function warningsFromCatalog(data) {
@@ -76,7 +77,7 @@ function createSetupSelectionController(options) {
     if (invalidArtifacts) {
       warnings.push(invalidArtifacts + " invalid GGUF artifact" +
         (invalidArtifacts === 1 ? " was" : "s were") +
-        " hidden; inspect gateway logs and republish.");
+        " hidden; inspect gateway logs and cached GGUF files.");
     }
     if (cacheWarnings) {
       warnings.push(cacheWarnings + " cache warning" +
@@ -109,6 +110,7 @@ function createSetupSelectionController(options) {
       appendOption(modelSelect, models[i].repo_id, models[i].repo_id, false);
     }
     artifactSelect.textContent = "";
+    appendOption(artifactSelect, "", "Select a GGUF artifact", true);
     for (var j = 0; j < artifacts.length; j++) {
       appendOption(
         artifactSelect,
@@ -149,8 +151,8 @@ function createSetupSelectionController(options) {
         true
       );
       artifactSelect.value = desiredArtifact;
-    } else if (artifacts.length > 0) {
-      artifactSelect.value = artifacts[0].artifact_id;
+    } else {
+      artifactSelect.value = "";
     }
 
     var llama = engine === "llama_cpp";
@@ -162,7 +164,9 @@ function createSetupSelectionController(options) {
     } else if (llama && !hasArtifact(artifactSelect.value)) {
       errorMessage = desiredArtifact
         ? "The previously selected GGUF artifact is no longer available."
-        : "No verified GGUF artifacts are available.";
+        : artifacts.length
+          ? "Select a GGUF artifact."
+          : "No GGUF files were discovered in the Hugging Face cache.";
     } else if (!llama && !hasModel(modelSelect.value)) {
       errorMessage = desiredModel
         ? "The previously selected vLLM model is no longer available."

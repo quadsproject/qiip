@@ -57,7 +57,7 @@ class Node(BaseModel):
         status: Current health status of the node.
         model: Name of the model being served.
         engine: Inference engine backend (vllm or llama_cpp).
-        artifact_id: Exact gateway-published GGUF generation, when applicable.
+        artifact_id: Exact gateway-discovered GGUF generation, when applicable.
         last_heartbeat: Timestamp of the last health check response.
         capabilities: Hardware and serving capabilities.
         active_connections: Number of active inference requests.

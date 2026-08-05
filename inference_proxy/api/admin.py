@@ -145,13 +145,15 @@ def _effective_setup_selection(
     return _SetupSelection(node.engine, node.model or None, None)
 
 
-def _validate_setup_selection(
+async def _validate_setup_selection(
     provisioner: NodeProvisioner,
     selection: _SetupSelection,
 ) -> None:
     """Validate one effective setup selection before any destructive work."""
     provisioner.validate_setup_configuration(selection.engine)
-    provisioner.resolve_artifact_selection(selection.engine, selection.artifact_id)
+    await provisioner.resolve_artifact_selection(
+        selection.engine, selection.artifact_id
+    )
 
 
 def _validated_hostname(hostname: str) -> str:
@@ -262,7 +264,7 @@ async def setup_node(
 
     try:
         provisioner.validate_endpoint(hostname)
-        _validate_setup_selection(provisioner, selection)
+        await _validate_setup_selection(provisioner, selection)
     except (EndpointValidationError, ProvisioningError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -317,7 +319,7 @@ async def setup_node(
                 )
 
         try:
-            _validate_setup_selection(provisioner, selection)
+            await _validate_setup_selection(provisioner, selection)
         except ProvisioningError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

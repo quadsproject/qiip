@@ -1,27 +1,26 @@
-"""Immutable GGUF artifact publication and validation.
-
-GGUF downloads are partial Hugging Face snapshots.  This module publishes an
-explicit, versioned manifest plus relative links under ``<cache>/gguf`` so the
-gateway and provisioned nodes share one exact serving contract.
-"""
+"""Deterministic GGUF artifact discovery over the native Hugging Face cache."""
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
-import os
 import re
-import shutil
-import tempfile
+from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
+from huggingface_hub import CachedRevisionInfo, HFCacheInfo, scan_cache_dir
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class GGUFArtifactError(ValueError):
-    """Raised when a GGUF artifact cannot be published or validated."""
+    """Raised when a GGUF artifact cannot be discovered or resolved safely."""
+
+
+_SPLIT_FILE_RE = re.compile(
+    r"^(?P<prefix>.+)-(?P<index>[0-9]{5})-of-(?P<total>[0-9]{5})\.gguf$"
+)
 
 
 def _validated_relative_gguf_path(value: str) -> str:
@@ -38,83 +37,70 @@ def _validated_relative_gguf_path(value: str) -> str:
     return value
 
 
-class GGUFDownloadSpec(BaseModel):
-    """Exact repository files forming one loadable GGUF artifact."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    files: tuple[str, ...] = Field(min_length=1)
-    entrypoint: str
-
-    @field_validator("files")
-    @classmethod
-    def validate_files(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        normalized = tuple(_validated_relative_gguf_path(value) for value in values)
-        if len(set(normalized)) != len(normalized):
-            raise ValueError("GGUF file paths must be unique")
-        return normalized
-
-    @field_validator("entrypoint")
-    @classmethod
-    def validate_entrypoint(cls, value: str) -> str:
-        return _validated_relative_gguf_path(value)
-
-    @model_validator(mode="after")
-    def entrypoint_is_in_files(self) -> GGUFDownloadSpec:
-        if self.entrypoint not in self.files:
-            raise ValueError("GGUF entrypoint must be included in files")
-        return self
+@dataclass(frozen=True, slots=True)
+class _SplitPart:
+    path: str
+    parent: str
+    prefix: str
+    index: int
+    total: int
 
 
-class GGUFArtifact(BaseModel):
-    """Versioned manifest for one immutable, loadable GGUF generation."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-    schema_version: Literal[1] = 1
-    artifact_id: str = Field(pattern=r"^[0-9a-f]{64}$")
-    repo_id: str
-    resolved_revision: str = Field(pattern=r"^[0-9a-f]{40,64}$")
-    files: tuple[str, ...] = Field(min_length=1)
-    entrypoint: str
-    model_alias: str
-    file_sizes: dict[str, int]
-
-    @field_validator("files")
-    @classmethod
-    def validate_files(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(_validated_relative_gguf_path(value) for value in values)
-
-    @field_validator("entrypoint")
-    @classmethod
-    def validate_entrypoint(cls, value: str) -> str:
-        return _validated_relative_gguf_path(value)
-
-    @model_validator(mode="after")
-    def validate_file_contract(self) -> GGUFArtifact:
-        if len(set(self.files)) != len(self.files):
-            raise ValueError("GGUF artifact files must be unique")
-        if self.entrypoint not in self.files:
-            raise ValueError("GGUF artifact entrypoint must be included in files")
-        if set(self.file_sizes) != set(self.files):
-            raise ValueError("GGUF artifact sizes must cover the exact file set")
-        if not self.model_alias:
-            raise ValueError("GGUF artifact model alias must not be empty")
-        return self
-
-    @property
-    def cache_relative_entrypoint(self) -> str:
-        """Return the exact path understood by the node launcher."""
-        return str(PurePosixPath("gguf", self.artifact_id, "files", self.entrypoint))
+def _split_part(value: str) -> _SplitPart | None:
+    path = PurePosixPath(value)
+    match = _SPLIT_FILE_RE.fullmatch(path.name)
+    if match is None:
+        return None
+    return _SplitPart(
+        path=value,
+        parent=path.parent.as_posix(),
+        prefix=match.group("prefix"),
+        index=int(match.group("index")),
+        total=int(match.group("total")),
+    )
 
 
-class ArtifactScanResult(BaseModel):
-    """Validated artifacts plus the number of hidden invalid manifests."""
+def _normalize_gguf_family(
+    files: tuple[str, ...], entrypoint: str
+) -> tuple[tuple[str, ...], str]:
+    """Return the one canonical single-file or split-family contract."""
+    normalized = tuple(_validated_relative_gguf_path(value) for value in files)
+    normalized_entrypoint = _validated_relative_gguf_path(entrypoint)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("GGUF file paths must be unique")
+    if normalized_entrypoint not in normalized:
+        raise ValueError("GGUF entrypoint must be included in files")
 
-    model_config = ConfigDict(frozen=True)
+    if len(normalized) == 1:
+        part = _split_part(normalized[0])
+        if part is not None and part.total > 1:
+            raise ValueError("GGUF split families must include every declared shard")
+        return normalized, normalized_entrypoint
 
-    artifacts: tuple[GGUFArtifact, ...]
-    invalid_count: int = 0
+    parts = tuple(_split_part(value) for value in normalized)
+    if any(part is None for part in parts):
+        raise ValueError(
+            "GGUF artifacts must contain one file or one complete split family"
+        )
+    split_parts = tuple(part for part in parts if part is not None)
+    first = split_parts[0]
+    if first.total <= 1:
+        raise ValueError("GGUF split families must declare more than one shard")
+    if any(
+        (part.parent, part.prefix, part.total)
+        != (first.parent, first.prefix, first.total)
+        for part in split_parts
+    ):
+        raise ValueError("GGUF split shards must belong to one filename family")
+    if len(split_parts) != first.total:
+        raise ValueError("GGUF split families must include every declared shard")
+    by_index = {part.index: part.path for part in split_parts}
+    if set(by_index) != set(range(1, first.total + 1)):
+        raise ValueError("GGUF split families must contain shards 1 through N exactly")
+    ordered = tuple(by_index[index] for index in range(1, first.total + 1))
+    if normalized_entrypoint != ordered[0]:
+        raise ValueError("GGUF split entrypoint must be shard 1")
+    return ordered, ordered[0]
 
 
 def _artifact_identity(
@@ -140,6 +126,95 @@ def _artifact_identity(
     return hashlib.sha256(payload).hexdigest()
 
 
+class GGUFDownloadSpec(BaseModel):
+    """Exact repository files forming one loadable GGUF artifact."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    files: tuple[str, ...] = Field(min_length=1)
+    entrypoint: str
+
+    @model_validator(mode="after")
+    def normalize_file_family(self) -> GGUFDownloadSpec:
+        files, entrypoint = _normalize_gguf_family(self.files, self.entrypoint)
+        object.__setattr__(self, "files", files)
+        object.__setattr__(self, "entrypoint", entrypoint)
+        return self
+
+
+class GGUFArtifact(BaseModel):
+    """Public identity and metadata for one immutable GGUF generation."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal[1] = 1
+    artifact_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    repo_id: str
+    resolved_revision: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+    files: tuple[str, ...] = Field(min_length=1)
+    entrypoint: str
+    model_alias: str
+    file_sizes: dict[str, int]
+
+    @field_validator("files")
+    @classmethod
+    def validate_files(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return tuple(_validated_relative_gguf_path(value) for value in values)
+
+    @field_validator("entrypoint")
+    @classmethod
+    def validate_entrypoint(cls, value: str) -> str:
+        return _validated_relative_gguf_path(value)
+
+    @model_validator(mode="after")
+    def validate_file_contract(self) -> GGUFArtifact:
+        files, entrypoint = _normalize_gguf_family(self.files, self.entrypoint)
+        object.__setattr__(self, "files", files)
+        object.__setattr__(self, "entrypoint", entrypoint)
+        if set(self.file_sizes) != set(files):
+            raise ValueError("GGUF artifact sizes must cover the exact file set")
+        if not self.model_alias:
+            raise ValueError("GGUF artifact model alias must not be empty")
+        return self
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedGGUFArtifact:
+    """Artifact identity plus its exact path relative to the shared export."""
+
+    artifact: GGUFArtifact
+    node_relative_entrypoint: str
+
+    @property
+    def artifact_id(self) -> str:
+        return self.artifact.artifact_id
+
+    @property
+    def model_alias(self) -> str:
+        return self.artifact.model_alias
+
+
+class ArtifactScanResult(BaseModel):
+    """Discovered artifacts plus the number of hidden invalid candidates."""
+
+    model_config = ConfigDict(frozen=True)
+
+    artifacts: tuple[GGUFArtifact, ...]
+    invalid_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexedArtifact:
+    artifact: GGUFArtifact
+    entrypoint_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class _IndexScan:
+    artifacts: tuple[_IndexedArtifact, ...]
+    invalid_count: int
+
+
 def _is_relative_to(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -148,43 +223,89 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     return True
 
 
-class GGUFArtifactStore:
-    """Publish and resolve immutable GGUF manifests under one HF cache."""
+class GGUFArtifactIndex:
+    """Discover and resolve GGUF artifacts without writing cache metadata."""
 
-    _MANIFEST_NAME = "artifact.json"
-
-    def __init__(self, cache_dir: str | Path) -> None:
+    def __init__(
+        self,
+        cache_dir: str | Path,
+        *,
+        shared_root: str | Path | None = None,
+    ) -> None:
         self._cache_dir = Path(cache_dir).resolve()
-        self._root = self._cache_dir / "gguf"
+        self._shared_root = Path(shared_root) if shared_root is not None else None
 
     @property
-    def root(self) -> Path:
-        return self._root
+    def cache_dir(self) -> Path:
+        return self._cache_dir
 
-    def _prepare_root(self, *, create: bool) -> bool:
-        """Reject an artifact root that could redirect publication elsewhere."""
-        if self._root.is_symlink() or (
-            os.path.lexists(self._root) and not self._root.is_dir()
-        ):
-            raise GGUFArtifactError(
-                f"GGUF artifact root is not a real directory: {self._root}"
-            )
-        if self._root.is_dir():
-            return True
-        if not create:
-            return False
+    def validate_shared_root(self) -> Path:
+        """Return the resolved export root or reject llama.cpp provisioning."""
+        if self._shared_root is None:
+            raise GGUFArtifactError("HuggingFace shared_root is not configured")
         try:
-            self._root.mkdir(parents=True, exist_ok=False)
-        except FileExistsError:
-            # Another identical publication may create the shared root between
-            # the checks above and mkdir. Accept only the intended directory.
-            if self._root.is_symlink() or not self._root.is_dir():
-                raise GGUFArtifactError(
-                    f"GGUF artifact root is not a real directory: {self._root}"
-                ) from None
-        return True
+            shared_root = self._shared_root.resolve(strict=True)
+            cache_dir = self._cache_dir.resolve(strict=True)
+        except OSError as exc:
+            raise GGUFArtifactError(
+                f"HuggingFace shared-root configuration is unavailable: {exc}"
+            ) from exc
+        if not shared_root.is_dir():
+            raise GGUFArtifactError(
+                f"HuggingFace shared_root is not a directory: {shared_root}"
+            )
+        if not _is_relative_to(cache_dir, shared_root):
+            raise GGUFArtifactError(
+                "HuggingFace cache_dir must be contained within shared_root"
+            )
+        return shared_root
 
-    def publish(
+    def scan(self, cache_info: HFCacheInfo | None = None) -> ArtifactScanResult:
+        """Return native-cache artifacts in deterministic display order."""
+        info = (
+            cache_info
+            if cache_info is not None
+            else scan_cache_dir(str(self._cache_dir))
+        )
+        result = self._discover(info)
+        return ArtifactScanResult(
+            artifacts=tuple(item.artifact for item in result.artifacts),
+            invalid_count=result.invalid_count,
+        )
+
+    def get(self, artifact_id: str) -> ResolvedGGUFArtifact | None:
+        """Resolve one artifact and its node-facing path from a fresh cache scan."""
+        if re.fullmatch(r"[0-9a-f]{64}", artifact_id) is None:
+            return None
+        cache_info = scan_cache_dir(str(self._cache_dir))
+        for repo in sorted(cache_info.repos, key=lambda item: item.repo_id):
+            if repo.repo_type != "model":
+                continue
+            for revision in sorted(repo.revisions, key=lambda item: item.commit_hash):
+                specs, _invalid_specs = self._revision_specs(revision)
+                for spec in specs:
+                    candidate_id = _artifact_identity(
+                        repo_id=repo.repo_id,
+                        resolved_revision=revision.commit_hash,
+                        files=spec.files,
+                        entrypoint=spec.entrypoint,
+                        model_alias=repo.repo_id,
+                    )
+                    if candidate_id != artifact_id:
+                        continue
+                    try:
+                        indexed = self._build_indexed_artifact(
+                            repo_id=repo.repo_id,
+                            resolved_revision=revision.commit_hash,
+                            snapshot_path=revision.snapshot_path,
+                            spec=spec,
+                        )
+                    except (GGUFArtifactError, OSError, ValueError) as exc:
+                        raise GGUFArtifactError(str(exc)) from exc
+                    return self._resolve_for_node(indexed)
+        return None
+
+    def artifact_from_download(
         self,
         *,
         repo_id: str,
@@ -192,13 +313,101 @@ class GGUFArtifactStore:
         snapshot_path: str | Path,
         spec: GGUFDownloadSpec,
     ) -> GGUFArtifact:
-        """Atomically publish *spec* from one resolved HF snapshot."""
-        if not re.fullmatch(r"[0-9a-f]{40,64}", resolved_revision):
+        """Validate and reconstruct exactly the artifact requested for download."""
+        return self._build_indexed_artifact(
+            repo_id=repo_id,
+            resolved_revision=resolved_revision,
+            snapshot_path=Path(snapshot_path),
+            spec=spec,
+        ).artifact
+
+    def _discover(self, cache_info: HFCacheInfo) -> _IndexScan:
+        artifacts: list[_IndexedArtifact] = []
+        invalid_count = 0
+        for repo in sorted(cache_info.repos, key=lambda item: item.repo_id):
+            if repo.repo_type != "model":
+                continue
+            for revision in sorted(repo.revisions, key=lambda item: item.commit_hash):
+                specs, invalid_specs = self._revision_specs(revision)
+                invalid_count += invalid_specs
+                for spec in specs:
+                    try:
+                        indexed = self._build_indexed_artifact(
+                            repo_id=repo.repo_id,
+                            resolved_revision=revision.commit_hash,
+                            snapshot_path=revision.snapshot_path,
+                            spec=spec,
+                        )
+                    except (GGUFArtifactError, OSError, ValueError):
+                        invalid_count += 1
+                    else:
+                        artifacts.append(indexed)
+        artifacts.sort(
+            key=lambda item: (
+                item.artifact.repo_id,
+                item.artifact.resolved_revision,
+                item.artifact.entrypoint,
+            )
+        )
+        return _IndexScan(tuple(artifacts), invalid_count)
+
+    def _revision_specs(
+        self, revision: CachedRevisionInfo
+    ) -> tuple[tuple[GGUFDownloadSpec, ...], int]:
+        standalone: list[str] = []
+        split_groups: dict[tuple[str, str, int], dict[int, str]] = defaultdict(dict)
+        invalid_count = 0
+
+        for file in sorted(revision.files, key=lambda item: str(item.file_path)):
+            if file.file_path.suffix != ".gguf":
+                continue
+            try:
+                relative = file.file_path.relative_to(revision.snapshot_path).as_posix()
+                relative = _validated_relative_gguf_path(relative)
+            except ValueError:
+                invalid_count += 1
+                continue
+            part = _split_part(relative)
+            if part is None or (part.total == 1 and part.index == 1):
+                standalone.append(relative)
+                continue
+            if part.total <= 1 or not 1 <= part.index <= part.total:
+                invalid_count += 1
+                continue
+            key = (part.parent, part.prefix, part.total)
+            if part.index in split_groups[key]:
+                invalid_count += 1
+                continue
+            split_groups[key][part.index] = relative
+
+        specs = [
+            GGUFDownloadSpec(files=(relative,), entrypoint=relative)
+            for relative in standalone
+        ]
+        for (_parent, _prefix, total), by_index in split_groups.items():
+            if set(by_index) != set(range(1, total + 1)):
+                invalid_count += 1
+                continue
+            files = tuple(by_index[index] for index in range(1, total + 1))
+            specs.append(GGUFDownloadSpec(files=files, entrypoint=files[0]))
+        return tuple(sorted(specs, key=lambda item: item.entrypoint)), invalid_count
+
+    def _build_indexed_artifact(
+        self,
+        *,
+        repo_id: str,
+        resolved_revision: str,
+        snapshot_path: Path,
+        spec: GGUFDownloadSpec,
+    ) -> _IndexedArtifact:
+        if re.fullmatch(r"[0-9a-f]{40,64}", resolved_revision) is None:
             raise GGUFArtifactError(
                 f"Resolved HuggingFace revision is not a commit SHA: {resolved_revision!r}"
             )
-
-        snapshot = Path(snapshot_path).resolve(strict=True)
+        try:
+            snapshot = snapshot_path.resolve(strict=True)
+        except OSError as exc:
+            raise GGUFArtifactError(f"Resolved snapshot is unavailable: {exc}") from exc
         if not _is_relative_to(snapshot, self._cache_dir):
             raise GGUFArtifactError("Resolved snapshot is outside the configured cache")
         if snapshot.name != resolved_revision:
@@ -207,6 +416,7 @@ class GGUFArtifactStore:
             )
 
         sources: dict[str, Path] = {}
+        sizes: dict[str, int] = {}
         missing: list[str] = []
         escaped: list[str] = []
         for relative in spec.files:
@@ -214,11 +424,16 @@ class GGUFArtifactStore:
             if not source.is_file():
                 missing.append(relative)
                 continue
-            resolved_source = source.resolve(strict=True)
+            try:
+                resolved_source = source.resolve(strict=True)
+            except OSError:
+                missing.append(relative)
+                continue
             if not _is_relative_to(resolved_source, self._cache_dir):
                 escaped.append(relative)
                 continue
             sources[relative] = source
+            sizes[relative] = resolved_source.stat().st_size
         if missing:
             raise GGUFArtifactError(
                 "Resolved snapshot "
@@ -231,11 +446,10 @@ class GGUFArtifactStore:
                 + ", ".join(escaped)
             )
 
-        files = tuple(spec.files)
         artifact_id = _artifact_identity(
             repo_id=repo_id,
             resolved_revision=resolved_revision,
-            files=files,
+            files=spec.files,
             entrypoint=spec.entrypoint,
             model_alias=repo_id,
         )
@@ -243,145 +457,27 @@ class GGUFArtifactStore:
             artifact_id=artifact_id,
             repo_id=repo_id,
             resolved_revision=resolved_revision,
-            files=files,
+            files=spec.files,
             entrypoint=spec.entrypoint,
             model_alias=repo_id,
-            file_sizes={
-                name: source.stat().st_size for name, source in sources.items()
-            },
+            file_sizes=sizes,
         )
+        return _IndexedArtifact(artifact, sources[spec.entrypoint])
 
-        self._prepare_root(create=True)
-        final_dir = self._root / artifact_id
-        if final_dir.exists():
-            return self._require_matching(final_dir, artifact)
-
-        staging = Path(
-            tempfile.mkdtemp(prefix=f".staging-{artifact_id[:12]}-", dir=self._root)
-        )
+    def _resolve_for_node(self, indexed: _IndexedArtifact) -> ResolvedGGUFArtifact:
+        shared_root = self.validate_shared_root()
         try:
-            for relative, source in sources.items():
-                destination = staging / "files" / Path(*PurePosixPath(relative).parts)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.symlink_to(os.path.relpath(source, destination.parent))
-                if destination.resolve(strict=True) != source.resolve(strict=True):
-                    raise GGUFArtifactError(
-                        f"Published GGUF link does not resolve to {relative!r}"
-                    )
-
-            manifest_tmp = staging / f".{self._MANIFEST_NAME}.tmp"
-            manifest_tmp.write_text(
-                artifact.model_dump_json(indent=2) + "\n", encoding="utf-8"
-            )
-            os.replace(manifest_tmp, staging / self._MANIFEST_NAME)
-            try:
-                staging.rename(final_dir)
-            except OSError as exc:
-                if exc.errno not in {errno.EEXIST, errno.ENOTEMPTY}:
-                    raise
-                return self._require_matching(final_dir, artifact)
-            return self._load_directory(final_dir)
-        finally:
-            if staging.exists():
-                shutil.rmtree(staging)
-
-    def get(self, artifact_id: str) -> GGUFArtifact | None:
-        """Return one fully validated artifact, or ``None`` if absent."""
-        if not re.fullmatch(r"[0-9a-f]{64}", artifact_id):
-            return None
-        if not self._prepare_root(create=False):
-            return None
-        directory = self._root / artifact_id
-        if not directory.is_dir():
-            return None
-        return self._load_directory(directory)
-
-    def scan(self) -> ArtifactScanResult:
-        """Return all valid published artifacts and count invalid entries."""
-        try:
-            root_exists = self._prepare_root(create=False)
-        except GGUFArtifactError:
-            return ArtifactScanResult(artifacts=(), invalid_count=1)
-        if not root_exists:
-            return ArtifactScanResult(artifacts=())
-        artifacts: list[GGUFArtifact] = []
-        invalid_count = 0
-        for directory in sorted(self._root.iterdir()):
-            if directory.name.startswith("."):
-                continue
-            if not directory.is_dir():
-                invalid_count += 1
-                continue
-            try:
-                artifacts.append(self._load_directory(directory))
-            except (GGUFArtifactError, OSError, ValueError):
-                invalid_count += 1
-        return ArtifactScanResult(
-            artifacts=tuple(sorted(artifacts, key=lambda item: item.artifact_id)),
-            invalid_count=invalid_count,
-        )
-
-    def _require_matching(
-        self, directory: Path, expected: GGUFArtifact
-    ) -> GGUFArtifact:
-        actual = self._load_directory(directory)
-        if actual != expected:
+            candidate = indexed.entrypoint_path
+            resolved = candidate.resolve(strict=True)
+        except OSError as exc:
             raise GGUFArtifactError(
-                f"Existing artifact {expected.artifact_id} does not match its identity"
-            )
-        return actual
-
-    def _load_directory(self, directory: Path) -> GGUFArtifact:
-        manifest = directory / self._MANIFEST_NAME
-        try:
-            artifact = GGUFArtifact.model_validate_json(
-                manifest.read_text(encoding="utf-8")
-            )
-        except (OSError, ValueError) as exc:
-            raise GGUFArtifactError(
-                f"Invalid GGUF artifact manifest in {directory.name!r}: {exc}"
+                f"GGUF artifact {indexed.artifact.artifact_id!r} is unavailable: {exc}"
             ) from exc
-
-        if artifact.artifact_id != directory.name:
-            raise GGUFArtifactError("Artifact directory does not match manifest ID")
-        expected_id = _artifact_identity(
-            repo_id=artifact.repo_id,
-            resolved_revision=artifact.resolved_revision,
-            files=artifact.files,
-            entrypoint=artifact.entrypoint,
-            model_alias=artifact.model_alias,
-        )
-        if artifact.artifact_id != expected_id:
-            raise GGUFArtifactError("Artifact manifest identity is invalid")
-
-        snapshot = (
-            self._cache_dir
-            / f"models--{artifact.repo_id.replace('/', '--')}"
-            / "snapshots"
-            / artifact.resolved_revision
-        )
-        for relative in artifact.files:
-            link = directory / "files" / Path(*PurePosixPath(relative).parts)
-            if not link.is_symlink() or os.path.isabs(os.readlink(link)):
-                raise GGUFArtifactError(
-                    f"Artifact file {relative!r} is not a relative symlink"
-                )
-            expected_source = snapshot.joinpath(*PurePosixPath(relative).parts)
-            try:
-                resolved_link = link.resolve(strict=True)
-                resolved_source = expected_source.resolve(strict=True)
-            except OSError as exc:
-                raise GGUFArtifactError(
-                    f"Artifact file {relative!r} is unavailable: {exc}"
-                ) from exc
-            if resolved_link != resolved_source or not _is_relative_to(
-                resolved_link, self._cache_dir
-            ):
-                raise GGUFArtifactError(
-                    f"Artifact file {relative!r} does not match its snapshot source"
-                )
-            if resolved_link.stat().st_size != artifact.file_sizes[relative]:
-                raise GGUFArtifactError(
-                    f"Artifact file {relative!r} size does not match its manifest"
-                )
-        return artifact
+        if not _is_relative_to(candidate, shared_root) or not _is_relative_to(
+            resolved, shared_root
+        ):
+            raise GGUFArtifactError(
+                "GGUF artifact entrypoint resolves outside HuggingFace shared_root"
+            )
+        relative = candidate.relative_to(shared_root).as_posix()
+        return ResolvedGGUFArtifact(indexed.artifact, relative)

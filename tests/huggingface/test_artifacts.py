@@ -1,103 +1,291 @@
-"""Tests for immutable GGUF artifact publication."""
+"""Tests for deterministic GGUF discovery in the native Hugging Face cache."""
 
 from __future__ import annotations
 
-import json
+import hashlib
 import os
-import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
+from huggingface_hub import scan_cache_dir
 
 from inference_proxy.huggingface.artifacts import (
     GGUFArtifact,
     GGUFArtifactError,
-    GGUFArtifactStore,
+    GGUFArtifactIndex,
     GGUFDownloadSpec,
 )
 
 
-def _snapshot(
+def _cached_snapshot(
     cache: Path,
     *,
-    repo_id: str = "org/model--with---separators-GGUF",
-    revision: str = "a" * 40,
-    files: tuple[str, ...] = ("weights/model Q4_K_M.gguf",),
+    repo_id: str,
+    revision: str,
+    files: dict[str, bytes],
 ) -> Path:
-    snapshot = cache / f"models--{repo_id.replace('/', '--')}" / "snapshots" / revision
-    for relative in files:
-        path = snapshot / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(relative.encode())
+    repo = cache / f"models--{repo_id.replace('/', '--')}"
+    snapshot = repo / "snapshots" / revision
+    blobs = repo / "blobs"
+    blobs.mkdir(parents=True, exist_ok=True)
+    for relative, content in files.items():
+        blob = blobs / hashlib.sha256(content).hexdigest()
+        blob.write_bytes(content)
+        link = snapshot / relative
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(Path(os.path.relpath(blob, link.parent)))
+    refs = repo / "refs"
+    refs.mkdir(exist_ok=True)
+    (refs / "main").write_text(revision, encoding="utf-8")
     return snapshot
 
 
-def test_publish_uses_resolved_revision_and_relative_links(tmp_path: Path) -> None:
+def _index_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
+    shared_root = tmp_path / "shared export"
+    cache_dir = shared_root / "hub"
+    node_mount = tmp_path / "node mount"
+    cache_dir.mkdir(parents=True)
+    node_mount.mkdir()
+    return shared_root, cache_dir, node_mount
+
+
+def test_single_file_discovery_matches_shipped_r2_identity_vector(
+    tmp_path: Path,
+) -> None:
+    shared_root, cache_dir, _node_mount = _index_layout(tmp_path)
+    repo_id = "LiquidAI/LFM2.5-8B-A1B-GGUF"
+    revision = "dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0"
+    entrypoint = "LFM2.5-8B-A1B-Q4_K_M.gguf"
+    _cached_snapshot(
+        cache_dir,
+        repo_id=repo_id,
+        revision=revision,
+        files={entrypoint: b"staging q4 weights"},
+    )
+
+    result = GGUFArtifactIndex(cache_dir, shared_root=shared_root).scan()
+
+    assert len(result.artifacts) == 1
+    artifact = result.artifacts[0]
+    assert artifact.artifact_id == (
+        "7fcf10e5a78a81f27d43e9d37a13adcdac993649d56bae0cd3ef8ab498b1f19d"
+    )
+    assert artifact.files == (entrypoint,)
+    assert not (cache_dir / "gguf").exists()
+
+
+def test_split_discovery_matches_shipped_r2_identity_vector(tmp_path: Path) -> None:
+    shared_root, cache_dir, _node_mount = _index_layout(tmp_path)
+    files = {
+        "big-00002-of-00002.gguf": b"second",
+        "big-00001-of-00002.gguf": b"first",
+    }
+    _cached_snapshot(
+        cache_dir,
+        repo_id="org/Big-GGUF",
+        revision="c" * 40,
+        files=files,
+    )
+
+    artifact = GGUFArtifactIndex(cache_dir, shared_root=shared_root).scan().artifacts[0]
+
+    assert artifact.artifact_id == (
+        "5dd18d722798ef5cdd526c3f32eab862f6d18e586cd3517d7647bde32bff6059"
+    )
+    assert artifact.files == (
+        "big-00001-of-00002.gguf",
+        "big-00002-of-00002.gguf",
+    )
+    assert artifact.entrypoint == "big-00001-of-00002.gguf"
+
+
+def test_get_maps_cache_snapshot_beneath_distinct_shared_and_node_roots(
+    tmp_path: Path,
+) -> None:
+    shared_root, cache_dir, node_mount = _index_layout(tmp_path)
     repo_id = "org/model--with---separators-GGUF"
     revision = "a" * 40
-    files = (
-        "quant/model -- Q4-00001-of-00002.gguf",
-        "quant/model -- Q4-00002-of-00002.gguf",
-    )
-    snapshot = _snapshot(tmp_path, repo_id=repo_id, revision=revision, files=files)
-    store = GGUFArtifactStore(tmp_path)
-
-    artifact = store.publish(
+    entrypoint = "quant/model -- Q4_K_M.gguf"
+    _cached_snapshot(
+        cache_dir,
         repo_id=repo_id,
-        resolved_revision=revision,
-        snapshot_path=snapshot,
-        spec=GGUFDownloadSpec(files=files, entrypoint=files[0]),
+        revision=revision,
+        files={entrypoint: b"weights"},
+    )
+    index = GGUFArtifactIndex(cache_dir, shared_root=shared_root)
+    public = index.scan().artifacts[0]
+
+    resolved = index.get(public.artifact_id)
+
+    assert resolved is not None
+    assert resolved.artifact == public
+    assert resolved.node_relative_entrypoint == (
+        "hub/models--org--model--with---separators-GGUF/snapshots/"
+        f"{revision}/{entrypoint}"
+    )
+    node_candidate = node_mount / resolved.node_relative_entrypoint
+    assert node_candidate.relative_to(node_mount).parts[0] == "hub"
+
+
+def test_get_validates_only_the_matching_artifact(tmp_path: Path) -> None:
+    shared_root, cache_dir, _node_mount = _index_layout(tmp_path)
+    _cached_snapshot(
+        cache_dir,
+        repo_id="org/first-GGUF",
+        revision="a" * 40,
+        files={"q4.gguf": b"first"},
+    )
+    _cached_snapshot(
+        cache_dir,
+        repo_id="org/target-GGUF",
+        revision="b" * 40,
+        files={"q8.gguf": b"target"},
+    )
+    index = GGUFArtifactIndex(cache_dir, shared_root=shared_root)
+    target = next(
+        artifact
+        for artifact in index.scan().artifacts
+        if artifact.repo_id == "org/target-GGUF"
     )
 
-    assert artifact.repo_id == repo_id
-    assert artifact.resolved_revision == revision
-    assert artifact.model_alias == repo_id
-    assert artifact.cache_relative_entrypoint.endswith(
-        f"/{artifact.artifact_id}/files/{files[0]}"
+    with patch.object(
+        index,
+        "_build_indexed_artifact",
+        wraps=index._build_indexed_artifact,
+    ) as build:
+        resolved = index.get(target.artifact_id)
+
+    assert resolved is not None
+    assert resolved.artifact == target
+    assert build.call_count == 1
+    assert build.call_args.kwargs["repo_id"] == "org/target-GGUF"
+
+
+def test_discovery_is_deterministic_uncapped_and_writes_nothing(tmp_path: Path) -> None:
+    shared_root, cache_dir, _node_mount = _index_layout(tmp_path)
+    _cached_snapshot(
+        cache_dir,
+        repo_id="org/z-GGUF",
+        revision="b" * 40,
+        files={f"quant-{index:02d}.gguf": str(index).encode() for index in range(30)},
     )
-    for relative in files:
-        link = tmp_path / "gguf" / artifact.artifact_id / "files" / relative
-        assert link.is_symlink()
-        assert not os.path.isabs(os.readlink(link))
-        assert link.resolve() == (snapshot / relative).resolve()
-    assert store.get(artifact.artifact_id) == artifact
+    _cached_snapshot(
+        cache_dir,
+        repo_id="org/a-GGUF",
+        revision="a" * 40,
+        files={"nested/q8.gguf": b"q8", "nested/q4.gguf": b"q4"},
+    )
+    before = sorted(str(path.relative_to(cache_dir)) for path in cache_dir.rglob("*"))
+    index = GGUFArtifactIndex(cache_dir, shared_root=shared_root)
+
+    first = index.scan()
+    second = GGUFArtifactIndex(cache_dir, shared_root=shared_root).scan(
+        scan_cache_dir(cache_dir)
+    )
+    after = sorted(str(path.relative_to(cache_dir)) for path in cache_dir.rglob("*"))
+
+    expected_order = sorted(
+        (item.repo_id, item.resolved_revision, item.entrypoint)
+        for item in first.artifacts
+    )
+    assert len(first.artifacts) == 32
+    assert [
+        (item.repo_id, item.resolved_revision, item.entrypoint)
+        for item in first.artifacts
+    ] == expected_order
+    assert second == first
+    assert after == before
 
 
-def test_resolved_revision_creates_distinct_generations(tmp_path: Path) -> None:
-    spec = GGUFDownloadSpec(files=("model.gguf",), entrypoint="model.gguf")
-    store = GGUFArtifactStore(tmp_path)
-    first = store.publish(
-        repo_id="org/model",
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"model-00001-of-00002.gguf": b"first"},
+        {
+            "model-00001-of-00002.gguf": b"first",
+            "model-00002-of-00003.gguf": b"second",
+        },
+        {"model-00000-of-00002.gguf": b"invalid"},
+    ],
+)
+def test_incomplete_or_malformed_split_families_are_hidden(
+    tmp_path: Path, files: dict[str, bytes]
+) -> None:
+    shared_root, cache_dir, _node_mount = _index_layout(tmp_path)
+    _cached_snapshot(
+        cache_dir,
+        repo_id="org/broken-GGUF",
+        revision="a" * 40,
+        files=files,
+    )
+
+    result = GGUFArtifactIndex(cache_dir, shared_root=shared_root).scan()
+
+    assert result.artifacts == ()
+    assert result.invalid_count >= 1
+
+
+def test_broken_or_escaping_cache_entries_fail_closed(tmp_path: Path) -> None:
+    shared_root, cache_dir, _node_mount = _index_layout(tmp_path)
+    snapshot = _cached_snapshot(
+        cache_dir,
+        repo_id="org/model-GGUF",
+        revision="a" * 40,
+        files={"model.gguf": b"inside"},
+    )
+    index = GGUFArtifactIndex(cache_dir, shared_root=shared_root)
+    artifact_id = index.scan().artifacts[0].artifact_id
+    outside = tmp_path / "outside.gguf"
+    outside.write_bytes(b"outside")
+    entrypoint = snapshot / "model.gguf"
+    entrypoint.unlink()
+    entrypoint.symlink_to(outside)
+
+    result = index.scan()
+
+    assert result.artifacts == ()
+    assert result.invalid_count == 1
+    with pytest.raises(GGUFArtifactError, match="outside the configured cache"):
+        index.get(artifact_id)
+
+
+def test_download_reconstruction_returns_only_the_requested_artifact(
+    tmp_path: Path,
+) -> None:
+    shared_root, cache_dir, _node_mount = _index_layout(tmp_path)
+    snapshot = _cached_snapshot(
+        cache_dir,
+        repo_id="org/model-GGUF",
+        revision="a" * 40,
+        files={"q4.gguf": b"q4", "q8.gguf": b"q8"},
+    )
+    index = GGUFArtifactIndex(cache_dir, shared_root=shared_root)
+
+    artifact = index.artifact_from_download(
+        repo_id="org/model-GGUF",
         resolved_revision="a" * 40,
-        snapshot_path=_snapshot(
-            tmp_path, repo_id="org/model", revision="a" * 40, files=spec.files
-        ),
-        spec=spec,
-    )
-    second = store.publish(
-        repo_id="org/model",
-        resolved_revision="b" * 40,
-        snapshot_path=_snapshot(
-            tmp_path, repo_id="org/model", revision="b" * 40, files=spec.files
-        ),
-        spec=spec,
+        snapshot_path=snapshot,
+        spec=GGUFDownloadSpec(files=("q4.gguf",), entrypoint="q4.gguf"),
     )
 
-    assert first.artifact_id != second.artifact_id
-    assert {item.artifact_id for item in store.scan().artifacts} == {
-        first.artifact_id,
-        second.artifact_id,
-    }
+    assert artifact.files == ("q4.gguf",)
+    assert artifact.entrypoint == "q4.gguf"
+    assert len(index.scan().artifacts) == 2
 
 
-def test_missing_exact_file_names_the_file(tmp_path: Path) -> None:
-    snapshot = _snapshot(tmp_path, files=("other.gguf",))
-    store = GGUFArtifactStore(tmp_path)
+def test_download_reconstruction_names_missing_files(tmp_path: Path) -> None:
+    shared_root, cache_dir, _node_mount = _index_layout(tmp_path)
+    snapshot = _cached_snapshot(
+        cache_dir,
+        repo_id="org/model-GGUF",
+        revision="a" * 40,
+        files={"other.gguf": b"other"},
+    )
 
     with pytest.raises(GGUFArtifactError, match="missing/model.gguf"):
-        store.publish(
-            repo_id="org/model--with---separators-GGUF",
+        GGUFArtifactIndex(cache_dir, shared_root=shared_root).artifact_from_download(
+            repo_id="org/model-GGUF",
             resolved_revision="a" * 40,
             snapshot_path=snapshot,
             spec=GGUFDownloadSpec(
@@ -111,6 +299,7 @@ def test_missing_exact_file_names_the_file(tmp_path: Path) -> None:
     [
         "/absolute.gguf",
         "../escape.gguf",
+        "nested//model.gguf",
         "dir\\escape.gguf",
         "model.bin",
         "model.GGUF",
@@ -121,13 +310,155 @@ def test_download_spec_rejects_unsafe_paths(value: str) -> None:
         GGUFDownloadSpec(files=(value,), entrypoint=value)
 
 
-def test_download_spec_rejects_noncanonical_duplicate_and_missing_entrypoint() -> None:
-    with pytest.raises(ValueError, match="canonical"):
-        GGUFDownloadSpec(files=("dir//model.gguf",), entrypoint="dir//model.gguf")
-    with pytest.raises(ValueError, match="unique"):
-        GGUFDownloadSpec(files=("model.gguf", "model.gguf"), entrypoint="model.gguf")
-    with pytest.raises(ValueError, match="included in files"):
-        GGUFDownloadSpec(files=("model.gguf",), entrypoint="other.gguf")
+def test_download_spec_normalizes_complete_split_and_rejects_loose_groups() -> None:
+    spec = GGUFDownloadSpec(
+        files=("model-00002-of-00002.gguf", "model-00001-of-00002.gguf"),
+        entrypoint="model-00001-of-00002.gguf",
+    )
+    assert spec.files == (
+        "model-00001-of-00002.gguf",
+        "model-00002-of-00002.gguf",
+    )
+
+    with pytest.raises(ValueError, match="one file or one complete split family"):
+        GGUFDownloadSpec(
+            files=("q4.gguf", "q8.gguf"),
+            entrypoint="q4.gguf",
+        )
+    with pytest.raises(ValueError, match="every declared shard"):
+        GGUFDownloadSpec(
+            files=("model-00001-of-00002.gguf",),
+            entrypoint="model-00001-of-00002.gguf",
+        )
+
+
+@pytest.mark.parametrize(
+    ("files", "entrypoint", "message"),
+    [
+        (
+            ("model-00000-of-00001.gguf", "model-00001-of-00001.gguf"),
+            "model-00001-of-00001.gguf",
+            "more than one shard",
+        ),
+        (
+            ("a-00001-of-00002.gguf", "b-00002-of-00002.gguf"),
+            "a-00001-of-00002.gguf",
+            "one filename family",
+        ),
+        (
+            ("model-00001-of-00003.gguf", "model-00002-of-00003.gguf"),
+            "model-00001-of-00003.gguf",
+            "every declared shard",
+        ),
+        (
+            ("model-00001-of-00002.gguf", "model-00003-of-00002.gguf"),
+            "model-00001-of-00002.gguf",
+            "shards 1 through N",
+        ),
+        (
+            ("model-00001-of-00002.gguf", "model-00002-of-00002.gguf"),
+            "model-00002-of-00002.gguf",
+            "entrypoint must be shard 1",
+        ),
+    ],
+)
+def test_download_spec_rejects_noncanonical_split_contracts(
+    files: tuple[str, ...], entrypoint: str, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        GGUFDownloadSpec(files=files, entrypoint=entrypoint)
+
+
+def test_shared_root_is_optional_for_browsing_but_required_for_resolution(
+    tmp_path: Path,
+) -> None:
+    _shared_root, cache_dir, _node_mount = _index_layout(tmp_path)
+    _cached_snapshot(
+        cache_dir,
+        repo_id="org/model-GGUF",
+        revision="a" * 40,
+        files={"model.gguf": b"model"},
+    )
+    index = GGUFArtifactIndex(cache_dir)
+    artifact = index.scan().artifacts[0]
+
+    with pytest.raises(GGUFArtifactError, match="shared_root is not configured"):
+        index.get(artifact.artifact_id)
+
+
+def test_shared_root_must_contain_cache_dir(tmp_path: Path) -> None:
+    _shared_root, cache_dir, _node_mount = _index_layout(tmp_path)
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+
+    with pytest.raises(GGUFArtifactError, match="contained within shared_root"):
+        GGUFArtifactIndex(cache_dir, shared_root=unrelated).validate_shared_root()
+
+
+def test_shared_root_must_exist_and_be_a_directory(tmp_path: Path) -> None:
+    shared_root, cache_dir, _node_mount = _index_layout(tmp_path)
+    index = GGUFArtifactIndex(cache_dir, shared_root=shared_root)
+    assert index.cache_dir == cache_dir.resolve()
+
+    missing = tmp_path / "missing"
+    with pytest.raises(GGUFArtifactError, match="configuration is unavailable"):
+        GGUFArtifactIndex(cache_dir, shared_root=missing).validate_shared_root()
+
+    file_root = tmp_path / "shared-root-file"
+    file_root.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(GGUFArtifactError, match="is not a directory"):
+        GGUFArtifactIndex(cache_dir, shared_root=file_root).validate_shared_root()
+
+
+def test_get_rejects_invalid_or_unknown_artifact_ids(tmp_path: Path) -> None:
+    shared_root, cache_dir, _node_mount = _index_layout(tmp_path)
+    index = GGUFArtifactIndex(cache_dir, shared_root=shared_root)
+
+    assert index.get("not-an-artifact-id") is None
+    assert index.get("a" * 64) is None
+
+
+@pytest.mark.parametrize(
+    ("revision", "snapshot_kind", "message"),
+    [
+        ("main", "valid", "not a commit SHA"),
+        ("a" * 40, "missing", "snapshot is unavailable"),
+        ("a" * 40, "outside", "outside the configured cache"),
+        ("a" * 40, "wrong-name", "does not match its commit SHA"),
+    ],
+)
+def test_download_reconstruction_rejects_invalid_snapshot_identity(
+    tmp_path: Path,
+    revision: str,
+    snapshot_kind: str,
+    message: str,
+) -> None:
+    shared_root, cache_dir, _node_mount = _index_layout(tmp_path)
+    if snapshot_kind == "valid":
+        snapshot = _cached_snapshot(
+            cache_dir,
+            repo_id="org/model-GGUF",
+            revision="a" * 40,
+            files={"model.gguf": b"weights"},
+        )
+    elif snapshot_kind == "missing":
+        snapshot = cache_dir / "models--org--model-GGUF" / "snapshots" / revision
+    elif snapshot_kind == "outside":
+        snapshot = tmp_path / revision
+        snapshot.mkdir()
+        (snapshot / "model.gguf").write_bytes(b"weights")
+    else:
+        snapshot = cache_dir / "models--org--model-GGUF" / "snapshots" / ("b" * 40)
+        snapshot.mkdir(parents=True)
+        (snapshot / "model.gguf").write_bytes(b"weights")
+
+    with pytest.raises(GGUFArtifactError, match=message):
+        GGUFArtifactIndex(cache_dir, shared_root=shared_root).artifact_from_download(
+            repo_id="org/model-GGUF",
+            resolved_revision=revision,
+            snapshot_path=snapshot,
+            spec=GGUFDownloadSpec(files=("model.gguf",), entrypoint="model.gguf"),
+        )
 
 
 @pytest.mark.parametrize(
@@ -139,7 +470,7 @@ def test_download_spec_rejects_noncanonical_duplicate_and_missing_entrypoint() -
         ({"model_alias": ""}, "must not be empty"),
     ],
 )
-def test_artifact_manifest_rejects_inconsistent_contract(
+def test_artifact_schema_rejects_inconsistent_contract(
     update: dict[str, object], message: str
 ) -> None:
     values: dict[str, object] = {
@@ -155,239 +486,3 @@ def test_artifact_manifest_rejects_inconsistent_contract(
 
     with pytest.raises(ValueError, match=message):
         GGUFArtifact.model_validate(values)
-
-
-def test_publish_rejects_source_symlink_outside_cache(tmp_path: Path) -> None:
-    snapshot = _snapshot(tmp_path, files=("placeholder.gguf",))
-    outside = tmp_path.parent / f"{tmp_path.name}-outside.gguf"
-    outside.write_bytes(b"outside")
-    escaped = snapshot / "escape.gguf"
-    escaped.symlink_to(outside)
-
-    with pytest.raises(GGUFArtifactError, match="outside the configured cache"):
-        GGUFArtifactStore(tmp_path).publish(
-            repo_id="org/model--with---separators-GGUF",
-            resolved_revision="a" * 40,
-            snapshot_path=snapshot,
-            spec=GGUFDownloadSpec(files=("escape.gguf",), entrypoint="escape.gguf"),
-        )
-
-
-def test_publish_rejects_invalid_revision_and_snapshot_location(tmp_path: Path) -> None:
-    store = GGUFArtifactStore(tmp_path)
-    spec = GGUFDownloadSpec(files=("model.gguf",), entrypoint="model.gguf")
-    snapshot = _snapshot(tmp_path, files=spec.files)
-
-    with pytest.raises(GGUFArtifactError, match="not a commit SHA"):
-        store.publish(
-            repo_id="org/model--with---separators-GGUF",
-            resolved_revision="main",
-            snapshot_path=snapshot,
-            spec=spec,
-        )
-
-    outside_cache = tmp_path.parent / f"{tmp_path.name}-outside-cache"
-    outside_snapshot = _snapshot(outside_cache, files=spec.files)
-    with pytest.raises(GGUFArtifactError, match="outside the configured cache"):
-        store.publish(
-            repo_id="org/model--with---separators-GGUF",
-            resolved_revision="a" * 40,
-            snapshot_path=outside_snapshot,
-            spec=spec,
-        )
-
-    with pytest.raises(GGUFArtifactError, match="does not match its commit SHA"):
-        store.publish(
-            repo_id="org/model--with---separators-GGUF",
-            resolved_revision="b" * 40,
-            snapshot_path=snapshot,
-            spec=spec,
-        )
-
-
-def test_republishing_identical_artifact_is_idempotent(tmp_path: Path) -> None:
-    snapshot = _snapshot(tmp_path)
-    store = GGUFArtifactStore(tmp_path)
-    spec = GGUFDownloadSpec(
-        files=("weights/model Q4_K_M.gguf",),
-        entrypoint="weights/model Q4_K_M.gguf",
-    )
-
-    first = store.publish(
-        repo_id="org/model--with---separators-GGUF",
-        resolved_revision="a" * 40,
-        snapshot_path=snapshot,
-        spec=spec,
-    )
-    second = store.publish(
-        repo_id="org/model--with---separators-GGUF",
-        resolved_revision="a" * 40,
-        snapshot_path=snapshot,
-        spec=spec,
-    )
-
-    assert second == first
-
-
-def test_interrupted_staging_directory_is_not_cataloged(tmp_path: Path) -> None:
-    root = tmp_path / "gguf"
-    (root / ".staging-dead").mkdir(parents=True)
-    (root / "not-an-artifact").mkdir()
-
-    result = GGUFArtifactStore(tmp_path).scan()
-
-    assert result.artifacts == ()
-    assert result.invalid_count == 1
-
-
-def test_get_rejects_invalid_or_missing_artifact_id(tmp_path: Path) -> None:
-    store = GGUFArtifactStore(tmp_path)
-
-    assert store.get("not-an-id") is None
-    assert store.get("a" * 64) is None
-
-
-def test_scan_counts_non_directory_entries(tmp_path: Path) -> None:
-    root = tmp_path / "gguf"
-    root.mkdir()
-    (root / "unexpected-file").write_text("not an artifact", encoding="utf-8")
-
-    result = GGUFArtifactStore(tmp_path).scan()
-
-    assert result.artifacts == ()
-    assert result.invalid_count == 1
-
-
-@pytest.mark.parametrize("root_kind", ["symlink", "file"])
-def test_artifact_root_cannot_redirect_publication(
-    tmp_path: Path, root_kind: str
-) -> None:
-    outside = tmp_path.parent / f"{tmp_path.name}-artifact-root"
-    outside.mkdir()
-    root = tmp_path / "gguf"
-    if root_kind == "symlink":
-        root.symlink_to(outside, target_is_directory=True)
-    else:
-        root.write_text("not a directory", encoding="utf-8")
-    snapshot = _snapshot(tmp_path)
-    store = GGUFArtifactStore(tmp_path)
-    spec = GGUFDownloadSpec(
-        files=("weights/model Q4_K_M.gguf",),
-        entrypoint="weights/model Q4_K_M.gguf",
-    )
-
-    with pytest.raises(GGUFArtifactError, match="not a real directory"):
-        store.publish(
-            repo_id="org/model--with---separators-GGUF",
-            resolved_revision="a" * 40,
-            snapshot_path=snapshot,
-            spec=spec,
-        )
-
-    assert store.scan().invalid_count == 1
-    assert not any(outside.iterdir())
-
-
-def _published_artifact(tmp_path: Path) -> tuple[GGUFArtifactStore, GGUFArtifact, Path]:
-    store = GGUFArtifactStore(tmp_path)
-    snapshot = _snapshot(tmp_path)
-    artifact = store.publish(
-        repo_id="org/model--with---separators-GGUF",
-        resolved_revision="a" * 40,
-        snapshot_path=snapshot,
-        spec=GGUFDownloadSpec(
-            files=("weights/model Q4_K_M.gguf",),
-            entrypoint="weights/model Q4_K_M.gguf",
-        ),
-    )
-    return store, artifact, snapshot
-
-
-def test_corrupt_manifest_identity_is_hidden_from_scan(tmp_path: Path) -> None:
-    store, artifact, _snapshot_path = _published_artifact(tmp_path)
-    directory = store.root / artifact.artifact_id
-    manifest = directory / "artifact.json"
-    values = json.loads(manifest.read_text(encoding="utf-8"))
-    values["repo_id"] = "org/different-model"
-    manifest.write_text(json.dumps(values), encoding="utf-8")
-
-    result = store.scan()
-
-    assert result.artifacts == ()
-    assert result.invalid_count == 1
-    with pytest.raises(GGUFArtifactError, match="identity is invalid"):
-        store.get(artifact.artifact_id)
-
-
-def test_manifest_id_must_match_directory_name(tmp_path: Path) -> None:
-    store, artifact, _snapshot_path = _published_artifact(tmp_path)
-    original = store.root / artifact.artifact_id
-    wrong = store.root / ("b" * 64)
-    original.rename(wrong)
-
-    with pytest.raises(GGUFArtifactError, match="directory does not match"):
-        store.get("b" * 64)
-
-
-@pytest.mark.parametrize("failure", ["absolute", "broken", "wrong-source", "size"])
-def test_artifact_files_fail_closed_after_publication(
-    tmp_path: Path, failure: str
-) -> None:
-    store, artifact, snapshot = _published_artifact(tmp_path)
-    link = store.root / artifact.artifact_id / "files" / artifact.entrypoint
-    source = snapshot / artifact.entrypoint
-
-    if failure == "absolute":
-        link.unlink()
-        link.symlink_to(source.resolve())
-        message = "not a relative symlink"
-    elif failure == "broken":
-        source.unlink()
-        message = "is unavailable"
-    elif failure == "wrong-source":
-        other = snapshot / "other.gguf"
-        other.write_bytes(b"other")
-        link.unlink()
-        link.symlink_to(os.path.relpath(other, link.parent))
-        message = "does not match its snapshot source"
-    else:
-        source.write_bytes(b"changed-size")
-        message = "size does not match its manifest"
-
-    with pytest.raises(GGUFArtifactError, match=message):
-        store.get(artifact.artifact_id)
-
-
-def test_concurrent_identical_publications_accept_the_winner(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    snapshot = _snapshot(tmp_path)
-    store = GGUFArtifactStore(tmp_path)
-    spec = GGUFDownloadSpec(
-        files=("weights/model Q4_K_M.gguf",),
-        entrypoint="weights/model Q4_K_M.gguf",
-    )
-    barrier = threading.Barrier(2)
-    original_rename = Path.rename
-
-    def synchronized_rename(path: Path, target: Path) -> Path:
-        if path.name.startswith(".staging-"):
-            barrier.wait(timeout=2)
-        return original_rename(path, target)
-
-    monkeypatch.setattr(Path, "rename", synchronized_rename)
-
-    def publish() -> str:
-        return store.publish(
-            repo_id="org/model--with---separators-GGUF",
-            resolved_revision="a" * 40,
-            snapshot_path=snapshot,
-            spec=spec,
-        ).artifact_id
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda _index: publish(), range(2)))
-
-    assert results[0] == results[1]
-    assert len(store.scan().artifacts) == 1
-    assert not list(store.root.glob(".staging-*"))

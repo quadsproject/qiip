@@ -172,7 +172,7 @@ def app(
         side_effect=lambda hostname: MagicMock(hostname=hostname)
     )
     mock_provisioner.connection_count = MagicMock(return_value=0)
-    mock_provisioner.resolve_artifact_selection = MagicMock(return_value=None)
+    mock_provisioner.resolve_artifact_selection = AsyncMock(return_value=None)
     mock_provisioner.cleanup_stale_node = AsyncMock()
     mock_provisioner.provision = AsyncMock()
     mock_provisioner.teardown = AsyncMock()

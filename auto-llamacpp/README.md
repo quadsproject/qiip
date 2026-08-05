@@ -8,8 +8,8 @@ bare-metal NVIDIA GPU nodes.
 - RHEL 9-compatible Linux on x86_64
 - An NVIDIA GPU and access to the configured NVIDIA package repositories;
   setup installs or validates the driver and CUDA toolkit
-- Reachable NFS export for the shared HuggingFace cache with GGUF models in the
-  `gguf/` subdirectory
+- Reachable NFS export containing the native Hugging Face Hub cache and its
+  GGUF snapshots
 
 QIIP-managed provisioning requires CUDA and fails before starting an engine if
 GPU verification fails. The start script retains a standalone CPU branch for
@@ -82,11 +82,11 @@ compatibility with existing provisioning infrastructure.
 
 ## Run
 
-Start llama-server with an exact cache-relative GGUF artifact and explicit
-model alias:
+Start llama-server with an exact path relative to the mounted export root and
+an explicit model alias. For an export whose Hub cache is in `hub/`:
 
 ```bash
-AUTOLLAMACPP_GGUF_PATH=gguf/<artifact-id>/files/model-Q4_K_M.gguf \
+AUTOLLAMACPP_GGUF_PATH=hub/models--org--model-GGUF/snapshots/<commit-sha>/model-Q4_K_M.gguf \
 AUTOLLAMACPP_MODEL_ALIAS=org/model \
   ./start-llamacpp.sh
 ```
@@ -111,22 +111,24 @@ and `AUTOLLAMACPP_PARALLEL=4`, each slot gets 2048 tokens.
 
 ### GGUF model storage
 
-QIIP publishes immutable artifacts under
-`<NFS_MOUNT_POINT>/gguf/<artifact-id>/`. Each artifact contains a versioned
-manifest and relative links to an exact HuggingFace snapshot commit. The
-launcher requires the manifest's exact cache-relative entrypoint; it never
-scans globally or chooses the first quantization match.
+QIIP does not create a parallel GGUF directory. It discovers standalone `.gguf`
+files and complete llama.cpp split families directly in native Hugging Face
+snapshot directories. The gateway maps the entrypoint from its configured
+`HUGGINGFACE__SHARED_ROOT` to the node's `NFS_MOUNT_POINT`, preserving the
+snapshot filename so llama.cpp can locate sibling shards.
 
-Artifact generations are not removed automatically. Older commits may still
-back running or restartable nodes, so operators must coordinate cache and
-artifact retention deliberately.
+The launcher receives one exact path; it never scans globally or chooses the
+first quantization match. Snapshot generations are not removed automatically.
+Older commits may still back running or restartable nodes, so operators must
+coordinate Hugging Face cache retention deliberately.
 
 ### Model name aliasing
 
 The `--alias` flag sets the canonical model name reported by `/v1/models`.
-QIIP passes the explicit alias stored in the artifact manifest and verifies
-that the launcher reports the same value. Directory names are never decoded,
-so repository names containing repeated `--` or `---` remain exact.
+QIIP uses the exact Hugging Face repository ID as the managed artifact alias
+and verifies that the launcher reports the same value. Directory names are
+never decoded to recover that identity, so repository names containing
+repeated `--` or `---` remain exact.
 
 ## Health check
 

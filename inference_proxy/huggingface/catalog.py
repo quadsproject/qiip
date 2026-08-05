@@ -13,13 +13,12 @@ from typing import Literal, NamedTuple
 import structlog
 from huggingface_hub import CachedRepoInfo, scan_cache_dir, snapshot_download
 from huggingface_hub.errors import (
-    CorruptedCacheException,
     IncompleteSnapshotError,
     LocalEntryNotFoundError,
 )
 from pydantic import BaseModel, Field
 
-from inference_proxy.huggingface.artifacts import GGUFArtifact, GGUFArtifactStore
+from inference_proxy.huggingface.artifacts import GGUFArtifact, GGUFArtifactIndex
 
 logger = structlog.get_logger()
 
@@ -59,42 +58,31 @@ class ModelCatalogService:
     def __init__(
         self,
         cache_dir: str,
-        artifact_store: GGUFArtifactStore | None = None,
+        artifact_index: GGUFArtifactIndex | None = None,
     ) -> None:
         self._cache_dir = cache_dir
-        self._artifact_store = artifact_store or GGUFArtifactStore(cache_dir)
+        self._artifact_index = artifact_index or GGUFArtifactIndex(cache_dir)
 
     async def list_models(self) -> ModelCatalogResponse:
         """Return complete models and counts for hidden cache entries."""
         return await asyncio.to_thread(self._scan_catalog)
 
     def _scan_catalog(self) -> ModelCatalogResponse:
-        artifact_scan = self._artifact_store.scan()
-        artifacts = list(artifact_scan.artifacts)
-        artifact_revisions = {
-            (artifact.repo_id, artifact.resolved_revision) for artifact in artifacts
-        }
         cache_info = scan_cache_dir(self._cache_dir)
+        artifact_scan = self._artifact_index.scan(cache_info)
+        artifacts = list(artifact_scan.artifacts)
         models: list[CatalogEntry] = []
         incomplete_count = 0
         unverifiable_count = 0
-        cache_warning_count = sum(
-            not self._is_artifact_root_warning(warning)
-            for warning in cache_info.warnings
-        )
-        for repo in cache_info.repos:
+        cache_warning_count = len(cache_info.warnings)
+        for repo in sorted(cache_info.repos, key=lambda item: item.repo_id):
             if repo.repo_type != "model":
                 continue
             check = self._snapshot_state(repo)
             if check.state == "complete":
                 models.append(CatalogEntry(repo_id=repo.repo_id))
             elif check.state == "incomplete":
-                intentionally_partial = (
-                    repo.repo_id,
-                    check.resolved_revision,
-                ) in artifact_revisions
-                if not intentionally_partial:
-                    incomplete_count += 1
+                incomplete_count += 1
             else:
                 unverifiable_count += 1
 
@@ -118,16 +106,6 @@ class ModelCatalogService:
             unverifiable_count=unverifiable_count,
             invalid_artifact_count=artifact_scan.invalid_count,
             cache_warning_count=cache_warning_count,
-        )
-
-    def _is_artifact_root_warning(self, warning: Exception) -> bool:
-        """Ignore only the cache scanner warning caused by our ``gguf`` root."""
-        expected = (
-            "Repo path is not a valid HuggingFace cache directory: "
-            f"{self._artifact_store.root}"
-        )
-        return isinstance(warning, CorruptedCacheException) and warning.args == (
-            expected,
         )
 
     def _snapshot_state(self, repo: CachedRepoInfo) -> _SnapshotCheck:

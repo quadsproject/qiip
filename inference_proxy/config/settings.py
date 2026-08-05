@@ -421,6 +421,7 @@ class HuggingFaceSettings(BaseModel):
 
     cache_dir: str  # Required -- gateway won't start without it
     nfs_export: str | None = None
+    shared_root: str | None = None
     api_token: SecretStr | None = None
 
     @field_validator("nfs_export")
@@ -432,6 +433,17 @@ class HuggingFaceSettings(BaseModel):
         normalized = value.strip()
         if not normalized:
             raise ValueError("huggingface.nfs_export must not be empty")
+        return normalized
+
+    @field_validator("shared_root")
+    @classmethod
+    def shared_root_is_not_empty(cls, value: str | None) -> str | None:
+        """Reject an explicitly configured empty shared-export root."""
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("huggingface.shared_root must not be empty")
         return normalized
 
 

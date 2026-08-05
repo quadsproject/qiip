@@ -157,7 +157,7 @@ INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT=storage.example.com:/exports/huggingface
 INFERENCE_PROXY_PROVISIONING__NFS_MOUNT_POINT=/srv/hf-cache
 ```
 
-The gateway cache path and node mount path may differ; `NFS_EXPORT` is the declared mapping between them. Proxy-only deployments may omit the export. A node setup without it returns 400 before acquiring a lease or doing remote work.
+The gateway cache path and node mount path may differ; `NFS_EXPORT` is the declared mapping between them. Proxy-only deployments may omit the export. A node setup without it returns 400 before acquiring a lease or doing remote work. Managed llama.cpp also requires the gateway-local export root described in section 22 so its native Hub snapshot path can be translated to the node mount.
 
 ### 11. Rename node launch overrides to `AUTOVLLM_*`
 
@@ -209,12 +209,12 @@ The upgrade therefore changes the node runtime versions as well as the package t
 
 ### 15. Account for model catalog verification
 
-The model catalog lists only snapshots that HuggingFace's local-only resolution verifies as complete and that carry a tree manifest. Two counts explain hidden entries:
+The model catalog lists full vLLM models only when HuggingFace's local-only resolution verifies a complete snapshot with a tree manifest. Native GGUF discovery is independent: a valid standalone file or complete split family can appear in `gguf_artifacts` even when its repository increments one of these counts:
 
 - `incomplete_count`: a manifest exists but required files are missing.
 - `unverifiable_count`: the legacy cache entry has no tree manifest, so completeness cannot be proven.
 
-When either count is nonzero, `/admin/models/catalog` returns `X-Inference-Proxy-Data-Degraded: model-catalog`, and the dashboard explains that some cache entries are hidden. A pre-manifest cache can therefore appear empty even when model files exist. Re-download or otherwise migrate those snapshots so the current HuggingFace tooling creates verifiable metadata.
+When either count is nonzero, `/admin/models/catalog` returns `X-Inference-Proxy-Data-Degraded: model-catalog`, and the dashboard explains that some cache entries are hidden. A pre-manifest cache can therefore hide a vLLM model even while exposing its valid GGUF files. Re-download or otherwise migrate those snapshots so the current HuggingFace tooling creates verifiable metadata.
 
 Duplicate download requests now return 200 with the existing status; a newly started download returns 202. The download worker limit remains two concurrent downloads.
 
@@ -291,20 +291,60 @@ different download.
 For llama.cpp, send `engine: "llama_cpp"` plus an exact `gguf` object containing
 the ordered repository-relative files and the entrypoint. Download status now
 includes a stable `download_id`, the requested revision, the resolved commit
-SHA, and the published artifact. Setup requires that artifact's 64-character
+SHA, and the exact artifact identity. Setup requires that artifact's 64-character
 `artifact_id`; a missing, unknown, or invalid artifact is rejected before a
 host lease, QUADS lookup, SSH, driver installation, or CUDA source build.
 
 `AUTOLLAMACPP_MODEL` and `AUTOLLAMACPP_QUANTIZATION` no longer select files.
 Standalone launchers must provide `AUTOLLAMACPP_GGUF_PATH` and
-`AUTOLLAMACPP_MODEL_ALIAS`. The path is cache-relative and must resolve beneath
-the configured NFS mount.
+`AUTOLLAMACPP_MODEL_ALIAS`. The path is relative to the mounted shared-export
+root and must resolve beneath the configured NFS mount.
 
 Artifact identity uses the resolved commit SHA, exact ordered file set,
 entrypoint, and alias. Re-downloading a moving branch therefore creates a new
 immutable generation instead of replacing the old one. QIIP deliberately does
-not prune generations or backing HuggingFace snapshots; coordinate retention
-only after confirming no running or restartable node depends on them.
+not prune backing HuggingFace snapshots; coordinate retention only after
+confirming no running or restartable node depends on them.
+
+### 22. Map native GGUF snapshots from the shared export
+
+The short-lived `<CACHE_DIR>/gguf/<artifact-id>/` publication tree is no longer
+read or written. QIIP discovers standalone GGUF files and complete llama.cpp
+split families directly from native Hugging Face snapshot directories. Existing
+cache files therefore become selectable without republishing or moving model
+data.
+
+Before managed llama.cpp setup, configure the gateway-local root of the same
+export mounted on each node:
+
+```dotenv
+INFERENCE_PROXY_HUGGINGFACE__SHARED_ROOT=/mnt/scratch
+INFERENCE_PROXY_HUGGINGFACE__CACHE_DIR=/mnt/scratch/hub
+INFERENCE_PROXY_HUGGINGFACE__NFS_EXPORT=storage.example.com:/exports/hf-cache
+INFERENCE_PROXY_PROVISIONING__NFS_MOUNT_POINT=/srv/hf-cache
+```
+
+`CACHE_DIR` must resolve beneath `SHARED_ROOT`. In this example QIIP sends a
+node-relative path beginning with `hub/models--.../snapshots/...`, which the
+node resolves under `/srv/hf-cache`. Proxy-only and vLLM-only deployments may
+omit `SHARED_ROOT`; a llama.cpp setup without a valid mapping returns 400 before
+reserving the host or starting SSH work.
+
+Artifact IDs remain identical for R2-compatible single-file artifacts and
+complete split families whose files were already ordered from shard 1 through
+N with shard 1 as the entrypoint, because their identity tuple is unchanged.
+An older artifact containing several unrelated files, a noncanonical shard
+order, or an arbitrary entrypoint is intentionally not reconstructible. Remove
+any abandoned `<CACHE_DIR>/gguf` tree only after confirming that no out-of-tree
+tooling depends on it; QIIP does not use it.
+
+Deleting or partially pruning the backing snapshot makes its persisted
+`artifact_id` unresolvable. GGUF discovery is independent of Hugging Face tree
+manifest health, so a valid generation can appear in `gguf_artifacts` while the
+same repository still increments `incomplete_count` or `unverifiable_count`.
+Treat those counters as cache-health signals instead of assuming a visible GGUF
+suppresses them. The dashboard also no longer chooses the first artifact: select
+the exact entrypoint or quantization explicitly.
 
 ## Artifact Sources and Mirror Policy
 
@@ -316,7 +356,7 @@ There is no single global mirror switch. Each source has a different trust and c
 | LLMFit archive used by `setup.sh` | Node-side `LLMFIT_URL`; the gateway forwards version and digest but not this URL | `AUTOVLLM_LLMFIT_SHA256`, normally populated from `LLMFIT__SHA256` | Point the node-side variable at byte-identical mirrored content. When invoking setup through QIIP, arrange the variable in the node's SSH environment or customize the shipped bundle. |
 | On-demand LLMFit runner install | `INFERENCE_PROXY_LLMFIT__INSTALL_URL` | `INFERENCE_PROXY_LLMFIT__SHA256` | Set the validated HTTP(S) `{version}` URL template and matching digest. Configure this separately from the setup-script URL. |
 | llama.cpp source archive | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` with the pinned `LLAMACPP_VERSION` | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256`; verification happens before extraction or build | Point the validated `{version}` URL template at a mirror serving byte-identical tag archives, or configure the matching digest with a custom version. Managed nodes compile CUDA-enabled binaries locally because the pinned release has no Linux CUDA archive. |
-| HuggingFace model snapshots and GGUF files | Repository ID, optional requested revision, and exact GGUF file set in the administrative download request | Download status records the resolved immutable commit; GGUF manifests bind that commit to an exact entrypoint and file set | Pre-seed the standard HuggingFace cache on the declared NFS export. QIIP does not provide a separate model-hub mirror URL. A resolved commit records reproducibility but is not an independently configured content digest. |
+| HuggingFace model snapshots and GGUF files | Repository ID, optional requested revision, and exact GGUF file set in the administrative download request | Download status records the resolved immutable commit; native discovery binds that commit to one standalone GGUF or complete split family and an exact entrypoint | Pre-seed the standard HuggingFace cache on the declared NFS export. QIIP does not provide a separate model-hub mirror URL. A resolved commit records reproducibility but is not an independently configured content digest. |
 | uv bootstrap binary | Pinned GitHub release in `setup.sh` and `auto-vllm/.uv-version` | Vendored checksum from Astral's release assets | Air-gapped nodes may preinstall the exact pinned uv version at the expected path. Changing the download source requires a reviewed bundle change. |
 | vLLM, FlashInfer, and Python dependencies | `auto-vllm/pyproject.toml` plus `auto-vllm/uv.lock` | Registry artifact hashes for the full installable closure; source builds are refused | Regenerate and review the node project and lock for a custom index. Runtime `FLASHINFER_INDEX_URL` overrides are rejected. A pre-seeded uv cache may be used only when it satisfies the frozen lock. |
 | DNF and CUDA RPM packages | Node repository configuration; setup also enables NVIDIA's RHEL 9 CUDA repository | Repository metadata and RPM signatures | Manage mirrors through node repository policy or a reviewed setup-bundle customization. QIIP has no gateway-level DNF mirror setting. |
@@ -361,9 +401,10 @@ that may provision or display the node understands the field.
 | **New surface** | `/admin/nodes` and `/admin/models/catalog` can return `X-Inference-Proxy-Data-Degraded` with `provisioning-tasks` or `model-catalog`. | Surface the degraded state instead of treating missing task fields or an empty catalog as authoritative. |
 | **Correctness fix** | A duplicate model-download POST returns 200 with the existing status; a newly accepted download returns 202. | Accept both success codes and inspect the returned download state. |
 | **Behavioral break** | Model downloads reject the removed `allow_patterns` field. llama.cpp downloads require an exact `gguf.files` and `gguf.entrypoint`; setup requires the resulting `artifact_id`. | Update direct administrative clients to the exact-artifact contract and handle 422 for obsolete request bodies. |
-| **New surface** | Download status records `download_id`, requested and resolved revisions, and published artifacts. The catalog returns validated GGUF generations in `gguf_artifacts`, separate from full vLLM `models`. | Persist the resolved SHA and artifact ID when reproducibility matters. Do not treat intentional partial GGUF snapshots as missing vLLM models. |
+| **New surface** | Download status records `download_id`, requested and resolved revisions, and exact artifacts. The catalog returns validated GGUF generations in `gguf_artifacts`, separate from full vLLM `models`. | Persist the resolved SHA and artifact ID when reproducibility matters. Keep the backing native snapshot while any node depends on that ID. |
+| **Behavioral break** | GGUF artifacts are discovered from native Hugging Face snapshots instead of the removed `<CACHE_DIR>/gguf` publication tree. Valid GGUFs remain visible even when their repository is incomplete or unverifiable, and the dashboard does not select the first artifact automatically. | Configure `HUGGINGFACE__SHARED_ROOT` before managed llama.cpp setup, preserve native snapshots referenced by nodes, inspect cache-health counters separately from `gguf_artifacts`, and select the exact GGUF entrypoint explicitly. |
 | **Behavioral break** | `/admin/nodes[].engine` is now nullable. Registered nodes report `vllm` or `llama_cpp`; QUADS-only hosts report `null` instead of the previous fabricated `vllm` value. | Treat `null` as “not provisioned or no registered engine identity,” not as vLLM. Update clients whose schema requires a string. |
-| **New surface** | `/admin/nodes[]` now includes nullable `artifact_id`. Managed llama.cpp nodes report the exact published GGUF generation selected at setup; vLLM, older, manual, and QUADS-only records can report `null`. | Preserve the field when correlating a node with the GGUF catalog, but continue to handle `null` during rolling upgrades and for non-artifact-backed nodes. |
+| **New surface** | `/admin/nodes[]` now includes nullable `artifact_id`. Managed llama.cpp nodes report the exact discovered GGUF generation selected at setup; vLLM, older, manual, and QUADS-only records can report `null`. | Preserve the field when correlating a node with the GGUF catalog, but continue to handle `null` during rolling upgrades and for non-artifact-backed nodes. |
 | **Behavioral break** | Recommendation `runtime` values are normalized to `vllm`, `llama_cpp`, `mlx`, or `unknown` instead of preserving LLMFit spellings such as `vLLM` and `llama.cpp`. | Compare against the canonical values. Treat this recommendation vocabulary as distinct from the provisionable `InferenceEngine` enum: `mlx` and `unknown` cannot be selected for setup. |
 | **New surface** | Recommendations can include typed `gguf_sources` entries with `repo` and `provider`. The dashboard joins `gguf_sources[].repo` to catalog `gguf_artifacts[].repo_id` exactly and case-sensitively. | Preserve the additive source list. Do not infer an exact GGUF download from it because LLMFit does not supply the required files, shard grouping, or entrypoint. |
 | **Behavioral break** | Unhealthy nodes no longer advertise `retry` in `/admin/nodes[].actions`; setup already rejected that state. | Tear down an unhealthy registered node before starting setup instead of presenting a retry action that the API will refuse. |
@@ -389,8 +430,8 @@ Do not recreate expired keys manually with `managed: true` unless the external w
 1. Request `/admin/models/catalog` with headers and inspect `incomplete_count`, `unverifiable_count`, `invalid_artifact_count`, `cache_warning_count`, and `X-Inference-Proxy-Data-Degraded`.
 2. For incomplete snapshots, restart the download and verify the download status reaches completion.
 3. For unverifiable legacy snapshots, re-download with the current HuggingFace tooling so tree-manifest metadata is created.
-4. For invalid GGUF artifacts, preserve the backing snapshot for diagnosis and re-run the exact download rather than editing a manifest or link manually.
-5. Refresh the catalog and verify all degraded counts are zero before provisioning a node with one of those models.
+4. For invalid GGUF candidates, preserve the backing snapshot for diagnosis and re-run the exact download rather than editing cache links manually.
+5. Refresh the catalog and verify the selected GGUF remains visible. Investigate any nonzero invalid, incomplete, unverifiable, or cache-warning count independently; one valid GGUF does not suppress unrelated cache-health signals.
 
 The catalog intentionally hides entries it cannot prove complete. Do not work around this by advertising the directory name directly; vLLM can otherwise start a long re-download or fail during model load while setup reports only a health-poll timeout.
 

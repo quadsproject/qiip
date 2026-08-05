@@ -10,7 +10,6 @@ import pytest
 from huggingface_hub.errors import CorruptedCacheException
 from structlog.testing import capture_logs
 
-from inference_proxy.huggingface.artifacts import GGUFArtifactStore, GGUFDownloadSpec
 from inference_proxy.huggingface.catalog import (
     CatalogEntry,
     ModelCatalogService,
@@ -30,9 +29,26 @@ def _mock_repo(
     repo.repo_type = repo_type
     if repo_path is not None:
         repo.repo_path = repo_path
-    repo.revisions = frozenset(
-        MagicMock(commit_hash=commit_hash) for commit_hash in revisions
-    )
+    revision_values = []
+    for commit_hash in revisions:
+        if repo_path is None:
+            snapshot_path = Path("/missing") / commit_hash
+            files: frozenset[MagicMock] = frozenset()
+        else:
+            snapshot_path = repo_path / "snapshots" / commit_hash
+            files = frozenset(
+                MagicMock(file_path=path)
+                for path in snapshot_path.rglob("*")
+                if path.is_file()
+            )
+        revision_values.append(
+            MagicMock(
+                commit_hash=commit_hash,
+                snapshot_path=snapshot_path,
+                files=files,
+            )
+        )
+    repo.revisions = frozenset(revision_values)
     return repo
 
 
@@ -197,7 +213,7 @@ class TestListModels:
 
     @pytest.mark.asyncio
     @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
-    async def test_valid_partial_gguf_is_cataloged_without_degradation(
+    async def test_valid_gguf_is_cataloged_without_hiding_incomplete_state(
         self, mock_scan: MagicMock, tmp_path: Path
     ) -> None:
         repo_id = "org/model-GGUF"
@@ -205,12 +221,6 @@ class TestListModels:
         snapshot = tmp_path / "models--org--model-GGUF" / "snapshots" / revision
         snapshot.mkdir(parents=True)
         (snapshot / "model.gguf").write_bytes(b"weights")
-        artifact = GGUFArtifactStore(tmp_path).publish(
-            repo_id=repo_id,
-            resolved_revision=revision,
-            snapshot_path=snapshot,
-            spec=GGUFDownloadSpec(files=("model.gguf",), entrypoint="model.gguf"),
-        )
         repo = _mock_repo(
             repo_id,
             repo_path=snapshot.parents[1],
@@ -227,10 +237,80 @@ class TestListModels:
             result = await service.list_models()
 
         assert result.models == []
-        assert result.gguf_artifacts == [artifact]
-        assert result.incomplete_count == 0
+        assert len(result.gguf_artifacts) == 1
+        assert result.gguf_artifacts[0].entrypoint == "model.gguf"
+        assert result.incomplete_count == 1
         assert result.invalid_artifact_count == 0
         assert result.cache_warning_count == 0
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
+    async def test_complete_mixed_format_repo_is_offered_to_both_engines(
+        self, mock_scan: MagicMock, tmp_path: Path
+    ) -> None:
+        repo_id = "org/mixed-model"
+        revision = "c" * 40
+        snapshot = tmp_path / "models--org--mixed-model" / "snapshots" / revision
+        snapshot.mkdir(parents=True)
+        (snapshot / "model.gguf").write_bytes(b"weights")
+        (snapshot / "model.safetensors").write_bytes(b"weights")
+        mock_scan.return_value = _mock_cache_info(
+            [
+                _mock_repo(
+                    repo_id,
+                    repo_path=snapshot.parents[1],
+                    revisions=(revision,),
+                )
+            ]
+        )
+        service = ModelCatalogService(str(tmp_path))
+
+        with patch.object(
+            service,
+            "_snapshot_state",
+            return_value=_SnapshotCheck("complete", revision),
+        ):
+            result = await service.list_models()
+
+        assert result.models == [CatalogEntry(repo_id=repo_id)]
+        assert [artifact.repo_id for artifact in result.gguf_artifacts] == [repo_id]
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
+    async def test_historical_gguf_revision_does_not_hide_current_vllm_model(
+        self, mock_scan: MagicMock, tmp_path: Path
+    ) -> None:
+        repo_id = "org/evolving-model"
+        gguf_revision = "a" * 40
+        current_revision = "b" * 40
+        repo_path = tmp_path / "models--org--evolving-model"
+        gguf_snapshot = repo_path / "snapshots" / gguf_revision
+        gguf_snapshot.mkdir(parents=True)
+        (gguf_snapshot / "model.gguf").write_bytes(b"weights")
+        current_snapshot = repo_path / "snapshots" / current_revision
+        current_snapshot.mkdir(parents=True)
+        (current_snapshot / "model.safetensors").write_bytes(b"weights")
+        mock_scan.return_value = _mock_cache_info(
+            [
+                _mock_repo(
+                    repo_id,
+                    repo_path=repo_path,
+                    revisions=(gguf_revision, current_revision),
+                )
+            ]
+        )
+        service = ModelCatalogService(str(tmp_path))
+
+        with patch.object(
+            service,
+            "_snapshot_state",
+            return_value=_SnapshotCheck("complete", current_revision),
+        ):
+            result = await service.list_models()
+
+        assert result.models == [CatalogEntry(repo_id=repo_id)]
+        assert len(result.gguf_artifacts) == 1
+        assert result.gguf_artifacts[0].resolved_revision == gguf_revision
 
     @pytest.mark.asyncio
     @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
@@ -245,12 +325,6 @@ class TestListModels:
         )
         snapshot.mkdir(parents=True)
         (snapshot / "model.gguf").write_bytes(b"weights")
-        artifact = GGUFArtifactStore(tmp_path).publish(
-            repo_id=repo_id,
-            resolved_revision=artifact_revision,
-            snapshot_path=snapshot,
-            spec=GGUFDownloadSpec(files=("model.gguf",), entrypoint="model.gguf"),
-        )
         mock_scan.return_value = _mock_cache_info(
             [
                 _mock_repo(
@@ -269,12 +343,13 @@ class TestListModels:
         ):
             result = await service.list_models()
 
-        assert result.gguf_artifacts == [artifact]
+        assert len(result.gguf_artifacts) == 1
+        assert result.gguf_artifacts[0].resolved_revision == artifact_revision
         assert result.incomplete_count == 1
 
     @pytest.mark.asyncio
     @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
-    async def test_only_exact_artifact_root_cache_warning_is_tolerated(
+    async def test_native_index_preserves_all_cache_warnings(
         self, mock_scan: MagicMock, tmp_path: Path
     ) -> None:
         artifact_root = tmp_path / "gguf"
@@ -293,5 +368,5 @@ class TestListModels:
 
         result = await ModelCatalogService(str(tmp_path)).list_models()
 
-        assert result.cache_warning_count == 1
-        assert result.invalid_artifact_count == 1
+        assert result.cache_warning_count == 2
+        assert result.invalid_artifact_count == 0
