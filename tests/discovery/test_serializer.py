@@ -16,10 +16,49 @@ from inference_proxy.discovery.serializer import node_from_etcd, node_to_etcd
 from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.node import (
     InferenceEngine,
+    LlamaCppCacheType,
+    LlamaCppFlashAttention,
+    LlamaCppGPUState,
+    LlamaCppRuntimeEffective,
+    LlamaCppRuntimeRequest,
+    LlamaCppRuntimeState,
+    LlamaCppSizingMode,
     Node,
     NodeCapabilities,
     NodeStatus,
 )
+
+
+def _runtime_state() -> LlamaCppRuntimeState:
+    return LlamaCppRuntimeState(
+        requested=LlamaCppRuntimeRequest(
+            sizing=LlamaCppSizingMode.AUTO,
+            fit_target_mib=512,
+        ),
+        effective=LlamaCppRuntimeEffective(
+            train_context=262144,
+            context_per_slot=12544,
+            slot_context_limit=12544,
+            slots=1,
+            aggregate_context=12544,
+            cache_type_k=LlamaCppCacheType.Q8_0,
+            cache_type_v=LlamaCppCacheType.Q8_0,
+            flash_attn=LlamaCppFlashAttention.ON,
+            kv_unified=True,
+            gpu_layers=31,
+            total_layers=31,
+        ),
+        gpus=(
+            LlamaCppGPUState(
+                index=0,
+                total_mib=14911,
+                used_mib=14089,
+                free_mib=822,
+            ),
+        ),
+        observed_at=datetime(2026, 8, 5, 20, 54, 7, tzinfo=UTC),
+    )
+
 
 _ENDPOINT_POLICY = EndpointPolicy.from_values(
     allowed_hosts=[],
@@ -268,6 +307,7 @@ class TestNodeToEtcdRoundtrip:
             active_connections=5,
             engine=InferenceEngine.LLAMA_CPP,
             artifact_id="b" * 64,
+            llamacpp_runtime=_runtime_state(),
         )
         prefix = "/nodes/"
 
@@ -287,6 +327,7 @@ class TestNodeToEtcdRoundtrip:
         assert restored.active_connections == original.active_connections
         assert restored.engine is InferenceEngine.LLAMA_CPP
         assert restored.artifact_id == "b" * 64
+        assert restored.llamacpp_runtime == _runtime_state()
 
 
 def test_endpoint_roundtrip_preserves_canonical_form() -> None:

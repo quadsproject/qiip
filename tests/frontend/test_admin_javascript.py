@@ -371,7 +371,7 @@ function runNextTimer() {
   return timer.delay;
 }
 
-function installDetailFetch(tasks, tasksOk, engine) {
+function installDetailFetch(tasks, tasksOk, engine, runtime) {
   sandbox.fetch = async function (url) {
     if (url === "/admin/nodes") {
       return {
@@ -380,6 +380,7 @@ function installDetailFetch(tasks, tasksOk, engine) {
         json: async function () { return [{
           node_id: "gpu01", state: "provisioning", model: "org/model",
           engine: engine || null, artifact_id: null,
+          llamacpp_runtime: runtime || null,
           endpoint: "gpu01:8000", active_connections: 0,
           circuit_breaker_state: "closed", actions: [],
         }]; },
@@ -722,6 +723,112 @@ installDetailFetch([], true, "llama_cpp");
     )
 
     assert "llama.cpp" in result["texts"]
+
+
+def test_node_detail_renders_verified_llamacpp_runtime_snapshot() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([], true, "llama_cpp", {
+  requested: { sizing: "auto", fit_target_mib: 512 },
+  effective: {
+    train_context: 262144, context_per_slot: 12544,
+    slot_context_limit: 12544, slots: 1, aggregate_context: 12544,
+    cache_type_k: "q8_0", cache_type_v: "q8_0", flash_attn: "on",
+    kv_unified: true, gpu_layers: 31, total_layers: 31,
+  },
+  gpus: [
+    { index: 0, total_mib: 14911, used_mib: 14089, free_mib: 822 },
+    { index: 1, total_mib: 14911, used_mib: 14207, free_mib: 704 },
+  ],
+  observed_at: "2026-08-05T20:54:07Z",
+});
+(async function () {
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    panelHidden: byId("llamacpp-runtime-panel").hidden,
+    statusHidden: byId("llamacpp-runtime-status").hidden,
+    valuesHidden: byId("llamacpp-runtime-values").hidden,
+    minimumFree: byId("llamacpp-runtime-min-free").textContent,
+    minimumHeadroom: byId("llamacpp-runtime-min-headroom").textContent,
+    sizing: byId("llamacpp-runtime-sizing").textContent,
+    context: byId("llamacpp-runtime-context").textContent,
+    trainContext: byId("llamacpp-runtime-train-context").textContent,
+    slots: byId("llamacpp-runtime-slots").textContent,
+    aggregate: byId("llamacpp-runtime-aggregate").textContent,
+    kv: byId("llamacpp-runtime-kv").textContent,
+    reserve: byId("llamacpp-runtime-reserve").textContent,
+    gpu: byId("llamacpp-runtime-gpus").children[0].textContent,
+    gpuCount: byId("llamacpp-runtime-gpus").children.length,
+    observed: byId("llamacpp-runtime-observed").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "panelHidden": False,
+        "statusHidden": True,
+        "valuesHidden": False,
+        "minimumFree": "704 MiB",
+        "minimumHeadroom": "192 MiB above target",
+        "sizing": "Automatic",
+        "context": "12,544 tokens",
+        "trainContext": "262,144 tokens",
+        "slots": "1",
+        "aggregate": "12,544 tokens",
+        "kv": "Q8_0 / Q8_0",
+        "reserve": "512 MiB per GPU",
+        "gpu": (
+            "GPU 0: 14,089 MiB used, 822 MiB free of 14,911 MiB (310 MiB above target)"
+        ),
+        "gpuCount": 2,
+        "observed": result["observed"],
+    }
+    assert result["observed"].startswith("Post-load snapshot at ")
+    assert result["observed"] != "Post-load snapshot at —"
+
+
+def test_node_detail_explains_missing_llamacpp_runtime_state() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([], true, "llama_cpp", null);
+(async function () {
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    panelHidden: byId("llamacpp-runtime-panel").hidden,
+    statusHidden: byId("llamacpp-runtime-status").hidden,
+    valuesHidden: byId("llamacpp-runtime-values").hidden,
+    status: byId("llamacpp-runtime-status").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "panelHidden": False,
+        "statusHidden": False,
+        "valuesHidden": True,
+        "status": (
+            "Runtime configuration is unavailable until the next successful "
+            "managed llama.cpp setup."
+        ),
+    }
+
+
+def test_node_detail_hides_llamacpp_runtime_card_for_vllm() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([], true, "vllm", null);
+(async function () {
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    panelHidden: byId("llamacpp-runtime-panel").hidden,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {"panelHidden": True}
 
 
 def _power_controls_result(status_code: int) -> object:

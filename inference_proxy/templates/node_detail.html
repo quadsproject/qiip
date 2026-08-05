@@ -80,6 +80,27 @@
                 </div>
             </section>
 
+            <section class="card" id="llamacpp-runtime-panel" hidden>
+                <h2 class="card-title">llama.cpp Runtime Configuration</h2>
+                <p id="llamacpp-runtime-status" class="runtime-status" aria-live="polite">Loading runtime configuration...</p>
+                <dl id="llamacpp-runtime-values" class="runtime-grid" hidden>
+                    <div class="runtime-summary"><dt>Minimum free VRAM</dt><dd id="llamacpp-runtime-min-free"></dd></div>
+                    <div class="runtime-summary"><dt>Minimum headroom</dt><dd id="llamacpp-runtime-min-headroom"></dd></div>
+                    <div><dt>Sizing</dt><dd id="llamacpp-runtime-sizing"></dd></div>
+                    <div><dt>Context per slot</dt><dd id="llamacpp-runtime-context"></dd></div>
+                    <div><dt>Model training context</dt><dd id="llamacpp-runtime-train-context"></dd></div>
+                    <div><dt>Slot context limit</dt><dd id="llamacpp-runtime-slot-limit"></dd></div>
+                    <div><dt>Parallel slots</dt><dd id="llamacpp-runtime-slots"></dd></div>
+                    <div><dt>Aggregate context</dt><dd id="llamacpp-runtime-aggregate"></dd></div>
+                    <div><dt>KV cache</dt><dd id="llamacpp-runtime-kv"></dd></div>
+                    <div><dt>Flash Attention</dt><dd id="llamacpp-runtime-flash"></dd></div>
+                    <div><dt>GPU offload</dt><dd id="llamacpp-runtime-offload"></dd></div>
+                    <div><dt>Free VRAM target</dt><dd id="llamacpp-runtime-reserve"></dd></div>
+                    <div class="runtime-grid-wide"><dt>Post-load GPU memory</dt><dd><ul id="llamacpp-runtime-gpus" class="runtime-gpu-list"></ul></dd></div>
+                    <div class="runtime-grid-wide"><dt>Observed</dt><dd id="llamacpp-runtime-observed"></dd></div>
+                </dl>
+            </section>
+
             <section class="card" id="recommendations-panel">
                 <h2 class="card-title">
                     Model Recommendations

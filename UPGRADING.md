@@ -437,6 +437,11 @@ The startup record now includes `cache_type_k`, `cache_type_v`, and
 `flash_attn`. Post-health verification reads llama.cpp's allocated KV-cache
 record and rejects a runtime whose cache types differ from the plan.
 
+Pure recurrent-state models (Mamba- and RWKV-family architectures) allocate
+fixed F32 recurrent state, ignore the requested cache types, and emit no
+KV-cache record, so this verification rejects them after health. Such models
+are unsupported by managed llama.cpp provisioning.
+
 ## Artifact Sources and Mirror Policy
 
 There is no single global mirror switch. Each source has a different trust and configuration boundary.
@@ -482,6 +487,13 @@ and the watcher excludes it, so introduce new engine values only with an
 ordered gateway rollout. Do not rely on artifact identity until every gateway
 that may provision or display the node understands the field.
 
+Records also include nullable `llamacpp_runtime` after a successful managed
+llama.cpp setup. It contains the requested sizing policy, verified effective
+configuration, per-GPU post-load memory, and an ISO-8601 UTC observation time.
+Older gateways ignore this additive field, and records created before this
+change load with `llamacpp_runtime: null`. Do not rely on the runtime snapshot
+until every gateway that may provision or display the node understands it.
+
 ### Administrative API and browser interfaces
 
 | Classification | Change | Client action |
@@ -498,6 +510,7 @@ that may provision or display the node understands the field.
 | **Behavioral break** | The managed llama.cpp free-VRAM target defaults to 512 MiB instead of 1,024 MiB. When F16 K/V cannot meet the minimum full-offload plan, QIIP retries with matching Q8_0 K/V and Flash Attention; it never falls below Q8_0 automatically. | Keep an explicit 1,024 MiB or larger target for shared GPUs. Monitor the emitted cache types and post-load free memory; select a smaller model when the Q8_0 minimum still fails. |
 | **Behavioral break** | `/admin/nodes[].engine` is now nullable. Registered nodes report `vllm` or `llama_cpp`; QUADS-only hosts report `null` instead of the previous fabricated `vllm` value. | Treat `null` as “not provisioned or no registered engine identity,” not as vLLM. Update clients whose schema requires a string. |
 | **New surface** | `/admin/nodes[]` now includes nullable `artifact_id`. Managed llama.cpp nodes report the exact discovered GGUF generation selected at setup; vLLM, older, manual, and QUADS-only records can report `null`. | Preserve the field when correlating a node with the GGUF catalog, but continue to handle `null` during rolling upgrades and for non-artifact-backed nodes. |
+| **New surface** | `/admin/nodes[]` now includes nullable `llamacpp_runtime`. Successful managed llama.cpp setup records requested sizing, verified effective context/concurrency/cache/offload values, per-GPU post-load memory, and an ISO-8601 UTC observation time. The node-detail dashboard renders the same state as a read-only card. | Treat the GPU values as a timestamped post-load snapshot, not live telemetry. Handle `null` for older records, vLLM nodes, QUADS-only hosts, and llama.cpp nodes that have not completed setup on the new version. |
 | **Behavioral break** | Recommendation `runtime` values are normalized to `vllm`, `llama_cpp`, `mlx`, or `unknown` instead of preserving LLMFit spellings such as `vLLM` and `llama.cpp`. | Compare against the canonical values. Treat this recommendation vocabulary as distinct from the provisionable `InferenceEngine` enum: `mlx` and `unknown` cannot be selected for setup. |
 | **New surface** | Recommendations can include typed `gguf_sources` entries with `repo` and `provider`. The dashboard joins `gguf_sources[].repo` to catalog `gguf_artifacts[].repo_id` exactly and case-sensitively. | Preserve the additive source list. Do not infer an exact GGUF download from it because LLMFit does not supply the required files, shard grouping, or entrypoint. |
 | **Behavioral break** | Unhealthy nodes no longer advertise `retry` in `/admin/nodes[].actions`; setup already rejected that state. | Tear down an unhealthy registered node before starting setup instead of presenting a retry action that the API will refuse. |

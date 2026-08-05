@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from inference_proxy.huggingface.artifacts import GGUFArtifact, GGUFDownloadSpec
 from inference_proxy.models.llmfit import ModelRecommendation, SystemInfo
-from inference_proxy.models.node import InferenceEngine
+from inference_proxy.models.node import InferenceEngine, LlamaCppRuntimeState
 
 
 class AdminNodeResponse(BaseModel):
@@ -36,6 +36,7 @@ class AdminNodeResponse(BaseModel):
     circuit_breaker_state: str
     engine: InferenceEngine | None = None
     artifact_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    llamacpp_runtime: LlamaCppRuntimeState | None = None
     state: str = ""
     actions: list[str] = []
     gpu_vendor: str | None = None

@@ -33,7 +33,18 @@ from inference_proxy.huggingface.artifacts import (
     ResolvedGGUFArtifact,
 )
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
-from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
+from inference_proxy.models.node import (
+    InferenceEngine,
+    LlamaCppCacheType,
+    LlamaCppFlashAttention,
+    LlamaCppGPUState,
+    LlamaCppRuntimeEffective,
+    LlamaCppRuntimeRequest,
+    LlamaCppRuntimeState,
+    LlamaCppSizingMode,
+    Node,
+    NodeStatus,
+)
 from inference_proxy.provisioning.host_lifecycle import (
     HostLifecycleCoordinator,
     HostLifecycleLease,
@@ -66,7 +77,9 @@ LLAMACPP_AGGREGATE_CONTEXT_PATTERN = re.compile(
     r"llama_context:\s+n_ctx\s*=\s*(?P<context>\d+)"
 )
 LLAMACPP_PLAN_PATTERN = re.compile(
-    r"qiip_fit_plan: context_per_slot=(?P<context>\d+) "
+    r"qiip_fit_plan: sizing=(?P<sizing>auto) "
+    r"train_context=(?P<train_context>\d+) "
+    r"context_per_slot=(?P<context>\d+) "
     r"slots=(?P<slots>\d+) "
     r"aggregate_context=(?P<aggregate>\d+) "
     r"fit_target_mib=(?P<target>\d+) "
@@ -151,6 +164,8 @@ class ProvisioningIdentity:
 class LlamaCppRuntimeFit:
     """Effective llama.cpp sizing parsed from the completed startup log."""
 
+    sizing: str
+    train_context: int
     context_per_slot: int
     slot_context_limit: int
     slots: int
@@ -182,7 +197,10 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
         raise ProvisioningError("llama.cpp startup log has no GPU offload record")
     cache_records = list(LLAMACPP_KV_CACHE_PATTERN.finditer(log_text))
     if not cache_records:
-        raise ProvisioningError("llama.cpp startup log has no KV cache type record")
+        raise ProvisioningError(
+            "llama.cpp startup log has no KV cache type record "
+            "(recurrent-state models are unsupported by managed provisioning)"
+        )
 
     plan = plans[-1].groupdict()
     context = contexts[-1].groupdict()
@@ -190,6 +208,8 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
     offload = offloads[-1].groupdict()
     cache_record = cache_records[-1].groupdict()
     fit = LlamaCppRuntimeFit(
+        sizing=plan["sizing"],
+        train_context=int(plan["train_context"]),
         context_per_slot=int(plan["context"]),
         slot_context_limit=int(context["context"]),
         slots=int(plan["slots"]),
@@ -203,8 +223,10 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
         total_layers=int(offload["total"]),
     )
     if (
-        fit.context_per_slot < 1
-        or fit.slot_context_limit < fit.context_per_slot
+        fit.train_context < 1
+        or fit.context_per_slot < 1
+        or fit.context_per_slot > fit.train_context
+        or fit.slot_context_limit != min(fit.train_context, fit.aggregate_context)
         or fit.slot_context_limit > fit.aggregate_context
         or fit.slots < 1
         or fit.fit_target_mib < 1
@@ -823,9 +845,13 @@ class NodeProvisioner:
             )
             self._log(hostname, "info", "Waiting for health endpoint")
             await self._poll_health(hostname, engine=engine)
+            llamacpp_runtime: LlamaCppRuntimeState | None = None
             if engine == InferenceEngine.LLAMA_CPP:
                 current_step = "llamacpp_runtime_verify"
-                await self._verify_llamacpp_runtime(hostname)
+                llamacpp_runtime = await self._verify_llamacpp_runtime(
+                    hostname,
+                    expected_fit_target_mib=self._settings.llamacpp_fit_target_mib,
+                )
             current_step = "registering"
             await self._update_state(
                 hostname, ProvisioningStep.REGISTERING, started_at=provision_started_at
@@ -837,6 +863,7 @@ class NodeProvisioner:
                 managed=managed,
                 engine=engine,
                 artifact_id=artifact_id,
+                llamacpp_runtime=llamacpp_runtime,
             )
             await self._update_state(
                 hostname, ProvisioningStep.COMPLETE, started_at=provision_started_at
@@ -983,7 +1010,12 @@ class NodeProvisioner:
                 f"also failed: {exc}",
             )
 
-    async def _verify_llamacpp_runtime(self, hostname: str) -> None:
+    async def _verify_llamacpp_runtime(
+        self,
+        hostname: str,
+        *,
+        expected_fit_target_mib: int,
+    ) -> LlamaCppRuntimeState:
         """Fail closed unless the healthy server proves the managed fit contract."""
         try:
             log_text = await self._ssh_run_command(
@@ -992,16 +1024,23 @@ class NodeProvisioner:
             fit = _parse_llamacpp_runtime_fit(log_text)
             memory_text = await self._ssh_run_command(
                 hostname,
-                "nvidia-smi --query-gpu=memory.used,memory.free "
+                "nvidia-smi --query-gpu=index,memory.total,memory.used,memory.free "
                 "--format=csv,noheader,nounits",
             )
-            memory_rows: list[tuple[int, int]] = []
+            memory_rows: list[LlamaCppGPUState] = []
             try:
                 for line in memory_text.splitlines():
                     if not line.strip():
                         continue
-                    used_text, free_text = line.split(",", maxsplit=1)
-                    memory_rows.append((int(used_text.strip()), int(free_text.strip())))
+                    index_text, total_text, used_text, free_text = line.split(",")
+                    memory_rows.append(
+                        LlamaCppGPUState(
+                            index=int(index_text.strip()),
+                            total_mib=int(total_text.strip()),
+                            used_mib=int(used_text.strip()),
+                            free_mib=int(free_text.strip()),
+                        )
+                    )
             except ValueError as exc:
                 raise ProvisioningError(
                     "could not parse post-load NVIDIA memory telemetry"
@@ -1010,21 +1049,48 @@ class NodeProvisioner:
                 raise ProvisioningError(
                     "post-load NVIDIA memory telemetry returned no GPUs"
                 )
-            if fit.fit_target_mib != self._settings.llamacpp_fit_target_mib:
+            if len({row.index for row in memory_rows}) != len(memory_rows):
                 raise ProvisioningError(
-                    "llama.cpp runtime fit target differs from gateway configuration"
+                    "post-load NVIDIA memory telemetry returned duplicate GPU indices"
                 )
-            if any(row[1] < fit.fit_target_mib for row in memory_rows):
+            if fit.fit_target_mib != expected_fit_target_mib:
                 raise ProvisioningError(
-                    "llama.cpp post-load free VRAM is below the configured fit target"
+                    "llama.cpp runtime fit target differs from its requested value"
+                )
+            if any(row.free_mib < fit.fit_target_mib for row in memory_rows):
+                raise ProvisioningError(
+                    "llama.cpp post-load free VRAM is below the requested fit target"
                 )
 
-            used = ",".join(str(row[0]) for row in memory_rows)
-            free = ",".join(str(row[1]) for row in memory_rows)
+            runtime = LlamaCppRuntimeState(
+                requested=LlamaCppRuntimeRequest(
+                    sizing=LlamaCppSizingMode(fit.sizing),
+                    fit_target_mib=fit.fit_target_mib,
+                ),
+                effective=LlamaCppRuntimeEffective(
+                    train_context=fit.train_context,
+                    context_per_slot=fit.context_per_slot,
+                    slot_context_limit=fit.slot_context_limit,
+                    slots=fit.slots,
+                    aggregate_context=fit.aggregate_context,
+                    cache_type_k=LlamaCppCacheType(fit.cache_type_k),
+                    cache_type_v=LlamaCppCacheType(fit.cache_type_v),
+                    flash_attn=LlamaCppFlashAttention(fit.flash_attn),
+                    kv_unified=fit.kv_unified,
+                    gpu_layers=fit.gpu_layers,
+                    total_layers=fit.total_layers,
+                ),
+                gpus=tuple(sorted(memory_rows, key=lambda row: row.index)),
+                observed_at=datetime.now(UTC),
+            )
+            used = ",".join(str(row.used_mib) for row in runtime.gpus)
+            free = ",".join(str(row.free_mib) for row in runtime.gpus)
             self._log(
                 hostname,
                 "info",
                 "llama.cpp fitted: "
+                f"sizing={fit.sizing} "
+                f"train_context={fit.train_context} "
                 f"context_per_slot={fit.context_per_slot} "
                 f"slot_context_limit={fit.slot_context_limit} "
                 f"slots={fit.slots} "
@@ -1034,9 +1100,10 @@ class NodeProvisioner:
                 f"cache_type_v={fit.cache_type_v} "
                 f"flash_attn={fit.flash_attn} "
                 f"gpu_layers={fit.gpu_layers}/{fit.total_layers} "
-                f"fit_target_mib={self._settings.llamacpp_fit_target_mib} "
+                f"fit_target_mib={expected_fit_target_mib} "
                 f"gpu_used_mib={used} gpu_free_mib={free}",
             )
+            return runtime
         except Exception:
             await self._stop_failed_llamacpp_start(hostname)
             raise
@@ -1152,6 +1219,7 @@ class NodeProvisioner:
         managed: bool = True,
         engine: InferenceEngine = InferenceEngine.VLLM,
         artifact_id: str | None = None,
+        llamacpp_runtime: LlamaCppRuntimeState | None = None,
     ) -> None:
         """Register node in etcd with correct fields (D-11, D-12)."""
         node = Node(
@@ -1161,6 +1229,7 @@ class NodeProvisioner:
             model=model,
             engine=engine,
             artifact_id=artifact_id,
+            llamacpp_runtime=llamacpp_runtime,
             last_heartbeat=datetime.now(UTC),
             managed=managed,
         )

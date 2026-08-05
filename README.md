@@ -245,6 +245,12 @@ Each `/admin/nodes` item reports the inference `engine` and immutable
 catalog also reports the selected 64-character artifact ID; vLLM and manually
 registered nodes normally report `artifact_id: null`.
 
+Successful managed llama.cpp setup also reports `llamacpp_runtime`, containing
+the requested sizing policy, verified effective plan, device-indexed post-load
+GPU memory, and an ISO-8601 UTC observation time. Other nodes and older records
+report `llamacpp_runtime: null`; the memory values are a snapshot, not live
+telemetry.
+
 A host present only in QUADS has not been provisioned and therefore reports
 both `engine: null` and `artifact_id: null`. Do not interpret a null engine as
 vLLM. It means QIIP has no registered serving identity for that host.
@@ -430,7 +436,10 @@ configured free-VRAM margin, use the selected KV types and unified cache, and
 offload every model layer to GPU before registering the node healthy. The
 provisioning log records the simultaneous per-slot guarantee, llama.cpp
 per-request ceiling, aggregate context, slot count, KV types, layer offload,
-configured margin, and post-load GPU memory. See
+configured margin, and post-load GPU memory. A successful managed setup also
+persists that verified runtime state, including model training context and a
+timestamped per-GPU memory snapshot, and exposes it on the node-detail
+dashboard. See
 [auto-llamacpp](auto-llamacpp/README.md) for the direct script contract and
 build details.
 

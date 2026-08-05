@@ -167,6 +167,71 @@ function stepBadgeClass(step) {
   return "badge-in-progress";
 }
 
+function formatRuntimeCount(value) {
+  return Number(value).toLocaleString();
+}
+
+function formatRuntimeTimestamp(value) {
+  var timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return "—";
+  return timestamp.toLocaleString([], { timeZoneName: "short" });
+}
+
+function renderLlamaCppRuntime(node) {
+  var panel = document.getElementById("llamacpp-runtime-panel");
+  var status = document.getElementById("llamacpp-runtime-status");
+  var values = document.getElementById("llamacpp-runtime-values");
+
+  if (!node || node.engine !== "llama_cpp") {
+    panel.hidden = true;
+    return;
+  }
+
+  panel.hidden = false;
+  var runtime = node.llamacpp_runtime;
+  if (!runtime) {
+    status.hidden = false;
+    status.textContent = "Runtime configuration is unavailable until the next successful managed llama.cpp setup.";
+    values.hidden = true;
+    return;
+  }
+
+  var requested = runtime.requested;
+  var effective = runtime.effective;
+  var sizingLabel = requested.sizing === "auto" ? "Automatic" : requested.sizing;
+  var minimumFree = Math.min.apply(null, runtime.gpus.map(function (gpu) { return gpu.free_mib; }));
+  var minimumHeadroom = minimumFree - requested.fit_target_mib;
+  status.hidden = true;
+  status.textContent = "";
+  values.hidden = false;
+  document.getElementById("llamacpp-runtime-min-free").textContent = formatRuntimeCount(minimumFree) + " MiB";
+  document.getElementById("llamacpp-runtime-min-headroom").textContent = formatRuntimeCount(minimumHeadroom) + " MiB above target";
+  document.getElementById("llamacpp-runtime-sizing").textContent = sizingLabel;
+  document.getElementById("llamacpp-runtime-context").textContent = formatRuntimeCount(effective.context_per_slot) + " tokens";
+  document.getElementById("llamacpp-runtime-train-context").textContent = formatRuntimeCount(effective.train_context) + " tokens";
+  document.getElementById("llamacpp-runtime-slot-limit").textContent = formatRuntimeCount(effective.slot_context_limit) + " tokens";
+  document.getElementById("llamacpp-runtime-slots").textContent = formatRuntimeCount(effective.slots);
+  document.getElementById("llamacpp-runtime-aggregate").textContent = formatRuntimeCount(effective.aggregate_context) + " tokens";
+  document.getElementById("llamacpp-runtime-kv").textContent = effective.cache_type_k.toUpperCase() + " / " + effective.cache_type_v.toUpperCase();
+  document.getElementById("llamacpp-runtime-flash").textContent = effective.flash_attn === "on" ? "On" : "Auto";
+  document.getElementById("llamacpp-runtime-offload").textContent = effective.gpu_layers + " / " + effective.total_layers + " layers";
+  document.getElementById("llamacpp-runtime-reserve").textContent = formatRuntimeCount(requested.fit_target_mib) + " MiB per GPU";
+  document.getElementById("llamacpp-runtime-observed").textContent = "Post-load snapshot at " + formatRuntimeTimestamp(runtime.observed_at);
+
+  var gpuList = document.getElementById("llamacpp-runtime-gpus");
+  gpuList.textContent = "";
+  runtime.gpus.forEach(function (gpu) {
+    var item = document.createElement("li");
+    var headroom = gpu.free_mib - requested.fit_target_mib;
+    item.textContent = "GPU " + gpu.index + ": " +
+      formatRuntimeCount(gpu.used_mib) + " MiB used, " +
+      formatRuntimeCount(gpu.free_mib) + " MiB free of " +
+      formatRuntimeCount(gpu.total_mib) + " MiB (" +
+      formatRuntimeCount(headroom) + " MiB above target)";
+    gpuList.appendChild(item);
+  });
+}
+
 async function refreshDetail() {
   var stateEl = document.getElementById("node-state");
   var infoBody = document.getElementById("node-info-body");
@@ -191,9 +256,11 @@ async function refreshDetail() {
       stateEl.textContent = "Node not found";
       renderTableMessage(infoBody, 10, "Node not found in registry");
       document.getElementById("config-download-panel").style.display = "none";
+      renderLlamaCppRuntime(null);
     } else {
       stateEl.textContent = node.state;
       setupSelection.setPreferredNode(node);
+      renderLlamaCppRuntime(node);
 
       infoBody.textContent = "";
       var tr = document.createElement("tr");

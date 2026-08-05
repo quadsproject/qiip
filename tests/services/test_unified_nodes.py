@@ -9,7 +9,18 @@ import pytest
 
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.admin import TaskStatusResponse
-from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
+from inference_proxy.models.node import (
+    InferenceEngine,
+    LlamaCppCacheType,
+    LlamaCppFlashAttention,
+    LlamaCppGPUState,
+    LlamaCppRuntimeEffective,
+    LlamaCppRuntimeRequest,
+    LlamaCppRuntimeState,
+    LlamaCppSizingMode,
+    Node,
+    NodeStatus,
+)
 from inference_proxy.models.quads import QUADSHost
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 from inference_proxy.routing.connection_tracker import ConnectionTracker
@@ -39,6 +50,7 @@ def _node(
     managed: bool = True,
     engine: InferenceEngine = InferenceEngine.VLLM,
     artifact_id: str | None = None,
+    llamacpp_runtime: LlamaCppRuntimeState | None = None,
 ) -> Node:
     return Node(
         node_id=node_id,
@@ -48,6 +60,38 @@ def _node(
         managed=managed,
         engine=engine,
         artifact_id=artifact_id,
+        llamacpp_runtime=llamacpp_runtime,
+    )
+
+
+def _runtime_state() -> LlamaCppRuntimeState:
+    return LlamaCppRuntimeState(
+        requested=LlamaCppRuntimeRequest(
+            sizing=LlamaCppSizingMode.AUTO,
+            fit_target_mib=512,
+        ),
+        effective=LlamaCppRuntimeEffective(
+            train_context=262144,
+            context_per_slot=12544,
+            slot_context_limit=12544,
+            slots=1,
+            aggregate_context=12544,
+            cache_type_k=LlamaCppCacheType.Q8_0,
+            cache_type_v=LlamaCppCacheType.Q8_0,
+            flash_attn=LlamaCppFlashAttention.ON,
+            kv_unified=True,
+            gpu_layers=31,
+            total_layers=31,
+        ),
+        gpus=(
+            LlamaCppGPUState(
+                index=0,
+                total_mib=14911,
+                used_mib=14089,
+                free_mib=822,
+            ),
+        ),
+        observed_at=datetime(2026, 8, 5, 20, 54, 7, tzinfo=UTC),
     )
 
 
@@ -130,11 +174,13 @@ class TestEtcdNodeStates:
 
     def test_registered_engine_and_artifact_are_preserved(self) -> None:
         registry = NodeRegistry()
+        runtime = _runtime_state()
         registry.add(
             _node(
                 "gpu01",
                 engine=InferenceEngine.LLAMA_CPP,
                 artifact_id="c" * 64,
+                llamacpp_runtime=runtime,
             )
         )
         svc = _service(registry=registry, poller=_poller())
@@ -142,6 +188,7 @@ class TestEtcdNodeStates:
         node = svc.get_unified_nodes()[0]
         assert node.engine is InferenceEngine.LLAMA_CPP
         assert node.artifact_id == "c" * 64
+        assert node.llamacpp_runtime == runtime
 
     def test_unhealthy_state_and_actions(self) -> None:
         registry = NodeRegistry()

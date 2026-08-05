@@ -39,7 +39,18 @@ from inference_proxy.huggingface.artifacts import (
 )
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
-from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
+from inference_proxy.models.node import (
+    InferenceEngine,
+    LlamaCppCacheType,
+    LlamaCppFlashAttention,
+    LlamaCppGPUState,
+    LlamaCppRuntimeEffective,
+    LlamaCppRuntimeRequest,
+    LlamaCppRuntimeState,
+    LlamaCppSizingMode,
+    Node,
+    NodeStatus,
+)
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     PreflightError,
@@ -78,10 +89,42 @@ def _artifact(alias: str = "org/model--with---separators") -> ResolvedGGUFArtifa
     )
 
 
+def _runtime_state() -> LlamaCppRuntimeState:
+    return LlamaCppRuntimeState(
+        requested=LlamaCppRuntimeRequest(
+            sizing=LlamaCppSizingMode.AUTO,
+            fit_target_mib=512,
+        ),
+        effective=LlamaCppRuntimeEffective(
+            train_context=262144,
+            context_per_slot=12544,
+            slot_context_limit=12544,
+            slots=1,
+            aggregate_context=12544,
+            cache_type_k=LlamaCppCacheType.Q8_0,
+            cache_type_v=LlamaCppCacheType.Q8_0,
+            flash_attn=LlamaCppFlashAttention.ON,
+            kv_unified=True,
+            gpu_layers=31,
+            total_layers=31,
+        ),
+        gpus=(
+            LlamaCppGPUState(
+                index=0,
+                total_mib=14911,
+                used_mib=14089,
+                free_mib=822,
+            ),
+        ),
+        observed_at=datetime(2026, 8, 5, 20, 54, 7, tzinfo=UTC),
+    )
+
+
 def _llamacpp_fit_log(
     *,
     context_per_slot: int = 24576,
     slot_context_limit: int | None = None,
+    train_context: int | None = None,
     slots: int = 4,
     runtime_slots: int | None = None,
     aggregate_context: int | None = None,
@@ -107,6 +150,8 @@ def _llamacpp_fit_log(
         runtime_cache_type_v = cache_type_v
     if slot_context_limit is None:
         slot_context_limit = context_per_slot
+    if train_context is None:
+        train_context = slot_context_limit
     if runtime_slots is None:
         runtime_slots = slots
     if aggregate_context is None:
@@ -115,6 +160,7 @@ def _llamacpp_fit_log(
         runtime_aggregate_context = aggregate_context
     lines = [
         "qiip_fit_plan: "
+        f"sizing=auto train_context={train_context} "
         f"context_per_slot={context_per_slot} slots={slots} "
         f"aggregate_context={aggregate_context} "
         f"fit_target_mib={fit_target_mib} "
@@ -1070,6 +1116,7 @@ class TestNodeRegistration:
         etcd.put = MagicMock(return_value=True)
 
         provisioner = _make_provisioner(etcd_client=etcd)
+        runtime = _runtime_state()
 
         with patch(
             "inference_proxy.provisioning.provisioner.asyncio.to_thread",
@@ -1085,6 +1132,7 @@ class TestNodeRegistration:
                     "test-model",
                     engine=InferenceEngine.LLAMA_CPP,
                     artifact_id="a" * 64,
+                    llamacpp_runtime=runtime,
                 )
 
                 # Verify Node was constructed correctly
@@ -1097,6 +1145,7 @@ class TestNodeRegistration:
                 assert node.last_heartbeat is not None
                 assert node.engine is InferenceEngine.LLAMA_CPP
                 assert node.artifact_id == "a" * 64
+                assert node.llamacpp_runtime == runtime
 
                 # Each managed registration gets a fresh lease before its PUT.
                 assert mock_to_thread.call_args_list == [
@@ -1560,6 +1609,8 @@ class TestLlamaCppRuntimeFit:
         fit = _parse_llamacpp_runtime_fit(log_text)
 
         assert fit.context_per_slot == 24577
+        assert fit.sizing == "auto"
+        assert fit.train_context == 24577
         assert fit.slot_context_limit == 24577
         assert fit.slots == 4
         assert fit.aggregate_context == 98308
@@ -1586,6 +1637,21 @@ class TestLlamaCppRuntimeFit:
         assert fit.slots == 8
         assert fit.aggregate_context == 1024000
 
+    def test_accepts_vram_constrained_context_below_training_limit(self) -> None:
+        fit = _parse_llamacpp_runtime_fit(
+            _llamacpp_fit_log(
+                train_context=262144,
+                context_per_slot=12544,
+                slot_context_limit=12544,
+                slots=1,
+                aggregate_context=12544,
+            )
+        )
+
+        assert fit.train_context == 262144
+        assert fit.context_per_slot == 12544
+        assert fit.slot_context_limit == 12544
+
     def test_accepts_q8_kv_cache_runtime_evidence(self) -> None:
         fit = _parse_llamacpp_runtime_fit(_llamacpp_fit_log(cache_type_k="q8_0"))
 
@@ -1604,7 +1670,8 @@ class TestLlamaCppRuntimeFit:
                 "no QIIP VRAM plan",
             ),
             (
-                "qiip_fit_plan: context_per_slot=24576 slots=4 "
+                "qiip_fit_plan: sizing=auto train_context=24576 "
+                "context_per_slot=24576 slots=4 "
                 "aggregate_context=98304 fit_target_mib=512 "
                 "cache_type_k=f16 cache_type_v=f16 flash_attn=auto\n"
                 "llama_model_load: offloaded 37/37 layers to GPU\n"
@@ -1613,7 +1680,8 @@ class TestLlamaCppRuntimeFit:
                 "no aggregate context record",
             ),
             (
-                "qiip_fit_plan: context_per_slot=24576 slots=4 "
+                "qiip_fit_plan: sizing=auto train_context=24576 "
+                "context_per_slot=24576 slots=4 "
                 "aggregate_context=98304 fit_target_mib=512 "
                 "cache_type_k=f16 cache_type_v=f16 flash_attn=auto\n"
                 "llama_context: n_ctx = 98304\n"
@@ -1621,7 +1689,8 @@ class TestLlamaCppRuntimeFit:
                 "no effective context record",
             ),
             (
-                "qiip_fit_plan: context_per_slot=24576 slots=4 "
+                "qiip_fit_plan: sizing=auto train_context=24576 "
+                "context_per_slot=24576 slots=4 "
                 "aggregate_context=98304 fit_target_mib=512 "
                 "cache_type_k=f16 cache_type_v=f16 flash_attn=auto\n"
                 "llama_context: n_ctx = 98304\n"
@@ -1631,6 +1700,10 @@ class TestLlamaCppRuntimeFit:
             ),
             (_llamacpp_fit_log(kv_unified=False), "requires unified KV cache"),
             (_llamacpp_fit_log(context_per_slot=0), "invalid effective context"),
+            (
+                _llamacpp_fit_log(train_context=24575),
+                "invalid effective context",
+            ),
             (
                 _llamacpp_fit_log(slot_context_limit=100000),
                 "invalid effective context",
@@ -1714,25 +1787,38 @@ class TestLlamaCppRuntimeFit:
                         slot_context_limit=98308,
                         fit_target_mib=1536,
                     ),
-                    "20854, 2180\n20860, 2174",
+                    "0, 23034, 20854, 2180\n1, 23034, 20860, 2174",
                 ],
             ) as run_command,
             patch.object(provisioner, "_log") as log,
         ):
-            await provisioner._verify_llamacpp_runtime("host1")
+            runtime = await provisioner._verify_llamacpp_runtime(
+                "host1", expected_fit_target_mib=1536
+            )
 
         assert run_command.await_args_list == [
             call("host1", "cat -- /var/log/llamacpp-serve.log"),
             call(
                 "host1",
-                "nvidia-smi --query-gpu=memory.used,memory.free "
+                "nvidia-smi --query-gpu=index,memory.total,memory.used,memory.free "
                 "--format=csv,noheader,nounits",
             ),
         ]
+        assert runtime.requested.sizing == "auto"
+        assert runtime.requested.fit_target_mib == 1536
+        assert runtime.effective.train_context == 98308
+        assert runtime.effective.context_per_slot == 24577
+        assert runtime.effective.slot_context_limit == 98308
+        assert runtime.effective.slots == 4
+        assert runtime.gpus[0].index == 0
+        assert runtime.gpus[0].total_mib == 23034
+        assert runtime.gpus[1].free_mib == 2174
+        assert runtime.observed_at.tzinfo is UTC
         log.assert_called_once_with(
             "host1",
             "info",
-            "llama.cpp fitted: context_per_slot=24577 slot_context_limit=98308 "
+            "llama.cpp fitted: sizing=auto train_context=98308 "
+            "context_per_slot=24577 slot_context_limit=98308 "
             "slots=4 aggregate_context=98308 kv_unified=true "
             "cache_type_k=f16 cache_type_v=f16 flash_attn=auto "
             "gpu_layers=37/37 fit_target_mib=1536 "
@@ -1747,13 +1833,35 @@ class TestLlamaCppRuntimeFit:
         run_command = AsyncMock(
             side_effect=[
                 _llamacpp_fit_log(fit_target_mib=1536),
-                "21854, 1180",
+                "0, 23034, 21854, 1180",
                 "",
             ]
         )
         with patch.object(provisioner, "_ssh_run_command", run_command):
-            with pytest.raises(ProvisioningError, match="below the configured"):
-                await provisioner._verify_llamacpp_runtime("host1")
+            with pytest.raises(ProvisioningError, match="below the requested"):
+                await provisioner._verify_llamacpp_runtime(
+                    "host1", expected_fit_target_mib=1536
+                )
+
+        assert run_command.await_args_list[-1] == call(
+            "host1", "bash auto-llamacpp/stop-llamacpp.sh"
+        )
+
+    @pytest.mark.asyncio
+    async def test_requested_fit_target_is_authoritative(self) -> None:
+        provisioner = _make_provisioner()
+        run_command = AsyncMock(
+            side_effect=[
+                _llamacpp_fit_log(fit_target_mib=512),
+                "0, 14911, 14089, 822",
+                "",
+            ]
+        )
+        with patch.object(provisioner, "_ssh_run_command", run_command):
+            with pytest.raises(ProvisioningError, match="requested value"):
+                await provisioner._verify_llamacpp_runtime(
+                    "host1", expected_fit_target_mib=1024
+                )
 
         assert run_command.await_args_list[-1] == call(
             "host1", "bash auto-llamacpp/stop-llamacpp.sh"
@@ -1770,7 +1878,9 @@ class TestLlamaCppRuntimeFit:
         )
         with patch.object(provisioner, "_ssh_run_command", run_command):
             with pytest.raises(ProvisioningError, match="did not fully offload"):
-                await provisioner._verify_llamacpp_runtime("host1")
+                await provisioner._verify_llamacpp_runtime(
+                    "host1", expected_fit_target_mib=512
+                )
 
         assert run_command.await_args_list == [
             call("host1", "cat -- /var/log/llamacpp-serve.log"),
@@ -1778,7 +1888,14 @@ class TestLlamaCppRuntimeFit:
         ]
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("memory_text", ["not-a-memory-record", "\n"])
+    @pytest.mark.parametrize(
+        "memory_text",
+        [
+            "not-a-memory-record",
+            "\n",
+            "0, 14911, 14089, 822\n0, 14911, 14089, 822",
+        ],
+    )
     async def test_invalid_memory_telemetry_stops_llamacpp(
         self, memory_text: str
     ) -> None:
@@ -1792,7 +1909,9 @@ class TestLlamaCppRuntimeFit:
         )
         with patch.object(provisioner, "_ssh_run_command", run_command):
             with pytest.raises(ProvisioningError, match="memory telemetry"):
-                await provisioner._verify_llamacpp_runtime("host1")
+                await provisioner._verify_llamacpp_runtime(
+                    "host1", expected_fit_target_mib=512
+                )
 
         assert run_command.await_args_list[-1] == call(
             "host1", "bash auto-llamacpp/stop-llamacpp.sh"
@@ -1813,7 +1932,9 @@ class TestLlamaCppRuntimeFit:
             patch.object(provisioner, "_log") as log,
             pytest.raises(ProvisioningError, match="did not fully offload"),
         ):
-            await provisioner._verify_llamacpp_runtime("host1")
+            await provisioner._verify_llamacpp_runtime(
+                "host1", expected_fit_target_mib=512
+            )
 
         log.assert_called_once_with(
             "host1",
@@ -1891,6 +2012,11 @@ class TestVerifyGpu:
         etcd.prefix = "/nodes/"
         provisioner = _make_provisioner(etcd_client=etcd)
         events: list[str] = []
+        runtime = _runtime_state()
+
+        def record_runtime(*_args: object, **_kwargs: object) -> LlamaCppRuntimeState:
+            events.append("runtime")
+            return runtime
 
         with (
             patch.object(provisioner, "_update_state", new_callable=AsyncMock),
@@ -1921,9 +2047,7 @@ class TestVerifyGpu:
             ),
         ):
             poll_health.side_effect = lambda *_args, **_kwargs: events.append("health")
-            verify_runtime.side_effect = lambda *_args, **_kwargs: events.append(
-                "runtime"
-            )
+            verify_runtime.side_effect = record_runtime
             register.side_effect = lambda *_args, **_kwargs: events.append("register")
 
             await provisioner._provision(
@@ -1933,6 +2057,9 @@ class TestVerifyGpu:
             )
 
         assert events == ["health", "runtime", "register"]
+        verify_runtime.assert_awaited_once_with("host1", expected_fit_target_mib=512)
+        assert register.await_args is not None
+        assert register.await_args.kwargs["llamacpp_runtime"] == runtime
 
 
 def _make_full_provisioner(etcd: MagicMock) -> tuple[NodeProvisioner, MagicMock]:

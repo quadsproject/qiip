@@ -30,6 +30,7 @@ LLAMACPP_FALLBACK_CACHE_TYPE=q8_0
 MANAGED_CONTEXT_PER_SLOT=0
 MANAGED_PARALLEL=0
 MANAGED_AGGREGATE_CONTEXT=0
+MANAGED_TRAIN_CONTEXT=0
 MANAGED_CACHE_TYPE_K="$LLAMACPP_PRIMARY_CACHE_TYPE"
 MANAGED_CACHE_TYPE_V="$LLAMACPP_PRIMARY_CACHE_TYPE"
 MANAGED_FLASH_ATTN=auto
@@ -448,6 +449,7 @@ plan_managed_configuration() {
     echo "Planning llama.cpp context and concurrency from free VRAM"
     read_managed_gpu_free_memory
     train_context=$(read_model_train_context)
+    MANAGED_TRAIN_CONTEXT="$train_context"
     min_context=4096
     if [ "$train_context" -lt "$min_context" ]; then
         min_context="$train_context"
@@ -511,6 +513,7 @@ run_llamacpp() {
 # Model:              ${MODEL_ALIAS}
 # GGUF:               ${GGUF_PATH}
 # VRAM Fit Target:    ${FIT_TARGET_MIB} MiB free per GPU
+# Training Context:   ${MANAGED_TRAIN_CONTEXT} tokens
 # Context Per Slot:   ${MANAGED_CONTEXT_PER_SLOT} tokens
 # Parallel Slots:     ${MANAGED_PARALLEL}
 # Aggregate Context:  ${MANAGED_AGGREGATE_CONTEXT} tokens
@@ -536,7 +539,8 @@ EOF
     fi
 
     if [ "$MANAGED" = "1" ]; then
-        printf 'qiip_fit_plan: context_per_slot=%s slots=%s aggregate_context=%s fit_target_mib=%s cache_type_k=%s cache_type_v=%s flash_attn=%s\n' \
+        printf 'qiip_fit_plan: sizing=auto train_context=%s context_per_slot=%s slots=%s aggregate_context=%s fit_target_mib=%s cache_type_k=%s cache_type_v=%s flash_attn=%s\n' \
+            "$MANAGED_TRAIN_CONTEXT" \
             "$MANAGED_CONTEXT_PER_SLOT" \
             "$MANAGED_PARALLEL" \
             "$MANAGED_AGGREGATE_CONTEXT" \

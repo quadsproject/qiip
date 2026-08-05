@@ -133,6 +133,13 @@ select Q4 or mixed cache types. If Q8_0 cannot meet the minimum plan, setup fail
 instead of accepting lower KV precision or CPU layer spill. Q8_0 can change
 generation relative to F16, which is why it is a capacity fallback rather than
 the default for every model.
+
+Pure recurrent-state models (Mamba- and RWKV-family architectures) keep no
+attention KV cache: llama.cpp allocates fixed F32 recurrent state and ignores
+the requested cache types, so the startup log carries no KV-cache record for
+post-health verification to confirm. Managed provisioning rejects such models;
+they are unsupported.
+
 The pinned helper emits model training context only through its normal fitting
 path at debug verbosity 5. QIIP accepts a nonzero fit status after that metadata
 is present because the all-layer probe can legitimately exceed an undersized
@@ -143,10 +150,16 @@ full-offload values explicitly and disables the server's second fitting pass.
 The aggregate context is at least `context_per_slot * slots`; idle slots leave
 their share available to active requests, while all slots can simultaneously
 reach the guaranteed context. QIIP waits for `/health`, then refuses healthy
-registration unless the runtime matches the plan, KV is unified, every model
 registration unless the runtime matches the plan, the selected K/V types are
-present in the allocated unified KV cache, every model layer was offloaded to
-GPU, and actual free VRAM still meets the target.
+present in the allocated unified KV cache, KV is unified, every model layer was
+offloaded to GPU, and actual free VRAM still meets the target.
+
+The `qiip_fit_plan` startup record includes `sizing=auto` and the model's
+`train_context` alongside the effective context, concurrency, reserve, and
+cache policy. After verification, QIIP stores the requested policy, effective
+configuration, device-indexed total/used/free VRAM, and an ISO-8601 UTC
+observation time in the node record. The node-detail dashboard presents this as
+a read-only post-load snapshot; it is not live GPU telemetry.
 
 With unified KV, llama.cpp internally reports `n_ctx_seq` as the aggregate
 pool. When that exceeds the model training context, b10242 emits its expected

@@ -42,6 +42,7 @@ class TestAdminNodeResponse:
         assert response.circuit_breaker_state == "closed"
         assert response.engine is None
         assert response.artifact_id is None
+        assert response.llamacpp_runtime is None
 
     def test_registered_engine_and_artifact_are_typed(self) -> None:
         response = AdminNodeResponse(

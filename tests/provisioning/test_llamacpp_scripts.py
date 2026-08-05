@@ -258,7 +258,8 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(
     assert not ({"-b", "--batch-size"} & set(args))
     assert "--cont-batching" not in args
     assert (tmp_path / "llama.log").read_text(encoding="utf-8") == (
-        "qiip_fit_plan: context_per_slot=128000 slots=8 "
+        "qiip_fit_plan: sizing=auto train_context=128000 "
+        "context_per_slot=128000 slots=8 "
         "aggregate_context=1024000 fit_target_mib=1536 "
         f"cache_type_k={expected_cache_type} "
         f"cache_type_v={expected_cache_type} "

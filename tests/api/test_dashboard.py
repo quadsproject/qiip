@@ -375,3 +375,17 @@ class TestNodeDetailPage:
         )
         assert 'id="artifact-select"' in response.text
         assert 'colspan="10"' in response.text
+
+    def test_node_detail_contains_read_only_llamacpp_runtime_card(
+        self, client: TestClient
+    ) -> None:
+        response = client.get("/dashboard/nodes/test-node")
+
+        assert 'id="llamacpp-runtime-panel" hidden' in response.text
+        assert 'id="llamacpp-runtime-status"' in response.text
+        assert 'aria-live="polite"' in response.text
+        assert 'id="llamacpp-runtime-values" class="runtime-grid"' in response.text
+        assert "<dl" in response.text
+        assert 'id="llamacpp-runtime-min-free"' in response.text
+        assert 'id="llamacpp-runtime-min-headroom"' in response.text
+        assert 'id="llamacpp-runtime-gpus"' in response.text

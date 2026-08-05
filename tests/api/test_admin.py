@@ -50,7 +50,12 @@ from inference_proxy.models.llmfit import (
     ModelRecommendation,
     SystemInfo,
 )
-from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
+from inference_proxy.models.node import (
+    InferenceEngine,
+    LlamaCppRuntimeState,
+    Node,
+    NodeStatus,
+)
 from inference_proxy.models.quads import QUADSHost
 from inference_proxy.provisioning.provisioner import (
     ProvisioningCapacityError,
@@ -78,6 +83,7 @@ def _make_node(
     managed: bool = True,
     engine: InferenceEngine = InferenceEngine.VLLM,
     artifact_id: str | None = None,
+    llamacpp_runtime: LlamaCppRuntimeState | None = None,
 ) -> Node:
     """Create a test node with sensible defaults."""
     return Node(
@@ -88,6 +94,32 @@ def _make_node(
         managed=managed,
         engine=engine,
         artifact_id=artifact_id,
+        llamacpp_runtime=llamacpp_runtime,
+    )
+
+
+def _llamacpp_runtime() -> LlamaCppRuntimeState:
+    return LlamaCppRuntimeState.model_validate(
+        {
+            "requested": {"sizing": "auto", "fit_target_mib": 512},
+            "effective": {
+                "train_context": 262144,
+                "context_per_slot": 12544,
+                "slot_context_limit": 12544,
+                "slots": 1,
+                "aggregate_context": 12544,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+                "flash_attn": "on",
+                "kv_unified": True,
+                "gpu_layers": 31,
+                "total_layers": 31,
+            },
+            "gpus": [
+                {"index": 0, "total_mib": 14911, "used_mib": 14089, "free_mib": 822}
+            ],
+            "observed_at": "2026-08-05T20:54:07Z",
+        }
     )
 
 
@@ -153,6 +185,7 @@ class TestAdminNodesPopulated:
             "circuit_breaker_state",
             "engine",
             "artifact_id",
+            "llamacpp_runtime",
             "state",
             "actions",
             "gpu_vendor",
@@ -165,6 +198,44 @@ class TestAdminNodesPopulated:
         assert set(node.keys()) == expected
         assert "last_heartbeat" not in node
         assert "capabilities" not in node
+
+    def test_managed_llamacpp_runtime_is_serialized(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+    ) -> None:
+        test_registry.add(
+            _make_node(
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact_id="a" * 64,
+                llamacpp_runtime=_llamacpp_runtime(),
+            )
+        )
+
+        response = client.get("/admin/nodes")
+
+        assert response.status_code == 200
+        runtime = response.json()[0]["llamacpp_runtime"]
+        assert runtime == {
+            "requested": {"sizing": "auto", "fit_target_mib": 512},
+            "effective": {
+                "train_context": 262144,
+                "context_per_slot": 12544,
+                "slot_context_limit": 12544,
+                "slots": 1,
+                "aggregate_context": 12544,
+                "cache_type_k": "q8_0",
+                "cache_type_v": "q8_0",
+                "flash_attn": "on",
+                "kv_unified": True,
+                "gpu_layers": 31,
+                "total_layers": 31,
+            },
+            "gpus": [
+                {"index": 0, "total_mib": 14911, "used_mib": 14089, "free_mib": 822}
+            ],
+            "observed_at": "2026-08-05T20:54:07Z",
+        }
 
     def test_mixed_statuses_all_appear(
         self,
@@ -227,6 +298,7 @@ class TestAdminNodesPopulated:
                 "circuit_breaker_state": "closed",
                 "engine": "vllm",
                 "artifact_id": None,
+                "llamacpp_runtime": None,
                 "state": "failed",
                 "actions": ["setup", "teardown"],
                 "gpu_vendor": None,

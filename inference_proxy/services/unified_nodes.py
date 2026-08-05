@@ -98,6 +98,7 @@ class UnifiedNodeService:
             circuit_breaker_state=breaker.state if breaker else "closed",
             engine=node.engine,
             artifact_id=node.artifact_id,
+            llamacpp_runtime=node.llamacpp_runtime,
             state=state,
             actions=list(_STATE_ACTIONS.get(state, [])),
             gpu_vendor=host.gpu_vendor if host else None,

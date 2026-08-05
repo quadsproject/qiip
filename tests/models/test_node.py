@@ -9,10 +9,48 @@ from pydantic import ValidationError
 
 from inference_proxy.models.node import (
     InferenceEngine,
+    LlamaCppCacheType,
+    LlamaCppFlashAttention,
+    LlamaCppGPUState,
+    LlamaCppRuntimeEffective,
+    LlamaCppRuntimeRequest,
+    LlamaCppRuntimeState,
+    LlamaCppSizingMode,
     Node,
     NodeCapabilities,
     NodeStatus,
 )
+
+
+def _runtime_state() -> LlamaCppRuntimeState:
+    return LlamaCppRuntimeState(
+        requested=LlamaCppRuntimeRequest(
+            sizing=LlamaCppSizingMode.AUTO,
+            fit_target_mib=512,
+        ),
+        effective=LlamaCppRuntimeEffective(
+            train_context=262144,
+            context_per_slot=12544,
+            slot_context_limit=12544,
+            slots=1,
+            aggregate_context=12544,
+            cache_type_k=LlamaCppCacheType.Q8_0,
+            cache_type_v=LlamaCppCacheType.Q8_0,
+            flash_attn=LlamaCppFlashAttention.ON,
+            kv_unified=True,
+            gpu_layers=31,
+            total_layers=31,
+        ),
+        gpus=(
+            LlamaCppGPUState(
+                index=0,
+                total_mib=14911,
+                used_mib=14089,
+                free_mib=822,
+            ),
+        ),
+        observed_at=datetime(2026, 8, 5, 20, 54, 7, tzinfo=UTC),
+    )
 
 
 class TestNodeStatusEnumValues:
@@ -46,6 +84,7 @@ class TestNodeMinimalCreation:
         assert node.managed is False
         assert node.engine is InferenceEngine.VLLM
         assert node.artifact_id is None
+        assert node.llamacpp_runtime is None
 
 
 class TestNodeFullCreation:
@@ -61,6 +100,7 @@ class TestNodeFullCreation:
             active_connections=5,
             engine=InferenceEngine.LLAMA_CPP,
             artifact_id="a" * 64,
+            llamacpp_runtime=_runtime_state(),
         )
         dumped = node.model_dump()
         roundtripped = Node.model_validate(dumped)
@@ -74,10 +114,18 @@ class TestNodeFullCreation:
         assert roundtripped.active_connections == 5
         assert roundtripped.engine is InferenceEngine.LLAMA_CPP
         assert roundtripped.artifact_id == "a" * 64
+        assert roundtripped.llamacpp_runtime == _runtime_state()
 
     def test_rejects_non_sha256_artifact_id(self) -> None:
         with pytest.raises(ValidationError):
             Node(node_id="node-1", endpoint="host:8000", artifact_id="latest")
+
+    def test_runtime_observation_requires_timezone(self) -> None:
+        payload = _runtime_state().model_dump()
+        payload["observed_at"] = datetime(2026, 8, 5, 20, 54, 7)
+
+        with pytest.raises(ValidationError, match="must include a timezone"):
+            LlamaCppRuntimeState.model_validate(payload)
 
 
 class TestNodeCapabilitiesDefaults:
