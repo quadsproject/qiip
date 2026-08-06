@@ -401,11 +401,16 @@ class TestNodeDetailPage:
         assert 'id="llamacpp-context-per-slot"' in response.text
         assert 'id="llamacpp-parallel-slots"' in response.text
         assert 'id="llamacpp-cache-type"' in response.text
+        assert 'class="runtime-input-unit runtime-cache-input"' in response.text
+        assert "<span>K/V</span>" in response.text
+        assert 'id="llamacpp-estimator-overrun" type="checkbox"' in response.text
+        assert "Attempt launch if estimate exceeds target" in response.text
         assert 'id="llamacpp-relaunch-submit"' in response.text
         assert 'id="llamacpp-relaunch-reset"' in response.text
         assert 'id="llamacpp-runtime-values" class="runtime-grid"' in response.text
         assert "<dl" in response.text
         assert 'id="llamacpp-runtime-min-free"' in response.text
+        assert 'id="llamacpp-runtime-estimator"' in response.text
         assert 'id="llamacpp-runtime-min-headroom"' in response.text
         assert "runtime-summary" not in response.text
         assert 'id="llamacpp-runtime-gpus"' in response.text

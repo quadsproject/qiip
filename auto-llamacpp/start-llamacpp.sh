@@ -16,6 +16,7 @@ MANAGED_SIZING="${AUTOLLAMACPP_MANAGED_SIZING:-auto}"
 MANAGED_REQUESTED_CONTEXT="${AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT:-}"
 MANAGED_REQUESTED_PARALLEL="${AUTOLLAMACPP_MANAGED_PARALLEL:-}"
 MANAGED_REQUESTED_CACHE_TYPE="${AUTOLLAMACPP_MANAGED_CACHE_TYPE:-}"
+MANAGED_ALLOW_ESTIMATOR_OVERRUN="${AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN:-0}"
 SCRIPT_DIR="${AUTOLLAMACPP_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 LLAMACPP_BIN="${AUTOLLAMACPP_BIN:-/usr/local/bin/llama-server}"
 LLAMACPP_FIT_BIN="${AUTOLLAMACPP_FIT_BIN:-/usr/local/bin/llama-fit-params}"
@@ -39,6 +40,7 @@ MANAGED_TRAIN_CONTEXT=0
 MANAGED_CACHE_TYPE_K="$LLAMACPP_PRIMARY_CACHE_TYPE"
 MANAGED_CACHE_TYPE_V="$LLAMACPP_PRIMARY_CACHE_TYPE"
 MANAGED_FLASH_ATTN=auto
+MANAGED_ESTIMATOR_OVERRUN_USED=false
 MANAGED_GPU_FREE_MIB=()
 
 # shellcheck source=auto-llamacpp/llamacpp-process.sh
@@ -133,12 +135,21 @@ configure_llamacpp_params() {
             echo "FATAL: AUTOLLAMACPP_FIT_TARGET_MIB must be a positive integer MiB value" >&2
             return 1
         fi
+        if [ "$MANAGED_ALLOW_ESTIMATOR_OVERRUN" != "0" ] \
+            && [ "$MANAGED_ALLOW_ESTIMATOR_OVERRUN" != "1" ]; then
+            echo "FATAL: AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN must be 0 or 1" >&2
+            return 1
+        fi
         case "$MANAGED_SIZING" in
             auto)
                 if [ -n "$MANAGED_REQUESTED_CONTEXT" ] \
                     || [ -n "$MANAGED_REQUESTED_PARALLEL" ] \
                     || [ -n "$MANAGED_REQUESTED_CACHE_TYPE" ]; then
                     echo "FATAL: automatic managed sizing does not accept custom values" >&2
+                    return 1
+                fi
+                if [ "$MANAGED_ALLOW_ESTIMATOR_OVERRUN" != "0" ]; then
+                    echo "FATAL: automatic managed sizing does not accept estimator overrun" >&2
                     return 1
                 fi
                 ;;
@@ -248,6 +259,7 @@ clear_script_environment() {
     unset AUTOLLAMACPP_MANAGED AUTOLLAMACPP_FIT_TARGET_MIB
     unset AUTOLLAMACPP_MANAGED_SIZING AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT
     unset AUTOLLAMACPP_MANAGED_PARALLEL AUTOLLAMACPP_MANAGED_CACHE_TYPE
+    unset AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN
     unset AUTOLLAMACPP_SCRIPT_DIR AUTOLLAMACPP_BIN AUTOLLAMACPP_FIT_BIN
     unset AUTOLLAMACPP_INSTALL_ROOT
     unset AUTOLLAMACPP_PID_FILE
@@ -525,8 +537,12 @@ plan_managed_configuration() {
             return 1
         fi
         if [ "$status" -ne 0 ]; then
-            echo "FATAL: custom llama.cpp sizing cannot fully offload while preserving ${FIT_TARGET_MIB} MiB free per GPU" >&2
-            return 1
+            if [ "$MANAGED_ALLOW_ESTIMATOR_OVERRUN" != "1" ]; then
+                echo "FATAL: custom llama.cpp sizing cannot fully offload while preserving ${FIT_TARGET_MIB} MiB free per GPU" >&2
+                return 1
+            fi
+            MANAGED_ESTIMATOR_OVERRUN_USED=true
+            echo "WARNING: llama.cpp estimator predicts less than ${FIT_TARGET_MIB} MiB free per GPU; attempting the exact custom configuration and verifying actual post-load VRAM"
         fi
         MANAGED_CONTEXT_PER_SLOT="$MANAGED_REQUESTED_CONTEXT"
         MANAGED_PARALLEL="$MANAGED_REQUESTED_PARALLEL"
@@ -605,6 +621,7 @@ run_llamacpp() {
 # Aggregate Context:  ${MANAGED_AGGREGATE_CONTEXT} tokens
 # KV Cache:           K=${MANAGED_CACHE_TYPE_K}, V=${MANAGED_CACHE_TYPE_V}
 # Flash Attention:    ${MANAGED_FLASH_ATTN}
+# Estimator Overrun:  ${MANAGED_ESTIMATOR_OVERRUN_USED}
 # ================================================
 
 EOF
@@ -625,7 +642,7 @@ EOF
     fi
 
     if [ "$MANAGED" = "1" ]; then
-        printf 'qiip_fit_plan: sizing=%s train_context=%s context_per_slot=%s slots=%s aggregate_context=%s fit_target_mib=%s cache_type_k=%s cache_type_v=%s flash_attn=%s\n' \
+        printf 'qiip_fit_plan: sizing=%s train_context=%s context_per_slot=%s slots=%s aggregate_context=%s fit_target_mib=%s cache_type_k=%s cache_type_v=%s flash_attn=%s estimator_overrun_used=%s\n' \
             "$MANAGED_SIZING" \
             "$MANAGED_TRAIN_CONTEXT" \
             "$MANAGED_CONTEXT_PER_SLOT" \
@@ -634,7 +651,8 @@ EOF
             "$FIT_TARGET_MIB" \
             "$MANAGED_CACHE_TYPE_K" \
             "$MANAGED_CACHE_TYPE_V" \
-            "$MANAGED_FLASH_ATTN" > "$LLAMACPP_LOG_FILE"
+            "$MANAGED_FLASH_ATTN" \
+            "$MANAGED_ESTIMATOR_OVERRUN_USED" > "$LLAMACPP_LOG_FILE"
         # llama.cpp's auto parallel value is a fixed four, not a VRAM fit. The
         # planner uses llama-fit-params to select the largest full-context slot
         # count that preserves the requested free-memory margin. A unified KV

@@ -149,6 +149,7 @@ class TestLlamaCppRuntimeRequest:
             context_per_slot=32768,
             slots=3,
             cache_type=LlamaCppCacheType.Q8_0,
+            allow_estimator_overrun=True,
         )
 
         payload = request.model_dump(mode="json")
@@ -158,6 +159,7 @@ class TestLlamaCppRuntimeRequest:
             "context_per_slot": 32768,
             "slots": 3,
             "cache_type": "q8_0",
+            "allow_estimator_overrun": True,
         }
         assert LlamaCppRuntimeRequest.model_validate(payload) == request
 
@@ -167,6 +169,7 @@ class TestLlamaCppRuntimeRequest:
             {"context_per_slot": 4096},
             {"slots": 2},
             {"cache_type": "f16"},
+            {"allow_estimator_overrun": True},
         ],
     )
     def test_automatic_policy_rejects_custom_fields(

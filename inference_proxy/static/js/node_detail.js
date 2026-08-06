@@ -313,12 +313,16 @@ function renderLlamaCppRelaunchForm(node, observation) {
   document.getElementById("llamacpp-context-per-slot").value = fields.context_per_slot;
   document.getElementById("llamacpp-parallel-slots").value = fields.slots;
   document.getElementById("llamacpp-cache-type").value = fields.cache_type;
+  document.getElementById("llamacpp-estimator-overrun").checked =
+    fields.allow_estimator_overrun;
 
   document.getElementById("llamacpp-sizing").disabled = disableAll;
   document.getElementById("llamacpp-fit-target").disabled = disableAll;
   document.getElementById("llamacpp-context-per-slot").disabled = disableAll || auto;
   document.getElementById("llamacpp-parallel-slots").disabled = disableAll || auto;
   document.getElementById("llamacpp-cache-type").disabled = disableAll || auto;
+  document.getElementById("llamacpp-estimator-overrun").disabled =
+    disableAll || auto;
   document.getElementById("llamacpp-relaunch-submit").disabled = disableAll;
   document.getElementById("llamacpp-relaunch-reset").disabled = busy ||
     (!controllerState.dirty && !controllerState.stale);
@@ -332,7 +336,9 @@ function renderLlamaCppRelaunchForm(node, observation) {
   } else if (auto) {
     help.textContent = "Automatic sizing recomputes context, slots, and KV cache from available VRAM. The disabled values show the current effective plan.";
   } else {
-    help.textContent = "Custom sizing is estimator-validated after draining. Context uses 256-token increments; K and V use the selected cache type.";
+    help.textContent = fields.allow_estimator_overrun
+      ? "Custom sizing will attempt the exact values even when the estimate exceeds the target. Actual post-load VRAM must still meet the target."
+      : "Custom sizing is estimator-validated after draining. Context uses 256-token increments; K and V use the selected cache type.";
   }
 
   var preview = llamaCppRelaunch.preview();
@@ -393,6 +399,12 @@ function renderLlamaCppRuntime(node, observation) {
   document.getElementById("llamacpp-runtime-flash").textContent = effective.flash_attn === "on" ? "On" : "Auto";
   document.getElementById("llamacpp-runtime-offload").textContent = effective.gpu_layers + " / " + effective.total_layers + " layers";
   document.getElementById("llamacpp-runtime-reserve").textContent = formatRuntimeCount(requested.fit_target_mib) + " MiB per GPU";
+  document.getElementById("llamacpp-runtime-estimator").textContent =
+    effective.estimator_overrun_used === true
+      ? "Overrun accepted; post-load target verified"
+      : requested.allow_estimator_overrun === true
+        ? "Within estimate; overrun allowed"
+        : "Within estimate";
   document.getElementById("llamacpp-runtime-observed").textContent = "Post-load snapshot at " + formatRuntimeTimestamp(runtime.observed_at);
 
   var gpuList = document.getElementById("llamacpp-runtime-gpus");
@@ -1216,9 +1228,15 @@ document.addEventListener("DOMContentLoaded", function () {
       ["llamacpp-context-per-slot", "context_per_slot", "input"],
       ["llamacpp-parallel-slots", "slots", "input"],
       ["llamacpp-cache-type", "cache_type", "change"],
+      ["llamacpp-estimator-overrun", "allow_estimator_overrun", "change"],
     ].forEach(function (binding) {
       document.getElementById(binding[0]).addEventListener(binding[2], function (event) {
-        llamaCppRelaunch.setField(binding[1], event.target.value);
+        llamaCppRelaunch.setField(
+          binding[1],
+          binding[1] === "allow_estimator_overrun"
+            ? event.target.checked
+            : event.target.value,
+        );
         clearRelaunchError();
         if (currentDetailNode) {
           renderLlamaCppRuntime(currentDetailNode, currentRelaunchObservation);

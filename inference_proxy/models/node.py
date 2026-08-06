@@ -88,6 +88,7 @@ class LlamaCppRuntimeRequest(BaseModel):
     context_per_slot: int | None = Field(default=None, ge=LLAMACPP_CONTEXT_ALIGNMENT)
     slots: int | None = Field(default=None, ge=1, le=LLAMACPP_MAX_SEQUENCES)
     cache_type: LlamaCppCacheType | None = None
+    allow_estimator_overrun: bool = False
 
     @model_serializer
     def serialize_policy(self) -> dict[str, object]:
@@ -102,13 +103,17 @@ class LlamaCppRuntimeRequest(BaseModel):
             values["slots"] = self.slots
         if self.cache_type is not None:
             values["cache_type"] = self.cache_type
+        if self.allow_estimator_overrun:
+            values["allow_estimator_overrun"] = True
         return values
 
     @model_validator(mode="after")
     def validate_sizing_policy(self) -> LlamaCppRuntimeRequest:
         custom_values = (self.context_per_slot, self.slots, self.cache_type)
         if self.sizing is LlamaCppSizingMode.AUTO:
-            if any(value is not None for value in custom_values):
+            if any(value is not None for value in custom_values) or (
+                self.allow_estimator_overrun
+            ):
                 raise ValueError(
                     "automatic llama.cpp sizing does not accept custom values"
                 )
@@ -146,6 +151,7 @@ class LlamaCppRuntimeEffective(BaseModel):
     kv_unified: bool
     gpu_layers: int = Field(ge=1)
     total_layers: int = Field(ge=1)
+    estimator_overrun_used: bool = False
 
 
 class LlamaCppGPUState(BaseModel):

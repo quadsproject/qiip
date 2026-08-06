@@ -419,6 +419,7 @@ function llamaRuntime(requested) {
       slot_context_limit: 12544, slots: 1, aggregate_context: 12544,
       cache_type_k: "q8_0", cache_type_v: "q8_0", flash_attn: "on",
       kv_unified: true, gpu_layers: 31, total_layers: 31,
+      estimator_overrun_used: false,
     },
     gpus: [
       { index: 0, total_mib: 15360, used_mib: 14117, free_mib: 1243 },
@@ -785,6 +786,7 @@ installDetailFetch([], true, "llama_cpp", {
     aggregate: byId("llamacpp-runtime-aggregate").textContent,
     kv: byId("llamacpp-runtime-kv").textContent,
     reserve: byId("llamacpp-runtime-reserve").textContent,
+    estimator: byId("llamacpp-runtime-estimator").textContent,
     gpu: byId("llamacpp-runtime-gpus").children[0].textContent,
     gpuCount: byId("llamacpp-runtime-gpus").children.length,
     observed: byId("llamacpp-runtime-observed").textContent,
@@ -806,6 +808,7 @@ installDetailFetch([], true, "llama_cpp", {
         "aggregate": "12,544 tokens",
         "kv": "Q8_0 / Q8_0",
         "reserve": "512 MiB per GPU",
+        "estimator": "Within estimate",
         "gpu": (
             "GPU 0: 14,089 MiB used, 822 MiB free of 14,911 MiB (310 MiB above target)"
         ),
@@ -814,6 +817,32 @@ installDetailFetch([], true, "llama_cpp", {
     }
     assert result["observed"].startswith("Post-load snapshot at ")
     assert result["observed"] != "Post-load snapshot at —"
+
+
+def test_node_detail_identifies_verified_estimator_overrun() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+const runtime = llamaRuntime({
+  sizing: "custom", fit_target_mib: 128,
+  context_per_slot: 55296, slots: 1, cache_type: "q8_0",
+  allow_estimator_overrun: true,
+});
+runtime.effective.estimator_overrun_used = true;
+installDetailFetch([], true, "llama_cpp", runtime);
+(async function () {
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    estimator: byId("llamacpp-runtime-estimator").textContent,
+    checked: byId("llamacpp-estimator-overrun").checked === true,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "estimator": "Overrun accepted; post-load target verified",
+        "checked": True,
+    }
 
 
 @pytest.mark.parametrize(
@@ -827,6 +856,7 @@ installDetailFetch([], true, "llama_cpp", {
                 "context_per_slot": 32768,
                 "slots": 3,
                 "cache_type": "f16",
+                "allow_estimator_overrun": True,
             },
             False,
         ),
@@ -842,6 +872,8 @@ installDetailFetch([], true, "llama_cpp", llamaRuntime({json.dumps(requested)}))
 (async function () {{
   await sandbox.refreshDetail();
   const disabledBeforeSubmit = byId("llamacpp-context-per-slot").disabled;
+  const overrideDisabled = byId("llamacpp-estimator-overrun").disabled;
+  const overrideChecked = byId("llamacpp-estimator-overrun").checked === true;
   const baseFetch = sandbox.fetch;
   let captured = null;
   sandbox.fetch = async function (url, options) {{
@@ -855,6 +887,8 @@ installDetailFetch([], true, "llama_cpp", llamaRuntime({json.dumps(requested)}))
   process.stdout.write(JSON.stringify({{
     formHidden: byId("llamacpp-relaunch-form").hidden,
     disabledBeforeSubmit,
+    overrideDisabled,
+    overrideChecked,
     captured,
     submission: sandbox.llamaCppRelaunch.state().submission,
   }}));
@@ -865,6 +899,8 @@ installDetailFetch([], true, "llama_cpp", llamaRuntime({json.dumps(requested)}))
     assert result == {
         "formHidden": False,
         "disabledBeforeSubmit": custom_controls_disabled,
+        "overrideDisabled": custom_controls_disabled,
+        "overrideChecked": requested.get("allow_estimator_overrun", False),
         "captured": requested,
         "submission": "waiting",
     }

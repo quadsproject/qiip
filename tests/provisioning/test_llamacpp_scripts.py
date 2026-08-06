@@ -104,6 +104,9 @@ model_mib=8500
 if [ "${{AUTOLLAMACPP_TEST_FORCE_Q8:-0}}" = 1 ] && [ "$cache_type_k" = f16 ]; then
     model_mib=50000
 fi
+if [ "${{AUTOLLAMACPP_TEST_FORCE_NONFIT:-0}}" = 1 ] && [ -n "$cache_type_k" ]; then
+    model_mib=50000
+fi
 printf 'CUDA0 %s %s 200\n' "$model_mib" "$context_mib"
 printf 'Host 0 0 100\n'
 """,
@@ -181,16 +184,76 @@ def test_start_preserves_split_entrypoint_filename_and_siblings(
         "requested_context",
         "requested_slots",
         "requested_cache_type",
+        "allow_estimator_overrun",
+        "force_nonfit",
         "expected_context_per_slot",
         "expected_slots",
         "expected_aggregate_context",
         "expected_cache_type",
         "expected_flash_attn",
+        "expected_estimator_overrun_used",
     ),
     [
-        ("auto", False, "", "", "", 128000, 8, 1024000, "f16", "auto"),
-        ("auto", True, "", "", "", 128000, 8, 1024000, "q8_0", "on"),
-        ("custom", False, "32768", "3", "q8_0", 32768, 3, 98304, "q8_0", "on"),
+        (
+            "auto",
+            False,
+            "",
+            "",
+            "",
+            "0",
+            False,
+            128000,
+            8,
+            1024000,
+            "f16",
+            "auto",
+            "false",
+        ),
+        (
+            "auto",
+            True,
+            "",
+            "",
+            "",
+            "0",
+            False,
+            128000,
+            8,
+            1024000,
+            "q8_0",
+            "on",
+            "false",
+        ),
+        (
+            "custom",
+            False,
+            "32768",
+            "3",
+            "q8_0",
+            "0",
+            False,
+            32768,
+            3,
+            98304,
+            "q8_0",
+            "on",
+            "false",
+        ),
+        (
+            "custom",
+            False,
+            "55296",
+            "1",
+            "q8_0",
+            "1",
+            True,
+            55296,
+            1,
+            55296,
+            "q8_0",
+            "on",
+            "true",
+        ),
     ],
 )
 def test_managed_launch_uses_exact_artifact_and_explicit_alias(
@@ -201,11 +264,14 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(
     requested_context: str,
     requested_slots: str,
     requested_cache_type: str,
+    allow_estimator_overrun: str,
+    force_nonfit: bool,
     expected_context_per_slot: int,
     expected_slots: int,
     expected_aggregate_context: int,
     expected_cache_type: str,
     expected_flash_attn: str,
+    expected_estimator_overrun_used: str,
 ) -> None:
     """Exercise the public launch path without relying on the new helper name."""
     exact = tmp_path / "gguf" / "artifact -- id" / "files" / "model---q4_k_m.gguf"
@@ -249,6 +315,7 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(
         "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": requested_context,
         "AUTOLLAMACPP_MANAGED_PARALLEL": requested_slots,
         "AUTOLLAMACPP_MANAGED_CACHE_TYPE": requested_cache_type,
+        "AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN": allow_estimator_overrun,
         "AUTOLLAMACPP_BIN": str(fake_server),
         "AUTOLLAMACPP_FIT_BIN": str(fake_fit),
         "AUTOLLAMACPP_PID_FILE": str(tmp_path / "llama.pid"),
@@ -256,6 +323,7 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(
         "AUTOLLAMACPP_TEST_ARGS": str(args_file),
         "AUTOLLAMACPP_TEST_CALLS": str(fit_calls),
         "AUTOLLAMACPP_TEST_FORCE_Q8": "1" if force_q8 else "0",
+        "AUTOLLAMACPP_TEST_FORCE_NONFIT": "1" if force_nonfit else "0",
     }
     command = "\n".join(
         (
@@ -292,7 +360,8 @@ def test_managed_launch_uses_exact_artifact_and_explicit_alias(
         f"aggregate_context={expected_aggregate_context} fit_target_mib=1536 "
         f"cache_type_k={expected_cache_type} "
         f"cache_type_v={expected_cache_type} "
-        f"flash_attn={expected_flash_attn}\n"
+        f"flash_attn={expected_flash_attn} "
+        f"estimator_overrun_used={expected_estimator_overrun_used}\n"
     )
     candidate_calls = [
         line
@@ -503,6 +572,97 @@ printf 'Host 0 0 100\n'
     assert "q4" not in calls
 
 
+@pytest.mark.parametrize(
+    ("allow_overrun", "expected_status", "expected_used"),
+    [("0", 1, None), ("1", 0, "true")],
+)
+def test_custom_estimator_overrun_only_bypasses_valid_nonfit(
+    tmp_path: Path,
+    allow_overrun: str,
+    expected_status: int,
+    expected_used: str | None,
+) -> None:
+    fake_fit = tmp_path / "llama-fit-params"
+    fake_tools = tmp_path / "bin"
+    fake_tools.mkdir()
+    _write_executable(
+        fake_fit,
+        """#!/bin/bash
+if [[ " $* " != *' --ctx-size '* ]]; then
+    echo 'llama_model_loader: n_ctx_train = 8192' >&2
+    exit 1
+fi
+printf 'CUDA0 9000 1000 500\n'
+printf 'Host 0 0 100\n'
+""",
+    )
+    _write_executable(fake_tools / "nvidia-smi", "#!/bin/bash\nprintf '10000\n'\n")
+    result = _run_shell(
+        _source_start(
+            "GPU_COUNT=1\n"
+            "GGUF_PATH=/cache/model.gguf\n"
+            "plan_managed_configuration\n"
+            'printf "overrun=%s\\n" "$MANAGED_ESTIMATOR_OVERRUN_USED"'
+        ),
+        env={
+            **os.environ,
+            "PATH": f"{fake_tools}:/usr/bin:/bin",
+            "AUTOLLAMACPP_FIT_BIN": str(fake_fit),
+            "AUTOLLAMACPP_MANAGED_SIZING": "custom",
+            "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "8192",
+            "AUTOLLAMACPP_MANAGED_PARALLEL": "1",
+            "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "q8_0",
+            "AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN": allow_overrun,
+        },
+    )
+
+    assert (result.returncode == 0) is (expected_status == 0)
+    if expected_used is None:
+        assert "cannot fully offload while preserving" in result.stderr
+    else:
+        assert "attempting the exact custom configuration" in result.stdout
+        assert result.stdout.splitlines()[-1] == f"overrun={expected_used}"
+
+
+def test_custom_estimator_overrun_never_bypasses_estimator_failure(
+    tmp_path: Path,
+) -> None:
+    fake_fit = tmp_path / "llama-fit-params"
+    fake_tools = tmp_path / "bin"
+    fake_tools.mkdir()
+    _write_executable(
+        fake_fit,
+        """#!/bin/bash
+if [[ " $* " != *' --ctx-size '* ]]; then
+    echo 'llama_model_loader: n_ctx_train = 8192' >&2
+    exit 1
+fi
+echo 'estimator crashed' >&2
+exit 47
+""",
+    )
+    _write_executable(fake_tools / "nvidia-smi", "#!/bin/bash\nprintf '10000\n'\n")
+    result = _run_shell(
+        _source_start(
+            "GPU_COUNT=1\nGGUF_PATH=/cache/model.gguf\nplan_managed_configuration"
+        ),
+        env={
+            **os.environ,
+            "PATH": f"{fake_tools}:/usr/bin:/bin",
+            "AUTOLLAMACPP_FIT_BIN": str(fake_fit),
+            "AUTOLLAMACPP_MANAGED_SIZING": "custom",
+            "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "8192",
+            "AUTOLLAMACPP_MANAGED_PARALLEL": "1",
+            "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "q8_0",
+            "AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN": "1",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "failed to estimate VRAM" in result.stderr
+    assert "attempting the exact custom configuration" not in result.stdout
+
+
 def test_managed_planner_names_missing_cuda_estimates(tmp_path: Path) -> None:
     fake_fit = tmp_path / "llama-fit-params"
     _write_executable(fake_fit, "#!/bin/bash\nprintf 'Vulkan0 10 20 30\\n'\n")
@@ -575,6 +735,17 @@ def test_managed_start_requires_positive_fit_target(value: str) -> None:
                 "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "4096",
             },
             "automatic managed sizing does not accept custom values",
+        ),
+        (
+            {
+                "AUTOLLAMACPP_MANAGED_SIZING": "auto",
+                "AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN": "1",
+            },
+            "automatic managed sizing does not accept estimator overrun",
+        ),
+        (
+            {"AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN": "yes"},
+            "must be 0 or 1",
         ),
         (
             {"AUTOLLAMACPP_MANAGED_SIZING": "custom"},
@@ -1129,6 +1300,7 @@ def test_start_clears_llama_argument_namespace_including_context_size() -> None:
         "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "4096",
         "AUTOLLAMACPP_MANAGED_PARALLEL": "2",
         "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "f16",
+        "AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN": "1",
     }
     result = _run_shell(
         f"source {shlex.quote(str(START_SCRIPT))}\n"
@@ -1136,7 +1308,8 @@ def test_start_clears_llama_argument_namespace_including_context_size() -> None:
         "if compgen -A variable LLAMA_ARG_ >/dev/null; then exit 9; fi\n"
         "for name in AUTOLLAMACPP_MANAGED_SIZING "
         "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT AUTOLLAMACPP_MANAGED_PARALLEL "
-        "AUTOLLAMACPP_MANAGED_CACHE_TYPE; do\n"
+        "AUTOLLAMACPP_MANAGED_CACHE_TYPE "
+        "AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN; do\n"
         '    if [ -n "${!name+x}" ]; then exit 10; fi\n'
         "done",
         env=env,

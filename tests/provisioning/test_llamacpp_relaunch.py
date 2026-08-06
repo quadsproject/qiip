@@ -50,6 +50,7 @@ def _request(
     fit_target_mib: int = 512,
     context_per_slot: int = 24576,
     slots: int = 2,
+    allow_estimator_overrun: bool = False,
 ) -> LlamaCppRuntimeRequest:
     if sizing is LlamaCppSizingMode.AUTO:
         return LlamaCppRuntimeRequest(
@@ -62,6 +63,7 @@ def _request(
         context_per_slot=context_per_slot,
         slots=slots,
         cache_type=LlamaCppCacheType.Q8_0,
+        allow_estimator_overrun=allow_estimator_overrun,
     )
 
 
@@ -292,6 +294,7 @@ async def test_drain_timeout_restores_node_without_stopping_server() -> None:
                 fit_target_mib=768,
                 context_per_slot=16384,
                 slots=3,
+                allow_estimator_overrun=True,
             ),
             "Previous custom sizing restored",
             id="custom",

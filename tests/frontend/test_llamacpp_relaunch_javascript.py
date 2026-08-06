@@ -37,6 +37,7 @@ function runtime(requested, overrides) {
       kv_unified: true,
       gpu_layers: 31,
       total_layers: 31,
+      estimator_overrun_used: false,
     }, overrides.effective || {}),
     gpus: overrides.gpus || [
       { index: 0, total_mib: 15360, used_mib: 14117, free_mib: 1243 },
@@ -82,6 +83,7 @@ process.stdout.write(JSON.stringify({
         "context_per_slot": "12544",
         "slots": "1",
         "cache_type": "q8_0",
+        "allow_estimator_overrun": False,
     }
     assert result["state"]["dirty"] is False
     assert result["validation"]["body"] == {
@@ -97,6 +99,7 @@ const controller = sandbox.createLlamaCppRelaunchController();
 const requested = {
   sizing: "custom", fit_target_mib: 768,
   context_per_slot: 32768, slots: 3, cache_type: "f16",
+  allow_estimator_overrun: true,
 };
 controller.reconcileRuntime(runtime(requested));
 process.stdout.write(JSON.stringify({
@@ -114,6 +117,7 @@ process.stdout.write(JSON.stringify({
             "context_per_slot": 32768,
             "slots": 3,
             "cache_type": "f16",
+            "allow_estimator_overrun": True,
         },
     }
 

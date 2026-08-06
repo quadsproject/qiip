@@ -133,6 +133,7 @@ def _custom_request(
     context_per_slot: int = 24576,
     slots: int = 4,
     cache_type: LlamaCppCacheType = LlamaCppCacheType.F16,
+    allow_estimator_overrun: bool = False,
 ) -> LlamaCppRuntimeRequest:
     return LlamaCppRuntimeRequest(
         sizing=LlamaCppSizingMode.CUSTOM,
@@ -140,6 +141,7 @@ def _custom_request(
         context_per_slot=context_per_slot,
         slots=slots,
         cache_type=cache_type,
+        allow_estimator_overrun=allow_estimator_overrun,
     )
 
 
@@ -163,6 +165,7 @@ def _llamacpp_fit_log(
     gpu_layers: int = 37,
     total_layers: int = 37,
     context_sharing_warnings: bool = True,
+    estimator_overrun_used: bool = False,
 ) -> str:
     if cache_type_v is None:
         cache_type_v = cache_type_k
@@ -189,7 +192,8 @@ def _llamacpp_fit_log(
         f"aggregate_context={aggregate_context} "
         f"fit_target_mib={fit_target_mib} "
         f"cache_type_k={cache_type_k} cache_type_v={cache_type_v} "
-        f"flash_attn={flash_attn}",
+        f"flash_attn={flash_attn} "
+        f"estimator_overrun_used={str(estimator_overrun_used).lower()}",
         f"llama_model_load: offloaded {gpu_layers}/{total_layers} layers to GPU",
         "llama_kv_cache: size = 1024.00 MiB "
         f"(98304 cells, 37 layers, 4/1 seqs), K ({runtime_cache_type_k}): "
@@ -360,6 +364,7 @@ def test_script_env_prefix_exact() -> None:
         "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "",
         "AUTOLLAMACPP_MANAGED_PARALLEL": "",
         "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "",
+        "AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN": "0",
         "AUTOLLAMACPP_GGUF_PATH": artifact.node_relative_entrypoint,
         "AUTOLLAMACPP_MODEL_ALIAS": artifact.model_alias,
         "HF_TOKEN": "hf secret",
@@ -373,6 +378,7 @@ def test_script_env_prefix_exact() -> None:
             context_per_slot=32768,
             slots=3,
             cache_type=LlamaCppCacheType.Q8_0,
+            allow_estimator_overrun=True,
         ),
     ) == {
         "AUTOLLAMACPP_NFS_MOUNT_POINT": "/srv/hf cache",
@@ -384,6 +390,7 @@ def test_script_env_prefix_exact() -> None:
         "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": "32768",
         "AUTOLLAMACPP_MANAGED_PARALLEL": "3",
         "AUTOLLAMACPP_MANAGED_CACHE_TYPE": "q8_0",
+        "AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN": "1",
         "AUTOLLAMACPP_GGUF_PATH": artifact.node_relative_entrypoint,
         "AUTOLLAMACPP_MODEL_ALIAS": artifact.model_alias,
         "HF_TOKEN": "hf secret",
@@ -1815,7 +1822,8 @@ class TestLlamaCppRuntimeFit:
                 "qiip_fit_plan: sizing=auto train_context=24576 "
                 "context_per_slot=24576 slots=4 "
                 "aggregate_context=98304 fit_target_mib=512 "
-                "cache_type_k=f16 cache_type_v=f16 flash_attn=auto\n"
+                "cache_type_k=f16 cache_type_v=f16 flash_attn=auto "
+                "estimator_overrun_used=false\n"
                 "llama_model_load: offloaded 37/37 layers to GPU\n"
                 "srv init: initializing, n_slots = 4, n_ctx_slot = 24576, "
                 "kv_unified = 'true'",
@@ -1825,7 +1833,8 @@ class TestLlamaCppRuntimeFit:
                 "qiip_fit_plan: sizing=auto train_context=24576 "
                 "context_per_slot=24576 slots=4 "
                 "aggregate_context=98304 fit_target_mib=512 "
-                "cache_type_k=f16 cache_type_v=f16 flash_attn=auto\n"
+                "cache_type_k=f16 cache_type_v=f16 flash_attn=auto "
+                "estimator_overrun_used=false\n"
                 "llama_context: n_ctx = 98304\n"
                 "llama_model_load: offloaded 37/37 layers to GPU",
                 "no effective context record",
@@ -1834,7 +1843,8 @@ class TestLlamaCppRuntimeFit:
                 "qiip_fit_plan: sizing=auto train_context=24576 "
                 "context_per_slot=24576 slots=4 "
                 "aggregate_context=98304 fit_target_mib=512 "
-                "cache_type_k=f16 cache_type_v=f16 flash_attn=auto\n"
+                "cache_type_k=f16 cache_type_v=f16 flash_attn=auto "
+                "estimator_overrun_used=false\n"
                 "llama_context: n_ctx = 98304\n"
                 "srv init: initializing, n_slots = 4, n_ctx_slot = 24576, "
                 "kv_unified = 'true'",
@@ -1964,6 +1974,7 @@ class TestLlamaCppRuntimeFit:
             "slots=4 aggregate_context=98308 kv_unified=true "
             "cache_type_k=f16 cache_type_v=f16 flash_attn=auto "
             "gpu_layers=37/37 fit_target_mib=1536 "
+            "estimator_overrun_used=false "
             "gpu_used_mib=20854,20860 gpu_free_mib=2180,2174",
         )
 
@@ -1997,6 +2008,54 @@ class TestLlamaCppRuntimeFit:
         assert runtime.effective.context_per_slot == 32768
         assert runtime.effective.slots == 2
         assert runtime.effective.cache_type_k is LlamaCppCacheType.Q8_0
+
+    @pytest.mark.asyncio
+    async def test_estimator_overrun_requires_request_permission(self) -> None:
+        provisioner = _make_provisioner()
+        run_command = AsyncMock(
+            side_effect=[
+                _llamacpp_fit_log(
+                    sizing="custom",
+                    estimator_overrun_used=True,
+                ),
+                "0, 23034, 22000, 1034",
+                "",
+            ]
+        )
+        with (
+            patch.object(provisioner, "_ssh_run_command", run_command),
+            pytest.raises(ProvisioningError, match="without request permission"),
+        ):
+            await provisioner._verify_llamacpp_runtime(
+                "host1", expected_request=_custom_request()
+            )
+
+        assert run_command.await_args_list[-1] == call(
+            "host1", "bash auto-llamacpp/stop-llamacpp.sh"
+        )
+
+    @pytest.mark.asyncio
+    async def test_permitted_estimator_overrun_is_verified_and_persisted(self) -> None:
+        provisioner = _make_provisioner()
+        request = _custom_request(allow_estimator_overrun=True)
+        with patch.object(
+            provisioner,
+            "_ssh_run_command",
+            new_callable=AsyncMock,
+            side_effect=[
+                _llamacpp_fit_log(
+                    sizing="custom",
+                    estimator_overrun_used=True,
+                ),
+                "0, 23034, 22000, 1034",
+            ],
+        ):
+            runtime = await provisioner._verify_llamacpp_runtime(
+                "host1", expected_request=request
+            )
+
+        assert runtime.requested == request
+        assert runtime.effective.estimator_overrun_used is True
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2051,6 +2110,32 @@ class TestLlamaCppRuntimeFit:
                 await provisioner._verify_llamacpp_runtime(
                     "host1", expected_request=_auto_request(1536)
                 )
+
+        assert run_command.await_args_list[-1] == call(
+            "host1", "bash auto-llamacpp/stop-llamacpp.sh"
+        )
+
+    @pytest.mark.asyncio
+    async def test_estimator_overrun_still_requires_post_load_target(self) -> None:
+        provisioner = _make_provisioner()
+        request = _custom_request(allow_estimator_overrun=True)
+        run_command = AsyncMock(
+            side_effect=[
+                _llamacpp_fit_log(
+                    sizing="custom",
+                    estimator_overrun_used=True,
+                ),
+                "0, 23034, 22600, 434",
+                "",
+            ]
+        )
+        with (
+            patch.object(provisioner, "_ssh_run_command", run_command),
+            pytest.raises(ProvisioningError, match="below the requested"),
+        ):
+            await provisioner._verify_llamacpp_runtime(
+                "host1", expected_request=request
+            )
 
         assert run_command.await_args_list[-1] == call(
             "host1", "bash auto-llamacpp/stop-llamacpp.sh"

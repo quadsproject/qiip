@@ -312,6 +312,50 @@ h1 {
   text-transform: none;
 }
 
+.runtime-checkbox-control {
+  align-items: flex-start;
+  color: var(--text);
+  cursor: pointer;
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 1rem;
+  min-height: 44px;
+}
+
+.runtime-checkbox-control input {
+  accent-color: var(--primary);
+  flex: 0 0 auto;
+  height: 1rem;
+  margin: 0.25rem 0 0;
+  width: 1rem;
+}
+
+.runtime-checkbox-control input:focus-visible {
+  outline: 3px solid rgba(59, 130, 246, 0.3);
+  outline-offset: 3px;
+}
+
+.runtime-checkbox-control:has(input:disabled) {
+  color: var(--disabled);
+  cursor: not-allowed;
+}
+
+.runtime-checkbox-label,
+.runtime-checkbox-help {
+  display: block;
+}
+
+.runtime-checkbox-label {
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.runtime-checkbox-help {
+  color: var(--text-light);
+  font-size: 0.75rem;
+  margin-top: 0.25rem;
+}
+
 .runtime-help,
 .runtime-form-error {
   font-size: 0.75rem;

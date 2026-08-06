@@ -141,6 +141,16 @@ runs the estimator once for the exact candidate and refuses to start unless
 every layer can remain on GPU while preserving the requested reserve. It never
 falls back to a different context, slot count, or cache type.
 
+The node-detail editor can authorize one narrower exception for custom sizing:
+`allow_estimator_overrun=true` attempts the exact candidate when a valid
+estimator result predicts less free VRAM than the requested target. It never
+bypasses an estimator execution or output failure, and automatic sizing remains
+estimator-strict. QIIP still requires full GPU offload and measures actual free
+VRAM after the server becomes healthy; missing the target stops the attempted
+server and triggers the normal transactional rollback. The permission is
+persisted with the requested policy so later retries and rollback can reproduce
+a configuration that was previously verified on the real node.
+
 The managed planner first estimates F16 for both K and V. If that policy cannot
 fully offload one request at the 4,096-token floor while preserving the reserve,
 it retries the complete plan with Q8_0 for both K and V. Q8_0 V requires Flash
@@ -171,12 +181,13 @@ registration unless the runtime matches the plan, the selected K/V types are
 present in the allocated unified KV cache, KV is unified, every model layer was
 offloaded to GPU, and actual free VRAM still meets the target.
 
-The `qiip_fit_plan` startup record includes `sizing=auto|custom` and the model's
-`train_context` alongside the effective context, concurrency, reserve, and
-cache policy. After verification, QIIP stores the requested policy, effective
-configuration, device-indexed total/used/free VRAM, and an ISO-8601 UTC
-observation time in the node record. The node-detail dashboard presents this as
-a read-only post-load snapshot; it is not live GPU telemetry.
+The `qiip_fit_plan` startup record includes `sizing=auto|custom`, the model's
+`train_context`, and whether an estimator overrun was actually used alongside
+the effective context, concurrency, reserve, and cache policy. After
+verification, QIIP stores the requested policy, effective configuration,
+device-indexed total/used/free VRAM, and an ISO-8601 UTC observation time in the
+node record. The node-detail dashboard presents this as a post-load snapshot;
+it is not live GPU telemetry.
 
 An implicit retry inherits that persisted request. Automatic policy reruns the
 search against current free VRAM; custom policy reruns the exact estimate and

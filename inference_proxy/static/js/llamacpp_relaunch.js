@@ -13,6 +13,7 @@ function createLlamaCppRelaunchController() {
     context_per_slot: "",
     slots: "",
     cache_type: "f16",
+    allow_estimator_overrun: false,
   };
   var sourceRuntime = null;
   var latestRuntime = null;
@@ -53,6 +54,9 @@ function createLlamaCppRelaunchController() {
       result.context_per_slot = policy.context_per_slot;
       result.slots = policy.slots;
       result.cache_type = policy.cache_type;
+      if (policy.allow_estimator_overrun === true) {
+        result.allow_estimator_overrun = true;
+      }
     }
     return result;
   }
@@ -64,7 +68,9 @@ function createLlamaCppRelaunchController() {
     if (left.sizing === "auto") return true;
     return left.context_per_slot === right.context_per_slot &&
       left.slots === right.slots &&
-      left.cache_type === right.cache_type;
+      left.cache_type === right.cache_type &&
+      Boolean(left.allow_estimator_overrun) ===
+        Boolean(right.allow_estimator_overrun);
   }
 
   function seed(runtime) {
@@ -81,6 +87,8 @@ function createLlamaCppRelaunchController() {
       requested.slots == null ? effective.slots : requested.slots
     );
     fields.cache_type = requested.cache_type || effective.cache_type_k;
+    fields.allow_estimator_overrun =
+      requested.allow_estimator_overrun === true;
     sourceRuntime = runtime;
     latestRuntime = runtime;
     sourceSignature = runtimeSignature(runtime);
@@ -171,6 +179,9 @@ function createLlamaCppRelaunchController() {
         context_per_slot: context,
         slots: slots,
         cache_type: fields.cache_type,
+        ...(fields.allow_estimator_overrun
+          ? { allow_estimator_overrun: true }
+          : {}),
       },
     };
   }
@@ -189,7 +200,9 @@ function createLlamaCppRelaunchController() {
 
   function setField(name, value) {
     if (!Object.prototype.hasOwnProperty.call(fields, name)) return;
-    fields[name] = String(value);
+    fields[name] = name === "allow_estimator_overrun"
+      ? value === true
+      : String(value);
     recalculateDirty();
   }
 

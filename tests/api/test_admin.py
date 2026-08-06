@@ -120,6 +120,7 @@ def _llamacpp_runtime() -> LlamaCppRuntimeState:
                 "kv_unified": True,
                 "gpu_layers": 31,
                 "total_layers": 31,
+                "estimator_overrun_used": False,
             },
             "gpus": [
                 {"index": 0, "total_mib": 14911, "used_mib": 14089, "free_mib": 822}
@@ -236,6 +237,7 @@ class TestAdminNodesPopulated:
                 "kv_unified": True,
                 "gpu_layers": 31,
                 "total_layers": 31,
+                "estimator_overrun_used": False,
             },
             "gpus": [
                 {"index": 0, "total_mib": 14911, "used_mib": 14089, "free_mib": 822}
@@ -879,6 +881,7 @@ class TestLlamaCppRelaunchEndpoint:
                 "context_per_slot": 24576,
                 "slots": 2,
                 "cache_type": "q8_0",
+                "allow_estimator_overrun": True,
             },
         )
 
@@ -899,6 +902,7 @@ class TestLlamaCppRelaunchEndpoint:
             context_per_slot=24576,
             slots=2,
             cache_type=LlamaCppCacheType.Q8_0,
+            allow_estimator_overrun=True,
         )
         assert type(request) is LlamaCppRuntimeRequest
 

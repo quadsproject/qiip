@@ -86,7 +86,8 @@ LLAMACPP_PLAN_PATTERN = re.compile(
     r"fit_target_mib=(?P<target>\d+) "
     r"cache_type_k=(?P<cache_type_k>f16|q8_0) "
     r"cache_type_v=(?P<cache_type_v>f16|q8_0) "
-    r"flash_attn=(?P<flash_attn>auto|on)"
+    r"flash_attn=(?P<flash_attn>auto|on) "
+    r"estimator_overrun_used=(?P<estimator_overrun_used>true|false)"
 )
 LLAMACPP_KV_CACHE_PATTERN = re.compile(
     r"llama_kv_cache[^:]*:\s+size\s*=.*?"
@@ -190,6 +191,7 @@ class LlamaCppRuntimeFit:
     kv_unified: bool
     gpu_layers: int
     total_layers: int
+    estimator_overrun_used: bool
 
 
 def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
@@ -234,6 +236,7 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
         kv_unified=context["unified"] == "true",
         gpu_layers=int(offload["loaded"]),
         total_layers=int(offload["total"]),
+        estimator_overrun_used=plan["estimator_overrun_used"] == "true",
     )
     if (
         fit.train_context < 1
@@ -528,6 +531,9 @@ class NodeProvisioner:
                 ),
                 "AUTOLLAMACPP_MANAGED_CACHE_TYPE": (
                     request.cache_type.value if request.cache_type is not None else ""
+                ),
+                "AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN": (
+                    "1" if request.allow_estimator_overrun else "0"
                 ),
             }
             if artifact is None:
@@ -1657,6 +1663,13 @@ class NodeProvisioner:
                     raise ProvisioningError(
                         "llama.cpp runtime differs from its requested custom sizing"
                     )
+            if (
+                fit.estimator_overrun_used
+                and not expected_request.allow_estimator_overrun
+            ):
+                raise ProvisioningError(
+                    "llama.cpp used an estimator overrun without request permission"
+                )
             if any(row.free_mib < fit.fit_target_mib for row in memory_rows):
                 raise ProvisioningError(
                     "llama.cpp post-load free VRAM is below the requested fit target"
@@ -1676,6 +1689,7 @@ class NodeProvisioner:
                     kv_unified=fit.kv_unified,
                     gpu_layers=fit.gpu_layers,
                     total_layers=fit.total_layers,
+                    estimator_overrun_used=fit.estimator_overrun_used,
                 ),
                 gpus=tuple(sorted(memory_rows, key=lambda row: row.index)),
                 observed_at=datetime.now(UTC),
@@ -1698,6 +1712,7 @@ class NodeProvisioner:
                 f"flash_attn={fit.flash_attn} "
                 f"gpu_layers={fit.gpu_layers}/{fit.total_layers} "
                 f"fit_target_mib={expected_request.fit_target_mib} "
+                f"estimator_overrun_used={str(fit.estimator_overrun_used).lower()} "
                 f"gpu_used_mib={used} gpu_free_mib={free}",
             )
             return runtime

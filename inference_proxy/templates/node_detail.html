@@ -108,12 +108,22 @@
                             </label>
                             <label class="runtime-control" for="llamacpp-cache-type">
                                 <span>KV cache</span>
-                                <select id="llamacpp-cache-type" aria-describedby="llamacpp-sizing-help llamacpp-relaunch-error">
-                                    <option value="f16">F16</option>
-                                    <option value="q8_0">Q8_0</option>
-                                </select>
+                                <span class="runtime-input-unit runtime-cache-input">
+                                    <select id="llamacpp-cache-type" aria-describedby="llamacpp-sizing-help llamacpp-relaunch-error">
+                                        <option value="f16">F16</option>
+                                        <option value="q8_0">Q8_0</option>
+                                    </select>
+                                    <span>K/V</span>
+                                </span>
                             </label>
                         </div>
+                        <label class="runtime-checkbox-control" for="llamacpp-estimator-overrun">
+                            <input id="llamacpp-estimator-overrun" type="checkbox" aria-describedby="llamacpp-estimator-overrun-help llamacpp-relaunch-error">
+                            <span>
+                                <span class="runtime-checkbox-label">Attempt launch if estimate exceeds target</span>
+                                <span id="llamacpp-estimator-overrun-help" class="runtime-checkbox-help">Custom sizing only. QIIP still requires the actual post-load free VRAM to meet the target or restores the previous policy.</span>
+                            </span>
+                        </label>
                         <p id="llamacpp-sizing-help" class="runtime-help"></p>
                         <dl class="runtime-preview" aria-label="Requested configuration preview">
                             <div><dt>Requested aggregate context</dt><dd id="llamacpp-requested-aggregate"></dd></div>
@@ -140,6 +150,7 @@
                     <div><dt>Flash Attention</dt><dd id="llamacpp-runtime-flash"></dd></div>
                     <div><dt>GPU offload</dt><dd id="llamacpp-runtime-offload"></dd></div>
                     <div><dt>Free VRAM target</dt><dd id="llamacpp-runtime-reserve"></dd></div>
+                    <div><dt>Estimator</dt><dd id="llamacpp-runtime-estimator"></dd></div>
                     <div class="runtime-grid-wide"><dt>Post-load GPU memory</dt><dd><ul id="llamacpp-runtime-gpus" class="runtime-gpu-list"></ul></dd></div>
                     <div class="runtime-grid-wide"><dt>Observed</dt><dd id="llamacpp-runtime-observed"></dd></div>
                 </dl>
