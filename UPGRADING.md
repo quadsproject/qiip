@@ -585,8 +585,10 @@ replayed exactly. If rollback succeeds, the node returns healthy and the task
 still records the requested relaunch as failed. If rollback fails, or the
 gateway restarts with an orphaned `relaunching` record, the node becomes
 `relaunch_failed`, its stale runtime observation is cleared, and health probes
-cannot promote it. Tear it down before setup; do not rewrite the status or
-runtime fields manually.
+cannot promote it. Startup reconciliation also marks the matching stale task
+failed with the interrupted step so the dashboard does not show work still in
+progress. Tear the node down before setup; do not rewrite the status or runtime
+fields manually.
 
 ### Recover an unregistered orphaned engine
 

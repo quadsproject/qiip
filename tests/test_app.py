@@ -176,6 +176,7 @@ def test_startup_reconciles_interrupted_relaunch_to_terminal_state(
         (EtcdRecord(key.encode(), value, 41, 7001),),
         41,
     )
+    etcd_client.get_record.return_value = None
     etcd_client.replace_if_revision.return_value = 42
 
     _initial_load(etcd_client, test_registry, RoutingSettings().endpoint_policy())
@@ -192,6 +193,57 @@ def test_startup_reconciles_interrupted_relaunch_to_terminal_state(
         expected_mod_revision=41,
         lease_id=0,
     )
+
+
+def test_startup_repairs_stale_task_for_existing_relaunch_failure(
+    test_registry: NodeRegistry,
+) -> None:
+    etcd_client = MagicMock()
+    etcd_client.prefix = "/nodes/"
+    node = Node(
+        node_id="gpu01",
+        endpoint="localhost:8000",
+        status=NodeStatus.RELAUNCH_FAILED,
+        model="org/model",
+        managed=True,
+    )
+    key, value = node_to_etcd(node, etcd_client.prefix)
+    etcd_client.get_snapshot.return_value = EtcdSnapshot(
+        (EtcdRecord(key.encode(), value, 41, 0),),
+        41,
+    )
+    task_value = json.dumps(
+        {
+            "hostname": "gpu01",
+            "current_step": "starting_llamacpp",
+            "started_at": "2026-08-06T01:54:44Z",
+            "updated_at": "2026-08-06T01:54:47Z",
+            "failed_step": None,
+            "error": None,
+        }
+    ).encode()
+    etcd_client.get_record.return_value = EtcdRecord(
+        b"/provisioning/gpu01",
+        task_value,
+        51,
+        0,
+    )
+    etcd_client.replace_if_revision.return_value = 52
+
+    _initial_load(etcd_client, test_registry, RoutingSettings().endpoint_policy())
+
+    reconciled = test_registry.get("gpu01")
+    assert reconciled is not None
+    assert reconciled.status is NodeStatus.RELAUNCH_FAILED
+    task_call = etcd_client.replace_if_revision.call_args
+    assert task_call.args[0] == "/provisioning/gpu01"
+    task = json.loads(task_call.args[1])
+    assert task["current_step"] == "failed"
+    assert task["failed_step"] == "starting_llamacpp"
+    assert task["error"] == (
+        "Gateway restarted during llama.cpp relaunch; teardown required"
+    )
+    assert task_call.kwargs == {"expected_mod_revision": 51, "lease_id": 0}
 
 
 def test_failed_initial_load_requests_watcher_recovery() -> None:

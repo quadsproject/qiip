@@ -293,7 +293,9 @@ registration without stopping the server. A failed launch attempts the prior
 requested policy: automatic sizing is recomputed, while custom sizing is
 replayed exactly. If rollback also fails, the node enters `relaunch_failed`,
 clears stale runtime telemetry, and permits teardown only. Follow progress at
-`/admin/provisioning/{hostname}/logs`.
+`/admin/provisioning/{hostname}/logs`. After an interrupted relaunch, startup
+reconciliation also marks the stale provisioning task failed and records the
+step where the gateway stopped.
 
 ### Force-recover an unregistered engine
 
