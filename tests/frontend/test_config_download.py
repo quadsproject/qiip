@@ -16,7 +16,7 @@ _DASHBOARD_JS = _ROOT / "inference_proxy/static/js/dashboard.js"
 _NODE_DETAIL_JS = _ROOT / "inference_proxy/static/js/node_detail.js"
 
 
-def _run_node(harness: str) -> dict[str, Any]:
+def _run_node_raw(harness: str) -> object:
     node = shutil.which("node")
     if node is None:
         pytest.fail(
@@ -32,29 +32,17 @@ def _run_node(harness: str) -> dict[str, Any]:
         timeout=3,
     )
     assert result.returncode == 0, result.stderr
-    parsed: object = json.loads(result.stdout)
+    return json.loads(result.stdout)
+
+
+def _run_node(harness: str) -> dict[str, Any]:
+    parsed = _run_node_raw(harness)
     assert isinstance(parsed, dict)
     return parsed
 
 
 def _run_node_yaml(harness: str) -> str:
-    """Run a Node.js harness that returns YAML string output."""
-    node = shutil.which("node")
-    if node is None:
-        pytest.fail(
-            "Node.js is required for config download regressions; "
-            "CI must install it explicitly"
-        )
-
-    result = subprocess.run(
-        [node, "-e", harness],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=3,
-    )
-    assert result.returncode == 0, result.stderr
-    parsed: object = json.loads(result.stdout)
+    parsed = _run_node_raw(harness)
     assert isinstance(parsed, str)
     return parsed
 
@@ -172,6 +160,7 @@ class TestGeneratePiConfig:
         )
         base_url = result["providers"]["qiip"]["baseUrl"]
         assert "//" not in base_url.split("://", 1)[1]
+        assert base_url.endswith("/v1")
 
 
 class TestGenerateOmpConfig:
@@ -188,8 +177,10 @@ class TestGenerateOmpConfig:
         assert "providers:" in result
         assert "  qiip:" in result
         assert "    baseUrl: http://proxy.example.com:8080/v1" in result
-        assert "    apiKey: none" in result
+        assert "    auth: none" in result
         assert "    api: openai-completions" in result
+        assert "      supportsDeveloperRole: false" in result
+        assert "      supportsReasoningEffort: false" in result
         assert "      - id: meta-llama/Llama-3-8B" in result
 
     def test_base_url_includes_v1(self) -> None:
@@ -210,8 +201,18 @@ class TestGenerateOmpConfig:
                 "generateOmpConfig",
             )
         )
-        assert ":///" not in result
         assert "baseUrl: http://proxy.example.com:8080/v1" in result
+
+
+    def test_special_chars_quoted(self) -> None:
+        result = _run_node_yaml(
+            _harness(
+                "http://proxy.example.com:8080",
+                "model: evil #comment",
+                "generateOmpConfig",
+            )
+        )
+        assert '"model: evil #comment"' in result
 
 
 class TestConfigFileContents:

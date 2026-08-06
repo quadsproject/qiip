@@ -41,23 +41,33 @@ function generatePiConfig(baseUrl, modelId) {
   };
 }
 
+function yamlScalar(v) {
+  if (/: | #|[{}\[\]]/.test(v)) {
+    return '"' + v.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+  }
+  return v;
+}
+
 function generateOmpConfig(baseUrl, modelId) {
   var base = baseUrl.replace(/\/+$/, "");
   return [
     "providers:",
     "  qiip:",
-    "    baseUrl: " + base + "/v1",
-    "    apiKey: none",
+    "    baseUrl: " + yamlScalar(base + "/v1"),
+    "    auth: none",
     "    api: openai-completions",
+    "    compat:",
+    "      supportsDeveloperRole: false",
+    "      supportsReasoningEffort: false",
     "    models:",
-    "      - id: " + modelId,
+    "      - id: " + yamlScalar(modelId),
   ].join("\n");
 }
 
 function downloadConfigFile(data, filename) {
   var isYaml = typeof data === "string";
   var content = isYaml ? data : JSON.stringify(data, null, 2);
-  var blob = new Blob([content], { type: isYaml ? "text/yaml" : "application/json" });
+  var blob = new Blob([content], { type: isYaml ? "application/yaml" : "application/json" });
   var url = URL.createObjectURL(blob);
   var a = document.createElement("a");
   a.href = url;
