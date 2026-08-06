@@ -220,6 +220,26 @@ class TestEtcdNodeStates:
         assert n.state == "draining"
         assert n.actions == ["force_teardown"]
 
+    @pytest.mark.parametrize(
+        ("status", "expected_actions"),
+        [
+            (NodeStatus.RELAUNCHING, []),
+            (NodeStatus.RELAUNCH_FAILED, ["teardown"]),
+        ],
+    )
+    def test_relaunch_states_and_actions(
+        self,
+        status: NodeStatus,
+        expected_actions: list[str],
+    ) -> None:
+        registry = NodeRegistry()
+        registry.add(_node("gpu01", status=status))
+        svc = _service(registry=registry, poller=_poller())
+
+        node = svc.get_unified_nodes()[0]
+        assert node.state == status.value
+        assert node.actions == expected_actions
+
 
 class TestFiltering:
     """Exclusion rules for the unified list."""

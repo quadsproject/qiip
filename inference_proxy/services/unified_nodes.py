@@ -26,6 +26,8 @@ _STATE_ACTIONS: dict[str, list[str]] = {
     "provisioning": ["cancel"],
     "failed": ["setup", "teardown"],
     "draining": ["force_teardown"],
+    "relaunching": [],
+    "relaunch_failed": ["teardown"],
 }
 
 

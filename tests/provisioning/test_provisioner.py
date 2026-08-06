@@ -1583,6 +1583,45 @@ class TestProvisioningFailureAccuracy:
         assert state_payloads[-1]["current_step"] == "failed"
         assert state_payloads[-1]["failed_step"] == "teardown"
 
+    @pytest.mark.asyncio
+    async def test_failed_teardown_preserves_relaunch_terminal_state(self) -> None:
+        etcd, _values, _state_payloads = _recording_etcd()
+        etcd.delete.side_effect = RuntimeError("etcd delete failed")
+        registry = NodeRegistry()
+        registry.add(
+            Node(
+                node_id="host1",
+                endpoint="host1:8000",
+                status=NodeStatus.RELAUNCH_FAILED,
+                model="model-a",
+                engine=InferenceEngine.LLAMA_CPP,
+                managed=True,
+            )
+        )
+        ssh = MagicMock()
+        ssh.upload = AsyncMock()
+
+        async def stopped(
+            _host: str,
+            _command: str,
+        ) -> AsyncIterator[tuple[str, str]]:
+            if False:  # pragma: no cover - defines an empty async generator
+                yield ("stdout", "")
+
+        ssh.run_streaming = stopped
+        provisioner = _make_provisioner(
+            ssh_client=ssh,
+            etcd_client=etcd,
+            registry=registry,
+        )
+
+        with pytest.raises(RuntimeError, match="etcd delete failed"):
+            await provisioner.teardown("host1", force=True)
+
+        failed_node = registry.get("host1")
+        assert failed_node is not None
+        assert failed_node.status is NodeStatus.RELAUNCH_FAILED
+
 
 class TestPreflight:
     """D-01 through D-04: Pre-flight validation with collected errors."""

@@ -61,7 +61,9 @@ class TestNodeStatusEnumValues:
         assert NodeStatus.UNKNOWN.value == "unknown"
         assert NodeStatus.PROVISIONING.value == "provisioning"
         assert NodeStatus.FAILED.value == "failed"
-        assert len(NodeStatus) == 6
+        assert NodeStatus.RELAUNCHING.value == "relaunching"
+        assert NodeStatus.RELAUNCH_FAILED.value == "relaunch_failed"
+        assert len(NodeStatus) == 8
 
 
 class TestNodeStatusIsStrEnum:

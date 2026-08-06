@@ -17,6 +17,7 @@ import json
 from collections.abc import Iterator
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 from pytest_httpx import HTTPXMock, IteratorStream
 
@@ -700,13 +701,22 @@ class TestModelUnavailable:
         assert data["error"]["code"] == "model_unavailable"
 
 
-class TestDrainingExcludedFromModels:
-    """DRAINING nodes do not appear in /v1/models response."""
+class TestNonServingNodesExcludedFromModels:
+    """Lifecycle states do not appear in /v1/models responses."""
 
-    def test_draining_nodes_excluded(
+    @pytest.mark.parametrize(
+        "status",
+        [
+            NodeStatus.DRAINING,
+            NodeStatus.RELAUNCHING,
+            NodeStatus.RELAUNCH_FAILED,
+        ],
+    )
+    def test_non_serving_nodes_excluded(
         self,
         client: TestClient,
         test_registry: NodeRegistry,
+        status: NodeStatus,
     ) -> None:
         """Only healthy nodes appear in model listing."""
         test_registry.add(
@@ -717,7 +727,7 @@ class TestDrainingExcludedFromModels:
                 node_id="node-2",
                 endpoint="10.0.1.101:8000",
                 model="mistral-7b",
-                status=NodeStatus.DRAINING,
+                status=status,
             )
         )
 

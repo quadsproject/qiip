@@ -195,6 +195,38 @@ class TestEtcdSnapshot:
 
 class TestEtcdWrites:
     @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_exact_record_retains_revision_and_lease(
+        self,
+        mock_etcd3_cls: MagicMock,
+    ) -> None:
+        mock_instance = mock_etcd3_cls.return_value
+        mock_instance.get_url.return_value = "http://etcd/kv/range"
+        mock_instance.post.return_value = {
+            "header": {"revision": "42"},
+            "kvs": [
+                {
+                    "key": _b64(b"/nodes/gpu01"),
+                    "value": _b64(b'{"status":"healthy"}'),
+                    "mod_revision": "41",
+                    "lease": "7001",
+                }
+            ],
+        }
+        client = EtcdClient(_settings())
+
+        record = client.get_record("/nodes/gpu01")
+
+        assert record is not None
+        assert record.key == b"/nodes/gpu01"
+        assert record.value == b'{"status":"healthy"}'
+        assert record.mod_revision == 41
+        assert record.lease_id == 7001
+        mock_instance.post.assert_called_once_with(
+            "http://etcd/kv/range",
+            json={"key": _b64(b"/nodes/gpu01")},
+        )
+
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
     def test_grant_uses_configured_node_ttl(
         self,
         mock_etcd3_cls: MagicMock,
@@ -259,7 +291,10 @@ class TestEtcdWrites:
         mock_etcd3_cls: MagicMock,
     ) -> None:
         mock_instance = mock_etcd3_cls.return_value
-        mock_instance.transaction.return_value = {"succeeded": True}
+        mock_instance.transaction.return_value = {
+            "succeeded": True,
+            "header": {"revision": "42"},
+        }
         client = EtcdClient(_settings())
 
         attached = client.attach_lease_if_current(
@@ -299,6 +334,69 @@ class TestEtcdWrites:
                 ],
                 "failure": [],
             }
+        )
+
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_revision_cas_writes_value_and_lease_in_one_transaction(
+        self,
+        mock_etcd3_cls: MagicMock,
+    ) -> None:
+        mock_instance = mock_etcd3_cls.return_value
+        mock_instance.transaction.return_value = {
+            "succeeded": True,
+            "header": {"revision": "42"},
+        }
+        client = EtcdClient(_settings())
+
+        replaced = client.replace_if_revision(
+            "/nodes/gpu01",
+            b'{"status":"relaunching"}',
+            expected_mod_revision=41,
+            lease_id=7001,
+        )
+
+        assert replaced == 42
+        mock_instance.replace.assert_not_called()
+        mock_instance.transaction.assert_called_once_with(
+            {
+                "compare": [
+                    {
+                        "key": _b64(b"/nodes/gpu01"),
+                        "result": "EQUAL",
+                        "target": "MOD",
+                        "mod_revision": "41",
+                    }
+                ],
+                "success": [
+                    {
+                        "request_put": {
+                            "key": _b64(b"/nodes/gpu01"),
+                            "value": _b64(b'{"status":"relaunching"}'),
+                            "lease": "7001",
+                        }
+                    }
+                ],
+                "failure": [],
+            }
+        )
+
+    @patch("inference_proxy.discovery.etcd_client.Etcd3Client")
+    def test_revision_cas_conflict_has_no_committed_revision(
+        self,
+        mock_etcd3_cls: MagicMock,
+    ) -> None:
+        mock_instance = mock_etcd3_cls.return_value
+        mock_instance.transaction.return_value = {"succeeded": False}
+        client = EtcdClient(_settings())
+
+        assert (
+            client.replace_if_revision(
+                "/nodes/gpu01",
+                b'{"status":"relaunching"}',
+                expected_mod_revision=41,
+                lease_id=7001,
+            )
+            is None
         )
 
 

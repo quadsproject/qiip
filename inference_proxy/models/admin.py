@@ -14,7 +14,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from inference_proxy.huggingface.artifacts import GGUFArtifact, GGUFDownloadSpec
 from inference_proxy.models.llmfit import ModelRecommendation, SystemInfo
-from inference_proxy.models.node import InferenceEngine, LlamaCppRuntimeState
+from inference_proxy.models.node import (
+    InferenceEngine,
+    LlamaCppRuntimeRequest,
+    LlamaCppRuntimeState,
+)
 
 
 class AdminNodeResponse(BaseModel):
@@ -96,6 +100,20 @@ class SetupRequest(BaseModel):
 
 class SetupResponse(BaseModel):
     """Response body for POST /admin/nodes/setup (202)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    task_id: str
+
+
+class LlamaCppRelaunchRequest(LlamaCppRuntimeRequest):
+    """Strict API-boundary policy for a managed llama.cpp relaunch."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class LlamaCppRelaunchResponse(BaseModel):
+    """Response body for a queued managed llama.cpp relaunch (202)."""
 
     model_config = ConfigDict(frozen=True)
 

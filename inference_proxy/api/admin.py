@@ -46,6 +46,8 @@ from inference_proxy.models.admin import (
     AdminNodeResponse,
     DownloadRequest,
     DownloadStatusResponse,
+    LlamaCppRelaunchRequest,
+    LlamaCppRelaunchResponse,
     PowerActionRequest,
     PowerStateResponse,
     QUADSStatusResponse,
@@ -63,10 +65,13 @@ from inference_proxy.models.node import (
     NodeStatus,
 )
 from inference_proxy.provisioning.provisioner import (
+    BackgroundOperation,
     NodeProvisioner,
     ProvisioningCapacityError,
     ProvisioningError,
     ProvisioningIdentity,
+    RelaunchPreconditionError,
+    RelaunchValidationError,
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -104,6 +109,8 @@ _SETUP_REJECTED_STATUSES = frozenset(
     {
         NodeStatus.HEALTHY,
         NodeStatus.UNHEALTHY,
+        NodeStatus.RELAUNCHING,
+        NodeStatus.RELAUNCH_FAILED,
     }
 )
 _SETUP_RETRYABLE_STATUSES = frozenset(
@@ -438,6 +445,93 @@ async def setup_node(
         task.add_done_callback(_setup_done)
         transferred = True
         return SetupResponse(task_id=hostname)
+    finally:
+        if not transferred:
+            lease.release()
+
+
+@admin_router.post("/nodes/{hostname}/llamacpp/relaunch", status_code=202)
+async def relaunch_llamacpp_node(
+    hostname: str,
+    body: LlamaCppRelaunchRequest,
+    registry: NodeRegistry = Depends(get_registry),
+    provisioner: NodeProvisioner = Depends(get_provisioner),
+) -> LlamaCppRelaunchResponse:
+    """Queue a drain-safe managed llama.cpp runtime relaunch."""
+    hostname = _validated_hostname(hostname)
+    if not provisioner.connection_tracking_available:
+        raise HTTPException(
+            status_code=503,
+            detail="llama.cpp relaunch requires active-connection tracking",
+        )
+    request = LlamaCppRuntimeRequest.model_validate(body.model_dump())
+    try:
+        node = provisioner.validate_llamacpp_relaunch(
+            registry.get(hostname),
+            request,
+        )
+    except RelaunchPreconditionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RelaunchValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    lease = await provisioner.try_reserve_host(hostname)
+    if lease is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Host lifecycle operation already in progress for '{hostname}'",
+        )
+
+    transferred = False
+    try:
+        try:
+            node = provisioner.validate_llamacpp_relaunch(
+                registry.get(hostname),
+                request,
+            )
+        except RelaunchPreconditionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RelaunchValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        async def _relaunch_and_cleanup() -> None:
+            try:
+                await provisioner.relaunch_llamacpp(
+                    hostname,
+                    request,
+                    lifecycle_lease=lease,
+                )
+            finally:
+                lease.release()
+
+        background = _relaunch_and_cleanup()
+        try:
+            task = provisioner.fire_background(
+                background,
+                provisioning_hostname=hostname,
+                provisioning_identity=ProvisioningIdentity(
+                    engine=InferenceEngine.LLAMA_CPP,
+                    artifact_id=node.artifact_id,
+                ),
+                operation=BackgroundOperation.RELAUNCH,
+            )
+        except ProvisioningCapacityError as exc:
+            background.close()
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Provisioning capacity reached: {exc.active} active "
+                    f"task(s), limit {exc.limit}; retry after an existing "
+                    "operation finishes"
+                ),
+            ) from exc
+        except Exception:
+            background.close()
+            raise
+
+        task.add_done_callback(lambda _task: lease.release())
+        transferred = True
+        return LlamaCppRelaunchResponse(task_id=hostname)
     finally:
         if not transferred:
             lease.release()

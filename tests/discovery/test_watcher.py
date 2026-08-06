@@ -14,6 +14,7 @@ from structlog.testing import capture_logs
 import inference_proxy.discovery.watcher as watcher_module
 from inference_proxy.discovery.etcd_client import (
     EtcdClient,
+    EtcdRecord,
     WatchCompactedError,
     WatchReadTimeoutError,
 )
@@ -151,11 +152,15 @@ class _FakeEtcdClient:
         self,
         snapshots: tuple[_Snapshot, ...],
         watches: tuple[_FakeStream, ...],
+        *,
+        replacement_revision: int | None = None,
     ) -> None:
         self._snapshots = deque(snapshots)
         self._watches = deque(watches)
         self.snapshot_calls = 0
         self.start_revisions: list[int | None] = []
+        self.replacement_revision = replacement_revision
+        self.replacements: list[tuple[str, bytes, int, int]] = []
 
     def get_snapshot(self) -> _Snapshot:
         self.snapshot_calls += 1
@@ -168,6 +173,20 @@ class _FakeEtcdClient:
     ) -> _FakeStream:
         self.start_revisions.append(start_revision)
         return self._watches.popleft()
+
+    def replace_if_revision(
+        self,
+        key: str,
+        value: bytes,
+        *,
+        expected_mod_revision: int,
+        lease_id: int,
+    ) -> int | None:
+        self.replacements.append((key, value, expected_mod_revision, lease_id))
+        return self.replacement_revision
+
+    def get_record(self, _key: str) -> EtcdRecord | None:
+        return None
 
 
 class _CountingRegistry(NodeRegistry):
@@ -185,6 +204,7 @@ def _start_watcher(
     registry: NodeRegistry,
     *,
     retry_delay: float = 0.001,
+    reconcile_startup_relaunches: bool = False,
 ) -> tuple[EtcdWatcher, threading.Thread]:
     stop_event = threading.Event()
     watcher = EtcdWatcher(
@@ -193,6 +213,7 @@ def _start_watcher(
         stop_event,
         endpoint_policy=_ENDPOINT_POLICY,
         retry_delay=retry_delay,
+        reconcile_startup_relaunches=reconcile_startup_relaunches,
     )
     thread = threading.Thread(
         target=watcher.run,
@@ -268,6 +289,49 @@ def test_idle_watch_stops_promptly() -> None:
     )
 
     assert stream.closed.is_set()
+
+
+def test_first_snapshot_after_failed_initial_load_reconciles_relaunch() -> None:
+    stream = _FakeStream(block_after=True)
+    interrupted = _node("gpu01", status=NodeStatus.RELAUNCHING)
+    client = _FakeEtcdClient(
+        (_snapshot(41, (interrupted, 41)),),
+        (stream,),
+        replacement_revision=42,
+    )
+    registry = NodeRegistry()
+
+    watcher, thread = _start_watcher(
+        client,
+        registry,
+        reconcile_startup_relaunches=True,
+    )
+    assert _wait_for_stream(stream)
+
+    recovered = registry.get("gpu01")
+    assert recovered is not None
+    assert recovered.status is NodeStatus.RELAUNCH_FAILED
+    assert client.replacements[0][2:] == (41, 0)
+    assert client.start_revisions == [42]
+
+    _stop_watcher(watcher, thread, stream)
+
+
+def test_normal_watcher_snapshot_preserves_live_relaunch() -> None:
+    stream = _FakeStream(block_after=True)
+    active = _node("gpu01", status=NodeStatus.RELAUNCHING)
+    client = _FakeEtcdClient((_snapshot(41, (active, 41)),), (stream,))
+    registry = NodeRegistry()
+
+    watcher, thread = _start_watcher(client, registry)
+    assert _wait_for_stream(stream)
+
+    observed = registry.get("gpu01")
+    assert observed is not None
+    assert observed.status is NodeStatus.RELAUNCHING
+    assert client.replacements == []
+
+    _stop_watcher(watcher, thread, stream)
 
 
 def test_silent_watch_disconnect_reconnects() -> None:

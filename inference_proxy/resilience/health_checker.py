@@ -247,6 +247,8 @@ def _handle_probe_success(
 
     if current.status in {
         NodeStatus.DRAINING,
+        NodeStatus.RELAUNCHING,
+        NodeStatus.RELAUNCH_FAILED,
         NodeStatus.PROVISIONING,
         NodeStatus.FAILED,
     }:

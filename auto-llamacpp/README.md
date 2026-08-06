@@ -182,6 +182,17 @@ An implicit retry inherits that persisted request. Automatic policy reruns the
 search against current free VRAM; custom policy reruns the exact estimate and
 launches only if every requested value still fits.
 
+The gateway can also relaunch a healthy managed node through
+`POST /admin/nodes/{hostname}/llamacpp/relaunch`. This is a transactional
+gateway operation, not a direct script feature: it removes the node from
+routing, waits for tracked requests to drain, stops the current server, runs
+the exact managed estimator and launch path, and verifies the new runtime. A
+failed requested launch retries the previously persisted policy. If that
+rollback also fails, the gateway clears stale runtime telemetry and records a
+teardown-only `relaunch_failed` state. A gateway restart converts any orphaned
+`relaunching` record to the same terminal state rather than allowing ordinary
+health recovery to bless an unverified server.
+
 With unified KV, llama.cpp internally reports `n_ctx_seq` as the aggregate
 pool. When that exceeds the model training context, b10242 emits its expected
 `possible training context overflow` and slot-capping warnings, then caps each

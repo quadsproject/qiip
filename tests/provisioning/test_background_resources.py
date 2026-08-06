@@ -16,6 +16,7 @@ from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.provisioning.provisioner import (
+    BackgroundOperation,
     NodeProvisioner,
     ProvisioningCapacityError,
     ProvisioningIdentity,
@@ -149,6 +150,40 @@ async def test_capacity_is_released_when_provision_task_finishes() -> None:
         provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
     )
     await asyncio.wait_for(second, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_relaunch_counts_capacity_but_is_not_cancelled_as_provisioning() -> None:
+    provisioner = _make_provisioner(limit=1)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def relaunch() -> None:
+        started.set()
+        await release.wait()
+
+    task = provisioner.fire_background(
+        relaunch(),
+        provisioning_hostname="gpu01",
+        provisioning_identity=ProvisioningIdentity(InferenceEngine.LLAMA_CPP),
+        operation=BackgroundOperation.RELAUNCH,
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    rejected = asyncio.sleep(0)
+    try:
+        with pytest.raises(ProvisioningCapacityError):
+            provisioner.fire_background(
+                rejected,
+                provisioning_hostname="gpu02",
+                provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
+            )
+        assert await provisioner.cancel_active_provision("gpu01") is None
+        assert not task.done()
+    finally:
+        rejected.close()
+        release.set()
+        await asyncio.wait_for(task, timeout=1)
 
 
 @pytest.mark.asyncio

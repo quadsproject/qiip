@@ -27,7 +27,13 @@ from inference_proxy.quads.client import (
 logger = structlog.get_logger()
 
 _ACTIONABLE_STATUSES = frozenset(
-    {NodeStatus.HEALTHY, NodeStatus.UNHEALTHY, NodeStatus.DRAINING}
+    {
+        NodeStatus.HEALTHY,
+        NodeStatus.UNHEALTHY,
+        NodeStatus.DRAINING,
+        NodeStatus.RELAUNCHING,
+        NodeStatus.RELAUNCH_FAILED,
+    }
 )
 _MAX_RETRY_BACKOFF_SECONDS = 3600.0
 
