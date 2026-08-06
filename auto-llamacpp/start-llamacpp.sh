@@ -12,6 +12,10 @@ BATCH_SIZE_OVERRIDE="${AUTOLLAMACPP_BATCH_SIZE:-}"
 EXTRA_ARGS_OVERRIDE="${AUTOLLAMACPP_EXTRA_ARGS:-}"
 MANAGED="${AUTOLLAMACPP_MANAGED:-0}"
 FIT_TARGET_MIB="${AUTOLLAMACPP_FIT_TARGET_MIB:-512}"
+MANAGED_SIZING="${AUTOLLAMACPP_MANAGED_SIZING:-auto}"
+MANAGED_REQUESTED_CONTEXT="${AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT:-}"
+MANAGED_REQUESTED_PARALLEL="${AUTOLLAMACPP_MANAGED_PARALLEL:-}"
+MANAGED_REQUESTED_CACHE_TYPE="${AUTOLLAMACPP_MANAGED_CACHE_TYPE:-}"
 SCRIPT_DIR="${AUTOLLAMACPP_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 LLAMACPP_BIN="${AUTOLLAMACPP_BIN:-/usr/local/bin/llama-server}"
 LLAMACPP_FIT_BIN="${AUTOLLAMACPP_FIT_BIN:-/usr/local/bin/llama-fit-params}"
@@ -24,6 +28,7 @@ STARTUP_LOG_LINES="${AUTOLLAMACPP_STARTUP_LOG_LINES:-40}"
 REQUIRE_CUDA="${AUTOLLAMACPP_REQUIRE_CUDA:-1}"
 LLAMACPP_MAX_SEQUENCES=256
 LLAMACPP_CONTEXT_ALIGNMENT=256
+LLAMACPP_MAX_AGGREGATE_CONTEXT=4294967040
 LLAMACPP_ESTIMATE_ROUNDING_MIB=4
 LLAMACPP_PRIMARY_CACHE_TYPE=f16
 LLAMACPP_FALLBACK_CACHE_TYPE=q8_0
@@ -128,6 +133,59 @@ configure_llamacpp_params() {
             echo "FATAL: AUTOLLAMACPP_FIT_TARGET_MIB must be a positive integer MiB value" >&2
             return 1
         fi
+        case "$MANAGED_SIZING" in
+            auto)
+                if [ -n "$MANAGED_REQUESTED_CONTEXT" ] \
+                    || [ -n "$MANAGED_REQUESTED_PARALLEL" ] \
+                    || [ -n "$MANAGED_REQUESTED_CACHE_TYPE" ]; then
+                    echo "FATAL: automatic managed sizing does not accept custom values" >&2
+                    return 1
+                fi
+                ;;
+            custom)
+                if [[ ! "$MANAGED_REQUESTED_CONTEXT" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "FATAL: custom context_per_slot must be a positive 256-token increment" >&2
+                    return 1
+                fi
+                if [ "${#MANAGED_REQUESTED_CONTEXT}" -gt "${#LLAMACPP_MAX_AGGREGATE_CONTEXT}" ] \
+                    || { [ "${#MANAGED_REQUESTED_CONTEXT}" -eq "${#LLAMACPP_MAX_AGGREGATE_CONTEXT}" ] \
+                        && [ "$MANAGED_REQUESTED_CONTEXT" -gt "$LLAMACPP_MAX_AGGREGATE_CONTEXT" ]; }; then
+                    echo "FATAL: custom aggregate context exceeds ${LLAMACPP_MAX_AGGREGATE_CONTEXT}" >&2
+                    return 1
+                fi
+                if [ "$MANAGED_REQUESTED_CONTEXT" -lt "$LLAMACPP_CONTEXT_ALIGNMENT" ] \
+                    || [ $((MANAGED_REQUESTED_CONTEXT % LLAMACPP_CONTEXT_ALIGNMENT)) -ne 0 ]; then
+                    echo "FATAL: custom context_per_slot must be a positive 256-token increment" >&2
+                    return 1
+                fi
+                if [[ ! "$MANAGED_REQUESTED_PARALLEL" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "FATAL: custom parallel slots must be between 1 and ${LLAMACPP_MAX_SEQUENCES}" >&2
+                    return 1
+                fi
+                if [ "${#MANAGED_REQUESTED_PARALLEL}" -gt "${#LLAMACPP_MAX_SEQUENCES}" ] \
+                    || { [ "${#MANAGED_REQUESTED_PARALLEL}" -eq "${#LLAMACPP_MAX_SEQUENCES}" ] \
+                        && [ "$MANAGED_REQUESTED_PARALLEL" -gt "$LLAMACPP_MAX_SEQUENCES" ]; }; then
+                    echo "FATAL: custom parallel slots must be between 1 and ${LLAMACPP_MAX_SEQUENCES}" >&2
+                    return 1
+                fi
+                case "$MANAGED_REQUESTED_CACHE_TYPE" in
+                    "$LLAMACPP_PRIMARY_CACHE_TYPE"|"$LLAMACPP_FALLBACK_CACHE_TYPE") ;;
+                    *)
+                        echo "FATAL: custom KV cache type must be f16 or q8_0" >&2
+                        return 1
+                        ;;
+                esac
+                if [ $((MANAGED_REQUESTED_CONTEXT * MANAGED_REQUESTED_PARALLEL)) \
+                    -gt "$LLAMACPP_MAX_AGGREGATE_CONTEXT" ]; then
+                    echo "FATAL: custom aggregate context exceeds ${LLAMACPP_MAX_AGGREGATE_CONTEXT}" >&2
+                    return 1
+                fi
+                ;;
+            *)
+                echo "FATAL: managed sizing must be auto or custom" >&2
+                return 1
+                ;;
+        esac
         if [ ! -x "$LLAMACPP_FIT_BIN" ]; then
             echo "FATAL: managed llama.cpp requires the VRAM planner at ${LLAMACPP_FIT_BIN}" >&2
             return 1
@@ -188,6 +246,8 @@ clear_script_environment() {
     unset AUTOLLAMACPP_GPU_LAYERS AUTOLLAMACPP_CTX_SIZE AUTOLLAMACPP_PARALLEL
     unset AUTOLLAMACPP_BATCH_SIZE AUTOLLAMACPP_EXTRA_ARGS
     unset AUTOLLAMACPP_MANAGED AUTOLLAMACPP_FIT_TARGET_MIB
+    unset AUTOLLAMACPP_MANAGED_SIZING AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT
+    unset AUTOLLAMACPP_MANAGED_PARALLEL AUTOLLAMACPP_MANAGED_CACHE_TYPE
     unset AUTOLLAMACPP_SCRIPT_DIR AUTOLLAMACPP_BIN AUTOLLAMACPP_FIT_BIN
     unset AUTOLLAMACPP_INSTALL_ROOT
     unset AUTOLLAMACPP_PID_FILE
@@ -274,7 +334,7 @@ managed_candidate_fits() {
     local -a estimated_mib=()
 
     aggregate_context=$(managed_aggregate_context "$context_per_slot" "$slots")
-    if [ "$aggregate_context" -gt 4294967040 ]; then
+    if [ "$aggregate_context" -gt "$LLAMACPP_MAX_AGGREGATE_CONTEXT" ]; then
         return 1
     fi
     if ! output=$("$LLAMACPP_FIT_BIN" \
@@ -450,6 +510,32 @@ plan_managed_configuration() {
     read_managed_gpu_free_memory
     train_context=$(read_model_train_context)
     MANAGED_TRAIN_CONTEXT="$train_context"
+
+    if [ "$MANAGED_SIZING" = "custom" ]; then
+        if [ "$MANAGED_REQUESTED_CONTEXT" -gt "$train_context" ]; then
+            echo "FATAL: custom context_per_slot ${MANAGED_REQUESTED_CONTEXT} exceeds model training context ${train_context}" >&2
+            return 1
+        fi
+        select_managed_cache_policy "$MANAGED_REQUESTED_CACHE_TYPE"
+        status=0
+        managed_candidate_fits \
+            "$MANAGED_REQUESTED_CONTEXT" "$MANAGED_REQUESTED_PARALLEL" \
+            || status=$?
+        if [ "$status" -eq 2 ]; then
+            return 1
+        fi
+        if [ "$status" -ne 0 ]; then
+            echo "FATAL: custom llama.cpp sizing cannot fully offload while preserving ${FIT_TARGET_MIB} MiB free per GPU" >&2
+            return 1
+        fi
+        MANAGED_CONTEXT_PER_SLOT="$MANAGED_REQUESTED_CONTEXT"
+        MANAGED_PARALLEL="$MANAGED_REQUESTED_PARALLEL"
+        MANAGED_AGGREGATE_CONTEXT=$(managed_aggregate_context \
+            "$MANAGED_CONTEXT_PER_SLOT" "$MANAGED_PARALLEL")
+        echo "Selected exact custom configuration: ${MANAGED_PARALLEL} slots x ${MANAGED_CONTEXT_PER_SLOT} tokens (${MANAGED_AGGREGATE_CONTEXT} aggregate) with ${MANAGED_CACHE_TYPE_K}/${MANAGED_CACHE_TYPE_V} KV cache"
+        return 0
+    fi
+
     min_context=4096
     if [ "$train_context" -lt "$min_context" ]; then
         min_context="$train_context"
@@ -539,7 +625,8 @@ EOF
     fi
 
     if [ "$MANAGED" = "1" ]; then
-        printf 'qiip_fit_plan: sizing=auto train_context=%s context_per_slot=%s slots=%s aggregate_context=%s fit_target_mib=%s cache_type_k=%s cache_type_v=%s flash_attn=%s\n' \
+        printf 'qiip_fit_plan: sizing=%s train_context=%s context_per_slot=%s slots=%s aggregate_context=%s fit_target_mib=%s cache_type_k=%s cache_type_v=%s flash_attn=%s\n' \
+            "$MANAGED_SIZING" \
             "$MANAGED_TRAIN_CONTEXT" \
             "$MANAGED_CONTEXT_PER_SLOT" \
             "$MANAGED_PARALLEL" \

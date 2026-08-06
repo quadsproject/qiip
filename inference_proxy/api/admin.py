@@ -56,7 +56,12 @@ from inference_proxy.models.admin import (
     TeardownResponse,
 )
 from inference_proxy.models.endpoint import EndpointValidationError
-from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
+from inference_proxy.models.node import (
+    InferenceEngine,
+    LlamaCppRuntimeRequest,
+    Node,
+    NodeStatus,
+)
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     ProvisioningCapacityError,
@@ -122,6 +127,7 @@ class _SetupSelection:
     engine: InferenceEngine
     model: str | None
     artifact_id: str | None
+    llamacpp_request: LlamaCppRuntimeRequest | None
 
 
 def _effective_setup_selection(
@@ -137,12 +143,19 @@ def _effective_setup_selection(
     """
     explicit = bool(body.model_fields_set & _SETUP_SELECTION_FIELDS)
     if explicit:
-        return _SetupSelection(body.engine, body.model, body.artifact_id)
+        return _SetupSelection(body.engine, body.model, body.artifact_id, None)
     if node is None:
-        return fallback or _SetupSelection(body.engine, body.model, body.artifact_id)
+        return fallback or _SetupSelection(
+            body.engine, body.model, body.artifact_id, None
+        )
     if node.engine is InferenceEngine.LLAMA_CPP:
-        return _SetupSelection(node.engine, None, node.artifact_id)
-    return _SetupSelection(node.engine, node.model or None, None)
+        request = (
+            node.llamacpp_runtime.requested
+            if node.llamacpp_runtime is not None
+            else None
+        )
+        return _SetupSelection(node.engine, None, node.artifact_id, request)
+    return _SetupSelection(node.engine, node.model or None, None, None)
 
 
 async def _validate_setup_selection(
@@ -364,14 +377,25 @@ async def setup_node(
 
         async def _provision_and_cleanup() -> None:
             try:
-                await provisioner.provision(
-                    hostname,
-                    managed=body.managed,
-                    model=selection.model,
-                    engine=selection.engine,
-                    artifact_id=selection.artifact_id,
-                    lifecycle_lease=lease,
-                )
+                if selection.llamacpp_request is None:
+                    await provisioner.provision(
+                        hostname,
+                        managed=body.managed,
+                        model=selection.model,
+                        engine=selection.engine,
+                        artifact_id=selection.artifact_id,
+                        lifecycle_lease=lease,
+                    )
+                else:
+                    await provisioner.provision(
+                        hostname,
+                        managed=body.managed,
+                        model=selection.model,
+                        engine=selection.engine,
+                        artifact_id=selection.artifact_id,
+                        llamacpp_request=selection.llamacpp_request,
+                        lifecycle_lease=lease,
+                    )
             finally:
                 pending_hosts.discard(hostname)
                 # NodeProvisioner owns the lease after transfer. This

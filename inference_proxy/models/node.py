@@ -14,7 +14,18 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
+
+LLAMACPP_CONTEXT_ALIGNMENT = 256
+LLAMACPP_MAX_AGGREGATE_CONTEXT = 4_294_967_040
+LLAMACPP_MAX_SEQUENCES = 256
 
 
 class InferenceEngine(StrEnum):
@@ -48,6 +59,7 @@ class LlamaCppSizingMode(StrEnum):
     """Gateway-authorized llama.cpp sizing policy."""
 
     AUTO = "auto"
+    CUSTOM = "custom"
 
 
 class LlamaCppCacheType(StrEnum):
@@ -71,6 +83,49 @@ class LlamaCppRuntimeRequest(BaseModel):
 
     sizing: LlamaCppSizingMode
     fit_target_mib: int = Field(ge=1)
+    context_per_slot: int | None = Field(default=None, ge=LLAMACPP_CONTEXT_ALIGNMENT)
+    slots: int | None = Field(default=None, ge=1, le=LLAMACPP_MAX_SEQUENCES)
+    cache_type: LlamaCppCacheType | None = None
+
+    @model_serializer
+    def serialize_policy(self) -> dict[str, object]:
+        """Keep the established automatic-policy wire shape compact."""
+        values: dict[str, object] = {
+            "sizing": self.sizing,
+            "fit_target_mib": self.fit_target_mib,
+        }
+        if self.context_per_slot is not None:
+            values["context_per_slot"] = self.context_per_slot
+        if self.slots is not None:
+            values["slots"] = self.slots
+        if self.cache_type is not None:
+            values["cache_type"] = self.cache_type
+        return values
+
+    @model_validator(mode="after")
+    def validate_sizing_policy(self) -> LlamaCppRuntimeRequest:
+        custom_values = (self.context_per_slot, self.slots, self.cache_type)
+        if self.sizing is LlamaCppSizingMode.AUTO:
+            if any(value is not None for value in custom_values):
+                raise ValueError(
+                    "automatic llama.cpp sizing does not accept custom values"
+                )
+            return self
+
+        if any(value is None for value in custom_values):
+            raise ValueError(
+                "custom llama.cpp sizing requires context_per_slot, slots, "
+                "and cache_type"
+            )
+        assert self.context_per_slot is not None
+        assert self.slots is not None
+        if self.context_per_slot % LLAMACPP_CONTEXT_ALIGNMENT:
+            raise ValueError("context_per_slot must be aligned to 256-token increments")
+        if self.context_per_slot * self.slots > LLAMACPP_MAX_AGGREGATE_CONTEXT:
+            raise ValueError(
+                "context_per_slot * slots exceeds llama.cpp's aggregate context limit"
+            )
+        return self
 
 
 class LlamaCppRuntimeEffective(BaseModel):

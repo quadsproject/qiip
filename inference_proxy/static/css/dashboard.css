@@ -237,18 +237,6 @@ h1 {
   min-width: 0;
 }
 
-.runtime-grid .runtime-summary {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 1rem;
-}
-
-.runtime-grid .runtime-summary dd {
-  font-size: 0.9375rem;
-  font-weight: 600;
-}
-
 .runtime-grid dt {
   color: var(--text-light);
   font-size: 0.6875rem;

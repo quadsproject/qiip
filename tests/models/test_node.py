@@ -128,6 +128,91 @@ class TestNodeFullCreation:
             LlamaCppRuntimeState.model_validate(payload)
 
 
+class TestLlamaCppRuntimeRequest:
+    def test_automatic_policy_preserves_the_existing_wire_shape(self) -> None:
+        request = LlamaCppRuntimeRequest(
+            sizing=LlamaCppSizingMode.AUTO,
+            fit_target_mib=512,
+        )
+
+        assert request.model_dump(mode="json") == {
+            "sizing": "auto",
+            "fit_target_mib": 512,
+        }
+
+    def test_custom_policy_roundtrips_exact_values(self) -> None:
+        request = LlamaCppRuntimeRequest(
+            sizing=LlamaCppSizingMode.CUSTOM,
+            fit_target_mib=768,
+            context_per_slot=32768,
+            slots=3,
+            cache_type=LlamaCppCacheType.Q8_0,
+        )
+
+        payload = request.model_dump(mode="json")
+        assert payload == {
+            "sizing": "custom",
+            "fit_target_mib": 768,
+            "context_per_slot": 32768,
+            "slots": 3,
+            "cache_type": "q8_0",
+        }
+        assert LlamaCppRuntimeRequest.model_validate(payload) == request
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"context_per_slot": 4096},
+            {"slots": 2},
+            {"cache_type": "f16"},
+        ],
+    )
+    def test_automatic_policy_rejects_custom_fields(
+        self, extra: dict[str, object]
+    ) -> None:
+        with pytest.raises(ValidationError, match="does not accept custom values"):
+            LlamaCppRuntimeRequest.model_validate(
+                {"sizing": "auto", "fit_target_mib": 512, **extra}
+            )
+
+    @pytest.mark.parametrize(
+        "missing",
+        ["context_per_slot", "slots", "cache_type"],
+    )
+    def test_custom_policy_requires_all_exact_fields(self, missing: str) -> None:
+        values: dict[str, object] = {
+            "sizing": "custom",
+            "fit_target_mib": 512,
+            "context_per_slot": 4096,
+            "slots": 2,
+            "cache_type": "f16",
+        }
+        del values[missing]
+
+        with pytest.raises(ValidationError, match="requires context_per_slot"):
+            LlamaCppRuntimeRequest.model_validate(values)
+
+    def test_custom_context_must_be_256_token_aligned(self) -> None:
+        with pytest.raises(ValidationError, match="256-token increments"):
+            LlamaCppRuntimeRequest(
+                sizing=LlamaCppSizingMode.CUSTOM,
+                fit_target_mib=512,
+                context_per_slot=4097,
+                slots=1,
+                cache_type=LlamaCppCacheType.F16,
+            )
+
+    def test_custom_aggregate_context_cannot_exceed_llamacpp_limit(self) -> None:
+        with pytest.raises(ValidationError, match="aggregate context limit"):
+            LlamaCppRuntimeRequest(
+                sizing=LlamaCppSizingMode.CUSTOM,
+                fit_target_mib=512,
+                context_per_slot=16_777_216,
+                slots=256,
+                cache_type=LlamaCppCacheType.F16,
+            )
+
+
 class TestNodeCapabilitiesDefaults:
     def test_node_capabilities_defaults(self) -> None:
         caps = NodeCapabilities()

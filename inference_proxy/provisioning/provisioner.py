@@ -77,7 +77,7 @@ LLAMACPP_AGGREGATE_CONTEXT_PATTERN = re.compile(
     r"llama_context:\s+n_ctx\s*=\s*(?P<context>\d+)"
 )
 LLAMACPP_PLAN_PATTERN = re.compile(
-    r"qiip_fit_plan: sizing=(?P<sizing>auto) "
+    r"qiip_fit_plan: sizing=(?P<sizing>auto|custom) "
     r"train_context=(?P<train_context>\d+) "
     r"context_per_slot=(?P<context>\d+) "
     r"slots=(?P<slots>\d+) "
@@ -477,16 +477,28 @@ class NodeProvisioner:
         model: str | None,
         engine: InferenceEngine = InferenceEngine.VLLM,
         artifact: ResolvedGGUFArtifact | None = None,
+        llamacpp_request: LlamaCppRuntimeRequest | None = None,
     ) -> dict[str, str]:
         """Return the exact environment accepted by the engine start script."""
         if engine == InferenceEngine.LLAMA_CPP:
+            request = llamacpp_request or self._default_llamacpp_runtime_request()
             env = {
                 "AUTOLLAMACPP_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
                 "AUTOLLAMACPP_PORT": str(self._settings.vllm_port),
                 "AUTOLLAMACPP_REQUIRE_CUDA": "1",
                 "AUTOLLAMACPP_MANAGED": "1",
-                "AUTOLLAMACPP_FIT_TARGET_MIB": str(
-                    self._settings.llamacpp_fit_target_mib
+                "AUTOLLAMACPP_FIT_TARGET_MIB": str(request.fit_target_mib),
+                "AUTOLLAMACPP_MANAGED_SIZING": request.sizing.value,
+                "AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT": (
+                    str(request.context_per_slot)
+                    if request.context_per_slot is not None
+                    else ""
+                ),
+                "AUTOLLAMACPP_MANAGED_PARALLEL": (
+                    str(request.slots) if request.slots is not None else ""
+                ),
+                "AUTOLLAMACPP_MANAGED_CACHE_TYPE": (
+                    request.cache_type.value if request.cache_type is not None else ""
                 ),
             }
             if artifact is None:
@@ -494,6 +506,10 @@ class NodeProvisioner:
             env["AUTOLLAMACPP_GGUF_PATH"] = artifact.node_relative_entrypoint
             env["AUTOLLAMACPP_MODEL_ALIAS"] = artifact.model_alias
         else:
+            if llamacpp_request is not None:
+                raise ProvisioningError(
+                    "llama.cpp sizing policy is only valid for llama_cpp starts"
+                )
             env = {
                 "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
                 "AUTOVLLM_API_PORT": str(self._settings.vllm_port),
@@ -503,6 +519,13 @@ class NodeProvisioner:
         if self._hf_token:
             env["HF_TOKEN"] = self._hf_token
         return env
+
+    def _default_llamacpp_runtime_request(self) -> LlamaCppRuntimeRequest:
+        """Return the configured automatic policy for a fresh managed start."""
+        return LlamaCppRuntimeRequest(
+            sizing=LlamaCppSizingMode.AUTO,
+            fit_target_mib=self._settings.llamacpp_fit_target_mib,
+        )
 
     def _script_command(
         self,
@@ -704,6 +727,7 @@ class NodeProvisioner:
         model: str | None = None,
         engine: InferenceEngine = InferenceEngine.VLLM,
         artifact_id: str | None = None,
+        llamacpp_request: LlamaCppRuntimeRequest | None = None,
         lifecycle_lease: HostLifecycleLease | None = None,
     ) -> None:
         """Provision *hostname* under the shared host lifecycle coordinator."""
@@ -713,6 +737,14 @@ class NodeProvisioner:
         self.validate_setup_configuration(engine)
         self.validate_endpoint(hostname)
         artifact = await self.resolve_artifact_selection(engine, artifact_id)
+        if engine == InferenceEngine.LLAMA_CPP:
+            llamacpp_request = (
+                llamacpp_request or self._default_llamacpp_runtime_request()
+            )
+        elif llamacpp_request is not None:
+            raise ProvisioningError(
+                "llama.cpp sizing policy is only valid for llama_cpp provisioning"
+            )
         lease = lifecycle_lease
         if lease is None:
             lease = await self._lifecycle.acquire(hostname)
@@ -720,13 +752,23 @@ class NodeProvisioner:
             raise ValueError("lifecycle lease does not own this host")
 
         try:
-            await self._provision(
-                hostname,
-                managed=managed,
-                model=model,
-                engine=engine,
-                artifact=artifact,
-            )
+            if llamacpp_request is None:
+                await self._provision(
+                    hostname,
+                    managed=managed,
+                    model=model,
+                    engine=engine,
+                    artifact=artifact,
+                )
+            else:
+                await self._provision(
+                    hostname,
+                    managed=managed,
+                    model=model,
+                    engine=engine,
+                    artifact=artifact,
+                    llamacpp_request=llamacpp_request,
+                )
         except asyncio.CancelledError:
             self._log(hostname, "error", "Provisioning cancelled by teardown")
             await self._update_state(
@@ -748,6 +790,7 @@ class NodeProvisioner:
         model: str | None = None,
         engine: InferenceEngine = InferenceEngine.VLLM,
         artifact: ResolvedGGUFArtifact | None = None,
+        llamacpp_request: LlamaCppRuntimeRequest | None = None,
     ) -> None:
         """Run full provisioning sequence on *hostname*.
 
@@ -837,7 +880,11 @@ class NodeProvisioner:
             )
             self._log(hostname, "info", f"Starting {engine} inference engine")
             model_name = await self._run_start_vllm(
-                hostname, model=model, engine=engine, artifact=artifact
+                hostname,
+                model=model,
+                engine=engine,
+                artifact=artifact,
+                llamacpp_request=llamacpp_request,
             )
             current_step = "health_poll"
             await self._update_state(
@@ -850,7 +897,9 @@ class NodeProvisioner:
                 current_step = "llamacpp_runtime_verify"
                 llamacpp_runtime = await self._verify_llamacpp_runtime(
                     hostname,
-                    expected_fit_target_mib=self._settings.llamacpp_fit_target_mib,
+                    expected_request=(
+                        llamacpp_request or self._default_llamacpp_runtime_request()
+                    ),
                 )
             current_step = "registering"
             await self._update_state(
@@ -1014,7 +1063,7 @@ class NodeProvisioner:
         self,
         hostname: str,
         *,
-        expected_fit_target_mib: int,
+        expected_request: LlamaCppRuntimeRequest,
     ) -> LlamaCppRuntimeState:
         """Fail closed unless the healthy server proves the managed fit contract."""
         try:
@@ -1053,20 +1102,33 @@ class NodeProvisioner:
                 raise ProvisioningError(
                     "post-load NVIDIA memory telemetry returned duplicate GPU indices"
                 )
-            if fit.fit_target_mib != expected_fit_target_mib:
+            if fit.sizing != expected_request.sizing.value:
+                raise ProvisioningError(
+                    "llama.cpp runtime sizing mode differs from its requested value"
+                )
+            if fit.fit_target_mib != expected_request.fit_target_mib:
                 raise ProvisioningError(
                     "llama.cpp runtime fit target differs from its requested value"
                 )
+            if expected_request.sizing is LlamaCppSizingMode.CUSTOM:
+                expected_cache_type = expected_request.cache_type
+                assert expected_cache_type is not None
+                if (
+                    fit.context_per_slot != expected_request.context_per_slot
+                    or fit.slots != expected_request.slots
+                    or fit.cache_type_k != expected_cache_type.value
+                    or fit.cache_type_v != expected_cache_type.value
+                ):
+                    raise ProvisioningError(
+                        "llama.cpp runtime differs from its requested custom sizing"
+                    )
             if any(row.free_mib < fit.fit_target_mib for row in memory_rows):
                 raise ProvisioningError(
                     "llama.cpp post-load free VRAM is below the requested fit target"
                 )
 
             runtime = LlamaCppRuntimeState(
-                requested=LlamaCppRuntimeRequest(
-                    sizing=LlamaCppSizingMode(fit.sizing),
-                    fit_target_mib=fit.fit_target_mib,
-                ),
+                requested=expected_request,
                 effective=LlamaCppRuntimeEffective(
                     train_context=fit.train_context,
                     context_per_slot=fit.context_per_slot,
@@ -1100,7 +1162,7 @@ class NodeProvisioner:
                 f"cache_type_v={fit.cache_type_v} "
                 f"flash_attn={fit.flash_attn} "
                 f"gpu_layers={fit.gpu_layers}/{fit.total_layers} "
-                f"fit_target_mib={expected_fit_target_mib} "
+                f"fit_target_mib={expected_request.fit_target_mib} "
                 f"gpu_used_mib={used} gpu_free_mib={free}",
             )
             return runtime
@@ -1115,6 +1177,7 @@ class NodeProvisioner:
         model: str | None = None,
         engine: InferenceEngine = InferenceEngine.VLLM,
         artifact: ResolvedGGUFArtifact | None = None,
+        llamacpp_request: LlamaCppRuntimeRequest | None = None,
     ) -> str:
         """Run the engine start script and extract model name from stdout."""
         if engine == InferenceEngine.LLAMA_CPP:
@@ -1123,7 +1186,9 @@ class NodeProvisioner:
             script = "start-vllm.sh"
         command = self._script_command(
             script,
-            env=self._start_script_env(model, engine, artifact),
+            env=self._start_script_env(
+                model, engine, artifact, llamacpp_request=llamacpp_request
+            ),
             scripts_dir=self._engine_scripts_dir(engine).name,
         )
         model_name: str | None = None
