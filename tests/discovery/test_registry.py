@@ -12,7 +12,7 @@ from pathlib import Path
 
 import structlog
 
-from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.discovery.registry import NodeRegistry, node_with_status
 from inference_proxy.models.node import Node, NodeStatus
 
 
@@ -337,6 +337,26 @@ def test_status_transitions_use_registry_primitive() -> None:
                     offenders.append(f"{relative}:{call.lineno}")
 
     assert offenders == []
+
+
+def test_node_with_status_preserves_fields_and_applies_owned_changes() -> None:
+    node = Node(
+        node_id="gpu01",
+        endpoint="http://gpu01:8000",
+        status=NodeStatus.HEALTHY,
+        model="original",
+    )
+
+    transitioned = node_with_status(
+        node,
+        NodeStatus.RELAUNCH_FAILED,
+        model="replacement",
+    )
+
+    assert transitioned.status is NodeStatus.RELAUNCH_FAILED
+    assert transitioned.model == "replacement"
+    assert transitioned.endpoint == node.endpoint
+    assert node.status is NodeStatus.HEALTHY
 
 
 class TestRegistryConcurrentAccess:

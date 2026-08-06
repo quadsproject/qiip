@@ -16,6 +16,7 @@ from collections.abc import Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from ipaddress import ip_address
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
@@ -24,9 +25,9 @@ import httpx
 import structlog
 
 from inference_proxy.config.settings import LLMFitSettings, ProvisioningSettings
-from inference_proxy.discovery.etcd_client import EtcdClient
-from inference_proxy.discovery.registry import NodeRegistry
-from inference_proxy.discovery.serializer import node_to_etcd
+from inference_proxy.discovery.etcd_client import EtcdClient, EtcdRecord
+from inference_proxy.discovery.registry import NodeRegistry, node_with_status
+from inference_proxy.discovery.serializer import node_from_etcd, node_to_etcd
 from inference_proxy.huggingface.artifacts import (
     GGUFArtifactError,
     GGUFArtifactIndex,
@@ -137,6 +138,18 @@ class ProvisioningCapacityError(RuntimeError):
         super().__init__(
             f"Provisioning capacity reached ({active}/{limit} active tasks)"
         )
+
+
+class RelaunchPreconditionError(RuntimeError):
+    """Raised when a node cannot safely accept a managed relaunch."""
+
+
+class RelaunchValidationError(ValueError):
+    """Raised when a relaunch policy conflicts with observed node limits."""
+
+
+class RelaunchConflictError(RuntimeError):
+    """Raised when etcd ownership changes during a relaunch transaction."""
 
 
 class PreflightError(Exception):
@@ -293,7 +306,23 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
 class _ProvisioningTask:
     task: asyncio.Task[None]
     identity: ProvisioningIdentity
+    operation: BackgroundOperation
     started: bool = False
+
+
+class BackgroundOperation(StrEnum):
+    """Capacity-counted background operation type."""
+
+    PROVISION = "provision"
+    RELAUNCH = "relaunch"
+
+
+class DrainOutcome(StrEnum):
+    """Result of waiting for a node's active requests to drain."""
+
+    COMPLETE = "complete"
+    TIMED_OUT = "timed_out"
+    UNAVAILABLE = "unavailable"
 
 
 class NodeProvisioner:
@@ -699,6 +728,512 @@ class NodeProvisioner:
         if self._tracker is None:
             return 0
         return self._tracker.get(hostname)
+
+    @property
+    def connection_tracking_available(self) -> bool:
+        """Return whether lifecycle operations can observe active requests."""
+        return self._tracker is not None
+
+    def validate_llamacpp_relaunch(
+        self,
+        node: Node | None,
+        request: LlamaCppRuntimeRequest,
+    ) -> Node:
+        """Return a relaunchable node or raise a typed boundary error."""
+        if node is None:
+            raise RelaunchPreconditionError("Node is not registered")
+        if node.status is not NodeStatus.HEALTHY:
+            raise RelaunchPreconditionError(
+                f"Node is {node.status.value}; relaunch requires a healthy node"
+            )
+        if not node.managed or node.engine is not InferenceEngine.LLAMA_CPP:
+            raise RelaunchPreconditionError(
+                "Relaunch requires a managed llama_cpp node"
+            )
+        if node.artifact_id is None or node.llamacpp_runtime is None:
+            raise RelaunchPreconditionError(
+                "Relaunch requires an artifact identity and verified runtime state"
+            )
+        if self._tracker is None:
+            raise RelaunchPreconditionError(
+                "Relaunch requires active-connection tracking"
+            )
+
+        runtime = node.llamacpp_runtime
+        if request.fit_target_mib >= min(gpu.total_mib for gpu in runtime.gpus):
+            raise RelaunchValidationError(
+                "fit_target_mib must be smaller than every GPU's total VRAM"
+            )
+        if (
+            request.sizing is LlamaCppSizingMode.CUSTOM
+            and request.context_per_slot is not None
+            and request.context_per_slot > runtime.effective.train_context
+        ):
+            raise RelaunchValidationError(
+                "context_per_slot exceeds the model training context"
+            )
+        return node
+
+    async def _read_node_record(self, hostname: str) -> tuple[EtcdRecord, Node]:
+        key = f"{self._etcd_client.prefix}{hostname}"
+        record = await asyncio.to_thread(self._etcd_client.get_record, key)
+        if record is None:
+            raise RelaunchConflictError(
+                f"Node {hostname!r} disappeared from etcd during relaunch"
+            )
+        node = node_from_etcd(
+            record.key,
+            record.value,
+            self._etcd_client.prefix,
+            endpoint_policy=self._endpoint_policy,
+        )
+        if node is None:
+            raise RelaunchConflictError(
+                f"Node {hostname!r} has an invalid etcd registration"
+            )
+        return record, node
+
+    async def _replace_node_revision(
+        self,
+        record: EtcdRecord,
+        expected_node: Node,
+        replacement: Node,
+        *,
+        lease_id: int,
+    ) -> EtcdRecord:
+        """Replace one node revision, retrying lease-only interleavings."""
+        key, value = node_to_etcd(replacement, self._etcd_client.prefix)
+        current_record = record
+        for _attempt in range(3):
+            replacement_revision = await asyncio.to_thread(
+                self._etcd_client.replace_if_revision,
+                key,
+                value,
+                expected_mod_revision=current_record.mod_revision,
+                lease_id=lease_id,
+            )
+            if replacement_revision is not None:
+                return EtcdRecord(
+                    key=key.encode("utf-8"),
+                    value=value,
+                    mod_revision=replacement_revision,
+                    lease_id=lease_id,
+                )
+
+            current_record, current_node = await self._read_node_record(
+                replacement.node_id
+            )
+            if current_node != expected_node:
+                raise RelaunchConflictError(
+                    f"Node {replacement.node_id!r} changed during relaunch"
+                )
+
+        raise RelaunchConflictError(
+            f"Node {replacement.node_id!r} revision changed repeatedly during relaunch"
+        )
+
+    async def _prepare_relaunch_lease(self, record: EtcdRecord) -> tuple[int, bool]:
+        """Return a fresh managed lease and whether this call granted it."""
+        if record.lease_id:
+            remaining = await asyncio.to_thread(
+                self._etcd_client.refresh_lease,
+                record.lease_id,
+            )
+            if remaining == -1:
+                raise RelaunchConflictError("The managed node lease has expired")
+            return record.lease_id, False
+        lease_id = await asyncio.to_thread(self._etcd_client.grant_node_lease)
+        return lease_id, True
+
+    async def _keep_relaunch_lease(
+        self,
+        hostname: str,
+        lease_id: int,
+    ) -> None:
+        """Keep a RELAUNCHING registration alive until terminal persistence."""
+        interval = max(1.0, self._etcd_client.node_lease_ttl / 3)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                remaining = await asyncio.to_thread(
+                    self._etcd_client.refresh_lease,
+                    lease_id,
+                )
+            except Exception:
+                logger.warning(
+                    "relaunch_lease_refresh_failed",
+                    hostname=hostname,
+                    lease_id=lease_id,
+                    exc_info=True,
+                )
+                continue
+            if remaining == -1:
+                logger.error(
+                    "relaunch_lease_expired",
+                    hostname=hostname,
+                    lease_id=lease_id,
+                )
+                return
+
+    async def relaunch_llamacpp(
+        self,
+        hostname: str,
+        request: LlamaCppRuntimeRequest,
+        *,
+        lifecycle_lease: HostLifecycleLease | None = None,
+    ) -> None:
+        """Transactionally relaunch one healthy managed llama.cpp node."""
+        lease = lifecycle_lease
+        if lease is None:
+            lease = await self._lifecycle.acquire(hostname)
+        elif not lease.belongs_to(self._lifecycle, hostname):
+            raise ValueError("lifecycle lease does not own this host")
+
+        try:
+            await self._relaunch_llamacpp(hostname, request)
+        finally:
+            lease.release()
+
+    async def _launch_llamacpp_runtime(
+        self,
+        hostname: str,
+        artifact: ResolvedGGUFArtifact,
+        request: LlamaCppRuntimeRequest,
+    ) -> tuple[str, LlamaCppRuntimeState]:
+        """Launch and verify one exact llama.cpp runtime policy."""
+        model_name = await self._run_start_vllm(
+            hostname,
+            engine=InferenceEngine.LLAMA_CPP,
+            artifact=artifact,
+            llamacpp_request=request,
+        )
+        await self._poll_health(hostname, engine=InferenceEngine.LLAMA_CPP)
+        runtime = await self._verify_llamacpp_runtime(
+            hostname,
+            expected_request=request,
+        )
+        return model_name, runtime
+
+    async def _stop_llamacpp(self, hostname: str) -> None:
+        """Stop llama.cpp through the verified engine-specific script."""
+        command = self._script_command(
+            "stop-llamacpp.sh",
+            scripts_dir=self._engine_scripts_dir(InferenceEngine.LLAMA_CPP).name,
+        )
+        await self._ssh_run_command(hostname, command)
+
+    async def _relaunch_llamacpp(
+        self,
+        hostname: str,
+        request: LlamaCppRuntimeRequest,
+    ) -> None:
+        started_at = datetime.now(UTC)
+        self._log_buffer.create(hostname)
+        self._log(hostname, "info", "llama.cpp relaunch started")
+        await self._update_state(
+            hostname,
+            ProvisioningStep.RELAUNCH_VALIDATING,
+            started_at=started_at,
+        )
+
+        relaunch_record: EtcdRecord | None = None
+        previous_node: Node | None = None
+        artifact: ResolvedGGUFArtifact | None = None
+        lease_id: int | None = None
+        granted_lease = False
+        keepalive: asyncio.Task[None] | None = None
+        stop_attempted = False
+        relaunch_active = False
+        current_step = ProvisioningStep.RELAUNCH_VALIDATING.value
+
+        try:
+            local_node = self._registry.get(hostname) if self._registry else None
+            self.validate_llamacpp_relaunch(local_node, request)
+            record, persisted_node = await self._read_node_record(hostname)
+            previous_node = self.validate_llamacpp_relaunch(persisted_node, request)
+            if local_node is None or (
+                local_node.engine,
+                local_node.artifact_id,
+                local_node.llamacpp_runtime,
+            ) != (
+                previous_node.engine,
+                previous_node.artifact_id,
+                previous_node.llamacpp_runtime,
+            ):
+                raise RelaunchConflictError(
+                    "The registry and persisted node identity differ"
+                )
+            artifact = await self.resolve_artifact_selection(
+                InferenceEngine.LLAMA_CPP,
+                previous_node.artifact_id,
+            )
+            if artifact is None:
+                raise RelaunchPreconditionError(
+                    "The persisted llama.cpp artifact is unavailable"
+                )
+
+            # Refresh the gateway-owned scripts before taking the node out of
+            # rotation so upload failure cannot create avoidable downtime.
+            self._log(hostname, "info", "Refreshing llama.cpp lifecycle scripts")
+            await self._upload_scripts(hostname, engine=InferenceEngine.LLAMA_CPP)
+
+            lease_id, granted_lease = await self._prepare_relaunch_lease(record)
+            relaunching = node_with_status(
+                previous_node,
+                NodeStatus.RELAUNCHING,
+            )
+            if self._registry is None:
+                raise RelaunchPreconditionError(
+                    "Relaunch requires the managed node registry"
+                )
+            # DRAINING stops selection immediately. Replacing it with the
+            # protected lifecycle state under the same registry lock prevents
+            # zero-connection drain cleanup from removing the node.
+            with self._registry.locked():
+                if self._registry.get(hostname) != local_node:
+                    raise RelaunchConflictError(
+                        "The node changed before relaunch could begin"
+                    )
+                self._registry.drain(hostname)
+                self._registry.add(relaunching)
+            try:
+                relaunch_record = await self._replace_node_revision(
+                    record,
+                    previous_node,
+                    relaunching,
+                    lease_id=lease_id,
+                )
+                relaunch_active = True
+            except Exception:
+                self._registry.add(local_node)
+                if granted_lease:
+                    with suppress(Exception):
+                        await asyncio.to_thread(
+                            self._etcd_client.revoke_lease,
+                            lease_id,
+                        )
+                raise
+
+            keepalive = asyncio.create_task(
+                self._keep_relaunch_lease(hostname, lease_id),
+                name=f"relaunch-lease:{hostname}",
+            )
+            current_step = ProvisioningStep.DRAINING.value
+            await self._update_state(
+                hostname,
+                ProvisioningStep.DRAINING,
+                started_at=started_at,
+            )
+            self._log(hostname, "info", "Draining active connections")
+            drain_outcome = await self._drain_wait(hostname)
+            if drain_outcome is not DrainOutcome.COMPLETE:
+                restored = await self._replace_node_revision(
+                    relaunch_record,
+                    relaunching,
+                    previous_node,
+                    lease_id=lease_id,
+                )
+                relaunch_record = restored
+                relaunch_active = False
+                self._registry.add(previous_node)
+                if drain_outcome is DrainOutcome.TIMED_OUT:
+                    raise ProvisioningError(
+                        "Relaunch aborted because active requests did not drain"
+                    )
+                raise ProvisioningError(
+                    "Relaunch aborted because connection tracking is unavailable"
+                )
+            self._log(hostname, "info", "Drain complete")
+
+            current_step = ProvisioningStep.STOPPING_LLAMACPP.value
+            await self._update_state(
+                hostname,
+                ProvisioningStep.STOPPING_LLAMACPP,
+                started_at=started_at,
+            )
+            self._log(hostname, "info", "Stopping the current llama.cpp server")
+            stop_attempted = True
+            await self._stop_llamacpp(hostname)
+
+            current_step = ProvisioningStep.STARTING_LLAMACPP.value
+            await self._update_state(
+                hostname,
+                ProvisioningStep.STARTING_LLAMACPP,
+                started_at=started_at,
+            )
+            self._log(hostname, "info", "Launching the requested configuration")
+            model_name, runtime = await self._launch_llamacpp_runtime(
+                hostname,
+                artifact,
+                request,
+            )
+            healthy = node_with_status(
+                previous_node,
+                NodeStatus.HEALTHY,
+                model=model_name,
+                llamacpp_runtime=runtime,
+                last_heartbeat=datetime.now(UTC),
+            )
+            current_step = ProvisioningStep.REGISTERING.value
+            relaunch_record = await self._replace_node_revision(
+                relaunch_record,
+                relaunching,
+                healthy,
+                lease_id=lease_id,
+            )
+            relaunch_active = False
+            self._registry.add(healthy)
+            await self._update_state(
+                hostname,
+                ProvisioningStep.COMPLETE,
+                started_at=started_at,
+            )
+            self._log(hostname, "info", "llama.cpp relaunch complete")
+            return
+        except BaseException as error:
+            if (
+                stop_attempted
+                and relaunch_record is not None
+                and previous_node is not None
+                and previous_node.llamacpp_runtime is not None
+                and artifact is not None
+                and lease_id is not None
+            ):
+                current_step = ProvisioningStep.ROLLING_BACK.value
+                await self._update_state(
+                    hostname,
+                    ProvisioningStep.ROLLING_BACK,
+                    started_at=started_at,
+                )
+                self._log(
+                    hostname,
+                    "warning",
+                    f"Relaunch failed; restoring the previous policy: {error}",
+                )
+                try:
+                    model_name, runtime = await self._launch_llamacpp_runtime(
+                        hostname,
+                        artifact,
+                        previous_node.llamacpp_runtime.requested,
+                    )
+                    restored_node = node_with_status(
+                        previous_node,
+                        NodeStatus.HEALTHY,
+                        model=model_name,
+                        llamacpp_runtime=runtime,
+                        last_heartbeat=datetime.now(UTC),
+                    )
+                    relaunch_record = await self._replace_node_revision(
+                        relaunch_record,
+                        node_with_status(previous_node, NodeStatus.RELAUNCHING),
+                        restored_node,
+                        lease_id=lease_id,
+                    )
+                except BaseException as rollback_error:
+                    failed = node_with_status(
+                        previous_node,
+                        NodeStatus.RELAUNCH_FAILED,
+                        llamacpp_runtime=None,
+                        last_heartbeat=datetime.now(UTC),
+                    )
+                    terminal_written = False
+                    try:
+                        await self._replace_node_revision(
+                            relaunch_record,
+                            node_with_status(previous_node, NodeStatus.RELAUNCHING),
+                            failed,
+                            lease_id=0,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "relaunch_terminal_state_write_failed",
+                            hostname=hostname,
+                            exc_info=True,
+                        )
+                    else:
+                        terminal_written = True
+                        relaunch_active = False
+                        if self._registry is not None:
+                            self._registry.add(failed)
+                    if terminal_written and lease_id:
+                        with suppress(Exception):
+                            await asyncio.to_thread(
+                                self._etcd_client.revoke_lease,
+                                lease_id,
+                            )
+                    combined = (
+                        f"Relaunch failed: {error}; rollback failed: {rollback_error}"
+                    )
+                    self._log(hostname, "error", combined)
+                    await self._update_state(
+                        hostname,
+                        ProvisioningStep.FAILED,
+                        failed_step=current_step,
+                        error=combined,
+                        started_at=started_at,
+                    )
+                    raise ProvisioningError(combined) from rollback_error
+                else:
+                    relaunch_active = False
+                    if self._registry is not None:
+                        self._registry.add(restored_node)
+                    if (
+                        previous_node.llamacpp_runtime.requested.sizing
+                        is LlamaCppSizingMode.AUTO
+                    ):
+                        rollback_message = "Automatic sizing restored"
+                    else:
+                        rollback_message = "Previous custom sizing restored"
+                    self._log(hostname, "warning", rollback_message)
+                    await self._update_state(
+                        hostname,
+                        ProvisioningStep.FAILED,
+                        failed_step=current_step,
+                        error=f"{error}; {rollback_message}",
+                        started_at=started_at,
+                    )
+                    raise
+
+            if (
+                relaunch_active
+                and not stop_attempted
+                and relaunch_record is not None
+                and previous_node is not None
+                and lease_id is not None
+            ):
+                try:
+                    await self._replace_node_revision(
+                        relaunch_record,
+                        node_with_status(previous_node, NodeStatus.RELAUNCHING),
+                        previous_node,
+                        lease_id=lease_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "relaunch_pre_stop_restore_failed",
+                        hostname=hostname,
+                        exc_info=True,
+                    )
+                else:
+                    relaunch_active = False
+                    if self._registry is not None:
+                        self._registry.add(previous_node)
+
+            self._log(hostname, "error", f"Relaunch failed: {error}")
+            await self._update_state(
+                hostname,
+                ProvisioningStep.FAILED,
+                failed_step=current_step,
+                error=str(error),
+                started_at=started_at,
+            )
+            raise
+        finally:
+            if keepalive is not None:
+                keepalive.cancel()
+                with suppress(asyncio.CancelledError):
+                    await keepalive
+            self._log_buffer.mark_complete(hostname)
 
     async def cleanup_stale_node(self, hostname: str) -> None:
         """Delete stale discovery and local routing state before a retry.
@@ -1346,6 +1881,7 @@ class NodeProvisioner:
         *,
         provisioning_hostname: str | None = None,
         provisioning_identity: ProvisioningIdentity | None = None,
+        operation: BackgroundOperation = BackgroundOperation.PROVISION,
         task_name: str | None = None,
     ) -> asyncio.Task[None]:
         """Schedule and observe an owned background operation.
@@ -1377,7 +1913,7 @@ class NodeProvisioner:
                 )
 
             if task_name is None:
-                task_name = f"provision:{provisioning_hostname}"
+                task_name = f"{operation.value}:{provisioning_hostname}"
 
         record: _ProvisioningTask | None = None
         scheduled_coro = coro
@@ -1405,7 +1941,7 @@ class NodeProvisioner:
         if provisioning_hostname is not None:
             if provisioning_identity is None:  # narrowed by the paired check above
                 raise RuntimeError("provisioning identity was not initialized")
-            record = _ProvisioningTask(task, provisioning_identity)
+            record = _ProvisioningTask(task, provisioning_identity, operation)
             self._provisioning_tasks[provisioning_hostname] = record
 
         def _task_done(done_task: asyncio.Task[None]) -> None:
@@ -1458,6 +1994,8 @@ class NodeProvisioner:
         record = self._provisioning_tasks.get(hostname)
         if record is None or record.task.done():
             return None
+        if record.operation is not BackgroundOperation.PROVISION:
+            return None
 
         task = record.task
         task.cancel()
@@ -1481,18 +2019,18 @@ class NodeProvisioner:
             )
         return record.identity
 
-    async def _drain_wait(self, hostname: str) -> None:
+    async def _drain_wait(self, hostname: str) -> DrainOutcome:
         """Wait for active connections to reach zero or timeout (D-08, D-09)."""
         if self._tracker is None:
             logger.warning("drain_skip_no_tracker", hostname=hostname)
-            return
+            return DrainOutcome.UNAVAILABLE
         deadline = asyncio.get_running_loop().time() + self._settings.drain_timeout
         while True:
             if self._tracker.get(hostname) == 0:
-                return
+                return DrainOutcome.COMPLETE
             if asyncio.get_running_loop().time() >= deadline:
                 logger.warning("drain_timeout_expired", hostname=hostname)
-                return
+                return DrainOutcome.TIMED_OUT
             await asyncio.sleep(1)
 
     async def teardown(
@@ -1588,8 +2126,21 @@ class NodeProvisioner:
                 self._log(hostname, "info", "Draining active connections")
                 if self._registry is not None:
                     self._registry.drain(hostname)
-                await self._drain_wait(hostname)
-                self._log(hostname, "info", "Drain complete")
+                drain_outcome = await self._drain_wait(hostname)
+                if drain_outcome is DrainOutcome.COMPLETE:
+                    self._log(hostname, "info", "Drain complete")
+                elif drain_outcome is DrainOutcome.TIMED_OUT:
+                    self._log(
+                        hostname,
+                        "warning",
+                        "Drain timed out; continuing teardown",
+                    )
+                else:
+                    self._log(
+                        hostname,
+                        "warning",
+                        "Connection tracking unavailable; continuing teardown",
+                    )
 
             if engine == InferenceEngine.LLAMA_CPP:
                 stopping_step = ProvisioningStep.STOPPING_LLAMACPP
@@ -1661,7 +2212,9 @@ class NodeProvisioner:
                 self._registry.update_status(
                     hostname,
                     NodeStatus.FAILED,
-                    allowed_from=set(NodeStatus),
+                    # A failed cleanup must not turn the teardown-only
+                    # relaunch terminal state into setup-retryable FAILED.
+                    allowed_from=set(NodeStatus) - {NodeStatus.RELAUNCH_FAILED},
                 )
             raise
         finally:

@@ -172,9 +172,14 @@ def app(
         side_effect=lambda hostname: MagicMock(hostname=hostname)
     )
     mock_provisioner.connection_count = MagicMock(return_value=0)
+    mock_provisioner.connection_tracking_available = True
+    mock_provisioner.validate_llamacpp_relaunch = MagicMock(
+        side_effect=lambda node, _request: node
+    )
     mock_provisioner.resolve_artifact_selection = AsyncMock(return_value=None)
     mock_provisioner.cleanup_stale_node = AsyncMock()
     mock_provisioner.provision = AsyncMock()
+    mock_provisioner.relaunch_llamacpp = AsyncMock()
     mock_provisioner.teardown = AsyncMock()
     application.state.provisioner = mock_provisioner
     application.dependency_overrides[get_provisioner] = lambda: mock_provisioner

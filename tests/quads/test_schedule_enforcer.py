@@ -194,6 +194,30 @@ class TestEnforceOnce:
         provisioner.try_reserve_host.assert_awaited_once_with("gpu01")
         provisioner.fire_background.assert_not_called()
 
+    async def test_active_relaunch_is_seen_but_not_interrupted(self) -> None:
+        enforcer, _, provisioner = _enforcer(
+            available=[],
+            nodes=[_node("gpu01", NodeStatus.RELAUNCHING)],
+        )
+        provisioner.try_reserve_host.side_effect = None
+        provisioner.try_reserve_host.return_value = None
+
+        await enforcer._enforce_once()
+
+        provisioner.try_reserve_host.assert_awaited_once_with("gpu01")
+        provisioner.fire_background.assert_not_called()
+
+    async def test_relaunch_failure_is_eligible_for_schedule_teardown(self) -> None:
+        enforcer, _, provisioner = _enforcer(
+            available=[],
+            nodes=[_node("gpu01", NodeStatus.RELAUNCH_FAILED)],
+        )
+
+        await enforcer._enforce_once()
+
+        provisioner.try_reserve_host.assert_awaited_once_with("gpu01")
+        provisioner.fire_background.assert_called_once()
+
     async def test_reconciled_draining_managed_node_is_torn_down(self) -> None:
         enforcer, registry, provisioner = _enforcer(
             available=[],

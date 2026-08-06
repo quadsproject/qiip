@@ -61,9 +61,12 @@ from inference_proxy.models.node import (
 )
 from inference_proxy.models.quads import QUADSHost
 from inference_proxy.provisioning.provisioner import (
+    BackgroundOperation,
     ProvisioningCapacityError,
     ProvisioningError,
     ProvisioningIdentity,
+    RelaunchPreconditionError,
+    RelaunchValidationError,
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -852,6 +855,190 @@ class TestSetupModelPassthrough:
         )
 
 
+class TestLlamaCppRelaunchEndpoint:
+    def test_queues_typed_relaunch_as_a_non_cancellable_operation(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        artifact_id = "a" * 64
+        node = _make_node(
+            node_id="gpu01",
+            engine=InferenceEngine.LLAMA_CPP,
+            artifact_id=artifact_id,
+            llamacpp_runtime=_llamacpp_runtime(),
+        )
+        test_registry.add(node)
+
+        response = client.post(
+            "/admin/nodes/gpu01/llamacpp/relaunch",
+            json={
+                "sizing": "custom",
+                "fit_target_mib": 512,
+                "context_per_slot": 24576,
+                "slots": 2,
+                "cache_type": "q8_0",
+            },
+        )
+
+        assert response.status_code == 202
+        assert response.json() == {"task_id": "gpu01"}
+        call_kwargs = mock_provisioner.fire_background.call_args.kwargs
+        assert call_kwargs["operation"] is BackgroundOperation.RELAUNCH
+        assert call_kwargs["provisioning_identity"] == ProvisioningIdentity(
+            InferenceEngine.LLAMA_CPP,
+            artifact_id,
+        )
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+        request = mock_provisioner.relaunch_llamacpp.await_args.args[1]
+        assert request == LlamaCppRuntimeRequest(
+            sizing=LlamaCppSizingMode.CUSTOM,
+            fit_target_mib=512,
+            context_per_slot=24576,
+            slots=2,
+            cache_type=LlamaCppCacheType.Q8_0,
+        )
+        assert type(request) is LlamaCppRuntimeRequest
+
+    def test_rejects_unknown_request_fields(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        response = client.post(
+            "/admin/nodes/gpu01/llamacpp/relaunch",
+            json={"sizing": "auto", "fit_target_mib": 512, "typo": 1},
+        )
+
+        assert response.status_code == 422
+        mock_provisioner.try_reserve_host.assert_not_awaited()
+
+    def test_requires_connection_tracking(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.connection_tracking_available = False
+
+        response = client.post(
+            "/admin/nodes/gpu01/llamacpp/relaunch",
+            json={"sizing": "auto", "fit_target_mib": 512},
+        )
+
+        assert response.status_code == 503
+        mock_provisioner.try_reserve_host.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("error", "status_code"),
+        [
+            (RelaunchPreconditionError("not relaunchable"), 409),
+            (RelaunchValidationError("outside limits"), 422),
+        ],
+    )
+    def test_maps_boundary_validation_before_reservation(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+        error: Exception,
+        status_code: int,
+    ) -> None:
+        mock_provisioner.validate_llamacpp_relaunch.side_effect = error
+
+        response = client.post(
+            "/admin/nodes/gpu01/llamacpp/relaunch",
+            json={"sizing": "auto", "fit_target_mib": 512},
+        )
+
+        assert response.status_code == status_code
+        mock_provisioner.try_reserve_host.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("error", "status_code"),
+        [
+            (RelaunchPreconditionError("node changed"), 409),
+            (RelaunchValidationError("limits changed"), 422),
+        ],
+    )
+    def test_revalidates_after_reserving_the_host(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+        error: Exception,
+        status_code: int,
+    ) -> None:
+        node = _make_node(
+            node_id="gpu01",
+            engine=InferenceEngine.LLAMA_CPP,
+            artifact_id="a" * 64,
+            llamacpp_runtime=_llamacpp_runtime(),
+        )
+        test_registry.add(node)
+        mock_provisioner.validate_llamacpp_relaunch.side_effect = [
+            node,
+            error,
+        ]
+
+        response = client.post(
+            "/admin/nodes/gpu01/llamacpp/relaunch",
+            json={"sizing": "auto", "fit_target_mib": 512},
+        )
+
+        assert response.status_code == status_code
+        mock_provisioner.fire_background.assert_not_called()
+        lease = mock_provisioner.try_reserve_host.await_args_list[0]
+        assert lease.args == ("gpu01",)
+
+    def test_busy_host_returns_conflict_without_scheduling(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = None
+
+        response = client.post(
+            "/admin/nodes/gpu01/llamacpp/relaunch",
+            json={"sizing": "auto", "fit_target_mib": 512},
+        )
+
+        assert response.status_code == 409
+        assert "lifecycle operation already in progress" in response.json()["detail"]
+        mock_provisioner.fire_background.assert_not_called()
+
+    def test_capacity_rejection_releases_host_reservation(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        node = _make_node(
+            node_id="gpu01",
+            engine=InferenceEngine.LLAMA_CPP,
+            artifact_id="a" * 64,
+            llamacpp_runtime=_llamacpp_runtime(),
+        )
+        test_registry.add(node)
+        lease = MagicMock(hostname="gpu01")
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = lease
+        mock_provisioner.fire_background.side_effect = ProvisioningCapacityError(
+            active=32,
+            limit=32,
+        )
+
+        response = client.post(
+            "/admin/nodes/gpu01/llamacpp/relaunch",
+            json={"sizing": "auto", "fit_target_mib": 512},
+        )
+
+        assert response.status_code == 429
+        assert "32 active" in response.json()["detail"]
+        lease.release.assert_called_once_with()
+
+
 class TestTasksEndpoint:
     """GET /admin/provisioning/tasks returns task status from etcd."""
 
@@ -1269,6 +1456,8 @@ class TestSetupEligibility:
         [
             (NodeStatus.HEALTHY, 409),
             (NodeStatus.UNHEALTHY, 409),
+            (NodeStatus.RELAUNCHING, 409),
+            (NodeStatus.RELAUNCH_FAILED, 409),
             # Acquiring the host lease proves no provision is still running,
             # so this is a persisted record left by an interrupted process.
             (NodeStatus.PROVISIONING, 202),

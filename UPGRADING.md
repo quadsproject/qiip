@@ -529,6 +529,7 @@ until every gateway that may provision or display the node understands it.
 | **New surface** | `/admin/nodes[]` now includes nullable `artifact_id`. Managed llama.cpp nodes report the exact discovered GGUF generation selected at setup; vLLM, older, manual, and QUADS-only records can report `null`. | Preserve the field when correlating a node with the GGUF catalog, but continue to handle `null` during rolling upgrades and for non-artifact-backed nodes. |
 | **New surface** | `/admin/nodes[]` now includes nullable `llamacpp_runtime`. Successful managed llama.cpp setup records requested sizing, verified effective context/concurrency/cache/offload values, per-GPU post-load memory, and an ISO-8601 UTC observation time. The node-detail dashboard renders the same state as a read-only card. | Treat the GPU values as a timestamped post-load snapshot, not live telemetry. Handle `null` for older records, vLLM nodes, QUADS-only hosts, and llama.cpp nodes that have not completed setup on the new version. |
 | **New surface** | `llamacpp_runtime.requested` can represent either automatic sizing or a complete gateway-authorized custom policy with `context_per_slot`, `slots`, and `cache_type`. Identity-preserving llama.cpp retries inherit the persisted policy: automatic policy recomputes, while custom policy replays exact values and revalidates fit. Host-ambient sizing overrides remain rejected. | Continue to omit selection fields for an identity-preserving retry. Preserve the complete `requested` object in clients and do not treat gateway-authorized sizing as permission to set ambient `AUTOLLAMACPP_*` or `LLAMA_ARG_*` overrides. |
+| **New surface** | `POST /admin/nodes/{hostname}/llamacpp/relaunch` accepts a strict typed automatic or custom policy for a healthy managed llama.cpp node. It drains traffic, performs a verified background relaunch, and rolls back to the previous requested policy on failure. New lifecycle states are `relaunching` and teardown-only `relaunch_failed`; both are excluded from routing and model listing. | Require 202 handling and follow the existing provisioning task and log endpoints. Treat 409 as an ineligible or busy node, 422 as an invalid policy, 429 as lifecycle capacity exhaustion, and 503 as unavailable connection tracking. Never route to either relaunch lifecycle state. |
 | **Behavioral break** | Recommendation `runtime` values are normalized to `vllm`, `llama_cpp`, `mlx`, or `unknown` instead of preserving LLMFit spellings such as `vLLM` and `llama.cpp`. | Compare against the canonical values. Treat this recommendation vocabulary as distinct from the provisionable `InferenceEngine` enum: `mlx` and `unknown` cannot be selected for setup. |
 | **New surface** | Recommendations can include typed `gguf_sources` entries with `repo` and `provider`. The dashboard joins `gguf_sources[].repo` to catalog `gguf_artifacts[].repo_id` exactly and case-sensitively. | Preserve the additive source list. Do not infer an exact GGUF download from it because LLMFit does not supply the required files, shard grouping, or entrypoint. |
 | **Behavioral break** | Unhealthy nodes no longer advertise `retry` in `/admin/nodes[].actions`; setup already rejected that state. | Tear down an unhealthy registered node before starting setup instead of presenting a retry action that the API will refuse. |
@@ -568,6 +569,24 @@ Gateway shutdown cancels the async download wrapper without waiting indefinitely
 - Teardown cancels and awaits an active local provision task, then verifies vLLM termination. Closing the SSH operation cannot guarantee that a remote installer backgrounded by the shell also stopped; inspect package-manager locks and node state after cancelling during driver or package installation.
 - Failed teardown retains registration and PID evidence when shutdown cannot be verified. Do not delete those records merely to clear the dashboard; they are the information needed to finish cleanup safely.
 - A scheduling enforcer failure backs off rather than retrying every cycle. Alert on `schedule_enforcer_teardown_requires_operator`.
+
+### Managed llama.cpp relaunch failure
+
+Relaunch is intentionally disruptive: validation that depends on free VRAM
+runs after the old server stops. Before downtime, QIIP refreshes lifecycle
+scripts, marks the node `relaunching`, removes it from routing, and requires
+active requests to drain. The node's etcd lease is refreshed throughout model
+load, and every lifecycle transition uses a modification-revision CAS whose put
+retains the lease atomically.
+
+If the requested policy fails, QIIP launches the previously requested policy.
+An automatic policy is recomputed against current free VRAM; a custom policy is
+replayed exactly. If rollback succeeds, the node returns healthy and the task
+still records the requested relaunch as failed. If rollback fails, or the
+gateway restarts with an orphaned `relaunching` record, the node becomes
+`relaunch_failed`, its stale runtime observation is cleared, and health probes
+cannot promote it. Tear it down before setup; do not rewrite the status or
+runtime fields manually.
 
 ### Recover an unregistered orphaned engine
 

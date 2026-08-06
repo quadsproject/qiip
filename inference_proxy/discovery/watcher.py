@@ -27,6 +27,7 @@ from inference_proxy.discovery.node_leases import (
     NodeLeaseObservation,
 )
 from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.discovery.relaunch_recovery import reconcile_interrupted_relaunch
 from inference_proxy.discovery.serializer import node_from_etcd
 from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.node import Node
@@ -45,6 +46,7 @@ class EtcdWatcher:
         endpoint_policy: EndpointPolicy,
         lease_manager: NodeLeaseManager | None = None,
         retry_delay: float = 5.0,
+        reconcile_startup_relaunches: bool = False,
     ) -> None:
         self._etcd_client = etcd_client
         self._registry = registry
@@ -52,6 +54,7 @@ class EtcdWatcher:
         self._endpoint_policy = endpoint_policy
         self._lease_manager = lease_manager
         self._retry_delay = retry_delay
+        self._reconcile_startup_relaunches = reconcile_startup_relaunches
         self._stream_lock = threading.Lock()
         self._active_stream: EtcdWatchStream | None = None
 
@@ -64,6 +67,16 @@ class EtcdWatcher:
             try:
                 if resume_revision is None:
                     snapshot = self._etcd_client.get_snapshot()
+                    if self._reconcile_startup_relaunches:
+                        snapshot = _reconcile_startup_snapshot(
+                            snapshot,
+                            self._etcd_client,
+                            self._endpoint_policy,
+                        )
+                        # Only the first successful discovery snapshot belongs
+                        # to startup. Later reconnect snapshots may observe a
+                        # legitimate relaunch owned by this live process.
+                        self._reconcile_startup_relaunches = False
                     key_revisions = _reconcile_snapshot(
                         snapshot,
                         self._registry,
@@ -159,6 +172,27 @@ class EtcdWatcher:
         with self._stream_lock:
             if self._active_stream is stream:
                 self._active_stream = None
+
+
+def _reconcile_startup_snapshot(
+    snapshot: EtcdSnapshot,
+    etcd_client: EtcdClient,
+    endpoint_policy: EndpointPolicy,
+) -> EtcdSnapshot:
+    """Apply restart recovery to the first snapshot after a failed initial load."""
+    records = tuple(
+        reconciled
+        for record in snapshot.records
+        if (
+            reconciled := reconcile_interrupted_relaunch(
+                etcd_client,
+                record,
+                endpoint_policy,
+            )
+        )
+        is not None
+    )
+    return EtcdSnapshot(records=records, revision=snapshot.revision)
 
 
 def _reconcile_snapshot(

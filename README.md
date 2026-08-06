@@ -62,6 +62,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - [API Endpoints](#api-endpoints)
   - [Administrative access](#administrative-access)
   - [Node inventory identity](#node-inventory-identity)
+  - [Relaunch managed llama.cpp sizing](#relaunch-managed-llamacpp-sizing)
   - [Force-recover an unregistered engine](#force-recover-an-unregistered-engine)
   - [Error responses](#error-responses)
 - [Configuration](#configuration)
@@ -203,6 +204,7 @@ HTTP Basic-protected administrative endpoints:
 | `POST` | `/admin/models/download` | Start or inspect a duplicate-safe model download |
 | `GET` | `/admin/models/downloads` | List tracked model-download states |
 | `POST` | `/admin/nodes/setup` | Start background node provisioning |
+| `POST` | `/admin/nodes/{hostname}/llamacpp/relaunch` | Drain and relaunch a healthy managed llama.cpp node with a typed sizing policy |
 | `DELETE` | `/admin/nodes/{node_id}` | Drain and tear down a node; supports force and the scoped recovery procedure below |
 | `GET` | `/admin/provisioning/tasks` | List provisioning task states |
 | `GET` | `/admin/provisioning/{hostname}/logs` | Stream provisioning logs over SSE |
@@ -256,6 +258,42 @@ Gateway-authorized custom records additionally contain exact
 A host present only in QUADS has not been provisioned and therefore reports
 both `engine: null` and `artifact_id: null`. Do not interpret a null engine as
 vLLM. It means QIIP has no registered serving identity for that host.
+
+### Relaunch managed llama.cpp sizing
+
+The relaunch endpoint accepts the same typed automatic or custom policy stored
+in `llamacpp_runtime.requested`. For example, this requests two simultaneous
+24,576-token slots with matching Q8_0 K/V caches:
+
+```bash
+curl -X POST \
+  -u "$INFERENCE_PROXY_ADMIN__USERNAME:$INFERENCE_PROXY_ADMIN__PASSWORD" \
+  -H 'Content-Type: application/json' \
+  http://gateway.example.com/admin/nodes/gpu01/llamacpp/relaunch \
+  -d '{
+    "sizing": "custom",
+    "fit_target_mib": 512,
+    "context_per_slot": 24576,
+    "slots": 2,
+    "cache_type": "q8_0"
+  }'
+```
+
+Only a healthy managed llama.cpp node with an exact artifact and verified
+runtime record is eligible. Unknown request fields are rejected. Custom
+context must be 256-token aligned and no larger than the model training
+context; slots are limited to 1-256; the aggregate must fit llama.cpp's
+32-bit ceiling; and the reserve must be smaller than every observed GPU.
+
+A 202 response queues a capacity-counted background operation. QIIP removes
+the node from routing, waits for tracked requests to drain, stops the server,
+estimates and launches the requested policy, and verifies the effective
+runtime before restoring healthy status. A drain timeout restores the original
+registration without stopping the server. A failed launch attempts the prior
+requested policy: automatic sizing is recomputed, while custom sizing is
+replayed exactly. If rollback also fails, the node enters `relaunch_failed`,
+clears stale runtime telemetry, and permits teardown only. Follow progress at
+`/admin/provisioning/{hostname}/logs`.
 
 ### Force-recover an unregistered engine
 

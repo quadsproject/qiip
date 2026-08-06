@@ -22,7 +22,7 @@ class TestProvisioningStepEnum:
     """ProvisioningStep has 13 members matching D-06 step sequence."""
 
     def test_member_count(self) -> None:
-        assert len(ProvisioningStep) == 23
+        assert len(ProvisioningStep) == 25
 
     def test_member_values(self) -> None:
         expected = {
@@ -38,6 +38,8 @@ class TestProvisioningStepEnum:
             "STARTING_VLLM": "starting_vllm",
             "HEALTH_POLL": "health_poll",
             "REGISTERING": "registering",
+            "RELAUNCH_VALIDATING": "relaunch_validating",
+            "ROLLING_BACK": "rolling_back",
             "DRAINING": "draining",
             "STOPPING_VLLM": "stopping_vllm",
             "DEREGISTERING": "deregistering",

@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.settings import DashboardSettings, Settings
 from inference_proxy.main import create_app
+from inference_proxy.models.node import NodeStatus
 
 
 class TestDashboardRoute:
@@ -200,9 +201,10 @@ class TestDashboardBadgeCSS:
     )
 
     def test_badge_css_contains_all_status_classes(self) -> None:
-        """dashboard.css contains .badge-healthy, .badge-unhealthy, .badge-draining."""
+        """dashboard.css contains a class for every node lifecycle status."""
         css = self._css_path.read_text()
-        for cls in (".badge-healthy", ".badge-unhealthy", ".badge-draining"):
+        for status in NodeStatus:
+            cls = f".badge-{status.value}"
             assert cls in css, f"Missing CSS class: {cls}"
 
     def test_badge_css_contains_all_cb_classes(self) -> None:

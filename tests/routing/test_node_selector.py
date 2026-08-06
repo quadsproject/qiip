@@ -150,6 +150,20 @@ class TestSelectSkipsDraining:
         assert result is not None
         assert result.node_id == "healthy-1"
 
+    def test_relaunch_lifecycle_nodes_are_skipped(self) -> None:
+        for status in (NodeStatus.RELAUNCHING, NodeStatus.RELAUNCH_FAILED):
+            lifecycle = _make_node("lifecycle-1", status=status)
+            healthy = _make_node(
+                "healthy-1",
+                endpoint="http://10.0.1.200:8000",
+            )
+            selector, _, _ = _make_selector([lifecycle, healthy])
+
+            result = selector.select()
+
+            assert result is not None
+            assert result.node_id == "healthy-1"
+
 
 class TestSelectSkipsUnhealthy:
     """select() skips nodes with UNHEALTHY and UNKNOWN status."""

@@ -41,6 +41,7 @@ from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.etcd_client import EtcdClient
 from inference_proxy.discovery.node_leases import NodeLeaseManager
 from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.discovery.relaunch_recovery import reconcile_interrupted_relaunch
 from inference_proxy.discovery.serializer import node_from_etcd
 from inference_proxy.discovery.watcher import EtcdWatcher
 from inference_proxy.huggingface.artifacts import GGUFArtifactIndex
@@ -120,7 +121,7 @@ def _initial_load(
     etcd_client: EtcdClient,
     registry: NodeRegistry,
     endpoint_policy: EndpointPolicy,
-) -> None:
+) -> bool:
     """Fetch all nodes from etcd and populate the registry.
 
     Per D-05: synchronous initial fetch is acceptable during startup.
@@ -133,14 +134,19 @@ def _initial_load(
         registry: The node registry to populate.
     """
     try:
-        results = etcd_client.get_prefix()
+        snapshot = etcd_client.get_snapshot()
         count = 0
-        for value_bytes, metadata in results:
-            raw_key: bytes | str = metadata["key"]
-            key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key
+        for record in snapshot.records:
+            reconciled = reconcile_interrupted_relaunch(
+                etcd_client,
+                record,
+                endpoint_policy,
+            )
+            if reconciled is None:
+                continue
             node = node_from_etcd(
-                key,
-                value_bytes,
+                reconciled.key,
+                reconciled.value,
                 etcd_client.prefix,
                 endpoint_policy=endpoint_policy,
             )
@@ -148,11 +154,13 @@ def _initial_load(
                 registry.add(node)
                 count += 1
         logger.info("initial node load complete", node_count=count)
+        return True
     except Exception:
         logger.warning(
             "etcd unavailable at startup, starting with empty registry",
             exc_info=True,
         )
+        return False
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -206,7 +214,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     allowed_ports=resolved_settings.routing.allowed_endpoint_ports,
                 )
 
-            _initial_load(etcd_client, registry, endpoint_policy)
+            initial_load_complete = _initial_load(
+                etcd_client,
+                registry,
+                endpoint_policy,
+            )
 
             stop_event = threading.Event()
             etcd_watcher = EtcdWatcher(
@@ -215,6 +227,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 stop_event,
                 endpoint_policy,
                 lease_manager,
+                reconcile_startup_relaunches=not initial_load_complete,
             )
             worker_threads: list[threading.Thread] = []
             resources.push_async_callback(

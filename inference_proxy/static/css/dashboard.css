@@ -407,7 +407,8 @@ tbody tr:last-child td { border-bottom: none; }
 
 .badge-unhealthy,
 .badge-open,
-.badge-failed {
+.badge-failed,
+.badge-relaunch_failed {
   background: var(--danger-bg);
   color: var(--danger);
 }
@@ -421,7 +422,8 @@ tbody tr:last-child td { border-bottom: none; }
 
 .badge-available,
 .badge-in-progress,
-.badge-provisioning {
+.badge-provisioning,
+.badge-relaunching {
   background: rgba(59, 130, 246, 0.08);
   color: var(--primary);
 }

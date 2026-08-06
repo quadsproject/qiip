@@ -30,6 +30,16 @@ _LIVENESS_STATUSES = {
 RemoveListener = Callable[[str], None]
 
 
+def node_with_status(
+    node: Node,
+    status: NodeStatus,
+    **changes: object,
+) -> Node:
+    """Return one node transition while preserving all unspecified fields."""
+    changes["status"] = status
+    return node.model_copy(update=changes)
+
+
 class NodeRegistry:
     """Thread-safe registry of discovered vLLM nodes.
 
@@ -91,9 +101,9 @@ class NodeRegistry:
         HEALTHY, UNHEALTHY, and UNKNOWN are locally probed liveness states.
         When both the current and discovered state are in that set, retain the
         current state while refreshing etcd-owned fields. Lifecycle
-        transitions involving PROVISIONING, FAILED, or DRAINING remain
-        authoritative so provisioning can complete and fresh registrations
-        can replace drained nodes.
+        transitions involving PROVISIONING, FAILED, DRAINING, RELAUNCHING, or
+        RELAUNCH_FAILED remain authoritative so lifecycle operations can
+        complete and fresh registrations can replace drained nodes.
         """
         with self._lock:
             current = self._nodes.get(node.node_id)

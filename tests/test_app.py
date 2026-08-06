@@ -19,7 +19,9 @@ from inference_proxy.config.settings import (
     RoutingSettings,
     Settings,
 )
+from inference_proxy.discovery.etcd_client import EtcdRecord, EtcdSnapshot
 from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.discovery.serializer import node_to_etcd
 from inference_proxy.main import _initial_load
 from inference_proxy.models.node import Node, NodeStatus
 
@@ -125,18 +127,22 @@ def test_default_allowlist_rejects_lab_endpoint_from_admin_nodes(
     """A secure-default rejection is visible and absent from the admin view."""
     etcd_client = MagicMock()
     etcd_client.prefix = "/nodes/"
-    etcd_client.get_prefix.return_value = [
-        (
-            json.dumps(
-                {
-                    "endpoint": "10.0.1.100:8000",
-                    "status": "healthy",
-                    "model": "llama-3",
-                }
-            ).encode(),
-            {"key": b"/nodes/gpu01"},
-        )
-    ]
+    etcd_client.get_snapshot.return_value = EtcdSnapshot(
+        records=(
+            EtcdRecord(
+                key=b"/nodes/gpu01",
+                value=json.dumps(
+                    {
+                        "endpoint": "10.0.1.100:8000",
+                        "status": "healthy",
+                        "model": "llama-3",
+                    }
+                ).encode(),
+                mod_revision=1,
+            ),
+        ),
+        revision=1,
+    )
 
     with patch("inference_proxy.discovery.serializer.logger") as serializer_logger:
         routing = RoutingSettings()
@@ -151,6 +157,90 @@ def test_default_allowlist_rejects_lab_endpoint_from_admin_nodes(
     fields = serializer_logger.warning.call_args.kwargs
     assert fields["endpoint"] == "10.0.1.100:8000"
     assert "host is not allowed" in fields["error"]
+
+
+def test_startup_reconciles_interrupted_relaunch_to_terminal_state(
+    test_registry: NodeRegistry,
+) -> None:
+    etcd_client = MagicMock()
+    etcd_client.prefix = "/nodes/"
+    node = Node(
+        node_id="gpu01",
+        endpoint="localhost:8000",
+        status=NodeStatus.RELAUNCHING,
+        model="org/model",
+        managed=True,
+    )
+    key, value = node_to_etcd(node, etcd_client.prefix)
+    etcd_client.get_snapshot.return_value = EtcdSnapshot(
+        (EtcdRecord(key.encode(), value, 41, 7001),),
+        41,
+    )
+    etcd_client.replace_if_revision.return_value = 42
+
+    _initial_load(etcd_client, test_registry, RoutingSettings().endpoint_policy())
+
+    reconciled = test_registry.get("gpu01")
+    assert reconciled is not None
+    assert reconciled.status is NodeStatus.RELAUNCH_FAILED
+    assert reconciled.llamacpp_runtime is None
+    replacement = etcd_client.replace_if_revision.call_args.args[1]
+    assert json.loads(replacement)["status"] == "relaunch_failed"
+    etcd_client.replace_if_revision.assert_called_once_with(
+        key,
+        replacement,
+        expected_mod_revision=41,
+        lease_id=0,
+    )
+
+
+def test_failed_initial_load_requests_watcher_recovery() -> None:
+    etcd_client = MagicMock()
+    etcd_client.get_snapshot.side_effect = RuntimeError("offline")
+
+    assert (
+        _initial_load(
+            etcd_client,
+            NodeRegistry(),
+            RoutingSettings().endpoint_policy(),
+        )
+        is False
+    )
+
+
+def test_startup_cas_does_not_overwrite_newer_node_state(
+    test_registry: NodeRegistry,
+) -> None:
+    etcd_client = MagicMock()
+    etcd_client.prefix = "/nodes/"
+    interrupted = Node(
+        node_id="gpu01",
+        endpoint="localhost:8000",
+        status=NodeStatus.RELAUNCHING,
+        model="org/model",
+        managed=True,
+    )
+    healthy = interrupted.model_copy(update={"status": NodeStatus.HEALTHY})
+    key, interrupted_value = node_to_etcd(interrupted, etcd_client.prefix)
+    _healthy_key, healthy_value = node_to_etcd(healthy, etcd_client.prefix)
+    etcd_client.get_snapshot.return_value = EtcdSnapshot(
+        (EtcdRecord(key.encode(), interrupted_value, 41, 7001),),
+        41,
+    )
+    etcd_client.replace_if_revision.return_value = None
+    etcd_client.get_record.return_value = EtcdRecord(
+        key.encode(),
+        healthy_value,
+        42,
+        7001,
+    )
+
+    _initial_load(etcd_client, test_registry, RoutingSettings().endpoint_policy())
+
+    current = test_registry.get("gpu01")
+    assert current is not None
+    assert current.status is NodeStatus.HEALTHY
+    etcd_client.replace_if_revision.assert_called_once()
 
 
 def test_subpackages_importable() -> None:
@@ -193,7 +283,7 @@ class TestLifespanRegistryIntegration:
     ) -> None:
         """Lifespan populates app.state.registry with a NodeRegistry."""
         mock_client = MagicMock()
-        mock_client.get_prefix.return_value = []
+        mock_client.get_snapshot.return_value = EtcdSnapshot((), 1)
         mock_client.prefix = "/nodes/"
         mock_etcd_cls.return_value = mock_client
 
@@ -216,7 +306,7 @@ class TestLifespanRegistryIntegration:
         test_settings: Settings,
     ) -> None:
         mock_client = MagicMock()
-        mock_client.get_prefix.return_value = []
+        mock_client.get_snapshot.return_value = EtcdSnapshot((), 1)
         mock_client.prefix = "/nodes/"
         mock_etcd_cls.return_value = mock_client
         huggingface = test_settings.huggingface.model_copy(
@@ -244,7 +334,7 @@ class TestLifespanRegistryIntegration:
     ) -> None:
         """Secure loopback defaults are announced loudly during startup."""
         mock_client = MagicMock()
-        mock_client.get_prefix.return_value = []
+        mock_client.get_snapshot.return_value = EtcdSnapshot((), 1)
         mock_client.prefix = "/nodes/"
         mock_etcd_cls.return_value = mock_client
 
@@ -277,7 +367,7 @@ class TestLifespanRegistryIntegration:
     ) -> None:
         """Lifespan starts with empty registry when etcd is unavailable."""
         mock_client = MagicMock()
-        mock_client.get_prefix.side_effect = ConnectionError("etcd down")
+        mock_client.get_snapshot.side_effect = ConnectionError("etcd down")
         mock_client.prefix = "/nodes/"
         mock_etcd_cls.return_value = mock_client
 
@@ -299,7 +389,7 @@ class TestLifespanRegistryIntegration:
     ) -> None:
         """Production registry removal discards the node's breaker state."""
         mock_client = MagicMock()
-        mock_client.get_prefix.return_value = []
+        mock_client.get_snapshot.return_value = EtcdSnapshot((), 1)
         mock_client.prefix = "/nodes/"
         mock_etcd_cls.return_value = mock_client
 
@@ -337,7 +427,7 @@ class TestLifespanRegistryIntegration:
         test_settings: Settings,
     ) -> None:
         mock_client = MagicMock()
-        mock_client.get_prefix.return_value = []
+        mock_client.get_snapshot.return_value = EtcdSnapshot((), 1)
         mock_client.prefix = "/nodes/"
         mock_etcd_cls.return_value = mock_client
 
@@ -353,7 +443,7 @@ class TestLifespanRegistryIntegration:
         test_settings: Settings,
     ) -> None:
         mock_etcd = MagicMock()
-        mock_etcd.get_prefix.return_value = []
+        mock_etcd.get_snapshot.return_value = EtcdSnapshot((), 1)
         mock_etcd.prefix = "/nodes/"
         redfish_http = MagicMock(aclose=AsyncMock())
         proxy_http = MagicMock(aclose=AsyncMock())
@@ -397,7 +487,7 @@ class TestLifespanRegistryIntegration:
         test_settings: Settings,
     ) -> None:
         mock_etcd = MagicMock()
-        mock_etcd.get_prefix.return_value = []
+        mock_etcd.get_snapshot.return_value = EtcdSnapshot((), 1)
         mock_etcd.prefix = "/nodes/"
         quads = QUADSSettings(
             base_url="http://quads.example.com",

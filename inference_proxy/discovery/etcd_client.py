@@ -322,6 +322,36 @@ class EtcdClient:
         """Return the configured node key prefix."""
         return self._prefix
 
+    @property
+    def node_lease_ttl(self) -> int:
+        """Return the configured managed-node lease TTL in seconds."""
+        return self._node_lease_ttl
+
+    def get_record(self, key: str) -> EtcdRecord | None:
+        """Read one exact key with its revision and lease metadata."""
+        raw_key = key.encode("utf-8")
+        response = self._client.post(
+            self._client.get_url("/kv/range"),
+            json={"key": _encode(raw_key)},
+        )
+        if not isinstance(response, dict):
+            raise EtcdProtocolError("range response must be an object")
+        raw_records = response.get("kvs", [])
+        if not isinstance(raw_records, list):
+            raise EtcdProtocolError("range kvs must be a list")
+        if not raw_records:
+            return None
+        if len(raw_records) != 1:
+            raise EtcdProtocolError("exact range returned multiple keys")
+        record_key, value, mod_revision, lease_id = _parse_kv(
+            raw_records[0],
+            "range",
+            value_required=True,
+        )
+        if record_key != raw_key or value is None:
+            raise EtcdProtocolError("exact range returned an unexpected key")
+        return EtcdRecord(record_key, value, mod_revision, lease_id)
+
     def get_prefix(self, prefix: str | None = None) -> list[tuple[bytes, KeyValue]]:
         """Fetch all key-value pairs under a prefix.
 
@@ -454,6 +484,50 @@ class EtcdClient:
             }
         )
         return bool(result.get("succeeded", False))
+
+    def replace_if_revision(
+        self,
+        key: str,
+        value: str | bytes,
+        *,
+        expected_mod_revision: int,
+        lease_id: int,
+    ) -> int | None:
+        """Atomically replace one exact revision and return the new revision.
+
+        Revision comparison prevents an ABA-style byte-equality match after
+        another writer has updated the node. Supplying the lease in the same
+        transaction avoids the unleased interval created by etcd3gw.replace().
+        A zero lease intentionally writes a persistent key. ``None`` means the
+        revision comparison failed.
+        """
+        raw_key = key.encode("utf-8")
+        raw_value = value.encode("utf-8") if isinstance(value, str) else value
+        result = self._client.transaction(
+            {
+                "compare": [
+                    {
+                        "key": _encode(raw_key),
+                        "result": "EQUAL",
+                        "target": "MOD",
+                        "mod_revision": str(expected_mod_revision),
+                    }
+                ],
+                "success": [
+                    {
+                        "request_put": {
+                            "key": _encode(raw_key),
+                            "value": _encode(raw_value),
+                            "lease": str(lease_id),
+                        }
+                    }
+                ],
+                "failure": [],
+            }
+        )
+        if not result.get("succeeded", False):
+            return None
+        return _header_revision(cast(dict[str, Any], result), "transaction")
 
     def replace(
         self,

@@ -41,6 +41,8 @@ class NodeStatus(StrEnum):
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
     DRAINING = "draining"
+    RELAUNCHING = "relaunching"
+    RELAUNCH_FAILED = "relaunch_failed"
     PROVISIONING = "provisioning"
     FAILED = "failed"
     UNKNOWN = "unknown"
