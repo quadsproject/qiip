@@ -28,8 +28,10 @@ const ACTION_CONFIG = {
     },
     confirm: false,
     confirmMsg: null,
+    danger: false,
     label: "Setup Node",
-    css: "btn-setup",
+    pendingLabel: "Starting…",
+    css: "btn-primary",
     successMsg: (nodeId) => `Setup started for ${nodeId}`,
   },
   teardown: {
@@ -39,8 +41,10 @@ const ACTION_CONFIG = {
     confirm: true,
     confirmMsg: (nodeId) =>
       `Teardown node ${nodeId}? This will drain connections and stop the container.`,
+    danger: true,
     label: "Teardown",
-    css: "btn-teardown",
+    pendingLabel: "Tearing down…",
+    css: "btn-danger",
     successMsg: (nodeId) => `Teardown started for ${nodeId}`,
   },
   retry: {
@@ -49,8 +53,10 @@ const ACTION_CONFIG = {
     body: (nodeId, node) => ({ hostname: nodeId, managed: node ? node.managed !== false : true }),
     confirm: false,
     confirmMsg: null,
+    danger: false,
     label: "Retry",
-    css: "btn-retry",
+    pendingLabel: "Retrying…",
+    css: "btn-warning",
     successMsg: (nodeId) => `Retry started for ${nodeId}`,
   },
   cancel: {
@@ -59,8 +65,10 @@ const ACTION_CONFIG = {
     body: null,
     confirm: true,
     confirmMsg: (nodeId) => `Cancel provisioning for ${nodeId}?`,
+    danger: true,
     label: "Cancel",
-    css: "btn-cancel",
+    pendingLabel: "Cancelling…",
+    css: "btn-danger",
     successMsg: (nodeId) => `Cancelled provisioning for ${nodeId}`,
   },
   force_teardown: {
@@ -70,8 +78,10 @@ const ACTION_CONFIG = {
     confirm: true,
     confirmMsg: (nodeId) =>
       `Force teardown ${nodeId}? This will immediately stop the container without draining.`,
+    danger: true,
     label: "Force Teardown",
-    css: "btn-force-teardown",
+    pendingLabel: "Forcing…",
+    css: "btn-danger",
     successMsg: (nodeId) => `Teardown started for ${nodeId}`,
   },
 };
@@ -84,11 +94,20 @@ let dashboardPollInFlight = false;
 let dashboardRequestSequence = 0;
 let dashboardLastRenderedSequence = 0;
 
-async function handleAction(action, nodeId, node) {
+async function handleAction(action, nodeId, node, onStart) {
   const config = ACTION_CONFIG[action];
   if (!config) return;
   if (inFlightNodes.has(nodeId)) return;
-  if (config.confirm && !window.confirm(config.confirmMsg(nodeId))) return;
+  if (config.confirm) {
+    const ok = await confirmDialog({
+      title: config.label,
+      message: config.confirmMsg(nodeId),
+      confirmLabel: config.label,
+      danger: config.danger,
+    });
+    if (!ok) return;
+  }
+  if (onStart) onStart();
   inFlightNodes.add(nodeId);
   const options = { method: config.method };
   if (config.body) {
@@ -131,10 +150,10 @@ function renderQuadsStatus(data) {
   badge.className = "badge";
   if (data.status === "connected") {
     badge.classList.add("badge-healthy");
-    badge.textContent = `QUADS: connected — ${relativeTime(data.last_sync)} ago`;
+    badge.textContent = `QUADS: connected (${relativeTime(data.last_sync)} ago)`;
   } else if (data.status === "stale") {
     badge.classList.add("badge-draining");
-    badge.textContent = `QUADS: stale — last sync ${relativeTime(data.last_sync)} ago`;
+    badge.textContent = `QUADS: stale (last sync ${relativeTime(data.last_sync)} ago)`;
   } else {
     badge.classList.add("badge-unhealthy");
     badge.textContent = "QUADS: unavailable";
@@ -146,16 +165,21 @@ function createActionButton(action, nodeId, node) {
   const config = ACTION_CONFIG[action];
   const btn = document.createElement("button");
   btn.type = "button";
-  btn.className = config.css;
+  btn.className = "btn btn-sm " + config.css;
   btn.textContent = config.label;
   btn.disabled = inFlightNodes.has(nodeId);
   btn.addEventListener("click", async function () {
     if (inFlightNodes.has(nodeId)) return;
     btn.disabled = true;
     try {
-      await handleAction(action, nodeId, node);
+      await handleAction(action, nodeId, node, function () {
+        btn.textContent = config.pendingLabel;
+        btn.setAttribute("aria-busy", "true");
+      });
     } finally {
       btn.disabled = inFlightNodes.has(nodeId);
+      btn.textContent = config.label;
+      btn.removeAttribute("aria-busy");
     }
   });
   return btn;
@@ -273,6 +297,7 @@ async function refreshDashboard() {
         tr.appendChild(tdState);
 
         const tdReqs = document.createElement("td");
+        tdReqs.className = "num";
         tdReqs.textContent = node.state === "available" ? "—" : (perNode[node.node_id] || 0);
         tr.appendChild(tdReqs);
 
@@ -282,12 +307,12 @@ async function refreshDashboard() {
           tdActions.appendChild(createActionButton(actions[0], node.node_id, node));
         } else if (actions.length > 1) {
           const group = document.createElement("div");
-          group.className = "action-group";
+          group.className = "action-group action-group--split";
           group.appendChild(createActionButton(actions[0], node.node_id, node));
 
           const caret = document.createElement("button");
           caret.type = "button";
-          caret.className = ACTION_CONFIG[actions[0]].css + " action-caret";
+          caret.className = "btn btn-sm " + ACTION_CONFIG[actions[0]].css + " action-caret";
           caret.textContent = "▾";
           const menu = document.createElement("div");
           menu.className = "action-menu";
@@ -381,7 +406,7 @@ async function refreshDashboard() {
     lastUpdatedEl.className = "last-updated";
   } catch (err) {
     if (requestSequence >= dashboardLastRenderedSequence) {
-      warningEl.textContent = "Update failed — retrying...";
+      warningEl.textContent = "Update failed. Retrying…";
       warningEl.className = "poll-warning";
     }
   } finally {

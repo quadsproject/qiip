@@ -127,9 +127,11 @@ class TestDashboardTableStructure:
         assert 'id="node-table-body"' in response.text
 
     def test_loading_row_colspan_matches_column_count(self, client: TestClient) -> None:
-        """Loading placeholder colspan matches the number of column headers."""
+        """Loading skeleton row renders one cell per column header (NODE-01)."""
         response = client.get("/dashboard")
-        assert 'colspan="9"' in response.text
+        body_start = response.text.index('id="node-table-body"')
+        first_row_end = response.text.index("</tr>", body_start)
+        assert response.text[body_start:first_row_end].count("<td>") == 9
 
 
 class TestDashboardPolling:
@@ -225,15 +227,15 @@ class TestDashboardBadgeCSS:
         assert ".badge-available" in css, "Missing CSS class: .badge-available"
 
     def test_badge_css_contains_action_button_classes(self) -> None:
-        """dashboard.css contains .btn-setup and .btn-teardown action variants (D-06)."""
+        """dashboard.css contains .btn-primary and .btn-danger action variants (D-06)."""
         css = self._css_path.read_text()
-        assert ".btn-setup" in css, "Missing CSS class: .btn-setup"
-        assert ".btn-teardown" in css, "Missing CSS class: .btn-teardown"
+        assert ".btn-primary" in css, "Missing CSS class: .btn-primary"
+        assert ".btn-danger" in css, "Missing CSS class: .btn-danger"
 
     def test_badge_css_contains_config_button_class(self) -> None:
-        """dashboard.css contains .btn-config for config download buttons."""
+        """dashboard.css contains .btn-neutral for config download buttons."""
         css = self._css_path.read_text()
-        assert ".btn-config" in css, "Missing CSS class: .btn-config"
+        assert ".btn-neutral" in css, "Missing CSS class: .btn-neutral"
 
     def test_setup_engine_selector_has_visible_theme_styling(self) -> None:
         """The engine selector cannot collapse to an unstyled empty control."""
@@ -385,7 +387,9 @@ class TestNodeDetailPage:
             in response.text
         )
         assert 'id="artifact-select"' in response.text
-        assert 'colspan="10"' in response.text
+        info_body_start = response.text.index('id="node-info-body"')
+        first_row_end = response.text.index("</tr>", info_body_start)
+        assert response.text[info_body_start:first_row_end].count("<td>") == 9
 
     def test_node_detail_contains_llamacpp_runtime_editor(
         self, client: TestClient

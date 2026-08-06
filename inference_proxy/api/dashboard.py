@@ -28,7 +28,10 @@ async def dashboard(
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
-        context={"poll_interval": settings.dashboard.poll_interval},
+        context={
+            "poll_interval": settings.dashboard.poll_interval,
+            "active_page": "dashboard",
+        },
     )
 
 
@@ -45,5 +48,6 @@ async def node_detail(
         context={
             "node_id": node_id,
             "poll_interval": settings.dashboard.poll_interval,
+            "active_page": "dashboard",
         },
     )

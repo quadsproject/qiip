@@ -3,30 +3,37 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>QUADS -- Chat</title>
+    <title>QIIP - Chat</title>
+    <meta name="description" content="Chat playground for testing models served through the QIIP inference proxy.">
+    <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Open+Sans:wght@400;500;600;700&family=Poppins:wght@500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
     <link rel="stylesheet" href="{{ static_asset_url(request, 'css/chat.css') }}">
     <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
 </head>
 <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    {% set dash_active = active_page == 'dashboard' %}
+    {% set chat_active = active_page == 'chat' %}
     <nav class="top-bar" aria-label="Primary">
         <div class="brand">
-            <span class="brand-icon" aria-hidden="true">Q</span>
-            QUADS
+            <img class="brand-mark" src="{{ static_asset_url(request, 'img/qiip.svg') }}" alt="QIIP" width="29" height="24">
             <span class="brand-sep" aria-hidden="true"></span>
             <span class="brand-sub">Inference Proxy</span>
         </div>
         <div class="nav-links">
-            <a href="/dashboard" class="nav-link">Dashboard</a>
-            <a href="/chat" class="nav-link">Chat</a>
+            <a href="/dashboard" class="nav-link{{ ' nav-link-active' if dash_active else '' }}"{% if dash_active %} aria-current="page"{% endif %}>Dashboard</a>
+            <a href="/chat" class="nav-link{{ ' nav-link-active' if chat_active else '' }}"{% if chat_active %} aria-current="page"{% endif %}>Chat</a>
         </div>
-        <button class="theme-toggle" onclick="let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;localStorage.setItem('theme',t);this.textContent=t==='dark'?'☀️':'🌙'" aria-label="Toggle theme"><script>document.write(__t==='dark'?'☀️':'🌙')</script></button>
+        <button class="theme-toggle" onclick="let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;localStorage.setItem('theme',t)" aria-label="Toggle color theme">
+            <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+            <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+        </button>
     </nav>
 
-    <div class="chat-page">
+    <main class="chat-page" id="main-content">
         <div class="model-selector-bar">
             <select id="model-select">
                 <option value="">Loading models...</option>
@@ -51,9 +58,9 @@
 
         <div class="input-bar">
             <textarea id="chat-input" placeholder="Type a message..." rows="1"></textarea>
-            <button id="send-btn" type="button" disabled>Send</button>
+            <button id="send-btn" type="button" class="btn btn-primary" disabled>Send</button>
         </div>
-    </div>
+    </main>
 
     <div id="toast-container"></div>
 
