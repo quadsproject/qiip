@@ -203,7 +203,6 @@ class TestGenerateOmpConfig:
         )
         assert "baseUrl: http://proxy.example.com:8080/v1" in result
 
-
     def test_special_chars_quoted(self) -> None:
         result = _run_node_yaml(
             _harness(
