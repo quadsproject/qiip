@@ -289,6 +289,23 @@ context must be 256-token aligned and no larger than the model training
 context; slots are limited to 1-256; the aggregate must fit llama.cpp's
 32-bit ceiling; and the reserve must be smaller than every observed GPU.
 
+The node-detail dashboard exposes the same contract as a typed editor. It
+seeds every control from `llamacpp_runtime.requested`, including a non-default
+automatic reserve. Automatic sizing leaves the effective context, slots, and
+cache visible but disabled; custom sizing enables exact context, slot, and
+F16/Q8_0 cache controls. The aggregate preview is arithmetic only. It does not
+predict whether the requested configuration will fit; the gateway runs the
+authoritative estimator after the node drains.
+
+Applying a policy requires confirmation and follows the per-host provisioning
+task and log stream. The form remains disabled during an ambiguous network
+outcome until the new task generation is observed. If no new task appears,
+reload the page to reconcile the current node and task state before retrying;
+the gateway lifecycle lease rejects a concurrent duplicate. Polling silently
+adopts a new verified policy while the form is pristine. If another browser
+changes the runtime while local edits exist, the editor marks them stale and
+requires a reset instead of submitting against an obsolete observation.
+
 A 202 response queues a capacity-counted background operation. QIIP removes
 the node from routing, waits for tracked requests to drain, stops the server,
 estimates and launches the requested policy, and verifies the effective
