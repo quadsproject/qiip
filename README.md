@@ -1,10 +1,5 @@
-<<<<<<< HEAD
 <p>
   <img src="assets/qiip.svg" width="15%" />
-=======
-<p align="center">
-  <img src="assets/qiip.svg" width="30%" />
->>>>>>> b54883b (docs: added qiip logo)
 </p>
 
 # QUADS Idle Inference Proxy
