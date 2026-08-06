@@ -179,8 +179,6 @@ class TestGenerateOmpConfig:
         assert "    baseUrl: http://proxy.example.com:8080/v1" in result
         assert "    auth: none" in result
         assert "    api: openai-completions" in result
-        assert "      supportsDeveloperRole: false" in result
-        assert "      supportsReasoningEffort: false" in result
         assert "      - id: meta-llama/Llama-3-8B" in result
 
     def test_base_url_includes_v1(self) -> None:

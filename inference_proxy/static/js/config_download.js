@@ -56,9 +56,6 @@ function generateOmpConfig(baseUrl, modelId) {
     "    baseUrl: " + yamlScalar(base + "/v1"),
     "    auth: none",
     "    api: openai-completions",
-    "    compat:",
-    "      supportsDeveloperRole: false",
-    "      supportsReasoningEffort: false",
     "    models:",
     "      - id: " + yamlScalar(modelId),
   ].join("\n");
