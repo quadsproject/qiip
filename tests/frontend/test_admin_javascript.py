@@ -307,6 +307,7 @@ class Element {
   appendChild(child) { this.children.push(child); child.parentNode = this; return child; }
   addEventListener(name, callback) { this.listeners[name] = callback; }
   setAttribute(name, value) { this.attributes[name] = String(value); }
+  removeAttribute(name) { delete this.attributes[name]; }
   getAttribute(name) { return this.attributes[name] || null; }
   focus() { this.focused = true; }
   remove() {}
@@ -352,6 +353,7 @@ const sandbox = {
     createTextNode(text) { const node = new Element("text"); node.textContent = text; return node; },
   },
   window: { confirm() { return true; } },
+  confirmDialog: async function () { return true; },
   requestAnimationFrame() {},
   setTimeout(callback, delay) {
     const timer = { callback, delay, active: true };
@@ -578,7 +580,7 @@ installDetailFetch([{
     assert result == {
         "sourceCount": 2,
         "done": True,
-        "status": "status unavailable — reload to retry",
+        "status": "status unavailable, reload to retry",
         "activeTimers": 0,
     }
 
@@ -733,7 +735,7 @@ sandbox.fetch = async function (url, options) {
     assert "Not downloaded" in result["texts"]
     assert "Unsupported" in result["texts"]
     assert "Unknown runtime" in result["texts"]
-    assert "<img src=x onerror=attack()> — org/exact" in result["texts"]
+    assert "<img src=x onerror=attack()> - org/exact" in result["texts"]
     assert result["downloadButtons"] == 1
     assert result["downloadPosts"] == 0
 
@@ -1286,10 +1288,14 @@ sandbox.fetch = async function () {{
 (async function () {{
   await sandbox.refreshPowerState();
   const controls = byId("power-actions");
+  const group = controls.children[0];
+  const trigger = group ? group.children[0] : null;
+  const menu = group ? group.children[1] : null;
   process.stdout.write(JSON.stringify({{
     hidden: controls.hidden,
-    disabled: controls.children.map(function (child) {{ return child.disabled; }}),
-    titles: controls.children.map(function (child) {{ return child.title; }}),
+    triggerDisabled: trigger ? trigger.disabled : null,
+    triggerTitle: trigger ? trigger.title : null,
+    menuItemCount: menu ? menu.children.length : 0,
   }}));
 }})().catch(function (error) {{ console.error(error); process.exit(1); }});
 """
@@ -1299,17 +1305,18 @@ sandbox.fetch = async function () {{
 def test_power_controls_hidden_when_redfish_unconfigured() -> None:
     assert _power_controls_result(503) == {
         "hidden": True,
-        "disabled": [],
-        "titles": [],
+        "triggerDisabled": None,
+        "triggerTitle": None,
+        "menuItemCount": 0,
     }
 
 
 def test_power_controls_disabled_when_state_unknown() -> None:
     assert _power_controls_result(502) == {
         "hidden": False,
-        "disabled": [True, True, True, True],
-        "titles": ["Power state is temporarily unavailable; controls are disabled."]
-        * 4,
+        "triggerDisabled": True,
+        "triggerTitle": "Power state is temporarily unavailable; controls are disabled.",
+        "menuItemCount": 4,
     }
 
 
@@ -1318,7 +1325,7 @@ def test_force_power_actions_always_require_confirmation(action: str) -> None:
     result = _run_node_detail_scenario(
         f"""
 let requestCount = 0;
-sandbox.window.confirm = function () {{ return false; }};
+sandbox.confirmDialog = async function () {{ return false; }};
 sandbox.fetch = async function () {{ requestCount += 1; return {{ ok: true }}; }};
 (async function () {{
   await sandbox.handlePowerAction({json.dumps(action)});
@@ -1378,6 +1385,7 @@ class Element {
   appendChild(child) { this.children.push(child); child.parentNode = this; return child; }
   addEventListener(name, callback) { this.listeners[name] = callback; }
   setAttribute(name, value) { this.attributes[name] = String(value); }
+  removeAttribute(name) { delete this.attributes[name]; }
   getAttribute(name) { return this.attributes[name] || null; }
   getBoundingClientRect() { return { top: 20, right: 20 }; }
   async click() {
@@ -1411,6 +1419,7 @@ const sandbox = {
     body: { appendChild(child) { return child; }, removeChild(child) {} },
   },
   window: { confirm() { return true; }, location: { origin: "http://localhost:8080" } },
+  confirmDialog: async function () { return true; },
   URL: { createObjectURL() { return "blob:test"; }, revokeObjectURL() {} },
   Blob: function () {},
   requestAnimationFrame(callback) { callback(); },

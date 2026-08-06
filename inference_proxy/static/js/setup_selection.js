@@ -51,7 +51,7 @@ function createSetupSelectionController(options) {
     var alias = artifact.model_alias || artifact.repo_id;
     var entrypoint = artifact.entrypoint || "unknown GGUF";
     var revision = (artifact.resolved_revision || "").slice(0, 12);
-    return alias + " — " + entrypoint + (revision ? " @" + revision : "");
+    return alias + " - " + entrypoint + (revision ? " @" + revision : "");
   }
 
   function warningsFromCatalog(data) {

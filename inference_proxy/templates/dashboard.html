@@ -3,26 +3,33 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>QUADS — Node Fleet Dashboard</title>
+    <title>QIIP - Node Fleet Dashboard</title>
+    <meta name="description" content="Operations dashboard for QIIP: monitor inference nodes, provisioning status, and fleet health.">
+    <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Open+Sans:wght@400;500;600;700&family=Poppins:wght@500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
     <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
 </head>
 <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    {% set dash_active = active_page == 'dashboard' %}
+    {% set chat_active = active_page == 'chat' %}
     <nav class="top-bar" aria-label="Primary">
         <div class="brand">
-            <span class="brand-icon" aria-hidden="true">Q</span>
-            QUADS
+            <img class="brand-mark" src="{{ static_asset_url(request, 'img/qiip.svg') }}" alt="QIIP" width="29" height="24">
             <span class="brand-sep" aria-hidden="true"></span>
             <span class="brand-sub">Inference Proxy</span>
         </div>
         <div class="nav-links">
-            <a href="/dashboard" class="nav-link">Dashboard</a>
-            <a href="/chat" class="nav-link">Chat</a>
+            <a href="/dashboard" class="nav-link{{ ' nav-link-active' if dash_active else '' }}"{% if dash_active %} aria-current="page"{% endif %}>Dashboard</a>
+            <a href="/chat" class="nav-link{{ ' nav-link-active' if chat_active else '' }}"{% if chat_active %} aria-current="page"{% endif %}>Chat</a>
         </div>
-        <button class="theme-toggle" onclick="let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;localStorage.setItem('theme',t);this.textContent=t==='dark'?'☀️':'🌙'" aria-label="Toggle theme"><script>document.write(__t==='dark'?'☀️':'🌙')</script></button>
+        <button class="theme-toggle" onclick="let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;localStorage.setItem('theme',t)" aria-label="Toggle color theme">
+            <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+            <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+        </button>
     </nav>
 
     <div class="dashboard">
@@ -38,9 +45,9 @@
             </div>
         </header>
 
-        <main>
+        <main id="main-content">
             <section class="card">
-                <h2 class="card-title">Nodes <a href="#" class="manual-setup-toggle" id="manual-setup-toggle">+ Manual setup</a></h2>
+                <h2 class="card-title">Nodes <button type="button" class="manual-setup-toggle" id="manual-setup-toggle">+ Manual setup</button></h2>
                 <div id="manual-setup-row" style="display: none;">
                     <form id="setup-form" class="setup-form">
                         <input type="text" id="setup-hostname" placeholder="Enter hostname" required>
@@ -48,8 +55,8 @@
                         <select id="model-select" class="setup-select setup-model-select" aria-label="vLLM model"></select>
                         <select id="artifact-select" class="setup-select setup-artifact-select" aria-label="GGUF artifact" style="display:none"></select>
                         <label class="standalone-label"><input type="checkbox" id="setup-standalone"> Standalone (no QUADS)</label>
-                        <button type="submit" id="setup-btn">Setup Node</button>
-                        <span id="model-status" style="color:var(--muted);font-size:0.875rem;display:none"></span>
+                        <button type="submit" id="setup-btn" class="btn btn-primary">Setup Node</button>
+                        <span id="model-status" class="hint-text" style="display:none"></span>
                     </form>
                 </div>
                 <div class="table-wrap">
@@ -67,9 +74,11 @@
                                 <th scope="col">Actions</th>
                             </tr>
                         </thead>
-                        <tbody id="node-table-body">
-                            <tr><td colspan="9">Loading node data...</td></tr>
-                        </tbody>
+        <tbody id="node-table-body">
+            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+        </tbody>
                     </table>
                 </div>
             </section>
@@ -79,10 +88,11 @@
     <div id="toast-container"></div>
 
     <footer>
-        <p>QUADS Inference Proxy</p>
+        <p>QIIP Inference Proxy</p>
     </footer>
 
     <script>const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};</script>
+    <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/config_download.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/setup_selection.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/dashboard.js') }}"></script>

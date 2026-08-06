@@ -17,4 +17,6 @@ chat_router = APIRouter(tags=["chat"])
 @chat_router.get("/chat", response_class=HTMLResponse)
 async def chat(request: Request) -> HTMLResponse:
     """Render the chat playground HTML shell."""
-    return templates.TemplateResponse(request=request, name="chat.html")
+    return templates.TemplateResponse(
+        request=request, name="chat.html", context={"active_page": "chat"}
+    )

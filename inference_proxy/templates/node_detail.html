@@ -3,42 +3,53 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ node_id }} — QUADS Node Detail</title>
+    <title>{{ node_id }} - QIIP Node Detail</title>
+    <meta name="description" content="Node detail, provisioning status, and runtime configuration for {{ node_id }} on QIIP.">
+    <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Open+Sans:wght@400;500;600;700&family=Poppins:wght@500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
     <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
 </head>
 <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    {% set dash_active = active_page == 'dashboard' %}
+    {% set chat_active = active_page == 'chat' %}
     <nav class="top-bar" aria-label="Primary">
         <div class="brand">
-            <span class="brand-icon" aria-hidden="true">Q</span>
-            QUADS
+            <img class="brand-mark" src="{{ static_asset_url(request, 'img/qiip.svg') }}" alt="QIIP" width="29" height="24">
             <span class="brand-sep" aria-hidden="true"></span>
             <span class="brand-sub">Inference Proxy</span>
         </div>
         <div class="nav-links">
-            <a href="/dashboard" class="nav-link">Dashboard</a>
-            <a href="/chat" class="nav-link">Chat</a>
+            <a href="/dashboard" class="nav-link{{ ' nav-link-active' if dash_active else '' }}"{% if dash_active %} aria-current="page"{% endif %}>Dashboard</a>
+            <a href="/chat" class="nav-link{{ ' nav-link-active' if chat_active else '' }}"{% if chat_active %} aria-current="page"{% endif %}>Chat</a>
         </div>
-        <button class="theme-toggle" onclick="let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;localStorage.setItem('theme',t);this.textContent=t==='dark'?'☀️':'🌙'" aria-label="Toggle theme"><script>document.write(__t==='dark'?'☀️':'🌙')</script></button>
+        <button class="theme-toggle" onclick="let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;localStorage.setItem('theme',t)" aria-label="Toggle color theme">
+            <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+            <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+        </button>
     </nav>
 
     <div class="dashboard">
         <header class="dashboard-header">
             <div>
-                <p style="margin:0 0 0.25rem"><a href="/dashboard">&larr; Back to fleet</a></p>
+                <p class="breadcrumb"><a href="/dashboard">&larr; Back to fleet</a></p>
                 <h1 id="node-title">{{ node_id }}</h1>
                 <p id="node-state">Loading...</p>
-                <p id="power-state" style="margin:0.25rem 0 0 0"><span class="badge badge-unknown">Power: Unknown</span> <span id="power-actions" style="display:inline-flex;gap:0.375rem;margin-left:0.5rem;vertical-align:middle"></span></p>
+                <p id="power-state"><span class="badge badge-unknown">Power: Unknown</span></p>
             </div>
             <div class="header-right">
                 <p id="last-updated"></p>
+                <div class="header-actions">
+                    <div id="power-actions"></div>
+                    <div id="node-actions"></div>
+                </div>
             </div>
         </header>
 
-        <main>
+        <main id="main-content">
             <section class="card">
                 <h2 class="card-title">Node Info</h2>
                 <div class="table-wrap">
@@ -54,11 +65,10 @@
                                 <th scope="col">Active Connections</th>
                                 <th scope="col">Circuit Breaker</th>
                                 <th scope="col">Requests</th>
-                                <th scope="col">Actions</th>
                             </tr>
                         </thead>
                         <tbody id="node-info-body">
-                            <tr><td colspan="10">Loading...</td></tr>
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -66,8 +76,8 @@
 
             <section class="card" id="config-download-panel" style="display:none">
                 <h2 class="card-title">Client Configuration</h2>
-                <p id="config-download-hint" style="color:var(--muted);font-size:0.875rem"></p>
-                <div id="config-download-buttons" style="display:flex;gap:0.5rem;margin-top:0.5rem"></div>
+                <p id="config-download-hint" class="hint-text"></p>
+                <div id="config-download-buttons"></div>
             </section>
 
             <section class="card" id="setup-config-panel">
@@ -76,7 +86,7 @@
                     <label>Engine <select id="setup-engine-select" class="setup-select setup-engine-select"></select></label>
                     <select id="model-select" class="setup-select setup-model-select" aria-label="vLLM model"></select>
                     <select id="artifact-select" class="setup-select setup-artifact-select" aria-label="GGUF artifact" style="display:none"></select>
-                    <span id="model-status" style="color:var(--muted);font-size:0.875rem;display:none"></span>
+                    <span id="model-status" class="hint-text" style="display:none"></span>
                 </div>
             </section>
 
@@ -159,10 +169,10 @@
             <section class="card" id="recommendations-panel">
                 <h2 class="card-title">
                     Model Recommendations
-                    <button type="button" class="btn-setup" id="load-recs-btn" style="margin-left:0.75rem;font-size:0.75rem;padding:0.25rem 0.625rem">Load</button>
+                    <button type="button" class="btn btn-sm btn-primary" id="load-recs-btn">Load</button>
                 </h2>
-                <div id="recs-hw-summary" style="display:none;margin-bottom:0.75rem;font-size:0.875rem"></div>
-                <div id="recs-content"><span style="color:var(--muted);font-size:0.875rem">Click Load to fetch model recommendations for this node.</span></div>
+                <div id="recs-hw-summary" style="display:none"></div>
+                <div id="recs-content"><span class="hint-text">Click Load to fetch model recommendations for this node.</span></div>
             </section>
 
             <section class="card" id="tasks-panel">
@@ -179,7 +189,7 @@
                             </tr>
                         </thead>
                         <tbody id="tasks-table-body">
-                            <tr><td colspan="5">Loading...</td></tr>
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -188,7 +198,7 @@
             <section class="card" id="logs-panel">
                 <h2 class="card-title">
                     Live Logs
-                    <span id="logs-status" class="badge" style="margin-left:0.5rem;font-size:0.625rem">waiting</span>
+                    <span id="logs-status" class="badge">waiting</span>
                 </h2>
                 <div id="logs-output" class="log-viewer"><span class="log-placeholder">Logs will appear here when provisioning starts.</span></div>
             </section>
@@ -198,13 +208,14 @@
     <div id="toast-container"></div>
 
     <footer>
-        <p>QUADS Inference Proxy</p>
+        <p>QIIP Inference Proxy</p>
     </footer>
 
     <script>
         const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};
         const NODE_ID = {{ node_id | tojson }};
     </script>
+    <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/config_download.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/setup_selection.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/llamacpp_relaunch.js') }}"></script>

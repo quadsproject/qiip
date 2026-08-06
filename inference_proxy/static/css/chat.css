@@ -4,7 +4,7 @@
 .chat-page {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 56px);
+  height: calc(100dvh - 56px);
 }
 
 
@@ -19,9 +19,9 @@
 }
 
 #model-select {
-  font-family: 'Open Sans', sans-serif;
+  font-family: var(--font-sans);
   font-size: 0.8125rem;
-  font-weight: 400;
+  font-weight: 500;
   color: var(--text);
   background: var(--bg);
   border: 1px solid var(--border-strong);
@@ -54,12 +54,14 @@
 }
 
 .empty-state h2 {
-  font-family: 'Poppins', 'Open Sans', sans-serif;
+  font-family: var(--font-display);
   font-size: 1.5rem;
   font-weight: 600;
   margin: 0 0 0.5rem;
   color: var(--text);
-  opacity: 0.5;
+  letter-spacing: -0.01em;
+  opacity: 0.6;
+  text-wrap: balance;
 }
 
 .empty-state p {
@@ -80,7 +82,7 @@
 .bubble-user {
   margin-left: auto;
   background: var(--primary);
-  color: #fff;
+  color: var(--on-primary);
 }
 
 .bubble-assistant {
@@ -92,10 +94,6 @@
 
 .bubble-error {
   color: var(--danger);
-}
-
-[data-theme="dark"] .bubble-user {
-  color: #111827;
 }
 
 /* --- Streaming cursor --- */
@@ -127,18 +125,19 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
   padding: 0.5rem 0.75rem;
-  font-family: 'Open Sans', sans-serif;
+  font-family: var(--font-sans);
   font-size: 0.875rem;
   line-height: 1.5;
   color: var(--text);
   background: var(--bg);
   resize: none;
   outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
 
 #chat-input:focus {
   border-color: var(--primary);
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+  box-shadow: var(--focus-ring);
 }
 
 #chat-input::placeholder {
@@ -148,24 +147,8 @@
 #send-btn {
   width: 40px;
   height: 40px;
-  border-radius: var(--radius);
-  background: var(--primary);
-  color: #fff;
-  border: none;
-  cursor: pointer;
-  font-size: 0.875rem;
-  font-weight: 600;
+  justify-content: center;
   flex-shrink: 0;
-  transition: background 0.15s;
-}
-
-#send-btn:hover:not(:disabled) {
-  background: var(--primary-hover);
-}
-
-#send-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }
 
 /* --- Markdown in assistant bubbles --- */
@@ -174,14 +157,14 @@
   padding: 12px 16px;
   border-radius: var(--radius);
   overflow-x: auto;
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 0.8125rem;
   line-height: 1.5;
   margin: 0.5rem 0;
 }
 
 .bubble-assistant code {
-  font-family: 'IBM Plex Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 0.8125rem;
 }
 
@@ -217,11 +200,12 @@
   align-items: center;
   gap: 4px;
   margin-left: 8px;
-  transition: color 0.15s;
+  transition: color 0.15s, border-color 0.15s;
 }
 
 .system-prompt-toggle:hover {
   color: var(--text);
+  border-color: var(--text);
 }
 
 .chevron {
@@ -267,17 +251,18 @@
   border: 1px solid var(--border-strong);
   border-radius: var(--radius);
   padding: 0.5rem 0.75rem;
-  font-family: 'Open Sans', sans-serif;
+  font-family: var(--font-sans);
   font-size: 0.875rem;
   line-height: 1.5;
   color: var(--text);
   background: var(--bg);
   outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
 
 #system-prompt:focus {
   border-color: var(--primary);
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+  box-shadow: var(--focus-ring);
 }
 
 #system-prompt::placeholder {
@@ -316,11 +301,13 @@
   .streaming-cursor::after {
     animation: none;
   }
-
-  #send-btn {
+  #chat-input {
     transition: none;
   }
 
+  #system-prompt {
+    transition: none;
+  }
 
   .system-prompt-panel {
     transition: none;

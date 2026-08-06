@@ -189,8 +189,8 @@ process.stdout.write(JSON.stringify({
             "placeholderDisabled": True,
             "labels": [
                 "Select a GGUF artifact",
-                "model — model-BF16.gguf @bbbbbbbbbbbb",
-                "model — model-Q4_K_M.gguf @bbbbbbbbbbbb",
+                "model - model-BF16.gguf @bbbbbbbbbbbb",
+                "model - model-Q4_K_M.gguf @bbbbbbbbbbbb",
             ],
         },
         "after": {"engine": "llama_cpp", "artifact_id": "c" * 64},
@@ -325,6 +325,6 @@ process.stdout.write(JSON.stringify({
     )
 
     assert result == {
-        "label": ("<script>attack()</script> — <b>model-Q4_K_M.gguf</b> @bbbbbbbbbbbb"),
+        "label": ("<script>attack()</script> - <b>model-Q4_K_M.gguf</b> @bbbbbbbbbbbb"),
         "childCount": 0,
     }
