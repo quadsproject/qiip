@@ -58,6 +58,7 @@ function generateOmpConfig(baseUrl, modelId) {
     "    api: openai-completions",
     "    models:",
     "      - id: " + yamlScalar(modelId),
+    "        name: " + yamlScalar(modelId + " (qiip)"),
   ].join("\n");
 }
 

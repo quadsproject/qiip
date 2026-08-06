@@ -180,6 +180,7 @@ class TestGenerateOmpConfig:
         assert "    auth: none" in result
         assert "    api: openai-completions" in result
         assert "      - id: meta-llama/Llama-3-8B" in result
+        assert "        name: meta-llama/Llama-3-8B (qiip)" in result
 
     def test_base_url_includes_v1(self) -> None:
         result = _run_node_yaml(
