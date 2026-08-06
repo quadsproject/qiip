@@ -14,6 +14,7 @@
     <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
 </head>
 <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
     {% set dash_active = active_page == 'dashboard' %}
     {% set chat_active = active_page == 'chat' %}
     <nav class="top-bar" aria-label="Primary">
@@ -32,7 +33,7 @@
         </button>
     </nav>
 
-    <div class="chat-page">
+    <main class="chat-page" id="main-content">
         <div class="model-selector-bar">
             <select id="model-select">
                 <option value="">Loading models...</option>
@@ -57,9 +58,9 @@
 
         <div class="input-bar">
             <textarea id="chat-input" placeholder="Type a message..." rows="1"></textarea>
-            <button id="send-btn" type="button" disabled>Send</button>
+            <button id="send-btn" type="button" class="btn btn-primary" disabled>Send</button>
         </div>
-    </div>
+    </main>
 
     <div id="toast-container"></div>
 

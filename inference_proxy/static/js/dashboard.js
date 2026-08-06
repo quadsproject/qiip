@@ -165,7 +165,7 @@ function createActionButton(action, nodeId, node) {
   const config = ACTION_CONFIG[action];
   const btn = document.createElement("button");
   btn.type = "button";
-  btn.className = config.css;
+  btn.className = "btn btn-sm " + config.css;
   btn.textContent = config.label;
   btn.disabled = inFlightNodes.has(nodeId);
   btn.addEventListener("click", async function () {
@@ -297,6 +297,7 @@ async function refreshDashboard() {
         tr.appendChild(tdState);
 
         const tdReqs = document.createElement("td");
+        tdReqs.className = "num";
         tdReqs.textContent = node.state === "available" ? "—" : (perNode[node.node_id] || 0);
         tr.appendChild(tdReqs);
 
@@ -306,12 +307,12 @@ async function refreshDashboard() {
           tdActions.appendChild(createActionButton(actions[0], node.node_id, node));
         } else if (actions.length > 1) {
           const group = document.createElement("div");
-          group.className = "action-group";
+          group.className = "action-group action-group--split";
           group.appendChild(createActionButton(actions[0], node.node_id, node));
 
           const caret = document.createElement("button");
           caret.type = "button";
-          caret.className = ACTION_CONFIG[actions[0]].css + " action-caret";
+          caret.className = "btn btn-sm " + ACTION_CONFIG[actions[0]].css + " action-caret";
           caret.textContent = "▾";
           const menu = document.createElement("div");
           menu.className = "action-menu";

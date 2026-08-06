@@ -87,8 +87,8 @@ function createConfigDropdown(baseUrl, modelId, positionFn, onToggle) {
 
   var trigger = document.createElement("button");
   trigger.type = "button";
-  trigger.className = "btn-config";
-  trigger.textContent = "Download ▾";
+  trigger.className = "btn btn-sm btn-neutral btn-trigger";
+  trigger.textContent = "Download";
 
   var menu = document.createElement("div");
   menu.className = "action-menu";
@@ -97,7 +97,7 @@ function createConfigDropdown(baseUrl, modelId, positionFn, onToggle) {
     (function (fmt) {
       var btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "btn-config";
+      btn.className = "btn btn-sm btn-neutral";
       btn.textContent = fmt.label;
       btn.addEventListener("click", function () {
         downloadConfigFile(fmt.generator(baseUrl, modelId), fmt.filename);

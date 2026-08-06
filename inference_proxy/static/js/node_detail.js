@@ -120,18 +120,26 @@ async function handleAction(action, nodeId, node, onStart) {
 
 var ALL_ACTIONS = ["setup", "teardown", "retry", "cancel", "force_teardown"];
 
-function createActionsDropdown(nodeId, enabledActions, node) {
-  var group = document.createElement("div");
-  group.className = "action-group";
-
-  var trigger = document.createElement("button");
-  trigger.type = "button";
-  trigger.className = "btn-action-trigger";
-  trigger.textContent = "Actions ▾";
-  if (enabledActions.length === 0) trigger.disabled = true;
-
+// ponytail: shared dropdown chrome (trigger + menu) reused by node actions and power controls
+function buildActionMenu(items) {
   var menu = document.createElement("div");
   menu.className = "action-menu";
+  items.forEach(function (item) {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-sm " + item.variant;
+    btn.textContent = item.label;
+    btn.disabled = item.disabled;
+    if (!item.disabled) {
+      btn.addEventListener("click", function () {
+        menu.classList.remove("open");
+        item.onClick(btn);
+      });
+    }
+    menu.appendChild(btn);
+  });
+  return menu;
+}
 
   for (var i = 0; i < ALL_ACTIONS.length; i++) {
     (function (action) {
@@ -162,6 +170,7 @@ function createActionsDropdown(nodeId, enabledActions, node) {
     })(ALL_ACTIONS[i]);
   }
 
+function attachDropdownToggle(trigger, menu) {
   trigger.addEventListener("click", function (e) {
     e.stopPropagation();
     var wasOpen = menu.classList.contains("open");
@@ -169,14 +178,44 @@ function createActionsDropdown(nodeId, enabledActions, node) {
     if (!wasOpen) {
       menu.classList.add("open");
       var rect = trigger.getBoundingClientRect();
-      menu.style.top = (rect.top - menu.offsetHeight) + "px";
+      menu.style.top = rect.bottom + "px";
       menu.style.left = (rect.right - menu.offsetWidth) + "px";
     }
   });
+}
 
+function buildDropdownGroup(trigger, menu) {
+  var group = document.createElement("div");
+  group.className = "action-group";
   group.appendChild(trigger);
   group.appendChild(menu);
   return group;
+}
+
+function createActionsDropdown(nodeId, enabledActions, node) {
+  var items = ALL_ACTIONS.map(function (action) {
+    var config = ACTION_CONFIG[action];
+    return {
+      label: config.label,
+      variant: config.css,
+      disabled: enabledActions.indexOf(action) === -1,
+      onClick: function (btn) {
+        btn.disabled = true;
+        handleAction(action, nodeId, node, function () {
+          btn.textContent = config.pendingLabel;
+          btn.setAttribute("aria-busy", "true");
+        }).finally(function () {
+          btn.disabled = false;
+          btn.textContent = config.label;
+          btn.removeAttribute("aria-busy");
+        });
+      },
+    };
+  });
+  var menu = buildActionMenu(items);
+  var trigger = buildDropdownTrigger("Actions", enabledActions.length === 0, null);
+  attachDropdownToggle(trigger, menu);
+  return buildDropdownGroup(trigger, menu);
 }
 
 function stepBadgeClass(step) {
@@ -272,7 +311,8 @@ async function refreshDetail() {
     var node = nodes.find(function (n) { return n.node_id === NODE_ID; });
     if (!node) {
       stateEl.textContent = "Node not found";
-      renderTableMessage(infoBody, 10, "Node not found in registry");
+      renderTableMessage(infoBody, 9, "Node not found in registry");
+      document.getElementById("node-actions").textContent = "";
       document.getElementById("config-download-panel").style.display = "none";
       renderLlamaCppRuntime(null);
     } else {
@@ -293,22 +333,22 @@ async function refreshDetail() {
       var sb = document.createElement("span"); sb.className = "badge badge-" + node.state; sb.textContent = node.state;
       tdSt.appendChild(sb); tr.appendChild(tdSt);
 
-      var tdCo = document.createElement("td"); tdCo.textContent = node.state === "available" ? "—" : node.active_connections; tr.appendChild(tdCo);
+      var tdCo = document.createElement("td"); tdCo.className = "num"; tdCo.textContent = node.state === "available" ? "—" : node.active_connections; tr.appendChild(tdCo);
 
       var tdCb = document.createElement("td");
       if (node.state === "available") { tdCb.textContent = "—"; }
       else { var cb = document.createElement("span"); cb.className = "badge badge-" + node.circuit_breaker_state; cb.textContent = node.circuit_breaker_state; tdCb.appendChild(cb); }
       tr.appendChild(tdCb);
 
-      var tdRq = document.createElement("td"); tdRq.textContent = node.state === "available" ? "—" : (perNode[node.node_id] || 0); tr.appendChild(tdRq);
+      var tdRq = document.createElement("td"); tdRq.className = "num"; tdRq.textContent = node.state === "available" ? "—" : (perNode[node.node_id] || 0); tr.appendChild(tdRq);
 
-      var tdAc = document.createElement("td");
       var enabledActions = node.actions || [];
       if (!setupSelection.isValid()) {
         enabledActions = enabledActions.filter(function (a) { return a !== "setup"; });
       }
-      tdAc.appendChild(createActionsDropdown(node.node_id, enabledActions, node));
-      tr.appendChild(tdAc);
+      var nodeActionsContainer = document.getElementById("node-actions");
+      nodeActionsContainer.textContent = "";
+      nodeActionsContainer.appendChild(createActionsDropdown(node.node_id, enabledActions, node));
 
       infoBody.appendChild(tr);
 
@@ -574,7 +614,7 @@ function renderDownloadCell(td, modelName, catalogSet, downloadMap) {
   } else {
     var btn = document.createElement("button");
     btn.type = "button";
-    btn.className = "btn-setup";
+    btn.className = "btn btn-sm btn-primary";
     btn.textContent = "Download";
     btn.addEventListener("click", function () { triggerDownload(modelName, td); });
     td.appendChild(btn);
@@ -873,8 +913,10 @@ var POWER_ACTIONS = [
 function renderPowerButtons() {
   var container = document.getElementById("power-actions");
   container.textContent = "";
-  container.hidden = powerControlsState === "unconfigured";
-  if (container.hidden) return;
+  var unconfigured = powerControlsState === "unconfigured";
+  container.hidden = unconfigured;
+  if (unconfigured) return;
+
   var visible;
   if (currentPowerState === "On") {
     visible = ["ForceOff", "GracefulRestart", "ForceRestart"];

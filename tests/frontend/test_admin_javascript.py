@@ -842,10 +842,14 @@ sandbox.fetch = async function () {{
 (async function () {{
   await sandbox.refreshPowerState();
   const controls = byId("power-actions");
+  const group = controls.children[0];
+  const trigger = group ? group.children[0] : null;
+  const menu = group ? group.children[1] : null;
   process.stdout.write(JSON.stringify({{
     hidden: controls.hidden,
-    disabled: controls.children.map(function (child) {{ return child.disabled; }}),
-    titles: controls.children.map(function (child) {{ return child.title; }}),
+    triggerDisabled: trigger ? trigger.disabled : null,
+    triggerTitle: trigger ? trigger.title : null,
+    menuItemCount: menu ? menu.children.length : 0,
   }}));
 }})().catch(function (error) {{ console.error(error); process.exit(1); }});
 """
@@ -855,17 +859,18 @@ sandbox.fetch = async function () {{
 def test_power_controls_hidden_when_redfish_unconfigured() -> None:
     assert _power_controls_result(503) == {
         "hidden": True,
-        "disabled": [],
-        "titles": [],
+        "triggerDisabled": None,
+        "triggerTitle": None,
+        "menuItemCount": 0,
     }
 
 
 def test_power_controls_disabled_when_state_unknown() -> None:
     assert _power_controls_result(502) == {
         "hidden": False,
-        "disabled": [True, True, True, True],
-        "titles": ["Power state is temporarily unavailable; controls are disabled."]
-        * 4,
+        "triggerDisabled": True,
+        "triggerTitle": "Power state is temporarily unavailable; controls are disabled.",
+        "menuItemCount": 4,
     }
 
 

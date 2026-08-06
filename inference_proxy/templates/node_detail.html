@@ -13,6 +13,7 @@
     <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
 </head>
 <body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
     {% set dash_active = active_page == 'dashboard' %}
     {% set chat_active = active_page == 'chat' %}
     <nav class="top-bar" aria-label="Primary">
@@ -37,14 +38,18 @@
                 <p class="breadcrumb"><a href="/dashboard">&larr; Back to fleet</a></p>
                 <h1 id="node-title">{{ node_id }}</h1>
                 <p id="node-state">Loading...</p>
-                <p id="power-state"><span class="badge badge-unknown">Power: Unknown</span> <span id="power-actions"></span></p>
+                <p id="power-state"><span class="badge badge-unknown">Power: Unknown</span></p>
             </div>
             <div class="header-right">
                 <p id="last-updated"></p>
+                <div class="header-actions">
+                    <div id="power-actions"></div>
+                    <div id="node-actions"></div>
+                </div>
             </div>
         </header>
 
-        <main>
+        <main id="main-content">
             <section class="card">
                 <h2 class="card-title">Node Info</h2>
                 <div class="table-wrap">
@@ -60,11 +65,10 @@
                                 <th scope="col">Active Connections</th>
                                 <th scope="col">Circuit Breaker</th>
                                 <th scope="col">Requests</th>
-                                <th scope="col">Actions</th>
                             </tr>
                         </thead>
                         <tbody id="node-info-body">
-                            <tr><td colspan="10">Loading...</td></tr>
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -110,7 +114,7 @@
             <section class="card" id="recommendations-panel">
                 <h2 class="card-title">
                     Model Recommendations
-                    <button type="button" class="btn-setup" id="load-recs-btn">Load</button>
+                    <button type="button" class="btn btn-sm btn-primary" id="load-recs-btn">Load</button>
                 </h2>
                 <div id="recs-hw-summary" style="display:none"></div>
                 <div id="recs-content"><span class="hint-text">Click Load to fetch model recommendations for this node.</span></div>
@@ -130,7 +134,7 @@
                             </tr>
                         </thead>
                         <tbody id="tasks-table-body">
-                            <tr><td colspan="5">Loading...</td></tr>
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
                         </tbody>
                     </table>
                 </div>
