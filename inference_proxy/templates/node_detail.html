@@ -82,7 +82,51 @@
 
             <section class="card" id="llamacpp-runtime-panel" hidden>
                 <h2 class="card-title">llama.cpp Runtime Configuration</h2>
-                <p id="llamacpp-runtime-status" class="runtime-status" aria-live="polite">Loading runtime configuration...</p>
+                <p id="llamacpp-runtime-status" class="runtime-status" role="status" aria-live="polite">Loading runtime configuration...</p>
+                <form id="llamacpp-relaunch-form" class="runtime-policy-form" hidden novalidate>
+                    <fieldset id="llamacpp-relaunch-fields" class="runtime-policy-fieldset">
+                        <legend>Requested policy</legend>
+                        <div class="runtime-control-grid">
+                            <label class="runtime-control" for="llamacpp-sizing">
+                                <span>Sizing policy</span>
+                                <select id="llamacpp-sizing" aria-describedby="llamacpp-sizing-help llamacpp-relaunch-error">
+                                    <option value="auto">Automatic</option>
+                                    <option value="custom">Custom</option>
+                                </select>
+                            </label>
+                            <label class="runtime-control" for="llamacpp-fit-target">
+                                <span>Free VRAM target per GPU</span>
+                                <span class="runtime-input-unit"><input id="llamacpp-fit-target" type="number" min="1" step="1" inputmode="numeric" aria-describedby="llamacpp-sizing-help llamacpp-relaunch-error"> <span>MiB</span></span>
+                            </label>
+                            <label class="runtime-control" for="llamacpp-context-per-slot">
+                                <span>Context per slot</span>
+                                <span class="runtime-input-unit"><input id="llamacpp-context-per-slot" type="number" min="256" step="256" inputmode="numeric" aria-describedby="llamacpp-sizing-help llamacpp-relaunch-error"> <span>tokens</span></span>
+                            </label>
+                            <label class="runtime-control" for="llamacpp-parallel-slots">
+                                <span>Parallel slots</span>
+                                <input id="llamacpp-parallel-slots" type="number" min="1" max="256" step="1" inputmode="numeric" aria-describedby="llamacpp-sizing-help llamacpp-relaunch-error">
+                            </label>
+                            <label class="runtime-control" for="llamacpp-cache-type">
+                                <span>KV cache</span>
+                                <select id="llamacpp-cache-type" aria-describedby="llamacpp-sizing-help llamacpp-relaunch-error">
+                                    <option value="f16">F16</option>
+                                    <option value="q8_0">Q8_0</option>
+                                </select>
+                            </label>
+                        </div>
+                        <p id="llamacpp-sizing-help" class="runtime-help"></p>
+                        <dl class="runtime-preview" aria-label="Requested configuration preview">
+                            <div><dt>Requested aggregate context</dt><dd id="llamacpp-requested-aggregate"></dd></div>
+                            <div><dt>Model training context</dt><dd id="llamacpp-requested-train-context"></dd></div>
+                        </dl>
+                        <div class="runtime-form-actions">
+                            <button id="llamacpp-relaunch-submit" class="runtime-primary-action" type="submit">Apply and relaunch</button>
+                            <button id="llamacpp-relaunch-reset" class="runtime-secondary-action" type="button" disabled>Reset</button>
+                        </div>
+                        <p id="llamacpp-relaunch-error" class="runtime-form-error" role="alert" hidden></p>
+                    </fieldset>
+                </form>
+                <h3 id="llamacpp-verified-heading" class="runtime-subheading" hidden>Verified runtime</h3>
                 <dl id="llamacpp-runtime-values" class="runtime-grid" hidden>
                     <div><dt>Minimum free VRAM</dt><dd id="llamacpp-runtime-min-free"></dd></div>
                     <div><dt>Minimum headroom</dt><dd id="llamacpp-runtime-min-headroom"></dd></div>
@@ -152,6 +196,7 @@
     </script>
     <script src="{{ static_asset_url(request, 'js/config_download.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/setup_selection.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/llamacpp_relaunch.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/node_detail.js') }}"></script>
 </body>
 </html>

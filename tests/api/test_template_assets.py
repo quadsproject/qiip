@@ -34,6 +34,7 @@ def _versioned_path(path: str) -> str:
                 "css/dashboard.css",
                 "js/config_download.js",
                 "js/setup_selection.js",
+                "js/llamacpp_relaunch.js",
                 "js/node_detail.js",
             ),
         ),

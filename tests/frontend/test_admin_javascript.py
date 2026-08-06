@@ -184,6 +184,9 @@ const source = fs.readFileSync(process.argv[1], "utf8");
 const setupSelectionSource = fs.readFileSync(
   path.join(path.dirname(process.argv[1]), "setup_selection.js"), "utf8"
 );
+const llamaCppRelaunchSource = fs.readFileSync(
+  path.join(path.dirname(process.argv[1]), "llamacpp_relaunch.js"), "utf8"
+);
 const elements = new Map();
 
 function element() {
@@ -268,6 +271,9 @@ const source = fs.readFileSync(process.argv[1], "utf8");
 const setupSelectionSource = fs.readFileSync(
   path.join(path.dirname(process.argv[1]), "setup_selection.js"), "utf8"
 );
+const llamaCppRelaunchSource = fs.readFileSync(
+  path.join(path.dirname(process.argv[1]), "llamacpp_relaunch.js"), "utf8"
+);
 const elements = new Map();
 const allElements = [];
 const eventSources = [];
@@ -302,6 +308,7 @@ class Element {
   addEventListener(name, callback) { this.listeners[name] = callback; }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return this.attributes[name] || null; }
+  focus() { this.focused = true; }
   remove() {}
   querySelector() { return null; }
   getBoundingClientRect() { return { top: 0, right: 0 }; }
@@ -355,11 +362,13 @@ const sandbox = {
   setInterval() { return 1; },
   clearInterval() {},
   EventSource: FakeEventSource,
+  createConfigDropdown() { return new Element("div"); },
   fetch: async function () { return { ok: false, status: 404, json: async function () { return {}; } }; },
 };
 
 vm.createContext(sandbox);
 vm.runInContext(setupSelectionSource, sandbox);
+vm.runInContext(llamaCppRelaunchSource, sandbox);
 vm.runInContext(source, sandbox);
 sandbox.showToast = function () {};
 
@@ -371,15 +380,18 @@ function runNextTimer() {
   return timer.delay;
 }
 
-function installDetailFetch(tasks, tasksOk, engine, runtime) {
+function installDetailFetch(tasks, tasksOk, engine, runtime, nodeState) {
   sandbox.fetch = async function (url) {
     if (url === "/admin/nodes") {
       return {
         ok: true,
         headers: { get() { return null; } },
         json: async function () { return [{
-          node_id: "gpu01", state: "provisioning", model: "org/model",
-          engine: engine || null, artifact_id: null,
+          node_id: "gpu01",
+          state: nodeState || (runtime ? "healthy" : "provisioning"),
+          model: "org/model", managed: runtime ? true : false,
+          engine: engine || null,
+          artifact_id: runtime ? "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" : null,
           llamacpp_runtime: runtime || null,
           endpoint: "gpu01:8000", active_connections: 0,
           circuit_breaker_state: "closed", actions: [],
@@ -396,6 +408,22 @@ function installDetailFetch(tasks, tasksOk, engine, runtime) {
       };
     }
     throw new Error("unexpected URL " + url);
+  };
+}
+
+function llamaRuntime(requested) {
+  return {
+    requested,
+    effective: {
+      train_context: 262144, context_per_slot: 12544,
+      slot_context_limit: 12544, slots: 1, aggregate_context: 12544,
+      cache_type_k: "q8_0", cache_type_v: "q8_0", flash_attn: "on",
+      kv_unified: true, gpu_layers: 31, total_layers: 31,
+    },
+    gpus: [
+      { index: 0, total_mib: 15360, used_mib: 14117, free_mib: 1243 },
+    ],
+    observed_at: "2026-08-05T21:55:24Z",
   };
 }
 
@@ -786,6 +814,388 @@ installDetailFetch([], true, "llama_cpp", {
     }
     assert result["observed"].startswith("Post-load snapshot at ")
     assert result["observed"] != "Post-load snapshot at —"
+
+
+@pytest.mark.parametrize(
+    ("requested", "custom_controls_disabled"),
+    [
+        ({"sizing": "auto", "fit_target_mib": 1024}, True),
+        (
+            {
+                "sizing": "custom",
+                "fit_target_mib": 768,
+                "context_per_slot": 32768,
+                "slots": 3,
+                "cache_type": "f16",
+            },
+            False,
+        ),
+    ],
+)
+def test_llamacpp_relaunch_form_roundtrips_persisted_policy(
+    requested: dict[str, Any],
+    custom_controls_disabled: bool,
+) -> None:
+    result = _run_node_detail_scenario(
+        f"""
+installDetailFetch([], true, "llama_cpp", llamaRuntime({json.dumps(requested)}));
+(async function () {{
+  await sandbox.refreshDetail();
+  const disabledBeforeSubmit = byId("llamacpp-context-per-slot").disabled;
+  const baseFetch = sandbox.fetch;
+  let captured = null;
+  sandbox.fetch = async function (url, options) {{
+    if (url.endsWith("/llamacpp/relaunch")) {{
+      captured = JSON.parse(options.body);
+      return {{ ok: true, status: 202, json: async function () {{ return {{}}; }} }};
+    }}
+    return baseFetch(url, options);
+  }};
+  await sandbox.submitLlamaCppRelaunch();
+  process.stdout.write(JSON.stringify({{
+    formHidden: byId("llamacpp-relaunch-form").hidden,
+    disabledBeforeSubmit,
+    captured,
+    submission: sandbox.llamaCppRelaunch.state().submission,
+  }}));
+}})().catch(function (error) {{ console.error(error); process.exit(1); }});
+"""
+    )
+
+    assert result == {
+        "formHidden": False,
+        "disabledBeforeSubmit": custom_controls_disabled,
+        "captured": requested,
+        "submission": "waiting",
+    }
+
+
+def test_invalid_llamacpp_relaunch_is_blocked_and_focuses_first_error() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([], true, "llama_cpp", llamaRuntime(
+  { sizing: "auto", fit_target_mib: 512 }
+));
+(async function () {
+  await sandbox.refreshDetail();
+  let postCount = 0;
+  sandbox.fetch = async function () { postCount += 1; return { ok: true }; };
+  sandbox.llamaCppRelaunch.setField("sizing", "custom");
+  sandbox.llamaCppRelaunch.setField("context_per_slot", "255");
+  await sandbox.submitLlamaCppRelaunch();
+  process.stdout.write(JSON.stringify({
+    postCount,
+    focused: byId("llamacpp-context-per-slot").focused === true,
+    invalid: byId("llamacpp-context-per-slot").getAttribute("aria-invalid"),
+    error: byId("llamacpp-relaunch-error").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "postCount": 0,
+        "focused": True,
+        "invalid": "true",
+        "error": "Context per slot must be at least 256 tokens.",
+    }
+
+
+def test_llamacpp_relaunch_double_submit_sends_one_request() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([], true, "llama_cpp", llamaRuntime(
+  { sizing: "auto", fit_target_mib: 512 }
+));
+(async function () {
+  await sandbox.refreshDetail();
+  let postCount = 0;
+  let confirmCount = 0;
+  let resolvePost;
+  sandbox.window.confirm = function () { confirmCount += 1; return true; };
+  sandbox.fetch = function () {
+    postCount += 1;
+    return new Promise(function (resolve) { resolvePost = resolve; });
+  };
+  const first = sandbox.submitLlamaCppRelaunch();
+  const second = sandbox.submitLlamaCppRelaunch();
+  await Promise.resolve();
+  const during = { postCount, confirmCount };
+  resolvePost({ ok: true, status: 202 });
+  await Promise.all([first, second]);
+  process.stdout.write(JSON.stringify({ during, postCount, confirmCount }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "during": {"postCount": 1, "confirmCount": 1},
+        "postCount": 1,
+        "confirmCount": 1,
+    }
+
+
+def test_llamacpp_relaunch_renders_server_validation_detail() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([], true, "llama_cpp", llamaRuntime(
+  { sizing: "auto", fit_target_mib: 512 }
+));
+(async function () {
+  await sandbox.refreshDetail();
+  sandbox.fetch = async function () {
+    return {
+      ok: false, status: 422,
+      json: async function () { return { detail: "requested context does not fit" }; },
+    };
+  };
+  await sandbox.submitLlamaCppRelaunch();
+  process.stdout.write(JSON.stringify({
+    error: byId("llamacpp-relaunch-error").textContent,
+    errorHidden: byId("llamacpp-relaunch-error").hidden,
+    submitDisabled: byId("llamacpp-relaunch-submit").disabled,
+    submission: sandbox.llamaCppRelaunch.state().submission,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "error": "requested context does not fit",
+        "errorHidden": False,
+        "submitDisabled": False,
+        "submission": "idle",
+    }
+
+
+def test_llamacpp_relaunch_waits_for_new_task_before_reconnecting_logs() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+const oldTask = {
+  hostname: "gpu01", current_step: "health_poll",
+  started_at: "2026-08-05T20:00:00Z", updated_at: "2026-08-05T20:01:00Z",
+  failed_step: null, error: null,
+};
+const runtime = llamaRuntime({ sizing: "auto", fit_target_mib: 512 });
+installDetailFetch([oldTask], true, "llama_cpp", runtime);
+(async function () {
+  await sandbox.refreshDetail();
+  const firstCount = eventSources.length;
+  const baseFetch = sandbox.fetch;
+  sandbox.fetch = async function (url, options) {
+    if (url.endsWith("/llamacpp/relaunch")) return { ok: true, status: 202 };
+    return baseFetch(url, options);
+  };
+  await sandbox.submitLlamaCppRelaunch();
+  installDetailFetch([oldTask], true, "llama_cpp", runtime);
+  await sandbox.refreshDetail();
+  const countWithOldTask = eventSources.length;
+  installDetailFetch([{
+    hostname: "gpu01", current_step: "relaunch_validating",
+    started_at: "2026-08-05T21:00:00Z", updated_at: "2026-08-05T21:00:00Z",
+    failed_step: null, error: null,
+  }], true, "llama_cpp", runtime);
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    firstCount,
+    countWithOldTask,
+    finalCount: eventSources.length,
+    status: byId("llamacpp-runtime-status").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "firstCount": 1,
+        "countWithOldTask": 1,
+        "finalCount": 2,
+        "status": "Validating requested sizing policy...",
+    }
+
+
+def test_task_after_terminal_relaunch_starts_a_fresh_log_stream() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+const oldTask = {
+  hostname: "gpu01", current_step: "complete",
+  started_at: "2026-08-05T20:00:00Z", updated_at: "2026-08-05T20:01:00Z",
+  failed_step: null, error: null,
+};
+const runtime = llamaRuntime({ sizing: "auto", fit_target_mib: 512 });
+installDetailFetch([oldTask], true, "llama_cpp", runtime);
+(async function () {
+  await sandbox.refreshDetail();
+  const baseFetch = sandbox.fetch;
+  sandbox.fetch = async function (url, options) {
+    if (url.endsWith("/llamacpp/relaunch")) return { ok: true, status: 202 };
+    return baseFetch(url, options);
+  };
+  await sandbox.submitLlamaCppRelaunch();
+  const relaunchStartedAt = "2026-08-05T21:00:00Z";
+  installDetailFetch([{
+    hostname: "gpu01", current_step: "relaunch_validating",
+    started_at: relaunchStartedAt, updated_at: relaunchStartedAt,
+    failed_step: null, error: null,
+  }], true, "llama_cpp", runtime, "relaunching");
+  await sandbox.refreshDetail();
+  const relaunchSource = eventSources[eventSources.length - 1];
+  installDetailFetch([{
+    hostname: "gpu01", current_step: "complete",
+    started_at: relaunchStartedAt, updated_at: "2026-08-05T21:01:00Z",
+    failed_step: null, error: null,
+  }], true, "llama_cpp", runtime);
+  await sandbox.refreshDetail();
+  installDetailFetch([{
+    hostname: "gpu01", current_step: "stopping_vllm",
+    started_at: "2026-08-05T22:00:00Z", updated_at: "2026-08-05T22:00:01Z",
+    failed_step: null, error: null,
+  }], true, "llama_cpp", runtime, "draining");
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    sourceCount: eventSources.length,
+    relaunchSourceClosed: relaunchSource.closed,
+    latestSourceClosed: eventSources[eventSources.length - 1].closed,
+    submission: sandbox.llamaCppRelaunch.state().submission,
+    tracked: sandbox.llamaCppRelaunch.state().tracked_task_started_at,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "sourceCount": 3,
+        "relaunchSourceClosed": True,
+        "latestSourceClosed": False,
+        "submission": "idle",
+        "tracked": None,
+    }
+
+
+def test_ambiguous_relaunch_response_locks_form_with_reload_guidance() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+const oldTask = {
+  hostname: "gpu01", current_step: "complete",
+  started_at: "2026-08-05T20:00:00Z", updated_at: "2026-08-05T20:01:00Z",
+  failed_step: null, error: null,
+};
+const runtime = llamaRuntime({ sizing: "auto", fit_target_mib: 512 });
+installDetailFetch([oldTask], true, "llama_cpp", runtime);
+(async function () {
+  await sandbox.refreshDetail();
+  const baseFetch = sandbox.fetch;
+  sandbox.fetch = async function (url, options) {
+    if (url.endsWith("/llamacpp/relaunch")) throw new Error("connection lost");
+    return baseFetch(url, options);
+  };
+  await sandbox.submitLlamaCppRelaunch();
+  installDetailFetch([oldTask], true, "llama_cpp", runtime);
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    submission: sandbox.llamaCppRelaunch.state().submission,
+    submitDisabled: byId("llamacpp-relaunch-submit").disabled,
+    status: byId("llamacpp-runtime-status").textContent,
+    error: byId("llamacpp-relaunch-error").textContent,
+    sourceCount: eventSources.length,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "submission": "unknown",
+        "submitDisabled": True,
+        "status": (
+            "The request outcome is unknown after a network error. Watching for a "
+            "new relaunch task; reload to retry safely."
+        ),
+        "error": (
+            "The relaunch request may have been accepted, but its response was lost: "
+            "connection lost"
+        ),
+        "sourceCount": 1,
+    }
+
+
+def test_fast_terminal_llamacpp_relaunch_failure_is_not_mistaken_for_old_task() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+const oldTask = {
+  hostname: "gpu01", current_step: "complete",
+  started_at: "2026-08-05T20:00:00Z", updated_at: "2026-08-05T20:01:00Z",
+  failed_step: null, error: null,
+};
+const runtime = llamaRuntime({ sizing: "auto", fit_target_mib: 512 });
+installDetailFetch([oldTask], true, "llama_cpp", runtime);
+(async function () {
+  await sandbox.refreshDetail();
+  const baseFetch = sandbox.fetch;
+  sandbox.fetch = async function (url, options) {
+    if (url.endsWith("/llamacpp/relaunch")) return { ok: true, status: 202 };
+    return baseFetch(url, options);
+  };
+  await sandbox.submitLlamaCppRelaunch();
+  installDetailFetch([{
+    hostname: "gpu01", current_step: "failed",
+    started_at: "2026-08-05T21:00:00Z", updated_at: "2026-08-05T21:00:01Z",
+    failed_step: "relaunch_validating", error: "artifact disappeared",
+  }], true, "llama_cpp", runtime);
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    status: byId("llamacpp-runtime-status").textContent,
+    submission: sandbox.llamaCppRelaunch.state().submission,
+    submitDisabled: byId("llamacpp-relaunch-submit").disabled,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "status": "artifact disappeared",
+        "submission": "terminal",
+        "submitDisabled": False,
+    }
+
+
+def test_dirty_form_refuses_submission_after_an_external_runtime_change() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+const first = llamaRuntime({ sizing: "auto", fit_target_mib: 512 });
+const second = llamaRuntime({ sizing: "auto", fit_target_mib: 1024 });
+second.observed_at = "2026-08-05T22:55:24Z";
+installDetailFetch([], true, "llama_cpp", first);
+(async function () {
+  await sandbox.refreshDetail();
+  sandbox.llamaCppRelaunch.setField("fit_target_mib", "768");
+  installDetailFetch([], true, "llama_cpp", second);
+  await sandbox.refreshDetail();
+  let postCount = 0;
+  sandbox.fetch = async function () { postCount += 1; return { ok: true }; };
+  await sandbox.submitLlamaCppRelaunch();
+  process.stdout.write(JSON.stringify({
+    postCount,
+    stale: sandbox.llamaCppRelaunch.state().stale,
+    localReserve: byId("llamacpp-fit-target").value,
+    submitDisabled: byId("llamacpp-relaunch-submit").disabled,
+    resetDisabled: byId("llamacpp-relaunch-reset").disabled,
+    status: byId("llamacpp-runtime-status").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "postCount": 0,
+        "stale": True,
+        "localReserve": "768",
+        "submitDisabled": True,
+        "resetDisabled": False,
+        "status": (
+            "The verified runtime changed while this form had edits. "
+            "Reset to the latest policy before relaunching."
+        ),
+    }
 
 
 def test_node_detail_explains_missing_llamacpp_runtime_state() -> None:

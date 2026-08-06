@@ -1,6 +1,14 @@
 // ponytail: vanilla fetch + DOM, same pattern as dashboard.js
 
 var setupSelection = createSetupSelectionController();
+var llamaCppRelaunch = typeof createLlamaCppRelaunchController === "function"
+  ? createLlamaCppRelaunchController()
+  : null;
+var currentDetailNode = null;
+var currentDetailTask = null;
+var currentRelaunchObservation = null;
+var relaunchErrorMessage = "";
+var relaunchErrorFields = {};
 
 function setupActionBody(id, node) {
   var base = {
@@ -177,10 +185,172 @@ function formatRuntimeTimestamp(value) {
   return timestamp.toLocaleString([], { timeZoneName: "short" });
 }
 
-function renderLlamaCppRuntime(node) {
+var RELAUNCH_PROGRESS_LABELS = {
+  relaunch_validating: "Validating requested sizing policy...",
+  draining: "Draining active requests...",
+  stopping_llamacpp: "Stopping llama.cpp...",
+  starting_llamacpp: "Starting llama.cpp with the requested policy...",
+  health_poll: "Waiting for the relaunched server to become healthy...",
+  registering: "Registering the verified runtime...",
+  rolling_back: "Relaunch failed; restoring the previous sizing policy...",
+};
+
+function setRelaunchError(message, fields) {
+  relaunchErrorMessage = message || "";
+  relaunchErrorFields = fields || {};
+}
+
+function clearRelaunchError() {
+  setRelaunchError("", {});
+}
+
+function responseDetail(data, fallback) {
+  if (data && typeof data.detail === "string") return data.detail;
+  if (data && data.detail != null) return JSON.stringify(data.detail);
+  return fallback;
+}
+
+function applyRelaunchErrors() {
+  var error = document.getElementById("llamacpp-relaunch-error");
+  var controls = {
+    sizing: document.getElementById("llamacpp-sizing"),
+    fit_target_mib: document.getElementById("llamacpp-fit-target"),
+    context_per_slot: document.getElementById("llamacpp-context-per-slot"),
+    slots: document.getElementById("llamacpp-parallel-slots"),
+    cache_type: document.getElementById("llamacpp-cache-type"),
+  };
+  Object.keys(controls).forEach(function (name) {
+    controls[name].setAttribute(
+      "aria-invalid",
+      Object.prototype.hasOwnProperty.call(relaunchErrorFields, name)
+        ? "true"
+        : "false",
+    );
+  });
+  error.textContent = relaunchErrorMessage;
+  error.hidden = relaunchErrorMessage === "";
+}
+
+function focusFirstRelaunchError(errors) {
+  var ids = {
+    sizing: "llamacpp-sizing",
+    fit_target_mib: "llamacpp-fit-target",
+    context_per_slot: "llamacpp-context-per-slot",
+    slots: "llamacpp-parallel-slots",
+    cache_type: "llamacpp-cache-type",
+  };
+  var names = Object.keys(ids);
+  for (var i = 0; i < names.length; i++) {
+    if (Object.prototype.hasOwnProperty.call(errors, names[i])) {
+      document.getElementById(ids[names[i]]).focus();
+      return;
+    }
+  }
+}
+
+function runtimeCanRelaunch(node) {
+  return Boolean(
+    node && node.state === "healthy" && node.managed === true &&
+    node.artifact_id && node.llamacpp_runtime,
+  );
+}
+
+function relaunchStatus(node, observation) {
+  var controllerState = llamaCppRelaunch.state();
+  if (controllerState.stale) {
+    return "The verified runtime changed while this form had edits. Reset to the latest policy before relaunching.";
+  }
+  if (controllerState.submission === "posting") return "Submitting relaunch request...";
+  if (controllerState.submission === "waiting") return "Relaunch queued; waiting for task progress...";
+  if (controllerState.submission === "unknown") {
+    return "The request outcome is unknown after a network error. Watching for a new relaunch task; reload to retry safely.";
+  }
+  if (observation && observation.belongs && observation.task) {
+    if (RELAUNCH_PROGRESS_LABELS[observation.task.current_step]) {
+      return RELAUNCH_PROGRESS_LABELS[observation.task.current_step];
+    }
+    if (observation.task.current_step === "complete") return "Relaunch complete.";
+    if (observation.task.current_step === "failed") {
+      return observation.task.error ||
+        "Relaunch failed; the node remains on a verified configuration.";
+    }
+  }
+  if (node.state === "relaunching") {
+    return "A llama.cpp relaunch is in progress. Controls will return when the node reaches a terminal state.";
+  }
+  if (node.state === "relaunch_failed") {
+    return "Relaunch and rollback failed. Runtime evidence was cleared; tear down the node before setup.";
+  }
+  if (!runtimeCanRelaunch(node)) {
+    return "Relaunch requires a healthy managed llama.cpp node with an exact artifact and verified runtime.";
+  }
+  return "";
+}
+
+function renderLlamaCppRelaunchForm(node, observation) {
+  var form = document.getElementById("llamacpp-relaunch-form");
+  var runtime = node.llamacpp_runtime;
+  var displayable = Boolean(
+    runtime && node.managed === true && node.artifact_id && llamaCppRelaunch,
+  );
+  form.hidden = !displayable;
+  if (!displayable) return;
+
+  llamaCppRelaunch.reconcileRuntime(
+    runtime,
+    Boolean(observation && observation.belongs && observation.terminal),
+  );
+  var controllerState = llamaCppRelaunch.state();
+  var fields = controllerState.fields;
+  var auto = fields.sizing === "auto";
+  var canSubmit = runtimeCanRelaunch(node) && !controllerState.stale;
+  var busy = llamaCppRelaunch.isBusy() || node.state === "relaunching";
+  var disableAll = busy || !canSubmit;
+
+  form.dataset.stale = controllerState.stale ? "true" : "false";
+  document.getElementById("llamacpp-sizing").value = fields.sizing;
+  document.getElementById("llamacpp-fit-target").value = fields.fit_target_mib;
+  document.getElementById("llamacpp-context-per-slot").value = fields.context_per_slot;
+  document.getElementById("llamacpp-parallel-slots").value = fields.slots;
+  document.getElementById("llamacpp-cache-type").value = fields.cache_type;
+
+  document.getElementById("llamacpp-sizing").disabled = disableAll;
+  document.getElementById("llamacpp-fit-target").disabled = disableAll;
+  document.getElementById("llamacpp-context-per-slot").disabled = disableAll || auto;
+  document.getElementById("llamacpp-parallel-slots").disabled = disableAll || auto;
+  document.getElementById("llamacpp-cache-type").disabled = disableAll || auto;
+  document.getElementById("llamacpp-relaunch-submit").disabled = disableAll;
+  document.getElementById("llamacpp-relaunch-reset").disabled = busy ||
+    (!controllerState.dirty && !controllerState.stale);
+  document.getElementById("llamacpp-context-per-slot").max = String(
+    runtime.effective.train_context,
+  );
+
+  var help = document.getElementById("llamacpp-sizing-help");
+  if (controllerState.stale) {
+    help.textContent = "A newer verified policy is available. Reset discards local edits and loads it.";
+  } else if (auto) {
+    help.textContent = "Automatic sizing recomputes context, slots, and KV cache from available VRAM. The disabled values show the current effective plan.";
+  } else {
+    help.textContent = "Custom sizing is estimator-validated after draining. Context uses 256-token increments; K and V use the selected cache type.";
+  }
+
+  var preview = llamaCppRelaunch.preview();
+  document.getElementById("llamacpp-requested-aggregate").textContent =
+    preview.aggregate_context === null
+      ? "—"
+      : formatRuntimeCount(preview.aggregate_context) + " tokens";
+  document.getElementById("llamacpp-requested-train-context").textContent =
+    formatRuntimeCount(runtime.effective.train_context) + " tokens";
+  applyRelaunchErrors();
+}
+
+function renderLlamaCppRuntime(node, observation) {
   var panel = document.getElementById("llamacpp-runtime-panel");
   var status = document.getElementById("llamacpp-runtime-status");
   var values = document.getElementById("llamacpp-runtime-values");
+  var heading = document.getElementById("llamacpp-verified-heading");
+  var form = document.getElementById("llamacpp-relaunch-form");
 
   if (!node || node.engine !== "llama_cpp") {
     panel.hidden = true;
@@ -191,18 +361,25 @@ function renderLlamaCppRuntime(node) {
   var runtime = node.llamacpp_runtime;
   if (!runtime) {
     status.hidden = false;
-    status.textContent = "Runtime configuration is unavailable until the next successful managed llama.cpp setup.";
+    status.textContent = node.state === "relaunch_failed"
+      ? "Relaunch and rollback failed. Runtime evidence was cleared; tear down the node before setup."
+      : "Runtime configuration is unavailable until the next successful managed llama.cpp setup.";
+    form.hidden = true;
+    heading.hidden = true;
     values.hidden = true;
     return;
   }
 
+  renderLlamaCppRelaunchForm(node, observation);
   var requested = runtime.requested;
   var effective = runtime.effective;
-  var sizingLabel = requested.sizing === "auto" ? "Automatic" : requested.sizing;
+  var sizingLabel = requested.sizing === "auto" ? "Automatic" : "Custom";
   var minimumFree = Math.min.apply(null, runtime.gpus.map(function (gpu) { return gpu.free_mib; }));
   var minimumHeadroom = minimumFree - requested.fit_target_mib;
-  status.hidden = true;
-  status.textContent = "";
+  var statusMessage = llamaCppRelaunch ? relaunchStatus(node, observation) : "";
+  status.hidden = statusMessage === "";
+  status.textContent = statusMessage;
+  heading.hidden = false;
   values.hidden = false;
   document.getElementById("llamacpp-runtime-min-free").textContent = formatRuntimeCount(minimumFree) + " MiB";
   document.getElementById("llamacpp-runtime-min-headroom").textContent = formatRuntimeCount(minimumHeadroom) + " MiB above target";
@@ -232,6 +409,58 @@ function renderLlamaCppRuntime(node) {
   });
 }
 
+async function submitLlamaCppRelaunch() {
+  if (!llamaCppRelaunch || !currentDetailNode) return;
+  if (llamaCppRelaunch.isBusy()) return;
+  if (llamaCppRelaunch.state().stale || !runtimeCanRelaunch(currentDetailNode)) {
+    return;
+  }
+  var validation = llamaCppRelaunch.validate();
+  if (!validation.valid) {
+    var firstError = validation.errors[Object.keys(validation.errors)[0]];
+    setRelaunchError(firstError, validation.errors);
+    renderLlamaCppRuntime(currentDetailNode, currentRelaunchObservation);
+    focusFirstRelaunchError(validation.errors);
+    return;
+  }
+  if (!window.confirm(
+    "Apply this llama.cpp sizing policy? The node will leave routing while the server drains and relaunches. QIIP will attempt to restore the previous policy if the relaunch fails.",
+  )) return;
+  if (!llamaCppRelaunch.beginSubmission(currentDetailTask)) return;
+
+  clearRelaunchError();
+  renderLlamaCppRuntime(currentDetailNode, currentRelaunchObservation);
+  try {
+    var response = await fetch(
+      "/admin/nodes/" + encodeURIComponent(NODE_ID) + "/llamacpp/relaunch",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(validation.body),
+      },
+    );
+    if (response.ok) {
+      llamaCppRelaunch.markAccepted();
+      resetLogStreamState();
+      showToast("llama.cpp relaunch queued for " + NODE_ID, "success");
+    } else {
+      var data = await response.json().catch(function () { return {}; });
+      llamaCppRelaunch.markRejected();
+      setRelaunchError(
+        responseDetail(data, "Relaunch request failed with HTTP " + response.status),
+        {},
+      );
+    }
+  } catch (error) {
+    llamaCppRelaunch.markNetworkUnknown();
+    setRelaunchError(
+      "The relaunch request may have been accepted, but its response was lost: " + error.message,
+      {},
+    );
+  }
+  renderLlamaCppRuntime(currentDetailNode, currentRelaunchObservation);
+}
+
 async function refreshDetail() {
   var stateEl = document.getElementById("node-state");
   var infoBody = document.getElementById("node-info-body");
@@ -250,17 +479,29 @@ async function refreshDetail() {
     var taskDataAvailable = tasksResp.ok;
     var allTasks = taskDataAvailable ? await tasksResp.json() : [];
     var perNode = metrics.per_node || {};
-
     var node = nodes.find(function (n) { return n.node_id === NODE_ID; });
+    var tasks = allTasks.filter(function (task) { return task.hostname === NODE_ID; });
+    currentDetailNode = node || null;
+    currentDetailTask = tasks.length > 0 ? tasks[0] : null;
+    currentRelaunchObservation = taskDataAvailable && llamaCppRelaunch
+      ? llamaCppRelaunch.observeTask(currentDetailTask, node ? node.state : null)
+      : null;
+    if (currentRelaunchObservation && currentRelaunchObservation.new_generation) {
+      resetLogStreamState();
+      clearRelaunchError();
+    }
+    if (taskDataAvailable) updateLogTaskState(tasks);
+    else markLogTaskStateUnavailable();
+
     if (!node) {
       stateEl.textContent = "Node not found";
       renderTableMessage(infoBody, 10, "Node not found in registry");
       document.getElementById("config-download-panel").style.display = "none";
-      renderLlamaCppRuntime(null);
+      renderLlamaCppRuntime(null, currentRelaunchObservation);
     } else {
       stateEl.textContent = node.state;
       setupSelection.setPreferredNode(node);
-      renderLlamaCppRuntime(node);
+      renderLlamaCppRuntime(node, currentRelaunchObservation);
 
       infoBody.textContent = "";
       var tr = document.createElement("tr");
@@ -307,11 +548,11 @@ async function refreshDetail() {
       }
     }
 
-    // ponytail: filter tasks by hostname — matching against node_id (which is the hostname)
-    var tasks = allTasks.filter(function (t) { return t.hostname === NODE_ID; });
-    if (taskDataAvailable) updateLogTaskState(tasks);
-    else markLogTaskStateUnavailable();
-    if (tasks.length > 0 && (!logTaskTerminal || !logStreamStarted)) connectLogStream();
+    if (tasks.length > 0 &&
+        (!llamaCppRelaunch || llamaCppRelaunch.shouldConnectLogs(currentDetailTask)) &&
+        (!logTaskTerminal || !logStreamStarted)) {
+      connectLogStream();
+    }
     if (tasks.length === 0) {
       renderTableMessage(tasksBody, 5, "No provisioning tasks for this node");
     } else {
@@ -963,6 +1204,35 @@ async function fetchCatalog() {
 }
 
 document.addEventListener("DOMContentLoaded", function () {
+  var relaunchForm = document.getElementById("llamacpp-relaunch-form");
+  if (relaunchForm && llamaCppRelaunch) {
+    relaunchForm.addEventListener("submit", function (event) {
+      event.preventDefault();
+      submitLlamaCppRelaunch();
+    });
+    [
+      ["llamacpp-sizing", "sizing", "change"],
+      ["llamacpp-fit-target", "fit_target_mib", "input"],
+      ["llamacpp-context-per-slot", "context_per_slot", "input"],
+      ["llamacpp-parallel-slots", "slots", "input"],
+      ["llamacpp-cache-type", "cache_type", "change"],
+    ].forEach(function (binding) {
+      document.getElementById(binding[0]).addEventListener(binding[2], function (event) {
+        llamaCppRelaunch.setField(binding[1], event.target.value);
+        clearRelaunchError();
+        if (currentDetailNode) {
+          renderLlamaCppRuntime(currentDetailNode, currentRelaunchObservation);
+        }
+      });
+    });
+    document.getElementById("llamacpp-relaunch-reset").addEventListener("click", function () {
+      llamaCppRelaunch.reset();
+      clearRelaunchError();
+      if (currentDetailNode) {
+        renderLlamaCppRuntime(currentDetailNode, currentRelaunchObservation);
+      }
+    });
+  }
   fetchCatalog().then(refreshDetail);
   refreshPowerState();
   setInterval(refreshDetail, POLL_INTERVAL_MS);
