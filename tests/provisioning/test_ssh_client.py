@@ -41,7 +41,7 @@ def _setup_mock_asyncssh(
     stdout_lines: list[str] | None = None,
     stderr_text: str = "",
     exit_status: int = 0,
-) -> None:
+) -> MagicMock:
     """Wire up mock_asyncssh with real exception classes and a mock process."""
     # Must set real exception classes so `except asyncssh.X` works
     mock_asyncssh.Error = asyncssh.Error
@@ -59,6 +59,7 @@ def _setup_mock_asyncssh(
     mock_conn.create_process = MagicMock(return_value=_AsyncCM(mock_process))
 
     mock_asyncssh.connect = MagicMock(return_value=_AsyncCM(mock_conn))
+    return mock_conn
 
 
 def _setup_streaming_process(
@@ -102,6 +103,26 @@ class TestSSHClientConnectParams:
             client_keys=["/tmp/test_key"],
             known_hosts=None,
             connect_timeout=5,
+        )
+
+
+class TestSSHClientTextDecoding:
+    """Remote output cannot abort commands because it contains invalid UTF-8."""
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.provisioning.ssh_client.asyncssh")
+    async def test_streaming_uses_utf8_replacement(
+        self, mock_asyncssh: MagicMock
+    ) -> None:
+        connection = _setup_mock_asyncssh(mock_asyncssh)
+        client = SSHClient(_make_settings())
+
+        _ = [line async for line in client.run_streaming("host1", "cat model.log")]
+
+        connection.create_process.assert_called_once_with(
+            "cat model.log",
+            encoding="utf-8",
+            errors="replace",
         )
 
 
@@ -660,6 +681,21 @@ class TestSSHClientRun:
 
         result = await client.run("host1", "echo hello")
         assert result == ("hello", "", 0)
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.provisioning.ssh_client.asyncssh")
+    async def test_run_uses_utf8_replacement(self, mock_asyncssh: MagicMock) -> None:
+        _setup_mock_asyncssh_run(mock_asyncssh)
+        client = SSHClient(_make_settings())
+
+        await client.run("host1", "cat model.log")
+
+        connection = mock_asyncssh.connect.return_value._value
+        connection.run.assert_awaited_once_with(
+            "cat model.log",
+            encoding="utf-8",
+            errors="replace",
+        )
 
 
 class TestSSHClientRunNonZeroExit:
