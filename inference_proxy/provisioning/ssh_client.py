@@ -27,6 +27,10 @@ logger = structlog.get_logger()
 # material is normalized consistently with connection and channel failures.
 _ASYNCSSH_CONNECTION_ERRORS = (asyncssh.Error, asyncssh.KeyImportError)
 _STREAM_QUEUE_MAXSIZE = 1024
+# Remote tools can write arbitrary model metadata bytes to their logs. Preserve
+# the UTF-8 text contract without allowing one invalid byte to abort an SSH job.
+_REMOTE_TEXT_ENCODING = "utf-8"
+_REMOTE_TEXT_ERRORS = "replace"
 
 
 class SSHConnectionError(Exception):
@@ -166,7 +170,11 @@ class SSHClient:
                     known_hosts=None,  # D-03: lab servers reimaged frequently
                     connect_timeout=self._connect_timeout,
                 ) as conn,
-                conn.create_process(command) as process,
+                conn.create_process(
+                    command,
+                    encoding=_REMOTE_TEXT_ENCODING,
+                    errors=_REMOTE_TEXT_ERRORS,
+                ) as process,
             ):
                 pumps = [
                     asyncio.create_task(
@@ -292,7 +300,11 @@ class SSHClient:
                 connect_timeout=self._connect_timeout,
             ) as conn:
                 result = await asyncio.wait_for(
-                    conn.run(command),
+                    conn.run(
+                        command,
+                        encoding=_REMOTE_TEXT_ENCODING,
+                        errors=_REMOTE_TEXT_ERRORS,
+                    ),
                     timeout=timeout,
                 )
                 exit_status = (
