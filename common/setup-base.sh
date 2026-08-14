@@ -131,6 +131,88 @@ install_cuda_toolkit() {
     fi
 }
 
+ensure_fabric_manager() {
+    local nvswitch_count
+    nvswitch_count=$(lspci 2>/dev/null | grep -ci nvswitch || true)
+    if [ "$nvswitch_count" -eq 0 ]; then
+        echo "No NVSwitch devices found, skipping Fabric Manager"
+        return 0
+    fi
+    echo "Found ${nvswitch_count} NVSwitch device(s), Fabric Manager required"
+
+    local driver_version=""
+    if command -v nvidia-smi &>/dev/null; then
+        driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader \
+            | sed '/^[[:space:]]*$/d' | head -1 | xargs)
+    fi
+    if [ -z "$driver_version" ] && [ -f /proc/driver/nvidia/version ]; then
+        driver_version=$(sed -n 's/.*Kernel Module[[:space:]]*\([0-9.]*\).*/\1/p' \
+            /proc/driver/nvidia/version)
+    fi
+    if [ -z "$driver_version" ]; then
+        echo "FATAL: cannot detect NVIDIA driver version for Fabric Manager install" >&2
+        return 1
+    fi
+    echo "Detected NVIDIA driver version: ${driver_version}"
+
+    local installed_fm_version=""
+    if rpm -q nvidia-fabric-manager &>/dev/null; then
+        installed_fm_version=$(rpm -q --qf '%{VERSION}' nvidia-fabric-manager)
+    fi
+
+    if [ "$installed_fm_version" = "$driver_version" ]; then
+        echo "nvidia-fabric-manager ${driver_version} already installed"
+    else
+        local module_license stream_suffix
+        module_license=$(modinfo nvidia 2>/dev/null \
+            | sed -n 's/^license:[[:space:]]*//Ip' | xargs) || true
+        if [[ "$module_license" == *"MIT/GPL"* ]]; then
+            stream_suffix="-open-dkms"
+        else
+            stream_suffix="-dkms"
+        fi
+        echo "Kernel module license: ${module_license:-unknown} (stream suffix: ${stream_suffix})"
+
+        local driver_major="${driver_version%%.*}"
+        sudo dnf module reset -y nvidia-driver 2>/dev/null || true
+        sudo dnf module enable -y "nvidia-driver:${driver_major}${stream_suffix}"
+        sudo dnf clean metadata
+        sudo dnf install -y "nvidia-fabric-manager-${driver_version}-1"
+    fi
+
+    if ! rpm -q python3-dnf-plugin-versionlock &>/dev/null; then
+        sudo dnf install -y python3-dnf-plugin-versionlock
+    fi
+    sudo dnf versionlock delete 'nvidia-fabric-manager*' 2>/dev/null || true
+    sudo dnf versionlock delete '*nvidia-driver*' 2>/dev/null || true
+    sudo dnf versionlock add nvidia-fabric-manager
+    local pkg
+    for pkg in $(rpm -qa 'nvidia-driver*' --qf '%{NAME}\n' | sort -u); do
+        sudo dnf versionlock add "$pkg" 2>/dev/null || true
+    done
+
+    sudo systemctl enable nvidia-fabricmanager
+    sudo systemctl restart nvidia-fabricmanager
+
+    local timeout="${AUTOVLLM_FM_TIMEOUT:-120}" elapsed=0
+    echo "Waiting for NVSwitch fabric training (timeout: ${timeout}s)..."
+    while [ "$elapsed" -lt "$timeout" ]; do
+        local fabric_state
+        fabric_state=$(nvidia-smi -q 2>/dev/null \
+            | grep -A2 'Fabric' | grep 'State' | head -1 \
+            | awk -F: '{print $2}' | xargs) || true
+        if [ "$fabric_state" = "Completed" ]; then
+            echo "NVSwitch fabric training completed"
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    echo "FATAL: NVSwitch fabric training did not complete within ${timeout}s" >&2
+    echo "Check /var/log/fabricmanager.log for details" >&2
+    return 1
+}
+
 mount_nfs_cache() {
     if mountpoint -q "${NFS_MOUNT_POINT}"; then
         echo "NFS already mounted at ${NFS_MOUNT_POINT}, skipping"

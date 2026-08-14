@@ -123,6 +123,27 @@ install_vllm() {
         'from importlib.metadata import version; from packaging.version import Version; import flashinfer_cubin; assert Version(version("flashinfer-cubin")).public == Version(version("flashinfer-python")).public'
 }
 
+install_vllm_unit() {
+    sudo install -m 755 "${SCRIPT_DIR}/wait-fabric.sh" /usr/local/bin/wait-nvswitch-fabric
+    cat <<UNIT | sudo tee /etc/systemd/system/vllm.service > /dev/null
+[Unit]
+Description=vLLM inference server
+After=network-online.target nvidia-fabricmanager.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStartPre=/usr/local/bin/wait-nvswitch-fabric
+ExecStart=${SCRIPT_DIR}/start-vllm.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    sudo systemctl daemon-reload
+}
+
 # --- Main ---
 main() {
     if [ -z "$NFS_EXPORT" ]; then
@@ -137,7 +158,9 @@ main() {
     step system_update run_system_update
     step nvidia_driver install_nvidia_driver
     step cuda_toolkit install_cuda_toolkit
+    step fabric_manager ensure_fabric_manager
     step vllm_install install_vllm
+    step vllm_unit install_vllm_unit
     step nfs_mount mount_nfs_cache
     step firewall configure_firewall
     soft_step llmfit_install install_llmfit

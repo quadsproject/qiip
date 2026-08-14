@@ -189,9 +189,11 @@ run_vllm() {
     verify_flashinfer_aot
     prepare_hf_cache
 
-    # Never launch over an older or orphaned server. A failed verified stop
-    # aborts this script under set -e rather than registering the wrong model.
-    bash "${SCRIPT_DIR}/stop-vllm.sh"
+    if [ -z "${INVOCATION_ID:-}" ]; then
+        # Never launch over an older or orphaned server. A failed verified stop
+        # aborts this script under set -e rather than registering the wrong model.
+        bash "${SCRIPT_DIR}/stop-vllm.sh"
+    fi
     clear_script_environment
 
     cat <<EOF
@@ -209,6 +211,22 @@ run_vllm() {
 EOF
 
     set -f
+    # Under systemd (INVOCATION_ID set), exec into vLLM so systemd owns the
+    # process directly. Journal captures stdout/stderr.
+    if [ -n "${INVOCATION_ID:-}" ]; then
+        # shellcheck disable=SC2086
+        exec "$VLLM_BIN" serve "$MODEL" \
+            --host 0.0.0.0 \
+            --port "${API_PORT}" \
+            --tensor-parallel-size "$TENSOR_PARALLEL" \
+            --gpu-memory-utilization "$GPU_MEM_UTIL" \
+            --max-model-len "$MAX_MODEL_LEN" \
+            --max-num-batched-tokens "$MAX_BATCHED_TOKENS" \
+            --enable-auto-tool-choice \
+            --tool-call-parser hermes \
+            ${EXTRA_ARGS:-}
+    fi
+
     # EXTRA_ARGS is an intentional word-split shell override.
     # shellcheck disable=SC2086
     "$VLLM_BIN" serve "$MODEL" \
