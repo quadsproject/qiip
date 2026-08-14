@@ -1,5 +1,5 @@
-<p align="center">
-  <img src="assets/qiip.svg" width="30%" />
+<p>
+  <img src="assets/qiip.svg" width="15%" />
 </p>
 
 # QUADS Idle Inference Proxy
@@ -58,6 +58,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 
 - [Features](#features)
 - [Requirements](#requirements)
+- [Running etcd](#running-etcd)
 - [Quick Start](#quick-start)
   - [Verify it's running](#verify-its-running)
   - [Send a request](#send-a-request)
@@ -104,6 +105,27 @@ provisioning state, but a temporary outage does not prevent the gateway from
 starting. At least one healthy registered inference node (vLLM or llama.cpp) is required to serve
 inference; health, discovery, dashboard, and provisioning functionality can
 start with an empty registry.
+
+### Running etcd
+
+The gateway expects etcd on `localhost:2379` by default. Run a single-node
+instance with Podman:
+
+```bash
+podman run -d --name etcd -p 2379:2379 \
+  -v etcd-data:/etcd-data \
+  quay.io/coreos/etcd:v3.5.21 \
+  /usr/local/bin/etcd \
+  --data-dir /etcd-data \
+  --advertise-client-urls http://0.0.0.0:2379 \
+  --listen-client-urls http://0.0.0.0:2379
+```
+
+Verify it is healthy:
+
+```bash
+curl -s http://localhost:2379/health
+```
 
 ## Quick Start
 
