@@ -31,6 +31,8 @@ unset VLLM_ATTENTION_BACKEND FLASHINFER_DISABLE_JIT FLASHINFER_CACHE_DIR
 
 # shellcheck source=auto-vllm/vllm-process.sh
 source "${SCRIPT_DIR}/vllm-process.sh"
+# shellcheck source=auto-vllm/preflight.sh
+source "${SCRIPT_DIR}/preflight.sh"
 
 detect_gpu_info() {
     if ! command -v nvidia-smi &>/dev/null; then
@@ -360,6 +362,13 @@ EOF
 main() {
     detect_gpu_info
     configure_vllm_params
+
+    EXPECTED_GPU_COUNT="$GPU_COUNT"
+    EXPECTED_TENSOR_PARALLEL="$TENSOR_PARALLEL"
+    MODEL_PATH="$MODEL"
+    export EXPECTED_GPU_COUNT EXPECTED_TENSOR_PARALLEL MODEL_PATH
+    run_preflight
+
     prestage_model_weights "$MODEL"
     run_vllm
 }
