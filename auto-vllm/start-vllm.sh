@@ -165,6 +165,38 @@ prepare_hf_cache() {
         return 1
     fi
     ln -sfnT "${NFS_MOUNT_POINT}" "$HF_CACHE_LINK"
+    echo "HF cache: ${HF_CACHE_LINK} → ${NFS_MOUNT_POINT} (symlink into NFS; HF_HOME resolves through this)"
+}
+
+prestage_model_weights() {
+    local model="$1"
+
+    if [ -d "$model" ]; then
+        return 0
+    fi
+
+    local avail_bytes model_bytes
+    avail_bytes=$(df --output=avail -B1 "$NFS_MOUNT_POINT" 2>/dev/null | tail -1 | xargs) || true
+    model_bytes=$("$VLLM_PYTHON" -c "
+import sys; from huggingface_hub import model_info
+print(sum(s.size or 0 for s in model_info(sys.argv[1]).siblings))
+" "$model" 2>/dev/null) || true
+
+    if [ -n "$model_bytes" ] && [ -n "$avail_bytes" ] \
+        && [ "$model_bytes" -gt "$avail_bytes" ]; then
+        local avail_gb=$((avail_bytes / 1073741824))
+        local need_gb=$((model_bytes / 1073741824))
+        echo "FATAL: ${NFS_MOUNT_POINT} has ${avail_gb}GB free but ${model} needs ${need_gb}GB" >&2
+        return 1
+    fi
+
+    echo "Pre-staging model weights in single process: ${model}"
+    HF_HOME="$NFS_MOUNT_POINT" "$VLLM_PYTHON" -c "
+import sys; from huggingface_hub import snapshot_download
+snapshot_download(sys.argv[1])
+" "$model"
+    echo "Model weights staged; vLLM will launch with HF_HUB_OFFLINE=1"
+    export HF_HUB_OFFLINE=1
 }
 
 verify_vllm_started() {
@@ -250,6 +282,7 @@ EOF
 main() {
     detect_gpu_info
     configure_vllm_params
+    prestage_model_weights "$MODEL"
     run_vllm
 }
 
