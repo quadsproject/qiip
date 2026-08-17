@@ -303,6 +303,11 @@ ensure_fabric_manager() {
     local timeout="${AUTOVLLM_FM_TIMEOUT:-120}" elapsed=0
     echo "Waiting for NVSwitch fabric training (timeout: ${timeout}s)..."
     while [ "$elapsed" -lt "$timeout" ]; do
+        if ! systemctl is-active --quiet nvidia-fabricmanager; then
+            echo "FATAL: nvidia-fabricmanager exited during fabric training" >&2
+            journalctl -u nvidia-fabricmanager --no-pager -n 20 >&2 2>/dev/null || true
+            return 1
+        fi
         local fabric_state
         fabric_state=$(nvidia-smi -q 2>/dev/null \
             | grep -A2 'Fabric' | grep 'State' | head -1 \
@@ -315,7 +320,9 @@ ensure_fabric_manager() {
         elapsed=$((elapsed + 2))
     done
     echo "FATAL: NVSwitch fabric training did not complete within ${timeout}s" >&2
-    echo "Check /var/log/fabricmanager.log for details" >&2
+    echo "Service active: $(systemctl is-active nvidia-fabricmanager 2>/dev/null || echo unknown)" >&2
+    echo "Last fabric state: '${fabric_state:-unknown}'" >&2
+    journalctl -u nvidia-fabricmanager --no-pager -n 20 >&2 2>/dev/null || true
     return 1
 }
 
