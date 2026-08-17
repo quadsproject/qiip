@@ -9,6 +9,8 @@ GPU_MEM_UTIL_OVERRIDE="${AUTOVLLM_GPU_MEM_UTIL:-}"
 MAX_MODEL_LEN_OVERRIDE="${AUTOVLLM_MAX_MODEL_LEN:-}"
 MAX_BATCHED_TOKENS_OVERRIDE="${AUTOVLLM_MAX_BATCHED_TOKENS:-}"
 EXTRA_ARGS_OVERRIDE="${AUTOVLLM_EXTRA_ARGS:-}"
+ATTENTION_BACKEND_OVERRIDE="${AUTOVLLM_ATTENTION_BACKEND:-}"
+FLASHINFER_CACHE="${AUTOVLLM_FLASHINFER_CACHE_DIR:-/var/cache/flashinfer}"
 SCRIPT_DIR="${AUTOVLLM_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 VLLM_BIN="${AUTOVLLM_BIN:-/opt/vllm-venv/bin/vllm}"
 PID_FILE="${AUTOVLLM_PID_FILE:-/var/run/vllm.pid}"
@@ -25,6 +27,7 @@ STARTUP_LOG_LINES="${AUTOVLLM_STARTUP_LOG_LINES:-40}"
 # VLLM_PORT is the upstream collision that motivated the namespace change.
 unset VLLM_MODEL VLLM_PORT VLLM_TENSOR_PARALLEL VLLM_GPU_MEM_UTIL
 unset VLLM_MAX_MODEL_LEN VLLM_MAX_BATCHED_TOKENS VLLM_EXTRA_ARGS
+unset VLLM_ATTENTION_BACKEND FLASHINFER_DISABLE_JIT FLASHINFER_CACHE_DIR
 
 # shellcheck source=auto-vllm/vllm-process.sh
 source "${SCRIPT_DIR}/vllm-process.sh"
@@ -42,6 +45,7 @@ detect_gpu_info() {
     GPU_COUNT=$(nvidia-smi --list-gpus | wc -l)
     GPU_VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i 0)
     GPU_VRAM_GB=$(( (GPU_VRAM_MB + 512) / 1024 ))
+    GPU_COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0 | xargs)
 }
 
 configure_vllm_params() {
@@ -146,16 +150,90 @@ clear_script_environment() {
     unset AUTOVLLM_PROC_ROOT AUTOVLLM_COMMAND_PATTERN
     unset AUTOVLLM_STARTUP_GRACE_PERIOD AUTOVLLM_STARTUP_LOG_LINES
     unset AUTOVLLM_STOP_TIMEOUT AUTOVLLM_STOP_INTERVAL
+    unset AUTOVLLM_ATTENTION_BACKEND AUTOVLLM_FLASHINFER_CACHE_DIR
 }
 
-verify_flashinfer_aot() {
-    if ! "$VLLM_PYTHON" -c \
+configure_attention_backend() {
+    local major="${GPU_COMPUTE_CAP%%.*}"
+    local minor="${GPU_COMPUTE_CAP#*.}"
+    local sm=$(( major * 10 + minor ))
+
+    # SM90+ (Hopper/Blackwell): FlashInfer wins.
+    # SM80-89 (Ampere/Ada): FLASH_ATTN ships prebuilt wheels, no compiler needed.
+    # Below SM80: let vLLM pick (xformers, eager, etc.).
+    local backend=""
+    if [ "$sm" -ge 90 ]; then
+        backend="FLASHINFER"
+    elif [ "$sm" -ge 80 ]; then
+        backend="FLASH_ATTN"
+    fi
+
+    if [ -n "$ATTENTION_BACKEND_OVERRIDE" ]; then
+        if [ "$ATTENTION_BACKEND_OVERRIDE" = "FLASHINFER" ] && [ "$sm" -lt 90 ]; then
+            echo "WARNING: FlashInfer on SM${sm} may require JIT compilation; FLASH_ATTN ships prebuilt for this architecture" >&2
+        fi
+        backend="$ATTENTION_BACKEND_OVERRIDE"
+    fi
+
+    if [ -z "$backend" ]; then
+        echo "SM${sm}: no attention backend forced; vLLM will select its default"
+        return 0
+    fi
+
+    export VLLM_ATTENTION_BACKEND="$backend"
+    echo "Attention backend: ${backend} (SM${sm})"
+
+    if [ "$backend" = "FLASHINFER" ]; then
+        configure_flashinfer
+    fi
+}
+
+configure_flashinfer() {
+    if "$VLLM_PYTHON" -c \
         'from importlib.metadata import version; from packaging.version import Version; import flashinfer_cubin; assert Version(version("flashinfer-cubin")).public == Version(version("flashinfer-python")).public' \
         &>/dev/null; then
-        echo "FATAL: matching FlashInfer AOT kernels are unavailable; run setup.sh to install the matching flashinfer-cubin package" >&2
+        export FLASHINFER_DISABLE_JIT=1
+        echo "FlashInfer: AOT kernels matched; JIT disabled"
+        return 0
+    fi
+
+    echo "FlashInfer: AOT kernels unavailable; verifying JIT toolchain"
+    verify_jit_toolchain
+
+    unset FLASHINFER_DISABLE_JIT
+    mkdir -p "$FLASHINFER_CACHE"
+    export FLASHINFER_CACHE_DIR="$FLASHINFER_CACHE"
+    echo "FlashInfer: JIT enabled; cache at ${FLASHINFER_CACHE}"
+}
+
+verify_jit_toolchain() {
+    local venv_bin missing=()
+    venv_bin="$(dirname "$VLLM_BIN")"
+
+    if ! "$venv_bin/ninja" --version &>/dev/null; then
+        missing+=("ninja (run: ${venv_bin}/pip install ninja)")
+    fi
+
+    if ! command -v nvcc &>/dev/null; then
+        missing+=("nvcc (install cuda-toolkit)")
+    else
+        local nvcc_ver torch_cuda_ver
+        nvcc_ver=$(nvcc --version | grep -oP 'V\K[0-9]+\.[0-9]+' | head -1) || true
+        torch_cuda_ver=$("$VLLM_PYTHON" -c 'import torch; print(".".join(torch.version.cuda.split(".")[:2]))' 2>/dev/null) || true
+        if [ -n "$nvcc_ver" ] && [ -n "$torch_cuda_ver" ] && [ "$nvcc_ver" != "$torch_cuda_ver" ]; then
+            missing+=("nvcc ${torch_cuda_ver} (installed: ${nvcc_ver}; must match torch.version.cuda)")
+        fi
+    fi
+
+    if ! command -v gcc &>/dev/null; then
+        missing+=("gcc")
+    fi
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "FATAL: FlashInfer JIT requires:" >&2
+        printf '  - %s\n' "${missing[@]}" >&2
         return 1
     fi
-    export FLASHINFER_DISABLE_JIT=1
 }
 
 prepare_hf_cache() {
@@ -218,7 +296,7 @@ verify_vllm_started() {
 }
 
 run_vllm() {
-    verify_flashinfer_aot
+    configure_attention_backend
     prepare_hf_cache
 
     if [ -z "${INVOCATION_ID:-}" ]; then
