@@ -131,6 +131,27 @@ install_cuda_toolkit() {
     fi
 }
 
+try_fabric_manager_via_module_stream() {
+    local driver_major="$1" driver_version="$2"
+    local module_license stream_suffix
+    module_license=$(modinfo nvidia 2>/dev/null \
+        | sed -n 's/^license:[[:space:]]*//Ip' | xargs) || true
+    if [[ "$module_license" == *"MIT/GPL"* ]]; then
+        stream_suffix="-open-dkms"
+    else
+        stream_suffix="-dkms"
+    fi
+    echo "Kernel module license: ${module_license:-unknown} (stream suffix: ${stream_suffix})"
+
+    sudo dnf module reset -y nvidia-driver 2>/dev/null || true
+    if ! sudo dnf module enable -y "nvidia-driver:${driver_major}${stream_suffix}" 2>/dev/null; then
+        # .run-installed drivers don't register module streams
+        return 1
+    fi
+    sudo dnf clean metadata
+    sudo dnf install -y "nvidia-fabric-manager-${driver_version}-1"
+}
+
 ensure_fabric_manager() {
     local nvswitch_count
     nvswitch_count=$(lspci 2>/dev/null | grep -ci nvswitch || true)
@@ -163,21 +184,17 @@ ensure_fabric_manager() {
     if [ "$installed_fm_version" = "$driver_version" ]; then
         echo "nvidia-fabric-manager ${driver_version} already installed"
     else
-        local module_license stream_suffix
-        module_license=$(modinfo nvidia 2>/dev/null \
-            | sed -n 's/^license:[[:space:]]*//Ip' | xargs) || true
-        if [[ "$module_license" == *"MIT/GPL"* ]]; then
-            stream_suffix="-open-dkms"
-        else
-            stream_suffix="-dkms"
-        fi
-        echo "Kernel module license: ${module_license:-unknown} (stream suffix: ${stream_suffix})"
-
         local driver_major="${driver_version%%.*}"
-        sudo dnf module reset -y nvidia-driver 2>/dev/null || true
-        sudo dnf module enable -y "nvidia-driver:${driver_major}${stream_suffix}"
-        sudo dnf clean metadata
-        sudo dnf install -y "nvidia-fabric-manager-${driver_version}-1"
+        # The CUDA repo carries nvidia-fabric-manager as a standalone RPM.
+        # When the driver was installed via .run (not RPM), no nvidia-driver
+        # dnf module stream exists, so we try module enable but fall back to
+        # a direct install if the stream is missing.
+        if ! try_fabric_manager_via_module_stream "$driver_major" "$driver_version"; then
+            echo "Module stream unavailable; installing fabric-manager directly from CUDA repo"
+            sudo dnf clean metadata
+            sudo dnf install -y --disableexcludes=all \
+                "nvidia-fabric-manager-${driver_version}-1"
+        fi
     fi
 
     if ! rpm -q python3-dnf-plugin-versionlock &>/dev/null; then
