@@ -149,7 +149,7 @@ try_fabric_manager_via_module_stream() {
         return 1
     fi
     sudo dnf clean metadata
-    sudo dnf install -y "nvidia-fabric-manager-${driver_version}-1"
+    sudo dnf install -y "nvidia-fabricmanager-${driver_version}-1"
 }
 
 ensure_fabric_manager() {
@@ -177,15 +177,15 @@ ensure_fabric_manager() {
     echo "Detected NVIDIA driver version: ${driver_version}"
 
     local installed_fm_version=""
-    if rpm -q nvidia-fabric-manager &>/dev/null; then
-        installed_fm_version=$(rpm -q --qf '%{VERSION}' nvidia-fabric-manager)
+    if rpm -q nvidia-fabricmanager &>/dev/null; then
+        installed_fm_version=$(rpm -q --qf '%{VERSION}' nvidia-fabricmanager)
     fi
 
     if [ "$installed_fm_version" = "$driver_version" ]; then
-        echo "nvidia-fabric-manager ${driver_version} already installed"
+        echo "nvidia-fabricmanager ${driver_version} already installed"
     else
         local driver_major="${driver_version%%.*}"
-        # The CUDA repo carries nvidia-fabric-manager as a standalone RPM.
+        # The CUDA repo carries nvidia-fabricmanager as a standalone RPM.
         # When the driver was installed via .run (not RPM), no nvidia-driver
         # dnf module stream exists, so we try module enable but fall back to
         # a direct install if the stream is missing.
@@ -193,16 +193,16 @@ ensure_fabric_manager() {
             echo "Module stream unavailable; installing fabric-manager directly from CUDA repo"
             sudo dnf clean metadata
             sudo dnf install -y --disableexcludes=all \
-                "nvidia-fabric-manager-${driver_version}-1"
+                "nvidia-fabricmanager-${driver_version}-1"
         fi
     fi
 
     if ! rpm -q python3-dnf-plugin-versionlock &>/dev/null; then
         sudo dnf install -y python3-dnf-plugin-versionlock
     fi
-    sudo dnf versionlock delete 'nvidia-fabric-manager*' 2>/dev/null || true
+    sudo dnf versionlock delete 'nvidia-fabricmanager*' 2>/dev/null || true
     sudo dnf versionlock delete '*nvidia-driver*' 2>/dev/null || true
-    sudo dnf versionlock add nvidia-fabric-manager
+    sudo dnf versionlock add nvidia-fabricmanager
     local pkg
     for pkg in $(rpm -qa 'nvidia-driver*' --qf '%{NAME}\n' | sort -u); do
         sudo dnf versionlock add "$pkg" 2>/dev/null || true
