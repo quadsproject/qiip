@@ -212,13 +212,10 @@ install_fabricmanager_from_redist() {
         return 1
     fi
 
-    # Install the systemd unit if present, otherwise write a minimal one
-    if [ -f "${extracted}/systemd/nvidia-fabricmanager.service" ]; then
-        sudo install -m 644 "${extracted}/systemd/nvidia-fabricmanager.service" \
-            /etc/systemd/system/nvidia-fabricmanager.service
-    elif [ ! -f /etc/systemd/system/nvidia-fabricmanager.service ] \
-        && [ ! -f /usr/lib/systemd/system/nvidia-fabricmanager.service ]; then
-        cat <<'UNIT' | sudo tee /etc/systemd/system/nvidia-fabricmanager.service > /dev/null
+    # The redist archive's bundled unit and config may reference options
+    # unsupported by this driver version (e.g. PARTITION_RAIL_POLICY).
+    # Use a minimal unit that lets nv-fabricmanager pick its own defaults.
+    cat <<'UNIT' | sudo tee /etc/systemd/system/nvidia-fabricmanager.service > /dev/null
 [Unit]
 Description=NVIDIA Fabric Manager
 After=nvidia-persistenced.service
@@ -231,21 +228,18 @@ LimitCORE=infinity
 [Install]
 WantedBy=multi-user.target
 UNIT
-    fi
 
-    # Install config if present and no existing config
-    if [ -f "${extracted}/etc/fabricmanager.cfg" ] \
-        && [ ! -f /usr/share/nvidia/nvswitch/fabricmanager.cfg ]; then
-        sudo mkdir -p /usr/share/nvidia/nvswitch
-        sudo install -m 644 "${extracted}/etc/fabricmanager.cfg" \
-            /usr/share/nvidia/nvswitch/fabricmanager.cfg
+    # Remove any stale config from a previous RPM or redist install —
+    # nv-fabricmanager reads it from the default path if present, and
+    # cross-version configs contain unsupported directives.
+    if [ -f /usr/share/nvidia/nvswitch/fabricmanager.cfg ]; then
+        sudo rm -f /usr/share/nvidia/nvswitch/fabricmanager.cfg
+        echo "Removed stale fabricmanager.cfg (letting nv-fabricmanager use built-in defaults)"
     fi
 
     sudo systemctl daemon-reload
-    status=0
     rm -rf "$work_dir"
     echo "Fabric Manager ${driver_version} installed from NVIDIA redistributable archive"
-    return "$status"
 }
 
 ensure_fabric_manager() {
