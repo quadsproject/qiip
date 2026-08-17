@@ -162,34 +162,90 @@ install_fabricmanager_rpm() {
         return 0
     fi
 
-    # Strategy 3: the default cuda-rhel9 repo tracks the latest branch and
-    # may not carry the fabricmanager for the running driver. Enable the
-    # branch-specific repo that matches this driver major version.
-    local branch_repo="https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo"
-    echo "Configured repos lack ${pkg}; adding branch repo for driver ${driver_major}"
-    sudo dnf config-manager --add-repo "$branch_repo" 2>/dev/null || true
+    # Strategy 3: NVIDIA redistributable archive. The standard CUDA repo
+    # only carries fabricmanager for the latest driver branch. For .run-
+    # installed drivers on a different branch, pull directly from NVIDIA.
+    echo "RPM not in repos; trying NVIDIA redistributable archive for ${driver_version}"
+    install_fabricmanager_from_redist "$driver_version"
+}
 
-    # List what the repo actually carries so the error is actionable
-    local available
-    available=$(dnf list --showduplicates nvidia-fabricmanager 2>/dev/null \
-        | awk '/nvidia-fabricmanager\./{print $2}' | sort -V) || true
+install_fabricmanager_from_redist() {
+    local driver_version="$1"
+    local base_url="https://developer.download.nvidia.com/compute/nvidia-driver/redist/fabricmanager/linux-x86_64"
+    local archive_name="fabricmanager-linux-x86_64-${driver_version}-archive.tar.xz"
+    local url="${base_url}/${archive_name}"
 
-    if [ -n "$available" ]; then
-        if echo "$available" | grep -q "^${driver_version}-"; then
-            sudo dnf install -y --disableexcludes=all "$pkg"
-            return $?
-        fi
-        echo "FATAL: nvidia-fabricmanager-${driver_version} not in any configured repo" >&2
-        echo "Available versions:" >&2
-        echo "$available" | sed 's/^/  /' >&2
+    local work_dir archive status
+    work_dir=$(mktemp -d "${INSTALL_TMP_DIR%/}/auto-setup-fm.XXXXXX")
+    archive="${work_dir}/${archive_name}"
+
+    echo "Downloading ${url}"
+    if ! wget -q "$url" -O "$archive"; then
+        rm -rf "$work_dir"
+        echo "FATAL: fabricmanager ${driver_version} not found at NVIDIA redist archive" >&2
+        echo "URL tried: ${url}" >&2
         echo "Either:" >&2
-        echo "  1. Set AUTOVLLM_NVIDIA_DRIVER_VERSION to a version with a matching fabricmanager RPM" >&2
-        echo "  2. Add a repo that carries nvidia-fabricmanager-${driver_version}" >&2
+        echo "  1. Set AUTOVLLM_NVIDIA_DRIVER_VERSION to a version NVIDIA publishes fabricmanager for" >&2
+        echo "  2. Provide the fabricmanager RPM or archive manually" >&2
         return 1
     fi
 
-    echo "FATAL: no nvidia-fabricmanager RPM found in any configured repo" >&2
-    return 1
+    tar -xf "$archive" -C "$work_dir"
+    local extracted="${work_dir}/fabricmanager-linux-x86_64-${driver_version}-archive"
+
+    if [ ! -d "$extracted" ]; then
+        # Handle slight naming variations in the archive
+        extracted=$(find "$work_dir" -maxdepth 1 -type d -name 'fabricmanager-*' | head -1)
+    fi
+    if [ -z "$extracted" ] || [ ! -d "$extracted" ]; then
+        rm -rf "$work_dir"
+        echo "FATAL: unexpected archive layout in ${archive_name}" >&2
+        return 1
+    fi
+
+    # The redist archive contains: bin/nv-fabricmanager, lib/, systemd/, etc.
+    if [ -x "${extracted}/bin/nv-fabricmanager" ]; then
+        sudo install -m 755 "${extracted}/bin/nv-fabricmanager" /usr/bin/nv-fabricmanager
+    else
+        rm -rf "$work_dir"
+        echo "FATAL: nv-fabricmanager binary not found in archive" >&2
+        return 1
+    fi
+
+    # Install the systemd unit if present, otherwise write a minimal one
+    if [ -f "${extracted}/systemd/nvidia-fabricmanager.service" ]; then
+        sudo install -m 644 "${extracted}/systemd/nvidia-fabricmanager.service" \
+            /etc/systemd/system/nvidia-fabricmanager.service
+    elif [ ! -f /etc/systemd/system/nvidia-fabricmanager.service ] \
+        && [ ! -f /usr/lib/systemd/system/nvidia-fabricmanager.service ]; then
+        cat <<'UNIT' | sudo tee /etc/systemd/system/nvidia-fabricmanager.service > /dev/null
+[Unit]
+Description=NVIDIA Fabric Manager
+After=nvidia-persistenced.service
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/nv-fabricmanager -D
+LimitCORE=infinity
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    fi
+
+    # Install config if present and no existing config
+    if [ -f "${extracted}/etc/fabricmanager.cfg" ] \
+        && [ ! -f /usr/share/nvidia/nvswitch/fabricmanager.cfg ]; then
+        sudo mkdir -p /usr/share/nvidia/nvswitch
+        sudo install -m 644 "${extracted}/etc/fabricmanager.cfg" \
+            /usr/share/nvidia/nvswitch/fabricmanager.cfg
+    fi
+
+    sudo systemctl daemon-reload
+    status=0
+    rm -rf "$work_dir"
+    echo "Fabric Manager ${driver_version} installed from NVIDIA redistributable archive"
+    return "$status"
 }
 
 ensure_fabric_manager() {
@@ -219,6 +275,9 @@ ensure_fabric_manager() {
     local installed_fm_version=""
     if rpm -q nvidia-fabricmanager &>/dev/null; then
         installed_fm_version=$(rpm -q --qf '%{VERSION}' nvidia-fabricmanager)
+    elif [ -x /usr/bin/nv-fabricmanager ]; then
+        installed_fm_version=$(nv-fabricmanager --version 2>/dev/null \
+            | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
     fi
 
     if [ "$installed_fm_version" = "$driver_version" ]; then
@@ -227,16 +286,19 @@ ensure_fabric_manager() {
         install_fabricmanager_rpm "$driver_version"
     fi
 
-    if ! rpm -q python3-dnf-plugin-versionlock &>/dev/null; then
-        sudo dnf install -y python3-dnf-plugin-versionlock
+    # Versionlock only applies when fabricmanager came from RPM
+    if rpm -q nvidia-fabricmanager &>/dev/null; then
+        if ! rpm -q python3-dnf-plugin-versionlock &>/dev/null; then
+            sudo dnf install -y python3-dnf-plugin-versionlock
+        fi
+        sudo dnf versionlock delete 'nvidia-fabricmanager*' 2>/dev/null || true
+        sudo dnf versionlock delete '*nvidia-driver*' 2>/dev/null || true
+        sudo dnf versionlock add nvidia-fabricmanager
+        local pkg
+        for pkg in $(rpm -qa 'nvidia-driver*' --qf '%{NAME}\n' | sort -u); do
+            sudo dnf versionlock add "$pkg" 2>/dev/null || true
+        done
     fi
-    sudo dnf versionlock delete 'nvidia-fabricmanager*' 2>/dev/null || true
-    sudo dnf versionlock delete '*nvidia-driver*' 2>/dev/null || true
-    sudo dnf versionlock add nvidia-fabricmanager
-    local pkg
-    for pkg in $(rpm -qa 'nvidia-driver*' --qf '%{NAME}\n' | sort -u); do
-        sudo dnf versionlock add "$pkg" 2>/dev/null || true
-    done
 
     sudo systemctl enable nvidia-fabricmanager
     sudo systemctl restart nvidia-fabricmanager
