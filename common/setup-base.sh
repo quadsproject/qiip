@@ -131,8 +131,12 @@ install_cuda_toolkit() {
     fi
 }
 
-try_fabric_manager_via_module_stream() {
-    local driver_major="$1" driver_version="$2"
+install_fabricmanager_rpm() {
+    local driver_version="$1"
+    local driver_major="${driver_version%%.*}"
+    local pkg="nvidia-fabricmanager-${driver_version}-1"
+
+    # Strategy 1: dnf module stream (RPM-installed drivers only)
     local module_license stream_suffix
     module_license=$(modinfo nvidia 2>/dev/null \
         | sed -n 's/^license:[[:space:]]*//Ip' | xargs) || true
@@ -144,12 +148,48 @@ try_fabric_manager_via_module_stream() {
     echo "Kernel module license: ${module_license:-unknown} (stream suffix: ${stream_suffix})"
 
     sudo dnf module reset -y nvidia-driver 2>/dev/null || true
-    if ! sudo dnf module enable -y "nvidia-driver:${driver_major}${stream_suffix}" 2>/dev/null; then
-        # .run-installed drivers don't register module streams
+    if sudo dnf module enable -y "nvidia-driver:${driver_major}${stream_suffix}" 2>/dev/null; then
+        sudo dnf clean metadata
+        if sudo dnf install -y "$pkg" 2>/dev/null; then
+            return 0
+        fi
+    fi
+
+    # Strategy 2: direct install from whatever repos are configured
+    echo "Module stream unavailable or version not found; trying direct install"
+    sudo dnf clean metadata
+    if sudo dnf install -y --disableexcludes=all "$pkg" 2>/dev/null; then
+        return 0
+    fi
+
+    # Strategy 3: the default cuda-rhel9 repo tracks the latest branch and
+    # may not carry the fabricmanager for the running driver. Enable the
+    # branch-specific repo that matches this driver major version.
+    local branch_repo="https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo"
+    echo "Configured repos lack ${pkg}; adding branch repo for driver ${driver_major}"
+    sudo dnf config-manager --add-repo "$branch_repo" 2>/dev/null || true
+
+    # List what the repo actually carries so the error is actionable
+    local available
+    available=$(dnf list --showduplicates nvidia-fabricmanager 2>/dev/null \
+        | awk '/nvidia-fabricmanager\./{print $2}' | sort -V) || true
+
+    if [ -n "$available" ]; then
+        if echo "$available" | grep -q "^${driver_version}-"; then
+            sudo dnf install -y --disableexcludes=all "$pkg"
+            return $?
+        fi
+        echo "FATAL: nvidia-fabricmanager-${driver_version} not in any configured repo" >&2
+        echo "Available versions:" >&2
+        echo "$available" | sed 's/^/  /' >&2
+        echo "Either:" >&2
+        echo "  1. Set AUTOVLLM_NVIDIA_DRIVER_VERSION to a version with a matching fabricmanager RPM" >&2
+        echo "  2. Add a repo that carries nvidia-fabricmanager-${driver_version}" >&2
         return 1
     fi
-    sudo dnf clean metadata
-    sudo dnf install -y "nvidia-fabricmanager-${driver_version}-1"
+
+    echo "FATAL: no nvidia-fabricmanager RPM found in any configured repo" >&2
+    return 1
 }
 
 ensure_fabric_manager() {
@@ -184,17 +224,7 @@ ensure_fabric_manager() {
     if [ "$installed_fm_version" = "$driver_version" ]; then
         echo "nvidia-fabricmanager ${driver_version} already installed"
     else
-        local driver_major="${driver_version%%.*}"
-        # The CUDA repo carries nvidia-fabricmanager as a standalone RPM.
-        # When the driver was installed via .run (not RPM), no nvidia-driver
-        # dnf module stream exists, so we try module enable but fall back to
-        # a direct install if the stream is missing.
-        if ! try_fabric_manager_via_module_stream "$driver_major" "$driver_version"; then
-            echo "Module stream unavailable; installing fabric-manager directly from CUDA repo"
-            sudo dnf clean metadata
-            sudo dnf install -y --disableexcludes=all \
-                "nvidia-fabricmanager-${driver_version}-1"
-        fi
+        install_fabricmanager_rpm "$driver_version"
     fi
 
     if ! rpm -q python3-dnf-plugin-versionlock &>/dev/null; then
