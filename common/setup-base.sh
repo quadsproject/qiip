@@ -221,21 +221,24 @@ Description=NVIDIA Fabric Manager
 After=nvidia-persistenced.service
 
 [Service]
-Type=forking
-ExecStart=/usr/bin/nv-fabricmanager -D
+Type=simple
+ExecStart=/usr/bin/nv-fabricmanager
 LimitCORE=infinity
+Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
-    # Remove any stale config from a previous RPM or redist install —
-    # nv-fabricmanager reads it from the default path if present, and
-    # cross-version configs contain unsupported directives.
-    if [ -f /usr/share/nvidia/nvswitch/fabricmanager.cfg ]; then
-        sudo rm -f /usr/share/nvidia/nvswitch/fabricmanager.cfg
-        echo "Removed stale fabricmanager.cfg (letting nv-fabricmanager use built-in defaults)"
-    fi
+    # Write a minimal config — the redist archive's bundled config may
+    # contain directives unsupported by this driver version. The binary
+    # requires the file to exist but works with just the mode setting.
+    sudo mkdir -p /usr/share/nvidia/nvswitch
+    cat <<'CFG' | sudo tee /usr/share/nvidia/nvswitch/fabricmanager.cfg > /dev/null
+FABRIC_MODE=1
+FABRIC_MODE_RESTART=0
+CFG
+    echo "Wrote minimal fabricmanager.cfg"
 
     sudo systemctl daemon-reload
     rm -rf "$work_dir"
