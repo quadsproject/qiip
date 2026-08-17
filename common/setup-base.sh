@@ -214,13 +214,78 @@ ensure_fabric_manager() {
 }
 
 mount_nfs_cache() {
+    # ponytail: hard mount blocks processes in D-state when the NFS server is
+    # unreachable — df/ls on the path will hang. That is correct for bulk model
+    # I/O (retries instead of EIO/corruption), but changes the failure mode
+    # from "job dies with IOError" to "job stalls silently". Any external
+    # monitoring or startup timeout around vLLM must account for this.
+    local nfs_opts="vers=3,hard,proto=tcp,timeo=600,retrans=3"
+
     if mountpoint -q "${NFS_MOUNT_POINT}"; then
-        echo "NFS already mounted at ${NFS_MOUNT_POINT}, skipping"
+        local current_opts
+        current_opts=$(awk -v mp="${NFS_MOUNT_POINT}" '$2 == mp {print $4}' /proc/mounts)
+        if [[ "$current_opts" == *",hard,"* || "$current_opts" == "hard,"* ]] \
+            && [[ "$current_opts" == *"timeo=600"* ]]; then
+            echo "NFS already mounted at ${NFS_MOUNT_POINT} with correct options"
+            ensure_nfs_persistence "$nfs_opts"
+            return 0
+        fi
+        echo "NFS at ${NFS_MOUNT_POINT} has stale options: ${current_opts}"
+        echo "hard/soft cannot be changed via remount; performing umount/mount cycle"
+        if fuser -m "${NFS_MOUNT_POINT}" &>/dev/null; then
+            echo "FATAL: ${NFS_MOUNT_POINT} is busy; processes holding it open:" >&2
+            fuser -vm "${NFS_MOUNT_POINT}" >&2 || true
+            echo "Stop the above processes, then re-run setup" >&2
+            return 1
+        fi
+        sudo umount "${NFS_MOUNT_POINT}"
+    fi
+
+    sudo mkdir -p "${NFS_MOUNT_POINT}"
+    sudo timeout --kill-after=5 60 \
+        mount -t nfs -o "$nfs_opts" "${NFS_EXPORT}" "${NFS_MOUNT_POINT}"
+
+    verify_nfs_mount_opts
+    ensure_nfs_persistence "$nfs_opts"
+}
+
+verify_nfs_mount_opts() {
+    local actual_opts
+    actual_opts=$(awk -v mp="${NFS_MOUNT_POINT}" '$2 == mp {print $4}' /proc/mounts)
+    if [ -z "$actual_opts" ]; then
+        echo "FATAL: ${NFS_MOUNT_POINT} not in /proc/mounts after mount returned success" >&2
+        return 1
+    fi
+    local opt
+    for opt in hard timeo=600 retrans=3; do
+        if [[ "$actual_opts" != *"$opt"* ]]; then
+            echo "FATAL: /proc/mounts shows '${actual_opts}' — missing '${opt}'" >&2
+            return 1
+        fi
+    done
+    echo "NFS mount verified via /proc/mounts: ${actual_opts}"
+}
+
+ensure_nfs_persistence() {
+    local nfs_opts="$1"
+
+    local autofs_map=""
+    autofs_map=$(grep -rl "${NFS_EXPORT}" /etc/auto.* 2>/dev/null | head -1) || true
+
+    if [ -n "$autofs_map" ]; then
+        echo "Mount managed by autofs (${autofs_map}); updating options in map"
+        sudo sed -i "s|-fstype=nfs,[^[:space:]]*|-fstype=nfs,${nfs_opts}|" "$autofs_map"
+        sudo systemctl reload autofs 2>/dev/null || true
         return 0
     fi
-    sudo mkdir -p "${NFS_MOUNT_POINT}"
-    sudo timeout --kill-after=5 30 \
-        mount -t nfs -o vers=3,soft,timeo=100,retrans=2 "${NFS_EXPORT}" "${NFS_MOUNT_POINT}"
+
+    local fstab_opts="${nfs_opts},_netdev,nofail"
+    if grep -q "${NFS_MOUNT_POINT}" /etc/fstab; then
+        sudo sed -i "\|${NFS_MOUNT_POINT}|d" /etc/fstab
+    fi
+    echo "${NFS_EXPORT} ${NFS_MOUNT_POINT} nfs ${fstab_opts} 0 0" \
+        | sudo tee -a /etc/fstab > /dev/null
+    echo "fstab entry for ${NFS_MOUNT_POINT} (nofail — storage outage will not block boot)"
 }
 
 configure_firewall() {
