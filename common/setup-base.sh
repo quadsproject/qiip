@@ -283,6 +283,19 @@ ensure_fabric_manager() {
         install_fabricmanager_rpm "$driver_version"
     fi
 
+    # Redist-installed binary needs a config file; ensure it exists even
+    # when the install step was skipped (version already matched).
+    if [ -x /usr/bin/nv-fabricmanager ] && ! rpm -q nvidia-fabricmanager &>/dev/null; then
+        if [ ! -f /usr/share/nvidia/nvswitch/fabricmanager.cfg ]; then
+            sudo mkdir -p /usr/share/nvidia/nvswitch
+            cat <<'CFG' | sudo tee /usr/share/nvidia/nvswitch/fabricmanager.cfg > /dev/null
+FABRIC_MODE=1
+FABRIC_MODE_RESTART=0
+CFG
+            echo "Wrote minimal fabricmanager.cfg"
+        fi
+    fi
+
     # Versionlock only applies when fabricmanager came from RPM
     if rpm -q nvidia-fabricmanager &>/dev/null; then
         if ! rpm -q python3-dnf-plugin-versionlock &>/dev/null; then
