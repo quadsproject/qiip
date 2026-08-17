@@ -82,10 +82,14 @@ check_fabric() {
     driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader \
         | sed '/^[[:space:]]*$/d' | head -1 | xargs)
 
-    if ! rpm -q nvidia-fabricmanager &>/dev/null; then
+    if rpm -q nvidia-fabricmanager &>/dev/null; then
+        fm_version=$(rpm -q --qf '%{VERSION}' nvidia-fabricmanager)
+    elif [ -x /usr/bin/nv-fabricmanager ]; then
+        fm_version=$(nv-fabricmanager --version 2>/dev/null \
+            | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
+    else
         _bail "NVSwitch present but nvidia-fabricmanager not installed (setup.sh ensure_fabric_manager)"
     fi
-    fm_version=$(rpm -q --qf '%{VERSION}' nvidia-fabricmanager)
     if [ "$fm_version" != "$driver_version" ]; then
         _bail "Fabric Manager ${fm_version} != driver ${driver_version} — version mismatch causes CUDA error 802"
     fi
