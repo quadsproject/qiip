@@ -221,10 +221,10 @@ Description=NVIDIA Fabric Manager
 After=nvidia-persistenced.service
 
 [Service]
-Type=simple
+Type=oneshot
+RemainAfterExit=yes
 ExecStart=/usr/bin/nv-fabricmanager
 LimitCORE=infinity
-Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
@@ -304,10 +304,10 @@ Description=NVIDIA Fabric Manager
 After=nvidia-persistenced.service
 
 [Service]
-Type=simple
+Type=oneshot
+RemainAfterExit=yes
 ExecStart=/usr/bin/nv-fabricmanager
 LimitCORE=infinity
-Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
