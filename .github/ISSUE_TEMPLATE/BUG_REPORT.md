@@ -3,9 +3,6 @@ name: Bug report
 about: Create a report to help us improve
 
 ---
-* QUADS version (`rpm -qa | grep quads` and/or `quads --version`):
-* Python version:
-* Operating System:
 
 **Describe the bug**
 A clear and concise description of what the bug is.
