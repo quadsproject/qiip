@@ -232,7 +232,6 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/bin/nv-fabricmanager
 LimitCORE=infinity
-Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
