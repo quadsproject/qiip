@@ -19,6 +19,15 @@ while [ "$elapsed" -lt "$TIMEOUT" ]; do
     if [ "$state" = "Completed" ]; then
         exit 0
     fi
+
+    # Oneshot fabricmanager (580.x): service active = training done,
+    # even when nvidia-smi reports N/A.
+    svc_state=$(systemctl show -p ActiveState --value nvidia-fabricmanager 2>/dev/null) || true
+    if [ "$svc_state" = "active" ] \
+        && [ "$(systemctl show -p Type --value nvidia-fabricmanager 2>/dev/null)" = "oneshot" ]; then
+        exit 0
+    fi
+
     sleep 2
     elapsed=$((elapsed + 2))
 done
