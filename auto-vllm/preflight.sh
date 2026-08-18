@@ -281,7 +281,7 @@ check_attention_backend() {
         venv_bin="$(dirname "$VLLM_BIN")"
 
         if ! "$venv_bin/ninja" --version &>/dev/null; then
-            missing+=("ninja (run: ${venv_bin}/pip install ninja)")
+            missing+=("ninja (run: dnf install ninja-build / apt install ninja-build)")
         fi
         if ! command -v nvcc &>/dev/null; then
             missing+=("nvcc (install cuda-toolkit)")
@@ -307,6 +307,20 @@ check_attention_backend() {
         _mark PASS "Attention backend: FlashInfer (JIT toolchain present)"
     else
         _mark PASS "Attention backend: ${backend} (SM${sm})"
+    fi
+
+    # vLLM v1 uses FlashInfer internally regardless of the attention backend.
+    # When AOT kernels aren't available, JIT compilation needs ninja.
+    if [ "$backend" != "FLASHINFER" ] \
+        && "$VLLM_PYTHON" -c 'import flashinfer' &>/dev/null \
+        && ! "$VLLM_PYTHON" -c \
+            'from importlib.metadata import version; from packaging.version import Version; import flashinfer_cubin; assert Version(version("flashinfer-cubin")).public == Version(version("flashinfer-python")).public' \
+            &>/dev/null; then
+        local venv_bin
+        venv_bin="$(dirname "$VLLM_BIN")"
+        if ! "$venv_bin/ninja" --version &>/dev/null && ! command -v ninja &>/dev/null; then
+            _bail "FlashInfer JIT needs ninja — run: dnf install ninja-build / apt install ninja-build"
+        fi
     fi
 }
 

@@ -213,7 +213,7 @@ verify_jit_toolchain() {
     venv_bin="$(dirname "$VLLM_BIN")"
 
     if ! "$venv_bin/ninja" --version &>/dev/null; then
-        missing+=("ninja (run: ${venv_bin}/pip install ninja)")
+        missing+=("ninja (dnf install ninja-build / apt install ninja-build)")
     fi
 
     if ! command -v nvcc &>/dev/null; then
@@ -307,6 +307,10 @@ run_vllm() {
         bash "${SCRIPT_DIR}/stop-vllm.sh"
     fi
     clear_script_environment
+
+    # Running the venv binary directly doesn't activate the venv, so tools
+    # like ninja (needed by FlashInfer JIT) aren't on PATH.
+    export PATH="$(dirname "$VLLM_BIN"):$PATH"
 
     cat <<EOF
 
