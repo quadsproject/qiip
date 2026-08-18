@@ -30,9 +30,9 @@ _rc=0
 _mark() {
     local status="$1"; shift
     case "$status" in
-        PASS) (( _pass++ )); printf '  [\e[32mPASS\e[0m] %s\n' "$*" ;;
-        FAIL) (( _fail++ )); printf '  [\e[31mFAIL\e[0m] %s\n' "$*"; _rc=1 ;;
-        WARN) (( _warn++ )); printf '  [\e[33mWARN\e[0m] %s\n' "$*" ;;
+        PASS) (( ++_pass )); printf '  [\e[32mPASS\e[0m] %s\n' "$*" ;;
+        FAIL) (( ++_fail )); printf '  [\e[31mFAIL\e[0m] %s\n' "$*"; _rc=1 ;;
+        WARN) (( ++_warn )); printf '  [\e[33mWARN\e[0m] %s\n' "$*" ;;
     esac
 }
 
@@ -82,12 +82,16 @@ check_fabric() {
     driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader \
         | sed '/^[[:space:]]*$/d' | head -1 | xargs)
 
-    if rpm -q nvidia-fabricmanager &>/dev/null; then
-        fm_version=$(rpm -q --qf '%{VERSION}' nvidia-fabricmanager)
-    elif [ -x /usr/bin/nv-fabricmanager ]; then
+    # Prefer the binary version — redist installs bypass RPM, so a stale
+    # RPM from a previous driver can report the wrong version.
+    if [ -x /usr/bin/nv-fabricmanager ]; then
         fm_version=$(nv-fabricmanager --version 2>/dev/null \
             | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
-    else
+    fi
+    if [ -z "$fm_version" ] && rpm -q nvidia-fabricmanager &>/dev/null; then
+        fm_version=$(rpm -q --qf '%{VERSION}' nvidia-fabricmanager)
+    fi
+    if [ -z "$fm_version" ]; then
         _bail "NVSwitch present but nvidia-fabricmanager not installed (setup.sh ensure_fabric_manager)"
     fi
     if [ "$fm_version" != "$driver_version" ]; then
