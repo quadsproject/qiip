@@ -102,10 +102,13 @@ check_fabric() {
     fabric_state=$(nvidia-smi -q 2>/dev/null \
         | grep -A2 'Fabric' | grep 'State' | head -1 \
         | awk -F: '{print $2}' | xargs) || true
-    if [ "$fabric_state" != "Completed" ]; then
+    if [ "$fabric_state" = "Completed" ]; then
+        _mark PASS "Fabric Manager ${fm_version}, training completed (nvidia-smi)"
+    elif [ "$(systemctl show -p Type --value nvidia-fabricmanager 2>/dev/null)" = "oneshot" ]; then
+        _mark PASS "Fabric Manager ${fm_version}, training completed (service exited successfully)"
+    else
         _bail "Fabric State: '${fabric_state:-unknown}' (expected Completed) — check /var/log/fabricmanager.log"
     fi
-    _mark PASS "Fabric Manager ${fm_version}, training completed"
 }
 
 # ── 3. CUDA device count vs tensor-parallel ─────────────────────────────

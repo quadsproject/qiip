@@ -352,25 +352,38 @@ UNIT
     local timeout="${AUTOVLLM_FM_TIMEOUT:-120}" elapsed=0
     echo "Waiting for NVSwitch fabric training (timeout: ${timeout}s)..."
     while [ "$elapsed" -lt "$timeout" ]; do
-        if ! systemctl is-active --quiet nvidia-fabricmanager; then
-            echo "FATAL: nvidia-fabricmanager exited during fabric training" >&2
+        # For oneshot units: "active" means the process exited 0 (training done).
+        # For long-running builds: check nvidia-smi fabric state.
+        local svc_state fabric_state
+        svc_state=$(systemctl show -p ActiveState --value nvidia-fabricmanager 2>/dev/null) || true
+        if [ "$svc_state" = "failed" ]; then
+            echo "FATAL: nvidia-fabricmanager failed during fabric training" >&2
             journalctl -u nvidia-fabricmanager --no-pager -n 20 >&2 2>/dev/null || true
             return 1
         fi
-        local fabric_state
+
         fabric_state=$(nvidia-smi -q 2>/dev/null \
             | grep -A2 'Fabric' | grep 'State' | head -1 \
             | awk -F: '{print $2}' | xargs) || true
+
         if [ "$fabric_state" = "Completed" ]; then
-            echo "NVSwitch fabric training completed"
+            echo "NVSwitch fabric training completed (nvidia-smi)"
             return 0
         fi
+
+        # Oneshot service that exited 0: training succeeded even if
+        # nvidia-smi reports N/A (580.x driver doesn't populate the field).
+        if [ "$svc_state" = "active" ] \
+            && [ "$(systemctl show -p Type --value nvidia-fabricmanager 2>/dev/null)" = "oneshot" ]; then
+            echo "NVSwitch fabric training completed (service exited successfully)"
+            return 0
+        fi
+
         sleep 2
         elapsed=$((elapsed + 2))
     done
     echo "FATAL: NVSwitch fabric training did not complete within ${timeout}s" >&2
-    echo "Service active: $(systemctl is-active nvidia-fabricmanager 2>/dev/null || echo unknown)" >&2
-    echo "Last fabric state: '${fabric_state:-unknown}'" >&2
+    echo "Service state: ${svc_state:-unknown}, fabric state: '${fabric_state:-unknown}'" >&2
     journalctl -u nvidia-fabricmanager --no-pager -n 20 >&2 2>/dev/null || true
     return 1
 }
