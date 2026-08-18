@@ -283,8 +283,8 @@ ensure_fabric_manager() {
         install_fabricmanager_rpm "$driver_version"
     fi
 
-    # Redist-installed binary needs a config file; ensure it exists even
-    # when the install step was skipped (version already matched).
+    # Redist-installed binary needs a config file and a correct systemd
+    # unit. Ensure both exist even when install was skipped (version matched).
     if [ -x /usr/bin/nv-fabricmanager ] && ! rpm -q nvidia-fabricmanager &>/dev/null; then
         if [ ! -f /usr/share/nvidia/nvswitch/fabricmanager.cfg ]; then
             sudo mkdir -p /usr/share/nvidia/nvswitch
@@ -294,6 +294,25 @@ FABRIC_MODE_RESTART=0
 CFG
             echo "Wrote minimal fabricmanager.cfg"
         fi
+
+        # The unit must not use -D (unsupported in some builds).
+        # Overwrite unconditionally — a stale unit from a prior install is
+        # the most common cause of "exited during fabric training".
+        cat <<'UNIT' | sudo tee /etc/systemd/system/nvidia-fabricmanager.service > /dev/null
+[Unit]
+Description=NVIDIA Fabric Manager
+After=nvidia-persistenced.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/nv-fabricmanager
+LimitCORE=infinity
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+        sudo systemctl daemon-reload
     fi
 
     # Versionlock only applies when fabricmanager came from RPM
@@ -308,6 +327,23 @@ CFG
         for pkg in $(rpm -qa 'nvidia-driver*' --qf '%{NAME}\n' | sort -u); do
             sudo dnf versionlock add "$pkg" 2>/dev/null || true
         done
+    fi
+
+    # Kill orphan nv-fabricmanager processes not managed by systemd (e.g.
+    # leftover from a manual run) — they hold a PID lock that blocks restart.
+    local orphan_pids
+    orphan_pids=$(pgrep -x nv-fabricmanager || true)
+    if [ -n "$orphan_pids" ]; then
+        local svc_pid=""
+        svc_pid=$(systemctl show -p MainPID --value nvidia-fabricmanager 2>/dev/null) || true
+        local pid
+        for pid in $orphan_pids; do
+            if [ "$pid" != "$svc_pid" ]; then
+                echo "Killing orphan nv-fabricmanager PID ${pid}"
+                sudo kill "$pid" 2>/dev/null || true
+            fi
+        done
+        sleep 1
     fi
 
     sudo systemctl enable nvidia-fabricmanager
