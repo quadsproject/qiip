@@ -38,6 +38,7 @@ class InferenceEngine(StrEnum):
 class NodeStatus(StrEnum):
     """Status of an inference node."""
 
+    AVAILABLE = "available"
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
     DRAINING = "draining"

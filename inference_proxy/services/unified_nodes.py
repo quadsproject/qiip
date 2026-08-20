@@ -91,6 +91,9 @@ class UnifiedNodeService:
         state = node.status.value
         breaker = self._cb_registry.get(node.node_id)
         task = task_map.get(node.node_id) if task_map else None
+        actions = list(_STATE_ACTIONS.get(state, []))
+        if state == "available" and not node.managed:
+            actions.append("remove")
         return AdminNodeResponse(
             node_id=node.node_id,
             endpoint=node.endpoint,
@@ -102,7 +105,7 @@ class UnifiedNodeService:
             artifact_id=node.artifact_id,
             llamacpp_runtime=node.llamacpp_runtime,
             state=state,
-            actions=list(_STATE_ACTIONS.get(state, [])),
+            actions=actions,
             gpu_vendor=host.gpu_vendor if host else None,
             gpu_model=host.gpu_model if host else None,
             gpu_count=host.gpu_count if host else None,

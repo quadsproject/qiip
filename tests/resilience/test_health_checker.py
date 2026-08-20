@@ -83,6 +83,7 @@ def test_health_cycle_removes_idle_draining_node_without_request_traffic() -> No
         (
             True,
             {
+                NodeStatus.AVAILABLE: NodeStatus.AVAILABLE,
                 NodeStatus.HEALTHY: NodeStatus.HEALTHY,
                 NodeStatus.UNHEALTHY: NodeStatus.HEALTHY,
                 NodeStatus.DRAINING: NodeStatus.DRAINING,
@@ -97,6 +98,7 @@ def test_health_cycle_removes_idle_draining_node_without_request_traffic() -> No
         (
             False,
             {
+                NodeStatus.AVAILABLE: NodeStatus.AVAILABLE,
                 NodeStatus.HEALTHY: NodeStatus.UNHEALTHY,
                 NodeStatus.UNHEALTHY: NodeStatus.UNHEALTHY,
                 NodeStatus.DRAINING: NodeStatus.DRAINING,
@@ -143,7 +145,7 @@ def test_probe_transition_matrix(
     finally:
         failures.close()
 
-    if status == NodeStatus.PROVISIONING:
+    if status in (NodeStatus.AVAILABLE, NodeStatus.PROVISIONING):
         client.get.assert_not_called()
     else:
         client.get.assert_called_once_with("http://10.0.1.100:8000/health")

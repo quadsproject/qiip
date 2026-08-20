@@ -247,10 +247,10 @@ class TestDashboardBadgeCSS:
 class TestSetupForm:
     """Dashboard HTML contains the setup form elements (DASH-01, D-04, D-05)."""
 
-    def test_contains_setup_form(self, client: TestClient) -> None:
-        """HTML contains form with id='setup-form' (moved inside Node Fleet card)."""
+    def test_contains_register_form(self, client: TestClient) -> None:
+        """HTML contains registration form with id='register-form'."""
         response = client.get("/dashboard")
-        assert 'id="setup-form"' in response.text
+        assert 'id="register-form"' in response.text
 
     def test_standalone_provision_card_removed(self, client: TestClient) -> None:
         """Standalone 'Provision Node' card is removed (D-04)."""
@@ -269,17 +269,17 @@ class TestSetupForm:
         assert 'id="manual-setup-row"' in response.text
 
     def test_contains_hostname_input(self, client: TestClient) -> None:
-        """HTML contains input with id='setup-hostname'."""
+        """HTML contains input with id='register-hostname'."""
         response = client.get("/dashboard")
-        assert 'id="setup-hostname"' in response.text
+        assert 'id="register-hostname"' in response.text
 
-    def test_contains_setup_button(self, client: TestClient) -> None:
-        """HTML contains button with id='setup-btn'."""
+    def test_contains_register_button(self, client: TestClient) -> None:
+        """HTML contains button with id='register-btn'."""
         response = client.get("/dashboard")
-        assert 'id="setup-btn"' in response.text
+        assert 'id="register-btn"' in response.text
 
     def test_contains_engine_specific_setup_selectors(self, client: TestClient) -> None:
-        """Manual setup exposes mutually exclusive engine artifact selectors."""
+        """Setup configuration exposes engine and artifact selectors."""
         response = client.get("/dashboard")
         assert (
             'id="setup-engine-select" class="setup-select setup-engine-select"'

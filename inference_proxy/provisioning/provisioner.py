@@ -1241,6 +1241,28 @@ class NodeProvisioner:
                     await keepalive
             self._log_buffer.mark_complete(hostname)
 
+    async def register_available(self, hostname: str) -> None:
+        """Register a hostname as available in the node pool (no provisioning)."""
+        endpoint = self.validate_endpoint(hostname)
+        node = Node(
+            node_id=hostname,
+            endpoint=endpoint,
+            status=NodeStatus.AVAILABLE,
+            managed=False,
+        )
+        key, value = node_to_etcd(node, self._etcd_client.prefix)
+        await asyncio.to_thread(self._etcd_client.put, key, value)
+        if self._registry is not None:
+            self._registry.add(node)
+
+    async def remove_available(self, hostname: str) -> None:
+        """Remove a manually registered available node from the pool."""
+        await asyncio.to_thread(
+            self._etcd_client.delete, f"{self._etcd_client.prefix}{hostname}"
+        )
+        if self._registry is not None:
+            self._registry.remove(hostname)
+
     async def cleanup_stale_node(self, hostname: str) -> None:
         """Delete stale discovery and local routing state before a retry.
 

@@ -148,8 +148,8 @@ def _probe_all_nodes(
         drain_cleanup.sweep_drained_nodes(registry, connection_tracker)
     nodes = registry.get_all()
     for node in nodes:
-        if node.status == NodeStatus.PROVISIONING:
-            logger.debug("skipping_provisioning_node", node_id=node.node_id)
+        if node.status in (NodeStatus.AVAILABLE, NodeStatus.PROVISIONING):
+            logger.debug("skipping_non_active_node", node_id=node.node_id)
             continue
         _probe_node(
             node_id=node.node_id,
@@ -246,6 +246,7 @@ def _handle_probe_success(
         return False
 
     if current.status in {
+        NodeStatus.AVAILABLE,
         NodeStatus.DRAINING,
         NodeStatus.RELAUNCHING,
         NodeStatus.RELAUNCH_FAILED,
