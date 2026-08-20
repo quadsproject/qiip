@@ -75,8 +75,14 @@ install_nvidia_driver() {
             return 0
         fi
         installed_versions=${installed_versions//$'\n'/, }
-        echo "FATAL: installed NVIDIA driver ${installed_versions:-unknown} does not match requested ${DRIVER_VERSION}; upgrade the driver explicitly before provisioning" >&2
-        return 1
+        echo "Installed NVIDIA driver ${installed_versions:-unknown} does not match requested ${DRIVER_VERSION}; uninstalling"
+        if [ -x /usr/bin/nvidia-uninstall ]; then
+            sudo /usr/bin/nvidia-uninstall --silent
+        else
+            sudo dnf -y remove '*nvidia*driver*' 2>/dev/null || true
+        fi
+        sudo rm -f /etc/modprobe.d/blacklist-nouveau.conf
+        sudo modprobe -r nvidia 2>/dev/null || true
     fi
     if modinfo nvidia &>/dev/null; then
         echo "NVIDIA kernel module found but not loaded, loading"
