@@ -381,6 +381,7 @@ def test_existing_nvidia_driver_version_matrix(
 ) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    operation_log = tmp_path / "operations.log"
     _write_executable(
         bin_dir / "nvidia-smi",
         """#!/bin/bash
@@ -390,12 +391,23 @@ fi
 exit 0
 """,
     )
+    _write_executable(
+        bin_dir / "sudo",
+        """#!/bin/bash
+echo "$*" >> "$AUTOVLLM_TEST_LOG"
+""",
+    )
+    _write_executable(bin_dir / "modinfo", "#!/bin/bash\nexit 1\n")
+    _write_executable(bin_dir / "ls", "#!/bin/bash\nexit 1\n")
+    _write_executable(bin_dir / "wget", "#!/bin/bash\nexit 1\n")
     env = os.environ.copy()
+    env.pop("BASH_ENV", None)
     env.update(
         {
             "PATH": f"{bin_dir}:/usr/bin:/bin",
             "AUTOVLLM_INSTALLED_DRIVER": installed_version,
             "AUTOVLLM_NVIDIA_DRIVER_VERSION": "580.126.09",
+            "AUTOVLLM_TEST_LOG": str(operation_log),
         }
     )
 
@@ -406,9 +418,9 @@ exit 0
     assert result.returncode == expected_returncode
     assert expected_marker in result.stdout
     if installed_version != "580.126.09":
-        assert "installed NVIDIA driver 570.172.08" in result.stderr
-        assert "requested 580.126.09" in result.stderr
-        assert "NVIDIA-driver.run" not in result.stdout + result.stderr
+        assert "does not match requested" in result.stdout
+        operations = operation_log.read_text().splitlines()
+        assert any("remove" in op and "nvidia" in op for op in operations)
 
 
 @pytest.mark.parametrize("valid_checksum", [True, False])
@@ -455,7 +467,7 @@ exit 0
 """,
     )
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if k != "BASH_ENV"},
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "AUTOVLLM_TMP_DIR": str(tmp_path),
         "AUTOVLLM_NVIDIA_DRIVER_SHA256": digest,
@@ -560,6 +572,7 @@ exit 2
     archive_bytes = b"verified llmfit fixture"
     archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
     env = os.environ.copy()
+    env.pop("BASH_ENV", None)
     env.update(
         {
             "PATH": f"{bin_dir}:/usr/bin:/bin",
@@ -711,6 +724,7 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
 """,
     )
     env = os.environ.copy()
+    env.pop("BASH_ENV", None)
     env.update(
         {
             "PATH": f"{bin_dir}:/usr/bin:/bin",
@@ -765,6 +779,7 @@ exit 0
 """,
     )
     env = os.environ.copy()
+    env.pop("BASH_ENV", None)
     env.update(
         {
             "PATH": f"{bin_dir}:/usr/bin:/bin",

@@ -46,6 +46,9 @@ case "$*" in
   *"--query-gpu=name"*) echo "NVIDIA A100" ;;
   *"--list-gpus"*) echo "GPU 0: NVIDIA A100" ;;
   *"--query-gpu=memory.total"*) echo "81920" ;;
+  *"--query-gpu=compute_cap"*) echo "8.0" ;;
+  *"--query-gpu=driver_version"*) echo "580.126.09" ;;
+  *"--query-gpu=persistence_mode"*) echo "Enabled" ;;
 esac
 """,
     )
@@ -53,6 +56,10 @@ esac
     _write_executable(
         flashinfer_python,
         """#!/bin/bash
+if [[ "$*" == *'torch.cuda.device_count()'* ]]; then
+    echo 1
+    exit 0
+fi
 [[ "${AUTOVLLM_FLASHINFER_AVAILABLE:-1}" == "1" ]]
 """,
     )
@@ -60,6 +67,7 @@ esac
     cache_dir = tmp_path / "nfs-cache"
     cache_dir.mkdir(exist_ok=True)
     env = os.environ.copy()
+    env.pop("INVOCATION_ID", None)
     env.update(
         {
             "PATH": f"{bin_dir}:{env['PATH']}",
@@ -335,7 +343,11 @@ while true; do sleep 1; done
             process.wait(timeout=2)
 
 
-def test_start_requires_flashinfer_aot_before_launch(tmp_path: Path) -> None:
+def test_start_requires_flashinfer_jit_toolchain_when_aot_unavailable(
+    tmp_path: Path,
+) -> None:
+    """When FlashInfer is selected (SM90+) and AOT kernels are missing,
+    the script must verify the JIT toolchain and fail if it is absent."""
     process_log = tmp_path / "process.log"
     vllm_bin = tmp_path / "fake-vllm"
     _write_executable(
@@ -350,6 +362,7 @@ echo launched >> "$AUTOVLLM_TEST_LOG"
         process_log=process_log,
     )
     env["AUTOVLLM_FLASHINFER_AVAILABLE"] = "0"
+    env["AUTOVLLM_ATTENTION_BACKEND"] = "FLASHINFER"
 
     result = subprocess.run(
         ["bash", str(START_SCRIPT)],
@@ -361,7 +374,7 @@ echo launched >> "$AUTOVLLM_TEST_LOG"
     )
 
     assert result.returncode != 0
-    assert "matching FlashInfer AOT kernels are unavailable" in result.stderr
+    assert "FlashInfer" in result.stdout + result.stderr
     assert not process_log.exists()
     assert not Path(env["AUTOVLLM_PID_FILE"]).exists()
 
@@ -382,6 +395,7 @@ while true; do sleep 1; done
         vllm_bin=vllm_bin,
         process_log=process_log,
     )
+    env["AUTOVLLM_ATTENTION_BACKEND"] = "FLASHINFER"
 
     try:
         result = subprocess.run(
@@ -668,6 +682,7 @@ while true; do sleep 1; done
     env.update(
         {
             "AUTOVLLM_CAPTURE_ENV": str(captured_env),
+            "AUTOVLLM_ATTENTION_BACKEND": "FLASHINFER",
             "AUTOVLLM_API_PORT": "8123",
             "AUTOVLLM_MODEL": "example/model",
             "AUTOVLLM_TENSOR_PARALLEL": "1",
@@ -721,6 +736,7 @@ while true; do sleep 1; done
             "AUTOVLLM_STARTUP_LOG_LINES",
             "AUTOVLLM_STOP_TIMEOUT",
             "AUTOVLLM_STOP_INTERVAL",
+            "AUTOVLLM_ATTENTION_BACKEND",
             "VLLM_PORT",
             "VLLM_TENSOR_PARALLEL",
             "VLLM_GPU_MEM_UTIL",
