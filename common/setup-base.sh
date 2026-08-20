@@ -62,6 +62,7 @@ run_system_update() {
 }
 
 install_nvidia_driver() {
+    # shellcheck disable=SC2153  # DRIVER_VERSION is set by the sourcing script
     require_sha256 "NVIDIA driver ${DRIVER_VERSION}" "$DRIVER_SHA256" \
         "AUTOVLLM_NVIDIA_DRIVER_SHA256"
     if nvidia-smi &>/dev/null; then
