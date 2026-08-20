@@ -1530,50 +1530,6 @@ sandbox.fetch = async function (url) {
     assert result == {"engines": ["vLLM", "llama.cpp", "—"]}
 
 
-def test_dashboard_quick_setup_sends_exact_selected_artifact() -> None:
-    result = _run_dashboard_scenario(
-        r"""
-let captured = null;
-vm.runInContext(`
-  setupSelection.setCatalog({
-    models: [{ repo_id: "org/vllm" }],
-    gguf_artifacts: [{
-      artifact_id: "a".repeat(64), repo_id: "org/model-GGUF",
-      model_alias: "model-q4", resolved_revision: "b".repeat(40),
-      entrypoint: "model-Q4_K_M.gguf",
-    }],
-  });
-  setupSelection.selectEngine("llama_cpp");
-  document.getElementById("artifact-select").value = "a".repeat(64);
-  document.getElementById("artifact-select").listeners.change();
-`, sandbox);
-sandbox.fetch = async function (url, options) {
-  captured = { url, options };
-  return response({});
-};
-(async function () {
-  await sandbox.handleAction(
-    "setup", "gpu01", node("gpu01", "available", ["setup"], null)
-  );
-  process.stdout.write(JSON.stringify({
-    url: captured.url,
-    body: JSON.parse(captured.options.body),
-  }));
-})().catch(function (error) { console.error(error); process.exit(1); });
-"""
-    )
-
-    assert result == {
-        "url": "/admin/nodes/setup",
-        "body": {
-            "hostname": "gpu01",
-            "managed": True,
-            "engine": "llama_cpp",
-            "artifact_id": "a" * 64,
-        },
-    }
-
-
 def test_dashboard_preserves_expanded_error_state_across_refresh() -> None:
     result = _run_dashboard_scenario(
         r"""

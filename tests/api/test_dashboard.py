@@ -278,15 +278,12 @@ class TestSetupForm:
         response = client.get("/dashboard")
         assert 'id="register-btn"' in response.text
 
-    def test_contains_engine_specific_setup_selectors(self, client: TestClient) -> None:
-        """Setup configuration exposes engine and artifact selectors."""
+    def test_model_selection_not_on_dashboard(self, client: TestClient) -> None:
+        """Model/engine selection removed from dashboard manual setup."""
         response = client.get("/dashboard")
-        assert (
-            'id="setup-engine-select" class="setup-select setup-engine-select"'
-            in response.text
-        )
-        assert 'id="model-select"' in response.text
-        assert 'id="artifact-select"' in response.text
+        assert 'id="setup-engine-select"' not in response.text
+        assert 'id="model-select"' not in response.text
+        assert 'id="artifact-select"' not in response.text
 
 
 class TestTasksPanel:

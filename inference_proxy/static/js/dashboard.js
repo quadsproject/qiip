@@ -1,7 +1,5 @@
 // ponytail: vanilla fetch + DOM, no framework needed
 
-const setupSelection = createSetupSelectionController();
-
 function showToast(message, type) {
   const container = document.getElementById("toast-container");
   const toast = document.createElement("div");
@@ -20,12 +18,7 @@ const ACTION_CONFIG = {
   setup: {
     method: "POST",
     url: () => "/admin/nodes/setup",
-    body: (nodeId, node) => {
-      const base = { hostname: nodeId, managed: node ? node.managed !== false : true };
-      return node && node.state !== "available"
-        ? base
-        : setupSelection.buildBody(base);
-    },
+    body: (nodeId, node) => ({ hostname: nodeId, managed: node ? node.managed !== false : true }),
     confirm: false,
     confirmMsg: null,
     danger: false,
@@ -123,14 +116,8 @@ async function handleAction(action, nodeId, node, onStart) {
   inFlightNodes.add(nodeId);
   const options = { method: config.method };
   if (config.body) {
-    const body = config.body(nodeId, node);
-    if (!body) {
-      showToast(setupSelection.errorMessage(), "error");
-      inFlightNodes.delete(nodeId);
-      return;
-    }
     options.headers = { "Content-Type": "application/json" };
-    options.body = JSON.stringify(body);
+    options.body = JSON.stringify(config.body(nodeId, node));
   }
   try {
     const resp = await fetch(config.url(nodeId), options);
@@ -174,6 +161,14 @@ function renderQuadsStatus(data) {
 }
 
 function createActionButton(action, nodeId, node) {
+  // ponytail: available nodes go to detail page for model selection
+  if (action === "setup" && node && node.state === "available") {
+    const link = document.createElement("a");
+    link.href = "/dashboard/nodes/" + encodeURIComponent(nodeId);
+    link.className = "btn btn-sm btn-primary";
+    link.textContent = "Setup";
+    return link;
+  }
   const config = ACTION_CONFIG[action];
   const btn = document.createElement("button");
   btn.type = "button";
@@ -439,18 +434,7 @@ function renderTaskDataWarning(nodesResponse, warningEl) {
   warningEl.className = "";
 }
 
-async function loadSetupCatalog() {
-  try {
-    const response = await fetch("/admin/models/catalog");
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    setupSelection.setCatalog(await response.json());
-  } catch (_) {
-    setupSelection.setCatalogUnavailable();
-  }
-}
-
 document.addEventListener("DOMContentLoaded", function () {
-  loadSetupCatalog();
   refreshDashboard();
   setInterval(refreshDashboard, POLL_INTERVAL_MS);
 
