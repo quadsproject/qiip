@@ -84,6 +84,18 @@ const ACTION_CONFIG = {
     css: "btn-danger",
     successMsg: (nodeId) => `Teardown started for ${nodeId}`,
   },
+  remove: {
+    method: "DELETE",
+    url: (nodeId) => `/admin/nodes/${nodeId}/pool`,
+    body: null,
+    confirm: true,
+    confirmMsg: (nodeId) => `Remove ${nodeId} from the available pool?`,
+    danger: false,
+    label: "Remove",
+    pendingLabel: "Removing…",
+    css: "btn-secondary",
+    successMsg: (nodeId) => `${nodeId} removed from pool`,
+  },
 };
 
 const inFlightNodes = new Set();
@@ -467,30 +479,23 @@ document.addEventListener("DOMContentLoaded", function () {
     }
   });
 
-  // Setup form handler
-  const form = document.getElementById("setup-form");
+  // Registration form handler — adds node to pool without provisioning
+  const form = document.getElementById("register-form");
   form.addEventListener("submit", async function (e) {
     e.preventDefault();
-    const input = document.getElementById("setup-hostname");
-    const btn = document.getElementById("setup-btn");
+    const input = document.getElementById("register-hostname");
+    const btn = document.getElementById("register-btn");
     const hostname = input.value.trim();
     if (!hostname) return;
-    const standalone = document.getElementById("setup-standalone").checked;
     btn.disabled = true;
     try {
-      const body = setupSelection.buildBody({ hostname, managed: !standalone });
-      if (!body) {
-        showToast(setupSelection.errorMessage(), "error");
-        btn.disabled = false;
-        return;
-      }
-      const resp = await fetch("/admin/nodes/setup", {
+      const resp = await fetch("/admin/nodes/pool", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ hostname }),
       });
       if (resp.ok) {
-        showToast(`Setup started for ${hostname}`, "success");
+        showToast(`${hostname} added to pool`, "success");
         input.value = "";
         setTimeout(function () { btn.disabled = false; }, 2000);
       } else {

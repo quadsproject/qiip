@@ -87,6 +87,13 @@ var ACTION_CONFIG = {
     label: "Force Teardown", pendingLabel: "Forcing…", css: "btn-danger",
     successMsg: function (id) { return "Teardown started for " + id; },
   },
+  remove: {
+    method: "DELETE", url: function (id) { return "/admin/nodes/" + id + "/pool"; },
+    body: null, confirm: true, danger: false,
+    confirmMsg: function (id) { return "Remove " + id + " from the available pool?"; },
+    label: "Remove", pendingLabel: "Removing…", css: "btn-secondary",
+    successMsg: function (id) { return id + " removed from pool"; },
+  },
 };
 
 async function handleAction(action, nodeId, node, onStart) {

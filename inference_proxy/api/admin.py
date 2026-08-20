@@ -52,6 +52,7 @@ from inference_proxy.models.admin import (
     PowerStateResponse,
     QUADSStatusResponse,
     RecommendationResponse,
+    RegisterRequest,
     SetupRequest,
     SetupResponse,
     TaskStatusResponse,
@@ -115,6 +116,7 @@ _SETUP_REJECTED_STATUSES = frozenset(
 )
 _SETUP_RETRYABLE_STATUSES = frozenset(
     {
+        NodeStatus.AVAILABLE,
         NodeStatus.PROVISIONING,
         NodeStatus.FAILED,
         NodeStatus.UNKNOWN,
@@ -264,6 +266,55 @@ async def list_downloads(
 ) -> list[DownloadStatusResponse]:
     """Return status of all tracked downloads (DL-03)."""
     return svc.get_all_statuses()
+
+
+@admin_router.post("/nodes/pool", status_code=201)
+async def register_node(
+    body: RegisterRequest,
+    registry: NodeRegistry = Depends(get_registry),
+    provisioner: NodeProvisioner = Depends(get_provisioner),
+) -> JSONResponse:
+    """Register a node in the available pool without provisioning."""
+    hostname = canonical_hostname(body.hostname)
+    node = registry.get(hostname)
+    if node is not None:
+        raise HTTPException(
+            status_code=409, detail=f"Node '{hostname}' is already registered"
+        )
+    try:
+        provisioner.validate_endpoint(hostname)
+    except EndpointValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await provisioner.register_available(hostname)
+    return JSONResponse(
+        status_code=201,
+        content={"hostname": hostname, "state": "available"},
+    )
+
+
+@admin_router.delete("/nodes/{node_id}/pool")
+async def remove_from_pool(
+    node_id: str,
+    registry: NodeRegistry = Depends(get_registry),
+    provisioner: NodeProvisioner = Depends(get_provisioner),
+) -> JSONResponse:
+    """Remove a manually registered node from the available pool."""
+    hostname = _validated_hostname(node_id)
+    node = registry.get(hostname)
+    if node is None:
+        raise HTTPException(status_code=404, detail=f"Node '{hostname}' not found")
+    if node.status != NodeStatus.AVAILABLE:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Node '{hostname}' is {node.status.value}; use teardown instead",
+        )
+    if node.managed:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Node '{hostname}' is managed; use teardown instead",
+        )
+    await provisioner.remove_available(hostname)
+    return JSONResponse(content={"hostname": hostname, "removed": True})
 
 
 @admin_router.post("/nodes/setup", status_code=202)

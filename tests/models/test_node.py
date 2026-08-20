@@ -55,6 +55,7 @@ def _runtime_state() -> LlamaCppRuntimeState:
 
 class TestNodeStatusEnumValues:
     def test_node_status_enum_values(self) -> None:
+        assert NodeStatus.AVAILABLE.value == "available"
         assert NodeStatus.HEALTHY.value == "healthy"
         assert NodeStatus.UNHEALTHY.value == "unhealthy"
         assert NodeStatus.DRAINING.value == "draining"
@@ -63,7 +64,7 @@ class TestNodeStatusEnumValues:
         assert NodeStatus.FAILED.value == "failed"
         assert NodeStatus.RELAUNCHING.value == "relaunching"
         assert NodeStatus.RELAUNCH_FAILED.value == "relaunch_failed"
-        assert len(NodeStatus) == 8
+        assert len(NodeStatus) == 9
 
 
 class TestNodeStatusIsStrEnum:
