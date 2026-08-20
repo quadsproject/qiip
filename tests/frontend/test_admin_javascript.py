@@ -640,6 +640,8 @@ sandbox.fetch = async function (url) {
 def test_catalog_degradation_is_visible_when_no_models_are_verified() -> None:
     result = _run_node_detail_scenario(
         r"""
+const toasts = [];
+sandbox.showToast = function (msg, type) { toasts.push({ msg, type }); };
 sandbox.fetch = async function (url) {
   if (url !== "/admin/models/catalog") throw new Error("unexpected URL " + url);
   return { ok: true, json: async function () {
@@ -653,20 +655,17 @@ sandbox.fetch = async function (url) {
     selectorVisible: byId("model-select").style.display !== "none",
     statusVisible: byId("model-status").style.display !== "none",
     status: byId("model-status").textContent,
+    toasts,
   }));
 })().catch(function (error) { console.error(error); process.exit(1); });
 """
     )
 
-    assert result == {
-        "selectorVisible": False,
-        "statusVisible": True,
-        "status": (
-            "No verified models. 3 cached models lack manifest metadata and "
-            "were hidden; re-download them to migrate the cache. 2 incomplete "
-            "cached models were hidden; re-download them."
-        ),
-    }
+    assert result["selectorVisible"] is False
+    assert result["statusVisible"] is True
+    assert result["status"] == "No verified models."
+    assert len(result["toasts"]) == 2
+    assert all(t["type"] == "warning" for t in result["toasts"])
 
 
 def test_recommendations_render_runtime_source_and_exact_artifact_availability() -> (
