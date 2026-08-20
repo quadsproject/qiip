@@ -236,7 +236,9 @@ check_nfs_mounts() {
             fi
             any_fail=1
         done
-        [ "$any_fail" -eq 0 ] && _mark PASS "NFS mounts healthy (hard, sane timeo)"
+        if [ "$any_fail" -eq 0 ]; then
+            _mark PASS "NFS mounts healthy (hard, sane timeo)"
+        fi
     fi
 }
 
