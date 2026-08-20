@@ -370,9 +370,8 @@ main() {
     EXPECTED_TENSOR_PARALLEL="$TENSOR_PARALLEL"
     MODEL_PATH="$MODEL"
     export EXPECTED_GPU_COUNT EXPECTED_TENSOR_PARALLEL MODEL_PATH
-    run_preflight
-
     prepare_hf_cache
+    run_preflight
     prestage_model_weights "$MODEL"
     run_vllm
 }
