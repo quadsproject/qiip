@@ -24,10 +24,12 @@ function createSetupSelectionController(options) {
     options.artifactSelectId || "artifact-select"
   );
   var status = document.getElementById(options.statusId || "model-status");
+  var onWarnings = options.onWarnings || null;
   var models = [];
   var artifacts = [];
   var catalogAvailable = false;
   var catalogWarnings = [];
+  var warningsFired = false;
   var preferred = null;
   var preferredApplied = false;
   var operatorChanged = false;
@@ -175,11 +177,8 @@ function createSetupSelectionController(options) {
       errorMessage = "";
     }
 
-    var messages = [];
-    if (errorMessage) messages.push(errorMessage);
-    messages = messages.concat(catalogWarnings);
-    status.textContent = messages.join(" ");
-    status.style.display = messages.length ? "inline" : "none";
+    status.textContent = errorMessage;
+    status.style.display = errorMessage ? "inline" : "none";
   }
 
   function setCatalog(data) {
@@ -188,6 +187,10 @@ function createSetupSelectionController(options) {
     catalogWarnings = warningsFromCatalog(data);
     catalogAvailable = true;
     render();
+    if (onWarnings && catalogWarnings.length && !warningsFired) {
+      warningsFired = true;
+      catalogWarnings.forEach(function (w) { onWarnings(w); });
+    }
   }
 
   function setCatalogUnavailable() {

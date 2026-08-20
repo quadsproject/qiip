@@ -1,6 +1,8 @@
 // ponytail: vanilla fetch + DOM, same pattern as dashboard.js
 
-var setupSelection = createSetupSelectionController();
+var setupSelection = createSetupSelectionController({
+  onWarnings: function (msg) { showToast(msg, "warning"); },
+});
 var llamaCppRelaunch = typeof createLlamaCppRelaunchController === "function"
   ? createLlamaCppRelaunchController()
   : null;
