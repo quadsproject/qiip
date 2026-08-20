@@ -299,7 +299,6 @@ verify_vllm_started() {
 
 run_vllm() {
     configure_attention_backend
-    prepare_hf_cache
 
     if [ -z "${INVOCATION_ID:-}" ]; then
         # Never launch over an older or orphaned server. A failed verified stop
@@ -373,6 +372,7 @@ main() {
     export EXPECTED_GPU_COUNT EXPECTED_TENSOR_PARALLEL MODEL_PATH
     run_preflight
 
+    prepare_hf_cache
     prestage_model_weights "$MODEL"
     run_vllm
 }
