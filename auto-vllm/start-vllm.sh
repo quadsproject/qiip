@@ -309,7 +309,9 @@ run_vllm() {
 
     # Running the venv binary directly doesn't activate the venv, so tools
     # like ninja (needed by FlashInfer JIT) aren't on PATH.
-    export PATH="$(dirname "$VLLM_BIN"):$PATH"
+    local venv_bin_dir
+    venv_bin_dir="$(dirname "$VLLM_BIN")"
+    export PATH="${venv_bin_dir}:$PATH"
 
     cat <<EOF
 
