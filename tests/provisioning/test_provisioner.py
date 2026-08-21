@@ -357,9 +357,7 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_REASONING_PARSER": "deepseek_r1",
         "HF_TOKEN": "hf secret",
     }
-    assert provisioner._start_script_env(
-        "org/model", vllm_params=VllmParams()
-    ) == {
+    assert provisioner._start_script_env("org/model", vllm_params=VllmParams()) == {
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
         "AUTOVLLM_API_PORT": "8123",
         "AUTOVLLM_MODEL": "org/model",

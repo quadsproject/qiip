@@ -1790,7 +1790,9 @@ class NodeProvisioner:
         command = self._script_command(
             script,
             env=self._start_script_env(
-                model, engine, artifact,
+                model,
+                engine,
+                artifact,
                 llamacpp_request=llamacpp_request,
                 vllm_params=vllm_params,
             ),
@@ -2266,7 +2268,9 @@ class NodeProvisioner:
                 self._registry.remove(hostname)
             if repool:
                 await self.register_available(hostname)
-                self._log(hostname, "info", "Returned standalone node to available pool")
+                self._log(
+                    hostname, "info", "Returned standalone node to available pool"
+                )
 
             await self._update_state(
                 hostname,
