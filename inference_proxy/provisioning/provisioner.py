@@ -1386,7 +1386,12 @@ class NodeProvisioner:
         Tracks state in etcd at each step (D-05 through D-11).
         """
         provision_started_at = datetime.now(UTC)
-        logger.info("provisioning_start", hostname=hostname)
+        logger.info(
+            "provisioning_start",
+            hostname=hostname,
+            engine=engine,
+            vllm_params=vllm_params.model_dump() if vllm_params else None,
+        )
         self._log_buffer.create(hostname)
         self._log(hostname, "info", "Provisioning started")
 

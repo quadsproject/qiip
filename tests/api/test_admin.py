@@ -528,6 +528,27 @@ class TestSetupModelPassthrough:
             lifecycle_lease=ANY,
         )
 
+    def test_passes_vllm_params_to_provisioner(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.provision = AsyncMock()
+        response = client.post(
+            "/admin/nodes/setup",
+            json={
+                "hostname": "gpu01",
+                "model": "org/model",
+                "vllm_params": {"tool_call_parser": "qwen3_coder"},
+            },
+        )
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args[0][0]
+        asyncio.get_event_loop().run_until_complete(coro)
+        call_kwargs = mock_provisioner.provision.call_args.kwargs
+        assert call_kwargs["vllm_params"] is not None
+        assert call_kwargs["vllm_params"].tool_call_parser == "qwen3_coder"
+
     def test_setup_without_model_defaults_none(
         self,
         client: TestClient,

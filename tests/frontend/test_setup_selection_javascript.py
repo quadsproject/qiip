@@ -29,6 +29,16 @@ class Element {
     this.disabled = false;
     this.hidden = false;
     this._textContent = "";
+    this.attributes = {};
+    this._dataset = {};
+  }
+  get dataset() { return this._dataset; }
+  setAttribute(name, value) {
+    this.attributes[name] = value;
+    if (name.startsWith("data-")) {
+      const key = name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+      this._dataset[key] = value;
+    }
   }
   get textContent() { return this._textContent; }
   set textContent(value) {
@@ -48,6 +58,17 @@ class Element {
     return child;
   }
   addEventListener(name, callback) { this.listeners[name] = callback; }
+  querySelectorAll(selector) {
+    const attr = (selector.match(/\[([^\]]+)\]/) || [])[1];
+    if (!attr) return [];
+    const results = [];
+    const walk = (el) => {
+      if (el.attributes && el.attributes[attr] !== undefined) results.push(el);
+      if (el.children) el.children.forEach(walk);
+    };
+    this.children.forEach(walk);
+    return results;
+  }
 }
 
 function byId(id) {
@@ -328,3 +349,41 @@ process.stdout.write(JSON.stringify({
         "label": ("<script>attack()</script> - <b>model-Q4_K_M.gguf</b> @bbbbbbbbbbbb"),
         "childCount": 0,
     }
+
+
+def test_vllm_params_included_in_selection_body() -> None:
+    result = _run_scenario(
+        r"""
+// Build a vllm-params-container with real child inputs
+const container = byId("vllm-params-container");
+const fields = [
+  { param: "tensor_parallel_size", value: "" },
+  { param: "max_model_len", value: "" },
+  { param: "gpu_memory_utilization", value: "" },
+  { param: "max_num_batched_tokens", value: "" },
+  { param: "tool_call_parser", value: "qwen3_coder" },
+  { param: "reasoning_parser", value: "" },
+];
+fields.forEach(function (f) {
+  const input = new Element("input");
+  input.setAttribute("data-vllm-param", f.param);
+  input.value = f.value;
+  container.appendChild(input);
+});
+
+controller.setCatalog({
+  models: [{ repo_id: "org/vllm-model" }],
+  gguf_artifacts: [],
+});
+const body = controller.buildBody({ hostname: "gpu01" });
+process.stdout.write(JSON.stringify({
+  body: body,
+  hasVllmParams: body && body.vllm_params != null,
+  toolCallParser: body && body.vllm_params ? body.vllm_params.tool_call_parser : null,
+}));
+"""
+    )
+
+    assert result["hasVllmParams"] is True
+    assert result["toolCallParser"] == "qwen3_coder"
+    assert result["body"]["vllm_params"] == {"tool_call_parser": "qwen3_coder"}

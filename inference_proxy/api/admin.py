@@ -334,6 +334,13 @@ async def setup_node(
     Includes dedup guard (D-08) and live QUADS re-validation (D-10/D-11).
     """
     hostname = canonical_hostname(body.hostname)
+    logger.info(
+        "setup_request_received",
+        hostname=hostname,
+        engine=body.engine,
+        vllm_params=body.vllm_params.model_dump() if body.vllm_params else None,
+        fields_set=sorted(body.model_fields_set),
+    )
     initial_node = registry.get(hostname)
     selection = _effective_setup_selection(body, initial_node)
 
