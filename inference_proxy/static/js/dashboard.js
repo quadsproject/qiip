@@ -1,16 +1,34 @@
 // ponytail: vanilla fetch + DOM, no framework needed
 
-function showToast(message, type) {
+function showToast(message, type, options) {
   const container = document.getElementById("toast-container");
   const toast = document.createElement("div");
   toast.className = "toast toast-" + (type || "info");
-  toast.textContent = message;
+  const persistent = options && options.persistent;
+  if (persistent) {
+    const text = document.createElement("span");
+    text.textContent = message;
+    toast.appendChild(text);
+    const btn = document.createElement("button");
+    btn.className = "toast-close";
+    btn.textContent = "×";
+    btn.setAttribute("aria-label", "Dismiss");
+    btn.addEventListener("click", () => {
+      toast.classList.remove("toast-visible");
+      setTimeout(() => toast.remove(), 300);
+    });
+    toast.appendChild(btn);
+  } else {
+    toast.textContent = message;
+  }
   container.appendChild(toast);
   requestAnimationFrame(() => toast.classList.add("toast-visible"));
-  setTimeout(() => {
-    toast.classList.remove("toast-visible");
-    setTimeout(() => toast.remove(), 300);
-  }, 4000);
+  if (!persistent) {
+    setTimeout(() => {
+      toast.classList.remove("toast-visible");
+      setTimeout(() => toast.remove(), 300);
+    }, 4000);
+  }
 }
 
 // ponytail: data-driven action dispatch replaces per-action functions

@@ -893,11 +893,13 @@ tbody tr:last-child td { border-bottom: none; }
 }
 
 .toast {
+  display: flex;
+  align-items: flex-start;
   padding: 0.75rem 1rem;
   border-radius: var(--radius);
   font-size: 0.8125rem;
   font-weight: 600;
-  max-width: 22rem;
+  max-width: 28rem;
   opacity: 0;
   transform: translateY(0.5rem);
   transition: opacity 0.25s, transform 0.25s;
@@ -910,6 +912,20 @@ tbody tr:last-child td { border-bottom: none; }
 .toast-error { background: var(--danger); color: var(--on-danger); }
 .toast-warning { background: var(--warning); color: var(--on-warning); }
 .toast-info { background: var(--primary); color: var(--on-primary); }
+
+.toast-close {
+  background: none;
+  border: none;
+  color: inherit;
+  font-size: 1.125rem;
+  line-height: 1;
+  cursor: pointer;
+  margin-left: 0.75rem;
+  padding: 0;
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+.toast-close:hover { opacity: 1; }
 
 /* --- Confirm dialog --- */
 .confirm-dialog {
