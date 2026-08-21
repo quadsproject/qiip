@@ -17,7 +17,12 @@ function setupActionBody(id, node) {
     hostname: id,
     managed: node ? node.managed !== false : true,
   };
-  return setupSelection.buildBody(base) || base;
+  if (node && node.state !== "available") {
+    var vp = setupSelection.getVllmParams();
+    if (vp) base.vllm_params = vp;
+    return base;
+  }
+  return setupSelection.buildBody(base);
 }
 
 function showToast(message, type, options) {

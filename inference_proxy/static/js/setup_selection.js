@@ -289,6 +289,7 @@ function createSetupSelectionController(options) {
     setPreferredNode: setPreferredNode,
     selectEngine: selectEngine,
     getSelection: getSelection,
+    getVllmParams: getVllmParams,
     buildBody: buildBody,
     isValid: function () { return getSelection() !== null; },
     errorMessage: function () { return errorMessage; },

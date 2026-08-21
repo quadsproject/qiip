@@ -155,11 +155,19 @@ def _effective_setup_selection(
     explicit = bool(body.model_fields_set & _SETUP_SELECTION_FIELDS)
     if explicit:
         return _SetupSelection(
-            body.engine, body.model, body.artifact_id, None, body.vllm_params,
+            body.engine,
+            body.model,
+            body.artifact_id,
+            None,
+            body.vllm_params,
         )
     if node is None:
         return fallback or _SetupSelection(
-            body.engine, body.model, body.artifact_id, None, body.vllm_params,
+            body.engine,
+            body.model,
+            body.artifact_id,
+            None,
+            body.vllm_params,
         )
     if node.engine is InferenceEngine.LLAMA_CPP:
         request = (
@@ -168,7 +176,13 @@ def _effective_setup_selection(
             else None
         )
         return _SetupSelection(node.engine, None, node.artifact_id, request)
-    return _SetupSelection(node.engine, node.model or None, None, None)
+    return _SetupSelection(
+        node.engine,
+        node.model or None,
+        None,
+        None,
+        body.vllm_params,
+    )
 
 
 async def _validate_setup_selection(
