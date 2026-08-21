@@ -61,8 +61,9 @@ async def _main(cache_dir: Path) -> None:
         model: str | None = None,
         engine: str = "vllm",
         artifact: object | None = None,
+        vllm_params: object | None = None,
     ) -> None:
-        del hostname, managed, model, engine, artifact
+        del hostname, managed, model, engine, artifact, vllm_params
         started.set()
         await asyncio.Event().wait()
 

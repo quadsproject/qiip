@@ -585,6 +585,7 @@ async def test_schedule_enforcer_uses_same_host_lifecycle_lock(
         model: str | None = None,
         engine: str = "vllm",
         artifact: object | None = None,
+        vllm_params: object | None = None,
     ) -> None:
         assert hostname == "gpu01"
         provision_entered.set()

@@ -50,6 +50,7 @@ from inference_proxy.models.node import (
     LlamaCppSizingMode,
     Node,
     NodeStatus,
+    VllmParams,
 )
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
@@ -331,6 +332,32 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_LLMFIT_SHA256": "c" * 64,
     }
     assert provisioner._start_script_env("org/model") == {
+        "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MODEL": "org/model",
+        "HF_TOKEN": "hf secret",
+    }
+    vllm_params = VllmParams(
+        tensor_parallel_size=4,
+        max_model_len=8192,
+        gpu_memory_utilization=0.85,
+        max_num_batched_tokens=4096,
+        reasoning_parser="deepseek_r1",
+    )
+    assert provisioner._start_script_env("org/model", vllm_params=vllm_params) == {
+        "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MODEL": "org/model",
+        "AUTOVLLM_TENSOR_PARALLEL": "4",
+        "AUTOVLLM_MAX_MODEL_LEN": "8192",
+        "AUTOVLLM_GPU_MEM_UTIL": "0.85",
+        "AUTOVLLM_MAX_BATCHED_TOKENS": "4096",
+        "AUTOVLLM_REASONING_PARSER": "deepseek_r1",
+        "HF_TOKEN": "hf secret",
+    }
+    assert provisioner._start_script_env(
+        "org/model", vllm_params=VllmParams()
+    ) == {
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
         "AUTOVLLM_API_PORT": "8123",
         "AUTOVLLM_MODEL": "org/model",

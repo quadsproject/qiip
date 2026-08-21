@@ -18,6 +18,7 @@ from inference_proxy.models.node import (
     InferenceEngine,
     LlamaCppRuntimeRequest,
     LlamaCppRuntimeState,
+    VllmParams,
 )
 
 
@@ -93,6 +94,7 @@ class SetupRequest(BaseModel):
     model: str | None = Field(default=None, max_length=256)
     engine: InferenceEngine = InferenceEngine.VLLM
     artifact_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    vllm_params: VllmParams | None = None
 
     @field_validator("hostname")
     @classmethod
@@ -111,6 +113,8 @@ class SetupRequest(BaseModel):
                 raise ValueError("llama_cpp setup requires artifact_id")
             if self.model is not None:
                 raise ValueError("llama_cpp setup uses artifact_id, not model")
+            if self.vllm_params is not None:
+                raise ValueError("vllm_params is only valid for vllm setup")
         elif self.artifact_id is not None:
             raise ValueError("artifact_id is only valid for llama_cpp setup")
         return self

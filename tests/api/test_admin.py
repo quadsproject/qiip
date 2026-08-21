@@ -524,6 +524,7 @@ class TestSetupModelPassthrough:
             model="org/model",
             engine=ANY,
             artifact_id=None,
+            vllm_params=None,
             lifecycle_lease=ANY,
         )
 
@@ -543,6 +544,7 @@ class TestSetupModelPassthrough:
             model=None,
             engine=ANY,
             artifact_id=None,
+            vllm_params=None,
             lifecycle_lease=ANY,
         )
 
@@ -598,6 +600,7 @@ class TestSetupModelPassthrough:
             model=None,
             engine=InferenceEngine.LLAMA_CPP,
             artifact_id=artifact_id,
+            vllm_params=None,
             lifecycle_lease=ANY,
         )
         assert mock_provisioner.fire_background.call_args.kwargs[
@@ -1503,6 +1506,7 @@ class TestSetupEligibility:
             model="llama-3",
             engine=ANY,
             artifact_id=None,
+            vllm_params=None,
             lifecycle_lease=ANY,
         )
 
@@ -1578,6 +1582,7 @@ class TestSetupEligibility:
             model: str | None,
             engine: object = None,
             artifact_id: str | None = None,
+            vllm_params: object = None,
             lifecycle_lease: object,
         ) -> None:
             assert hostname == "gpu01"

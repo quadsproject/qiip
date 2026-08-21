@@ -143,6 +143,7 @@ class TestAdminBasicAuthentication:
             model=None,
             engine=ANY,
             artifact_id=None,
+            vllm_params=None,
             lifecycle_lease=ANY,
         )
 

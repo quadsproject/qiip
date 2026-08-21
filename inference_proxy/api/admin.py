@@ -64,6 +64,7 @@ from inference_proxy.models.node import (
     LlamaCppRuntimeRequest,
     Node,
     NodeStatus,
+    VllmParams,
 )
 from inference_proxy.provisioning.provisioner import (
     BackgroundOperation,
@@ -137,6 +138,7 @@ class _SetupSelection:
     model: str | None
     artifact_id: str | None
     llamacpp_request: LlamaCppRuntimeRequest | None
+    vllm_params: VllmParams | None = None
 
 
 def _effective_setup_selection(
@@ -152,10 +154,12 @@ def _effective_setup_selection(
     """
     explicit = bool(body.model_fields_set & _SETUP_SELECTION_FIELDS)
     if explicit:
-        return _SetupSelection(body.engine, body.model, body.artifact_id, None)
+        return _SetupSelection(
+            body.engine, body.model, body.artifact_id, None, body.vllm_params,
+        )
     if node is None:
         return fallback or _SetupSelection(
-            body.engine, body.model, body.artifact_id, None
+            body.engine, body.model, body.artifact_id, None, body.vllm_params,
         )
     if node.engine is InferenceEngine.LLAMA_CPP:
         request = (
@@ -442,6 +446,7 @@ async def setup_node(
                         model=selection.model,
                         engine=selection.engine,
                         artifact_id=selection.artifact_id,
+                        vllm_params=selection.vllm_params,
                         lifecycle_lease=lease,
                     )
                 else:

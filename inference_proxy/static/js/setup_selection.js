@@ -24,6 +24,9 @@ function createSetupSelectionController(options) {
     options.artifactSelectId || "artifact-select"
   );
   var status = document.getElementById(options.statusId || "model-status");
+  var vllmParamsContainer = document.getElementById(
+    options.vllmParamsId || "vllm-params-container"
+  );
   var onWarnings = options.onWarnings || null;
   var models = [];
   var artifacts = [];
@@ -160,6 +163,9 @@ function createSetupSelectionController(options) {
     var llama = engine === "llama_cpp";
     modelSelect.style.display = !llama && models.length ? "" : "none";
     artifactSelect.style.display = llama && artifacts.length ? "" : "none";
+    if (vllmParamsContainer) {
+      vllmParamsContainer.style.display = llama ? "none" : "";
+    }
 
     if (!catalogAvailable) {
       errorMessage = "Model catalog is unavailable.";
@@ -213,6 +219,28 @@ function createSetupSelectionController(options) {
     render();
   }
 
+  function getVllmParams() {
+    if (!vllmParamsContainer || !vllmParamsContainer.querySelectorAll) return null;
+    var fields = vllmParamsContainer.querySelectorAll("[data-vllm-param]");
+    var params = {};
+    var hasAny = false;
+    for (var i = 0; i < fields.length; i++) {
+      var field = fields[i];
+      var name = field.dataset.vllmParam;
+      var raw = field.value.trim();
+      if (!raw) continue;
+      hasAny = true;
+      if (name === "gpu_memory_utilization") {
+        params[name] = parseFloat(raw);
+      } else if (name === "reasoning_parser") {
+        params[name] = raw;
+      } else {
+        params[name] = parseInt(raw, 10);
+      }
+    }
+    return hasAny ? params : null;
+  }
+
   function getSelection() {
     if (!catalogAvailable) return null;
     if (engineSelect.value === "llama_cpp") {
@@ -220,7 +248,10 @@ function createSetupSelectionController(options) {
       return { engine: "llama_cpp", artifact_id: artifactSelect.value };
     }
     if (!hasModel(modelSelect.value)) return null;
-    return { engine: "vllm", model: modelSelect.value };
+    var selection = { engine: "vllm", model: modelSelect.value };
+    var vp = getVllmParams();
+    if (vp) selection.vllm_params = vp;
+    return selection;
   }
 
   function buildBody(base) {

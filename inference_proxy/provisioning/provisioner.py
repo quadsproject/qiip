@@ -45,6 +45,7 @@ from inference_proxy.models.node import (
     LlamaCppSizingMode,
     Node,
     NodeStatus,
+    VllmParams,
 )
 from inference_proxy.provisioning.host_lifecycle import (
     HostLifecycleCoordinator,
@@ -510,6 +511,7 @@ class NodeProvisioner:
         engine: InferenceEngine = InferenceEngine.VLLM,
         artifact: ResolvedGGUFArtifact | None = None,
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
+        vllm_params: VllmParams | None = None,
     ) -> dict[str, str]:
         """Return the exact environment accepted by the engine start script."""
         if engine == InferenceEngine.LLAMA_CPP:
@@ -551,6 +553,23 @@ class NodeProvisioner:
             }
             if model is not None:
                 env["AUTOVLLM_MODEL"] = model
+            if vllm_params is not None:
+                if vllm_params.tensor_parallel_size is not None:
+                    env["AUTOVLLM_TENSOR_PARALLEL"] = str(
+                        vllm_params.tensor_parallel_size
+                    )
+                if vllm_params.max_model_len is not None:
+                    env["AUTOVLLM_MAX_MODEL_LEN"] = str(vllm_params.max_model_len)
+                if vllm_params.gpu_memory_utilization is not None:
+                    env["AUTOVLLM_GPU_MEM_UTIL"] = str(
+                        vllm_params.gpu_memory_utilization
+                    )
+                if vllm_params.max_num_batched_tokens is not None:
+                    env["AUTOVLLM_MAX_BATCHED_TOKENS"] = str(
+                        vllm_params.max_num_batched_tokens
+                    )
+                if vllm_params.reasoning_parser is not None:
+                    env["AUTOVLLM_REASONING_PARSER"] = vllm_params.reasoning_parser
         if self._hf_token:
             env["HF_TOKEN"] = self._hf_token
         return env
@@ -1291,6 +1310,7 @@ class NodeProvisioner:
         engine: InferenceEngine = InferenceEngine.VLLM,
         artifact_id: str | None = None,
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
+        vllm_params: VllmParams | None = None,
         lifecycle_lease: HostLifecycleLease | None = None,
     ) -> None:
         """Provision *hostname* under the shared host lifecycle coordinator."""
@@ -1322,6 +1342,7 @@ class NodeProvisioner:
                     model=model,
                     engine=engine,
                     artifact=artifact,
+                    vllm_params=vllm_params,
                 )
             else:
                 await self._provision(
@@ -1354,6 +1375,7 @@ class NodeProvisioner:
         engine: InferenceEngine = InferenceEngine.VLLM,
         artifact: ResolvedGGUFArtifact | None = None,
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
+        vllm_params: VllmParams | None = None,
     ) -> None:
         """Run full provisioning sequence on *hostname*.
 
@@ -1448,6 +1470,7 @@ class NodeProvisioner:
                 engine=engine,
                 artifact=artifact,
                 llamacpp_request=llamacpp_request,
+                vllm_params=vllm_params,
             )
             current_step = "health_poll"
             await self._update_state(
@@ -1750,6 +1773,7 @@ class NodeProvisioner:
         engine: InferenceEngine = InferenceEngine.VLLM,
         artifact: ResolvedGGUFArtifact | None = None,
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
+        vllm_params: VllmParams | None = None,
     ) -> str:
         """Run the engine start script and extract model name from stdout."""
         if engine == InferenceEngine.LLAMA_CPP:
@@ -1759,7 +1783,9 @@ class NodeProvisioner:
         command = self._script_command(
             script,
             env=self._start_script_env(
-                model, engine, artifact, llamacpp_request=llamacpp_request
+                model, engine, artifact,
+                llamacpp_request=llamacpp_request,
+                vllm_params=vllm_params,
             ),
             scripts_dir=self._engine_scripts_dir(engine).name,
         )
