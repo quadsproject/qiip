@@ -124,6 +124,26 @@ class TestAdminMetricsResponse:
             response.total_requests = 1  # type: ignore[misc]
 
 
+class TestRegisterRequest:
+    def test_valid_hostname(self) -> None:
+        from inference_proxy.models.admin import RegisterRequest
+
+        req = RegisterRequest(hostname="gpu01")
+        assert req.hostname == "gpu01"
+
+    def test_rejects_empty_hostname(self) -> None:
+        from inference_proxy.models.admin import RegisterRequest
+
+        with pytest.raises(ValidationError):
+            RegisterRequest(hostname="")
+
+    def test_rejects_invalid_hostname(self) -> None:
+        from inference_proxy.models.admin import RegisterRequest
+
+        with pytest.raises(ValidationError):
+            RegisterRequest(hostname="-gpu01")
+
+
 class TestSetupRequest:
     """SetupRequest model validation for the model field."""
 

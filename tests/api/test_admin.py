@@ -694,6 +694,35 @@ class TestSetupModelPassthrough:
             InferenceEngine.VLLM
         )
 
+    def test_implicit_vllm_retry_preserves_vllm_params(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                status=NodeStatus.FAILED,
+                model="org/persisted-model",
+            )
+        )
+        mock_provisioner.provision = AsyncMock()
+        response = client.post(
+            "/admin/nodes/setup",
+            json={
+                "hostname": "gpu01",
+                "vllm_params": {"tool_call_parser": "qwen3_coder"},
+            },
+        )
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+        call_kwargs = mock_provisioner.provision.await_args.kwargs
+        assert call_kwargs["model"] == "org/persisted-model"
+        assert call_kwargs["vllm_params"] is not None
+        assert call_kwargs["vllm_params"].tool_call_parser == "qwen3_coder"
+
     def test_explicit_selection_overrides_persisted_identity(
         self,
         client: TestClient,
