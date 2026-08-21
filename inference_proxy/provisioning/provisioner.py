@@ -2223,12 +2223,17 @@ class NodeProvisioner:
             await self._update_state(
                 hostname, ProvisioningStep.DEREGISTERING, started_at=teardown_started_at
             )
+            node = self._registry.get(hostname) if self._registry else None
+            repool = node is not None and not node.managed
             self._log(hostname, "info", "Deregistering node from etcd")
             await asyncio.to_thread(
                 self._etcd_client.delete, f"{self._etcd_client.prefix}{hostname}"
             )
             if self._registry is not None:
                 self._registry.remove(hostname)
+            if repool:
+                await self.register_available(hostname)
+                self._log(hostname, "info", "Returned standalone node to available pool")
 
             await self._update_state(
                 hostname,
