@@ -243,3 +243,28 @@ class TestNodeRejectsInvalidStatus:
     def test_node_rejects_invalid_status(self) -> None:
         with pytest.raises(ValidationError):
             Node(node_id="x", endpoint="y", status="invalid")
+
+
+class TestVllmParams:
+    def test_all_fields_default_to_none(self) -> None:
+        from inference_proxy.models.node import VllmParams
+
+        params = VllmParams()
+        assert params.tensor_parallel_size is None
+        assert params.max_model_len is None
+        assert params.gpu_memory_utilization is None
+        assert params.max_num_batched_tokens is None
+        assert params.tool_call_parser is None
+        assert params.reasoning_parser is None
+
+    def test_rejects_invalid_values(self) -> None:
+        from inference_proxy.models.node import VllmParams
+
+        with pytest.raises(ValidationError):
+            VllmParams(tensor_parallel_size=0)
+        with pytest.raises(ValidationError):
+            VllmParams(gpu_memory_utilization=0.0)
+        with pytest.raises(ValidationError):
+            VllmParams(gpu_memory_utilization=1.1)
+        with pytest.raises(ValidationError):
+            VllmParams(reasoning_parser="")
