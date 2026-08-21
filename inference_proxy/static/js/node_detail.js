@@ -17,9 +17,7 @@ function setupActionBody(id, node) {
     hostname: id,
     managed: node ? node.managed !== false : true,
   };
-  return node && node.state !== "available"
-    ? base
-    : setupSelection.buildBody(base);
+  return setupSelection.buildBody(base) || base;
 }
 
 function showToast(message, type, options) {
