@@ -44,6 +44,7 @@ class VllmParams(BaseModel):
     max_model_len: int | None = Field(default=None, ge=1)
     gpu_memory_utilization: float | None = Field(default=None, gt=0.0, le=1.0)
     max_num_batched_tokens: int | None = Field(default=None, ge=1)
+    tool_call_parser: str | None = Field(default=None, min_length=1, max_length=256)
     reasoning_parser: str | None = Field(default=None, min_length=1, max_length=256)
 
 

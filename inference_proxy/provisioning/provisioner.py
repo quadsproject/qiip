@@ -568,6 +568,8 @@ class NodeProvisioner:
                     env["AUTOVLLM_MAX_BATCHED_TOKENS"] = str(
                         vllm_params.max_num_batched_tokens
                     )
+                if vllm_params.tool_call_parser is not None:
+                    env["AUTOVLLM_TOOL_CALL_PARSER"] = vllm_params.tool_call_parser
                 if vllm_params.reasoning_parser is not None:
                     env["AUTOVLLM_REASONING_PARSER"] = vllm_params.reasoning_parser
         if self._hf_token:

@@ -342,6 +342,7 @@ def test_script_env_prefix_exact() -> None:
         max_model_len=8192,
         gpu_memory_utilization=0.85,
         max_num_batched_tokens=4096,
+        tool_call_parser="mistral",
         reasoning_parser="deepseek_r1",
     )
     assert provisioner._start_script_env("org/model", vllm_params=vllm_params) == {
@@ -352,6 +353,7 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_MAX_MODEL_LEN": "8192",
         "AUTOVLLM_GPU_MEM_UTIL": "0.85",
         "AUTOVLLM_MAX_BATCHED_TOKENS": "4096",
+        "AUTOVLLM_TOOL_CALL_PARSER": "mistral",
         "AUTOVLLM_REASONING_PARSER": "deepseek_r1",
         "HF_TOKEN": "hf secret",
     }
