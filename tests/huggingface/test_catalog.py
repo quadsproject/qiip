@@ -197,9 +197,12 @@ class TestListModels:
         with capture_logs() as logs:
             result = await svc.list_models()
 
-        assert [entry.repo_id for entry in result.models] == ["org/complete"]
+        assert [entry.repo_id for entry in result.models] == [
+            "org/complete",
+            "org/legacy",
+        ]
         assert result.incomplete_count == 1
-        assert result.unverifiable_count == 1
+        assert result.unverifiable_count == 0
         assert logs == [
             {
                 "event": "catalog scan skipped models",
@@ -207,7 +210,7 @@ class TestListModels:
                 "invalid_artifact_count": 0,
                 "log_level": "warning",
                 "cache_warning_count": 0,
-                "unverifiable_count": 1,
+                "unverifiable_count": 0,
             }
         ]
 

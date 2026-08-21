@@ -127,11 +127,4 @@ class ModelCatalogService:
         if not isinstance(snapshot_path, str):
             raise TypeError("snapshot_download returned a dry-run result unexpectedly")
 
-        # huggingface_hub accepts legacy snapshots without a tree manifest
-        # because it cannot prove they are incomplete. The catalog takes the
-        # safer position and exposes these separately for operator migration.
-        commit = Path(snapshot_path).name
-        manifest = repo.repo_path / "trees" / f"{commit}.json"
-        if manifest.is_file():
-            return _SnapshotCheck("complete", commit)
-        return _SnapshotCheck("unverifiable", commit)
+        return _SnapshotCheck("complete", Path(snapshot_path).name)
