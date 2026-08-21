@@ -51,3 +51,19 @@ async def node_detail(
             "active_page": "dashboard",
         },
     )
+
+
+@dashboard_router.get("/models", response_class=HTMLResponse)
+async def models_page(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> HTMLResponse:
+    """Render the model catalog page."""
+    return templates.TemplateResponse(
+        request=request,
+        name="models.html",
+        context={
+            "poll_interval": settings.dashboard.poll_interval,
+            "active_page": "models",
+        },
+    )

@@ -3,8 +3,8 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>QIIP - Node Fleet Dashboard</title>
-    <meta name="description" content="Operations dashboard for QIIP: monitor inference nodes, provisioning status, and fleet health.">
+    <title>QIIP - Models</title>
+    <meta name="description" content="Model catalog and downloads for the QIIP inference proxy.">
     <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -37,45 +37,57 @@
     <div class="dashboard">
         <header class="dashboard-header">
             <div>
-                <h1>Node Fleet</h1>
-                <p id="node-count">Loading node data...</p>
+                <h1>Model Catalog</h1>
+                <p id="model-count">Loading model data...</p>
             </div>
             <div class="header-right">
-                <span id="quads-status"></span>
                 <p id="last-updated"></p>
-                <p id="poll-warning"></p>
             </div>
         </header>
 
         <main id="main-content">
             <section class="card">
-                <h2 class="card-title">Nodes <button type="button" class="manual-setup-toggle" id="manual-setup-toggle">+ Manual setup</button></h2>
-                <div id="manual-setup-row" style="display: none;">
-                    <form id="register-form" class="setup-form">
-                        <input type="text" id="register-hostname" placeholder="Enter hostname" required>
-                        <button type="submit" id="register-btn" class="btn btn-primary">Add to Pool</button>
+                <h2 class="card-title">Download Model <button type="button" class="manual-setup-toggle" id="download-toggle">+ New download</button></h2>
+                <div id="download-row" style="display: none;">
+                    <form id="download-form" class="setup-form">
+                        <input type="text" id="download-repo" placeholder="e.g. meta-llama/Llama-3.1-8B-Instruct" required aria-label="Repository ID">
+                        <input type="text" id="download-revision" placeholder="Revision (optional)" aria-label="Revision">
+                        <button type="submit" id="download-btn" class="btn btn-primary">Download</button>
                     </form>
                 </div>
+            </section>
+
+            <section class="card" id="downloads-section" style="display: none;">
+                <h2 class="card-title">Active Downloads</h2>
                 <div class="table-wrap">
                     <table>
                         <thead>
                             <tr>
-                                <th scope="col">Node ID</th>
-                                <th scope="col">GPU Vendor</th>
-                                <th scope="col">GPU Model</th>
-                                <th scope="col">Engine</th>
-                                <th scope="col">Model</th>
-                                <th scope="col">Config</th>
-                                <th scope="col">State</th>
-                                <th scope="col">Requests</th>
-                                <th scope="col">Actions</th>
+                                <th scope="col">Repository</th>
+                                <th scope="col">Revision</th>
+                                <th scope="col">Status</th>
+                                <th scope="col">Started</th>
                             </tr>
                         </thead>
-        <tbody id="node-table-body">
-            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
-            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
-            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
-        </tbody>
+                        <tbody id="downloads-table-body"></tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="card">
+                <h2 class="card-title">Cached Models</h2>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">Repository ID</th>
+                            </tr>
+                        </thead>
+                        <tbody id="catalog-table-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td></tr>
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td></tr>
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td></tr>
+                        </tbody>
                     </table>
                 </div>
             </section>
@@ -89,9 +101,6 @@
     </footer>
 
     <script>const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};</script>
-    <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
-    <script src="{{ static_asset_url(request, 'js/config_download.js') }}"></script>
-    <script src="{{ static_asset_url(request, 'js/setup_selection.js') }}"></script>
-    <script src="{{ static_asset_url(request, 'js/dashboard.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/models.js') }}"></script>
 </body>
 </html>
