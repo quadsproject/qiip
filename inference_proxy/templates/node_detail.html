@@ -105,6 +105,10 @@
                         <span>Max batched tokens</span>
                         <span class="runtime-input-unit"><input id="vllm-max-batched-tokens" type="number" min="1" step="1" inputmode="numeric" data-vllm-param="max_num_batched_tokens" placeholder="auto"> <span>tokens</span></span>
                     </label>
+                    <label class="runtime-control" for="vllm-tool-call-parser">
+                        <span>Tool call parser</span>
+                        <input id="vllm-tool-call-parser" type="text" maxlength="256" data-vllm-param="tool_call_parser" placeholder="hermes">
+                    </label>
                     <label class="runtime-control" for="vllm-reasoning-parser">
                         <span>Reasoning parser</span>
                         <input id="vllm-reasoning-parser" type="text" maxlength="256" data-vllm-param="reasoning_parser" placeholder="none">
