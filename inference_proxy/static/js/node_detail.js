@@ -1,7 +1,7 @@
 // ponytail: vanilla fetch + DOM, same pattern as dashboard.js
 
 var setupSelection = createSetupSelectionController({
-  onWarnings: function (msg) { showToast(msg, "warning"); },
+  onWarnings: function (msg) { showToast(msg, "warning", { persistent: true }); },
 });
 var llamaCppRelaunch = typeof createLlamaCppRelaunchController === "function"
   ? createLlamaCppRelaunchController()
@@ -22,17 +22,35 @@ function setupActionBody(id, node) {
     : setupSelection.buildBody(base);
 }
 
-function showToast(message, type) {
+function showToast(message, type, options) {
   var container = document.getElementById("toast-container");
   var toast = document.createElement("div");
   toast.className = "toast toast-" + (type || "info");
-  toast.textContent = message;
+  var persistent = options && options.persistent;
+  if (persistent) {
+    var text = document.createElement("span");
+    text.textContent = message;
+    toast.appendChild(text);
+    var btn = document.createElement("button");
+    btn.className = "toast-close";
+    btn.textContent = "×";
+    btn.setAttribute("aria-label", "Dismiss");
+    btn.addEventListener("click", function () {
+      toast.classList.remove("toast-visible");
+      setTimeout(function () { toast.remove(); }, 300);
+    });
+    toast.appendChild(btn);
+  } else {
+    toast.textContent = message;
+  }
   container.appendChild(toast);
   requestAnimationFrame(function () { toast.classList.add("toast-visible"); });
-  setTimeout(function () {
-    toast.classList.remove("toast-visible");
-    setTimeout(function () { toast.remove(); }, 300);
-  }, 4000);
+  if (!persistent) {
+    setTimeout(function () {
+      toast.classList.remove("toast-visible");
+      setTimeout(function () { toast.remove(); }, 300);
+    }, 4000);
+  }
 }
 
 function renderTableMessage(tbody, colSpan, message) {
