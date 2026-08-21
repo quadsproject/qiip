@@ -232,7 +232,7 @@ function createSetupSelectionController(options) {
       hasAny = true;
       if (name === "gpu_memory_utilization") {
         params[name] = parseFloat(raw);
-      } else if (name === "reasoning_parser") {
+      } else if (name === "tool_call_parser" || name === "reasoning_parser") {
         params[name] = raw;
       } else {
         params[name] = parseInt(raw, 10);
