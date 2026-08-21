@@ -35,6 +35,18 @@ class InferenceEngine(StrEnum):
     LLAMA_CPP = "llama_cpp"
 
 
+class VllmParams(BaseModel):
+    """Optional vLLM serve parameters submitted at setup time."""
+
+    model_config = ConfigDict(frozen=True)
+
+    tensor_parallel_size: int | None = Field(default=None, ge=1)
+    max_model_len: int | None = Field(default=None, ge=1)
+    gpu_memory_utilization: float | None = Field(default=None, gt=0.0, le=1.0)
+    max_num_batched_tokens: int | None = Field(default=None, ge=1)
+    reasoning_parser: str | None = Field(default=None, min_length=1, max_length=256)
+
+
 class NodeStatus(StrEnum):
     """Status of an inference node."""
 

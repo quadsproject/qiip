@@ -172,6 +172,30 @@ class TestSetupRequest:
         with pytest.raises(ValidationError, match="only valid for llama_cpp"):
             SetupRequest(hostname="gpu01", artifact_id="a" * 64)
 
+    def test_vllm_params_accepted_for_vllm_engine(self) -> None:
+        from inference_proxy.models.node import VllmParams
+
+        params = VllmParams(tensor_parallel_size=4, gpu_memory_utilization=0.85)
+        req = SetupRequest(hostname="gpu01", model="org/model", vllm_params=params)
+        assert req.vllm_params is not None
+        assert req.vllm_params.tensor_parallel_size == 4
+        assert req.vllm_params.gpu_memory_utilization == 0.85
+
+    def test_vllm_params_rejected_for_llamacpp_engine(self) -> None:
+        from inference_proxy.models.node import VllmParams
+
+        with pytest.raises(ValidationError, match="only valid for vllm"):
+            SetupRequest(
+                hostname="gpu01",
+                engine=InferenceEngine.LLAMA_CPP,
+                artifact_id="a" * 64,
+                vllm_params=VllmParams(tensor_parallel_size=2),
+            )
+
+    def test_vllm_params_defaults_to_none(self) -> None:
+        req = SetupRequest(hostname="gpu01")
+        assert req.vllm_params is None
+
 
 class TestDownloadRequest:
     def test_llamacpp_requires_exact_gguf_specification(self) -> None:

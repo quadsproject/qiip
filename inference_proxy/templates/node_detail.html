@@ -88,6 +88,28 @@
                     <select id="artifact-select" class="setup-select setup-artifact-select" aria-label="GGUF artifact" style="display:none"></select>
                     <span id="model-status" class="hint-text" style="display:none"></span>
                 </div>
+                <div id="vllm-params-container" class="runtime-control-grid" style="margin-top:0.75rem">
+                    <label class="runtime-control" for="vllm-tensor-parallel">
+                        <span>Tensor parallel size</span>
+                        <input id="vllm-tensor-parallel" type="number" min="1" step="1" inputmode="numeric" data-vllm-param="tensor_parallel_size" placeholder="auto">
+                    </label>
+                    <label class="runtime-control" for="vllm-max-model-len">
+                        <span>Max model length</span>
+                        <span class="runtime-input-unit"><input id="vllm-max-model-len" type="number" min="1" step="1" inputmode="numeric" data-vllm-param="max_model_len" placeholder="auto"> <span>tokens</span></span>
+                    </label>
+                    <label class="runtime-control" for="vllm-gpu-mem-util">
+                        <span>GPU memory utilization</span>
+                        <input id="vllm-gpu-mem-util" type="number" min="0.01" max="1" step="0.01" data-vllm-param="gpu_memory_utilization" placeholder="auto">
+                    </label>
+                    <label class="runtime-control" for="vllm-max-batched-tokens">
+                        <span>Max batched tokens</span>
+                        <span class="runtime-input-unit"><input id="vllm-max-batched-tokens" type="number" min="1" step="1" inputmode="numeric" data-vllm-param="max_num_batched_tokens" placeholder="auto"> <span>tokens</span></span>
+                    </label>
+                    <label class="runtime-control" for="vllm-reasoning-parser">
+                        <span>Reasoning parser</span>
+                        <input id="vllm-reasoning-parser" type="text" maxlength="256" data-vllm-param="reasoning_parser" placeholder="none">
+                    </label>
+                </div>
             </section>
 
             <section class="card" id="llamacpp-runtime-panel" hidden>

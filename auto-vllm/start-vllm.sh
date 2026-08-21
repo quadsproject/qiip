@@ -8,6 +8,7 @@ TENSOR_PARALLEL_OVERRIDE="${AUTOVLLM_TENSOR_PARALLEL:-}"
 GPU_MEM_UTIL_OVERRIDE="${AUTOVLLM_GPU_MEM_UTIL:-}"
 MAX_MODEL_LEN_OVERRIDE="${AUTOVLLM_MAX_MODEL_LEN:-}"
 MAX_BATCHED_TOKENS_OVERRIDE="${AUTOVLLM_MAX_BATCHED_TOKENS:-}"
+REASONING_PARSER_OVERRIDE="${AUTOVLLM_REASONING_PARSER:-}"
 EXTRA_ARGS_OVERRIDE="${AUTOVLLM_EXTRA_ARGS:-}"
 ATTENTION_BACKEND_OVERRIDE="${AUTOVLLM_ATTENTION_BACKEND:-}"
 FLASHINFER_CACHE="${AUTOVLLM_FLASHINFER_CACHE_DIR:-/var/cache/flashinfer}"
@@ -27,7 +28,8 @@ STARTUP_LOG_LINES="${AUTOVLLM_STARTUP_LOG_LINES:-40}"
 # VLLM_PORT is the upstream collision that motivated the namespace change.
 unset VLLM_MODEL VLLM_PORT VLLM_TENSOR_PARALLEL VLLM_GPU_MEM_UTIL
 unset VLLM_MAX_MODEL_LEN VLLM_MAX_BATCHED_TOKENS VLLM_EXTRA_ARGS
-unset VLLM_ATTENTION_BACKEND FLASHINFER_DISABLE_JIT FLASHINFER_CACHE_DIR
+unset VLLM_ATTENTION_BACKEND VLLM_REASONING_PARSER
+unset FLASHINFER_DISABLE_JIT FLASHINFER_CACHE_DIR
 
 # shellcheck source=auto-vllm/vllm-process.sh
 source "${SCRIPT_DIR}/vllm-process.sh"
@@ -147,6 +149,7 @@ clear_script_environment() {
     unset AUTOVLLM_API_PORT AUTOVLLM_NFS_MOUNT_POINT AUTOVLLM_MODEL
     unset AUTOVLLM_TENSOR_PARALLEL AUTOVLLM_GPU_MEM_UTIL
     unset AUTOVLLM_MAX_MODEL_LEN AUTOVLLM_MAX_BATCHED_TOKENS AUTOVLLM_EXTRA_ARGS
+    unset AUTOVLLM_REASONING_PARSER
     unset AUTOVLLM_SCRIPT_DIR AUTOVLLM_BIN AUTOVLLM_PID_FILE
     unset AUTOVLLM_HF_CACHE_LINK AUTOVLLM_LOG_FILE AUTOVLLM_PYTHON
     unset AUTOVLLM_PROC_ROOT AUTOVLLM_COMMAND_PATTERN
@@ -313,6 +316,11 @@ run_vllm() {
     venv_bin_dir="$(dirname "$VLLM_BIN")"
     export PATH="${venv_bin_dir}:$PATH"
 
+    local reasoning_args=""
+    if [ -n "$REASONING_PARSER_OVERRIDE" ]; then
+        reasoning_args="--reasoning-parser ${REASONING_PARSER_OVERRIDE}"
+    fi
+
     cat <<EOF
 
 # vLLM Configuration
@@ -323,6 +331,7 @@ run_vllm() {
 # Memory Util:        ${GPU_MEM_UTIL}
 # Max Context:        $MAX_MODEL_LEN tokens
 # Max Batched Tokens: $MAX_BATCHED_TOKENS tokens
+# Reasoning Parser:   ${REASONING_PARSER_OVERRIDE:-(auto)}
 # ================================================
 
 EOF
@@ -341,6 +350,7 @@ EOF
             --max-num-batched-tokens "$MAX_BATCHED_TOKENS" \
             --enable-auto-tool-choice \
             --tool-call-parser hermes \
+            ${reasoning_args} \
             ${EXTRA_ARGS:-}
     fi
 
@@ -355,6 +365,7 @@ EOF
         --max-num-batched-tokens "$MAX_BATCHED_TOKENS" \
         --enable-auto-tool-choice \
         --tool-call-parser hermes \
+        ${reasoning_args} \
         ${EXTRA_ARGS:-} \
         > "$VLLM_LOG_FILE" 2>&1 &
 
