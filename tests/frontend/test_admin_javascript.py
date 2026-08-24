@@ -1837,4 +1837,3 @@ sandbox.refreshDashboard = async function () {};
         "labeled": "Add to Fleet",
         "reset": "Add to Pool",
     }
-
