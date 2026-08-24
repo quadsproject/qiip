@@ -388,6 +388,11 @@ class TestNodeDetailPage:
         first_row_end = response.text.index("</tr>", info_body_start)
         assert response.text[info_body_start:first_row_end].count("<td>") == 9
 
+    def test_node_detail_contains_vllm_dtype_control(self, client: TestClient) -> None:
+        response = client.get("/dashboard/nodes/test-node")
+        assert 'id="vllm-dtype"' in response.text
+        assert 'data-vllm-param="dtype"' in response.text
+
     def test_node_detail_contains_llamacpp_runtime_editor(
         self, client: TestClient
     ) -> None:

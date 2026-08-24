@@ -572,6 +572,8 @@ class NodeProvisioner:
                     env["AUTOVLLM_TOOL_CALL_PARSER"] = vllm_params.tool_call_parser
                 if vllm_params.reasoning_parser is not None:
                     env["AUTOVLLM_REASONING_PARSER"] = vllm_params.reasoning_parser
+                if vllm_params.dtype is not None:
+                    env["AUTOVLLM_DTYPE"] = vllm_params.dtype
         if self._hf_token:
             env["HF_TOKEN"] = self._hf_token
         return env

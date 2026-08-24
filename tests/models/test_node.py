@@ -256,6 +256,7 @@ class TestVllmParams:
         assert params.max_num_batched_tokens is None
         assert params.tool_call_parser is None
         assert params.reasoning_parser is None
+        assert params.dtype is None
 
     def test_rejects_invalid_values(self) -> None:
         from inference_proxy.models.node import VllmParams
@@ -268,3 +269,5 @@ class TestVllmParams:
             VllmParams(gpu_memory_utilization=1.1)
         with pytest.raises(ValidationError):
             VllmParams(reasoning_parser="")
+        with pytest.raises(ValidationError):
+            VllmParams(dtype="")

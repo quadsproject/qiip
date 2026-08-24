@@ -68,6 +68,7 @@ fi
     cache_dir.mkdir(exist_ok=True)
     env = os.environ.copy()
     env.pop("INVOCATION_ID", None)
+    env.pop("AUTOVLLM_DTYPE", None)
     env.update(
         {
             "PATH": f"{bin_dir}:{env['PATH']}",
@@ -109,6 +110,7 @@ def _configured_profile(
         "AUTOVLLM_MAX_MODEL_LEN",
         "AUTOVLLM_MAX_BATCHED_TOKENS",
         "AUTOVLLM_EXTRA_ARGS",
+        "AUTOVLLM_DTYPE",
     ):
         env.pop(name, None)
     env["AUTOVLLM_SCRIPT_DIR"] = str(SCRIPT_ROOT / "auto-vllm")
@@ -420,6 +422,55 @@ while true; do sleep 1; done
         )
 
 
+def _captured_vllm_argv(tmp_path: Path, extra_env: dict[str, str] | None = None) -> str:
+    process_log = tmp_path / "process.log"
+    vllm_bin = tmp_path / "fake-vllm"
+    _write_executable(
+        vllm_bin,
+        """#!/bin/bash
+printf '%s\\n' "$*" >> "$AUTOVLLM_TEST_LOG"
+trap 'exit 0' TERM
+while true; do sleep 1; done
+""",
+    )
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=vllm_bin,
+        process_log=process_log,
+    )
+    env.update(extra_env or {})
+    try:
+        result = subprocess.run(
+            ["bash", str(START_SCRIPT)],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        return process_log.read_text()
+    finally:
+        subprocess.run(
+            ["bash", str(STOP_SCRIPT), "--force"],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+
+
+def test_dtype_override_is_passed_to_vllm_serve(tmp_path: Path) -> None:
+    argv = _captured_vllm_argv(tmp_path, {"AUTOVLLM_DTYPE": "bfloat16"})
+    assert " --dtype bfloat16" in f" {argv}"
+
+
+def test_empty_dtype_is_omitted_from_vllm_serve(tmp_path: Path) -> None:
+    argv = _captured_vllm_argv(tmp_path)
+    assert "--dtype" not in argv
+
+
 def test_hf_cache_real_directory_aborts_before_launch(tmp_path: Path) -> None:
     process_log = tmp_path / "process.log"
     vllm_bin = tmp_path / "fake-vllm"
@@ -690,6 +741,7 @@ while true; do sleep 1; done
             "AUTOVLLM_MAX_MODEL_LEN": "1234",
             "AUTOVLLM_MAX_BATCHED_TOKENS": "5678",
             "AUTOVLLM_EXTRA_ARGS": "--dtype float16",
+            "AUTOVLLM_DTYPE": "bfloat16",
             "VLLM_PORT": "8123",
             "VLLM_TENSOR_PARALLEL": "99",
             "VLLM_GPU_MEM_UTIL": "0.01",
@@ -724,6 +776,7 @@ while true; do sleep 1; done
             "AUTOVLLM_MAX_MODEL_LEN",
             "AUTOVLLM_MAX_BATCHED_TOKENS",
             "AUTOVLLM_EXTRA_ARGS",
+            "AUTOVLLM_DTYPE",
             "AUTOVLLM_SCRIPT_DIR",
             "AUTOVLLM_BIN",
             "AUTOVLLM_PID_FILE",

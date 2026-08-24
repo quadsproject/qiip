@@ -10,6 +10,7 @@ MAX_MODEL_LEN_OVERRIDE="${AUTOVLLM_MAX_MODEL_LEN:-}"
 MAX_BATCHED_TOKENS_OVERRIDE="${AUTOVLLM_MAX_BATCHED_TOKENS:-}"
 TOOL_CALL_PARSER_OVERRIDE="${AUTOVLLM_TOOL_CALL_PARSER:-}"
 REASONING_PARSER_OVERRIDE="${AUTOVLLM_REASONING_PARSER:-}"
+DTYPE_OVERRIDE="${AUTOVLLM_DTYPE:-}"
 EXTRA_ARGS_OVERRIDE="${AUTOVLLM_EXTRA_ARGS:-}"
 ATTENTION_BACKEND_OVERRIDE="${AUTOVLLM_ATTENTION_BACKEND:-}"
 FLASHINFER_CACHE="${AUTOVLLM_FLASHINFER_CACHE_DIR:-/var/cache/flashinfer}"
@@ -150,7 +151,7 @@ clear_script_environment() {
     unset AUTOVLLM_API_PORT AUTOVLLM_NFS_MOUNT_POINT AUTOVLLM_MODEL
     unset AUTOVLLM_TENSOR_PARALLEL AUTOVLLM_GPU_MEM_UTIL
     unset AUTOVLLM_MAX_MODEL_LEN AUTOVLLM_MAX_BATCHED_TOKENS AUTOVLLM_EXTRA_ARGS
-    unset AUTOVLLM_TOOL_CALL_PARSER AUTOVLLM_REASONING_PARSER
+    unset AUTOVLLM_TOOL_CALL_PARSER AUTOVLLM_REASONING_PARSER AUTOVLLM_DTYPE
     unset AUTOVLLM_SCRIPT_DIR AUTOVLLM_BIN AUTOVLLM_PID_FILE
     unset AUTOVLLM_HF_CACHE_LINK AUTOVLLM_LOG_FILE AUTOVLLM_PYTHON
     unset AUTOVLLM_PROC_ROOT AUTOVLLM_COMMAND_PATTERN
@@ -322,6 +323,10 @@ run_vllm() {
     if [ -n "$REASONING_PARSER_OVERRIDE" ]; then
         reasoning_args="--reasoning-parser ${REASONING_PARSER_OVERRIDE}"
     fi
+    local dtype_args=""
+    if [ -n "$DTYPE_OVERRIDE" ]; then
+        dtype_args="--dtype ${DTYPE_OVERRIDE}"
+    fi
 
     cat <<EOF
 
@@ -335,6 +340,7 @@ run_vllm() {
 # Max Batched Tokens: $MAX_BATCHED_TOKENS tokens
 # Tool Call Parser:   $tool_call_parser
 # Reasoning Parser:   ${REASONING_PARSER_OVERRIDE:-(none)}
+# Dtype:              ${DTYPE_OVERRIDE:-(none)}
 # ================================================
 
 EOF
@@ -354,7 +360,8 @@ EOF
             --enable-auto-tool-choice \
             --tool-call-parser "$tool_call_parser" \
             ${reasoning_args} \
-            ${EXTRA_ARGS:-}
+            ${EXTRA_ARGS:-} \
+            ${dtype_args}
     fi
 
     # EXTRA_ARGS is an intentional word-split shell override.
@@ -370,6 +377,7 @@ EOF
         --tool-call-parser "$tool_call_parser" \
         ${reasoning_args} \
         ${EXTRA_ARGS:-} \
+        ${dtype_args} \
         > "$VLLM_LOG_FILE" 2>&1 &
 
     local pid=$!

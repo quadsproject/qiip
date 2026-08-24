@@ -344,6 +344,7 @@ def test_script_env_prefix_exact() -> None:
         max_num_batched_tokens=4096,
         tool_call_parser="mistral",
         reasoning_parser="deepseek_r1",
+        dtype="bfloat16",
     )
     assert provisioner._start_script_env("org/model", vllm_params=vllm_params) == {
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
@@ -355,6 +356,7 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_MAX_BATCHED_TOKENS": "4096",
         "AUTOVLLM_TOOL_CALL_PARSER": "mistral",
         "AUTOVLLM_REASONING_PARSER": "deepseek_r1",
+        "AUTOVLLM_DTYPE": "bfloat16",
         "HF_TOKEN": "hf secret",
     }
     assert provisioner._start_script_env("org/model", vllm_params=VllmParams()) == {

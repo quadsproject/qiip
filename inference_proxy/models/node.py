@@ -46,6 +46,7 @@ class VllmParams(BaseModel):
     max_num_batched_tokens: int | None = Field(default=None, ge=1)
     tool_call_parser: str | None = Field(default=None, min_length=1, max_length=256)
     reasoning_parser: str | None = Field(default=None, min_length=1, max_length=256)
+    dtype: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class NodeStatus(StrEnum):
