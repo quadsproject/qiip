@@ -218,6 +218,8 @@ class Node(BaseModel):
         active_connections: Number of active inference requests.
         managed: Whether the proxy owns the node lifecycle. Externally
             registered nodes must opt in explicitly.
+        self_setup: Whether the node was adopted from an already-running
+            vLLM instance. These nodes are never torn down.
     """
 
     model_config = ConfigDict(frozen=True, extra="ignore")
@@ -233,3 +235,10 @@ class Node(BaseModel):
     capabilities: NodeCapabilities = Field(default_factory=NodeCapabilities)
     active_connections: int = 0
     managed: bool = False
+    self_setup: bool = False
+
+    @model_validator(mode="after")
+    def self_setup_is_unmanaged(self) -> Node:
+        if self.self_setup and self.managed:
+            raise ValueError("self_setup nodes cannot be managed")
+        return self

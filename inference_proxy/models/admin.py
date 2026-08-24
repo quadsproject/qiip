@@ -48,6 +48,7 @@ class AdminNodeResponse(BaseModel):
     gpu_model: str | None = None
     gpu_count: int | None = None
     managed: bool = True
+    self_setup: bool = False
     failed_step: str | None = None
     error: str | None = None
 
@@ -72,6 +73,7 @@ class RegisterRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     hostname: str
+    self_setup: bool = False
 
     @field_validator("hostname")
     @classmethod

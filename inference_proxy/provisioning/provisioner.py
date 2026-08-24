@@ -33,7 +33,11 @@ from inference_proxy.huggingface.artifacts import (
     GGUFArtifactIndex,
     ResolvedGGUFArtifact,
 )
-from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
+from inference_proxy.models.endpoint import (
+    EndpointPolicy,
+    EndpointValidationError,
+    build_backend_url,
+)
 from inference_proxy.models.node import (
     InferenceEngine,
     LlamaCppCacheType,
@@ -67,6 +71,8 @@ if TYPE_CHECKING:
     from etcd3gw.types import KeyValue
 
 logger = structlog.get_logger()
+
+_SELF_SETUP_PROBE_TIMEOUT = 5.0
 
 STEP_PATTERN = re.compile(r"\[STEP:(\w+):(START|OK|FAIL|WARN)\]")
 MODEL_PATTERN = re.compile(r"#\s*Model:\s+(.+)")
@@ -129,6 +135,27 @@ _ENGINE_BUNDLE_FILES = {
 
 class ProvisioningError(Exception):
     """Raised when any stage of provisioning fails."""
+
+
+class SelfSetupError(Exception):
+    """Raised when an already-running vLLM instance cannot be adopted."""
+
+
+def served_vllm_model_id(payload: object) -> str | None:
+    """Return the first OpenAI-compatible model id from a ``/v1/models`` body."""
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if not isinstance(data, list) or not data:
+        return None
+    first = data[0]
+    if not isinstance(first, dict):
+        return None
+    model_id = first.get("id")
+    if not isinstance(model_id, str):
+        return None
+    model_id = model_id.strip()
+    return model_id or None
 
 
 class ProvisioningCapacityError(RuntimeError):
@@ -1278,13 +1305,86 @@ class NodeProvisioner:
         if self._registry is not None:
             self._registry.add(node)
 
+    async def register_self_setup(self, hostname: str) -> Node:
+        """Adopt an already-running vLLM instance into the fleet.
+
+        Probes ``/health`` and ``/v1/models`` immediately, then registers the
+        detected model in etcd. QIIP never owns this node's lifecycle.
+        """
+        endpoint = self.validate_endpoint(hostname)
+        model = await self._discover_running_vllm_model(endpoint, hostname)
+        node = Node(
+            node_id=hostname,
+            endpoint=endpoint,
+            status=NodeStatus.HEALTHY,
+            model=model,
+            engine=InferenceEngine.VLLM,
+            last_heartbeat=datetime.now(UTC),
+            managed=False,
+            self_setup=True,
+        )
+        key, value = node_to_etcd(node, self._etcd_client.prefix)
+        await asyncio.to_thread(self._etcd_client.put, key, value)
+        if self._registry is not None:
+            self._registry.add(node)
+        logger.info(
+            "self_setup_node_registered",
+            hostname=hostname,
+            model=model,
+            key=key,
+        )
+        return node
+
+    async def _discover_running_vllm_model(self, endpoint: str, hostname: str) -> str:
+        """Health-check an existing vLLM server and return the served model id."""
+        health_url = build_backend_url(endpoint, "/health")
+        models_url = build_backend_url(endpoint, "/v1/models")
+        timeout = httpx.Timeout(_SELF_SETUP_PROBE_TIMEOUT)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                health = await client.get(health_url)
+                if health.status_code != 200:
+                    raise SelfSetupError(
+                        f"vLLM health check failed on {hostname}: "
+                        f"HTTP {health.status_code}"
+                    )
+                models = await client.get(models_url)
+                if models.status_code != 200:
+                    raise SelfSetupError(
+                        f"vLLM model discovery failed on {hostname}: "
+                        f"HTTP {models.status_code}"
+                    )
+                try:
+                    payload: object = models.json()
+                except ValueError as exc:
+                    raise SelfSetupError(
+                        f"vLLM model list on {hostname} was not valid JSON"
+                    ) from exc
+        except SelfSetupError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise SelfSetupError(f"vLLM health check timed out on {hostname}") from exc
+        except httpx.HTTPError as exc:
+            raise SelfSetupError(f"vLLM is not reachable on {hostname}") from exc
+
+        model = served_vllm_model_id(payload)
+        if model is None:
+            raise SelfSetupError(
+                f"vLLM on {hostname} is healthy but reported no models"
+            )
+        return model
+
     async def remove_available(self, hostname: str) -> None:
-        """Remove a manually registered available node from the pool."""
+        """Remove a manually registered node from the fleet."""
         await asyncio.to_thread(
             self._etcd_client.delete, f"{self._etcd_client.prefix}{hostname}"
         )
         if self._registry is not None:
             self._registry.remove(hostname)
+        if self._tracker is not None:
+            self._tracker.remove(hostname)
+        if self._cb_registry is not None:
+            self._cb_registry.remove(hostname)
 
     async def cleanup_stale_node(self, hostname: str) -> None:
         """Delete stale discovery and local routing state before a retry.
@@ -1894,6 +1994,7 @@ class NodeProvisioner:
         engine: InferenceEngine = InferenceEngine.VLLM,
         artifact_id: str | None = None,
         llamacpp_runtime: LlamaCppRuntimeState | None = None,
+        self_setup: bool = False,
     ) -> None:
         """Register node in etcd with correct fields (D-11, D-12)."""
         node = Node(
@@ -1906,6 +2007,7 @@ class NodeProvisioner:
             llamacpp_runtime=llamacpp_runtime,
             last_heartbeat=datetime.now(UTC),
             managed=managed,
+            self_setup=self_setup,
         )
         key, value = node_to_etcd(node, self._etcd_client.prefix)
         # ponytail: etcd3gw is sync, asyncio.to_thread wraps it (Pitfall 5)

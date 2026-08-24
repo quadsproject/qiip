@@ -90,6 +90,7 @@ def _make_node(
     engine: InferenceEngine = InferenceEngine.VLLM,
     artifact_id: str | None = None,
     llamacpp_runtime: LlamaCppRuntimeState | None = None,
+    self_setup: bool = False,
 ) -> Node:
     """Create a test node with sensible defaults."""
     return Node(
@@ -101,6 +102,7 @@ def _make_node(
         engine=engine,
         artifact_id=artifact_id,
         llamacpp_runtime=llamacpp_runtime,
+        self_setup=self_setup,
     )
 
 
@@ -199,6 +201,7 @@ class TestAdminNodesPopulated:
             "gpu_model",
             "gpu_count",
             "managed",
+            "self_setup",
             "failed_step",
             "error",
         }
@@ -313,6 +316,7 @@ class TestAdminNodesPopulated:
                 "gpu_model": None,
                 "gpu_count": None,
                 "managed": True,
+                "self_setup": False,
                 "failed_step": None,
                 "error": None,
             }
@@ -1153,6 +1157,144 @@ class TestTasksEndpoint:
         assert response.json() == []
 
 
+class TestNodePool:
+    """POST/DELETE /admin/nodes/pool for available and self-setup nodes."""
+
+    def test_register_available_pool(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.register_available = AsyncMock()
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+
+        response = client.post("/admin/nodes/pool", json={"hostname": "gpu01"})
+
+        assert response.status_code == 201
+        assert response.json() == {"hostname": "gpu01", "state": "available"}
+        mock_provisioner.register_available.assert_awaited_once_with("gpu01")
+        mock_provisioner.register_self_setup.assert_not_called()
+
+    def test_register_self_setup_adopts_running_vllm(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.register_self_setup = AsyncMock(
+            return_value=_make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+        )
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+
+        response = client.post(
+            "/admin/nodes/pool",
+            json={"hostname": "gpu01", "self_setup": True},
+        )
+
+        assert response.status_code == 201
+        assert response.json() == {
+            "hostname": "gpu01",
+            "state": "healthy",
+            "model": "org/model",
+            "self_setup": True,
+        }
+        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01")
+        mock_provisioner.register_available.assert_not_called()
+
+    def test_register_self_setup_unreachable_returns_502(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        from inference_proxy.provisioning.provisioner import SelfSetupError
+
+        mock_provisioner.register_self_setup = AsyncMock(
+            side_effect=SelfSetupError("vLLM is not reachable on gpu01")
+        )
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+
+        response = client.post(
+            "/admin/nodes/pool",
+            json={"hostname": "gpu01", "self_setup": True},
+        )
+
+        assert response.status_code == 502
+        assert "not reachable" in response.json()["detail"]
+
+    def test_duplicate_registration_returns_409(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(_make_node(node_id="gpu01"))
+        response = client.post("/admin/nodes/pool", json={"hostname": "gpu01"})
+        assert response.status_code == 409
+        mock_provisioner.register_available.assert_not_called()
+
+    def test_remove_available_unmanaged(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.remove_available = AsyncMock()
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                status=NodeStatus.AVAILABLE,
+                managed=False,
+                model="",
+            )
+        )
+
+        response = client.delete("/admin/nodes/gpu01/pool")
+
+        assert response.status_code == 200
+        assert response.json() == {"hostname": "gpu01", "removed": True}
+        mock_provisioner.remove_available.assert_awaited_once_with("gpu01")
+
+    def test_remove_healthy_self_setup(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.remove_available = AsyncMock()
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+        )
+
+        response = client.delete("/admin/nodes/gpu01/pool")
+
+        assert response.status_code == 200
+        mock_provisioner.remove_available.assert_awaited_once_with("gpu01")
+
+    def test_remove_healthy_standalone_requires_teardown(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.remove_available = AsyncMock()
+        test_registry.add(_make_node(node_id="gpu01", managed=False))
+
+        response = client.delete("/admin/nodes/gpu01/pool")
+
+        assert response.status_code == 409
+        assert "teardown" in response.json()["detail"]
+        mock_provisioner.remove_available.assert_not_called()
+
+
 class TestTeardownEndpoint:
     """DELETE /admin/nodes/{id} triggers teardown."""
 
@@ -1166,6 +1308,26 @@ class TestTeardownEndpoint:
         response = client.delete("/admin/nodes/gpu01")
         assert response.status_code == 202
         assert response.json() == {"task_id": "gpu01"}
+
+    def test_self_setup_node_cannot_be_torn_down(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+        )
+        response = client.delete("/admin/nodes/gpu01")
+        assert response.status_code == 409
+        assert "self-setup" in response.json()["detail"]
+        mock_provisioner.cancel_active_provision.assert_not_awaited()
+        mock_provisioner.fire_background.assert_not_called()
 
     def test_force_param_passed(
         self,
@@ -1596,6 +1758,28 @@ class TestSetupEligibility:
         assert "2 active request" in response.json()["detail"]
         assert "wait" in response.json()["detail"].lower()
         mock_provisioner.cleanup_stale_node.assert_not_awaited()
+
+    def test_self_setup_node_cannot_be_provisioned(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+        )
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 409
+        assert "self-setup" in response.json()["detail"]
+        mock_provisioner.try_reserve_host.assert_not_awaited()
+        mock_provisioner.fire_background.assert_not_called()
 
     def test_setup_returns_409_while_host_operation_is_reserved(
         self,

@@ -278,6 +278,12 @@ class TestSetupForm:
         response = client.get("/dashboard")
         assert 'id="register-btn"' in response.text
 
+    def test_contains_self_setup_checkbox(self, client: TestClient) -> None:
+        """Manual setup can adopt an existing vLLM instance."""
+        response = client.get("/dashboard")
+        assert 'id="register-self-setup"' in response.text
+        assert "Existing vLLM instance" in response.text
+
     def test_model_selection_not_on_dashboard(self, client: TestClient) -> None:
         """Model/engine selection removed from dashboard manual setup."""
         response = client.get("/dashboard")
@@ -319,6 +325,10 @@ class TestNodeDetailPage:
         """Page contains the node_id."""
         response = client.get("/dashboard/nodes/test-node")
         assert "test-node" in response.text
+
+    def test_contains_origin_tag(self, client: TestClient) -> None:
+        response = client.get("/dashboard/nodes/test-node")
+        assert 'id="node-origin-tag"' in response.text
 
     def test_contains_back_link(self, client: TestClient) -> None:
         """Page contains a link back to the fleet dashboard."""

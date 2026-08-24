@@ -74,6 +74,7 @@ from inference_proxy.provisioning.provisioner import (
     ProvisioningIdentity,
     RelaunchPreconditionError,
     RelaunchValidationError,
+    SelfSetupError,
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -292,7 +293,7 @@ async def register_node(
     registry: NodeRegistry = Depends(get_registry),
     provisioner: NodeProvisioner = Depends(get_provisioner),
 ) -> JSONResponse:
-    """Register a node in the available pool without provisioning."""
+    """Register a node in the available pool, or adopt a running vLLM instance."""
     hostname = canonical_hostname(body.hostname)
     node = registry.get(hostname)
     if node is not None:
@@ -303,6 +304,20 @@ async def register_node(
         provisioner.validate_endpoint(hostname)
     except EndpointValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if body.self_setup:
+        try:
+            adopted = await provisioner.register_self_setup(hostname)
+        except SelfSetupError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return JSONResponse(
+            status_code=201,
+            content={
+                "hostname": hostname,
+                "state": adopted.status.value,
+                "model": adopted.model,
+                "self_setup": True,
+            },
+        )
     await provisioner.register_available(hostname)
     return JSONResponse(
         status_code=201,
@@ -316,11 +331,14 @@ async def remove_from_pool(
     registry: NodeRegistry = Depends(get_registry),
     provisioner: NodeProvisioner = Depends(get_provisioner),
 ) -> JSONResponse:
-    """Remove a manually registered node from the available pool."""
+    """Remove a manually registered node from the fleet."""
     hostname = _validated_hostname(node_id)
     node = registry.get(hostname)
     if node is None:
         raise HTTPException(status_code=404, detail=f"Node '{hostname}' not found")
+    if node.self_setup:
+        await provisioner.remove_available(hostname)
+        return JSONResponse(content={"hostname": hostname, "removed": True})
     if node.status != NodeStatus.AVAILABLE:
         raise HTTPException(
             status_code=409,
@@ -356,6 +374,14 @@ async def setup_node(
         fields_set=sorted(body.model_fields_set),
     )
     initial_node = registry.get(hostname)
+    if initial_node is not None and initial_node.self_setup:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Node '{hostname}' is a self-setup vLLM instance; "
+                "remove it from the fleet instead of provisioning"
+            ),
+        )
     selection = _effective_setup_selection(body, initial_node)
 
     try:
@@ -668,6 +694,15 @@ async def teardown_node(
     """Trigger teardown of a node (runs in background)."""
     node_id = canonical_hostname(node_id)
     cancelled_identity: ProvisioningIdentity | None = None
+    existing = registry.get(node_id)
+    if existing is not None and existing.self_setup:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Node '{node_id}' is a self-setup vLLM instance; "
+                "remove it from the fleet instead of tearing it down"
+            ),
+        )
 
     if recovery_engine is not None:
         if not force:
@@ -713,6 +748,14 @@ async def teardown_node(
     transferred = False
     try:
         registered_node = registry.get(node_id)
+        if registered_node is not None and registered_node.self_setup:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Node '{node_id}' is a self-setup vLLM instance; "
+                    "remove it from the fleet instead of tearing it down"
+                ),
+            )
         if recovery_engine is not None and registered_node is not None:
             raise HTTPException(
                 status_code=409,

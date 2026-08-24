@@ -100,12 +100,18 @@ const ACTION_CONFIG = {
     url: (nodeId) => `/admin/nodes/${nodeId}/pool`,
     body: null,
     confirm: true,
-    confirmMsg: (nodeId) => `Remove ${nodeId} from the available pool?`,
+    confirmMsg: (nodeId, node) =>
+      node && node.self_setup
+        ? `Remove ${nodeId} from the fleet? The existing vLLM instance will keep running.`
+        : `Remove ${nodeId} from the available pool?`,
     danger: false,
     label: "Remove",
     pendingLabel: "Removing…",
     css: "btn-secondary",
-    successMsg: (nodeId) => `${nodeId} removed from pool`,
+    successMsg: (nodeId, node) =>
+      node && node.self_setup
+        ? `${nodeId} removed from fleet`
+        : `${nodeId} removed from pool`,
   },
 };
 
@@ -124,7 +130,7 @@ async function handleAction(action, nodeId, node, onStart) {
   if (config.confirm) {
     const ok = await confirmDialog({
       title: config.label,
-      message: config.confirmMsg(nodeId),
+      message: config.confirmMsg(nodeId, node),
       confirmLabel: config.label,
       danger: config.danger,
     });
@@ -140,7 +146,7 @@ async function handleAction(action, nodeId, node, onStart) {
   try {
     const resp = await fetch(config.url(nodeId), options);
     if (resp.ok) {
-      showToast(config.successMsg(nodeId), "success");
+      showToast(config.successMsg(nodeId, node), "success");
     } else {
       const data = await resp.json().catch(() => ({ detail: `HTTP ${resp.status}` }));
       showToast(data.detail || `HTTP ${resp.status}`, "error");
@@ -268,7 +274,13 @@ async function refreshDashboard() {
         idLink.textContent = node.node_id.split(".")[0];
         idLink.title = node.node_id;
         tdId.appendChild(idLink);
-        if (node.managed === false) {
+        if (node.self_setup) {
+          const tag = document.createElement("span");
+          tag.className = "badge badge-self-setup";
+          tag.textContent = "vllm-self";
+          tdId.appendChild(document.createTextNode(" "));
+          tdId.appendChild(tag);
+        } else if (node.managed === false) {
           const tag = document.createElement("span");
           tag.className = "badge badge-standalone";
           tag.textContent = "standalone";
@@ -481,24 +493,43 @@ document.addEventListener("DOMContentLoaded", function () {
     }
   });
 
-  // Registration form handler — adds node to pool without provisioning
+  // Registration form handler — adds node to pool or adopts a running vLLM
   const form = document.getElementById("register-form");
+  const selfSetup = document.getElementById("register-self-setup");
+  const registerBtn = document.getElementById("register-btn");
+  function syncRegisterLabel() {
+    registerBtn.textContent = selfSetup.checked ? "Add to Fleet" : "Add to Pool";
+  }
+  selfSetup.addEventListener("change", syncRegisterLabel);
   form.addEventListener("submit", async function (e) {
     e.preventDefault();
     const input = document.getElementById("register-hostname");
     const btn = document.getElementById("register-btn");
     const hostname = input.value.trim();
     if (!hostname) return;
+    const adoptExisting = selfSetup.checked;
     btn.disabled = true;
     try {
       const resp = await fetch("/admin/nodes/pool", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ hostname }),
+        body: JSON.stringify({ hostname, self_setup: adoptExisting }),
       });
       if (resp.ok) {
-        showToast(`${hostname} added to pool`, "success");
+        const data = await resp.json().catch(function () { return {}; });
+        if (adoptExisting) {
+          showToast(
+            data.model
+              ? `${hostname} added to fleet serving ${data.model}`
+              : `${hostname} added to fleet`,
+            "success"
+          );
+        } else {
+          showToast(`${hostname} added to pool`, "success");
+        }
         input.value = "";
+        selfSetup.checked = false;
+        syncRegisterLabel();
         setTimeout(function () { btn.disabled = false; }, 2000);
       } else {
         const data = await resp.json().catch(() => ({ detail: `HTTP ${resp.status}` }));
