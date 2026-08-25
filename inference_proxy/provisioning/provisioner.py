@@ -142,7 +142,14 @@ class SelfSetupError(Exception):
 
 
 def served_vllm_model_id(payload: object) -> str | None:
-    """Return the first OpenAI-compatible model id from a ``/v1/models`` body."""
+    """Return the primary OpenAI-compatible model id from a ``/v1/models`` body.
+
+    Self-setup adoption tracks exactly one model: the first entry vLLM
+    reports. Additional aliases and LoRA entries are intentionally not
+    tracked (single-model contract). Re-adoption re-probes the live server
+    and reconciles the stored model, so an external restart with another
+    primary model is refreshed on each re-adoption.
+    """
     if not isinstance(payload, dict):
         return None
     data = payload.get("data")
@@ -1310,9 +1317,24 @@ class NodeProvisioner:
 
         Probes ``/health`` and ``/v1/models`` immediately, then registers the
         detected model in etcd. QIIP never owns this node's lifecycle.
+
+        Single-model contract: a self-setup node tracks exactly one model —
+        the primary id vLLM reports first on ``/v1/models``. Aliases and LoRA
+        entries are ignored by design. Re-adoption re-probes the live server
+        and reconciles the stored model, so drift from an external restart
+        with another primary model is refreshed on each re-adoption instead of
+        silently keeping the first reported model forever.
         """
         endpoint = self.validate_endpoint(hostname)
         model = await self._discover_running_vllm_model(endpoint, hostname)
+        prior = self._registry.get(hostname) if self._registry is not None else None
+        if prior is not None and prior.self_setup and prior.model != model:
+            logger.warning(
+                "self_setup_model_drift_reconciled",
+                hostname=hostname,
+                previous_model=prior.model,
+                model=model,
+            )
         node = Node(
             node_id=hostname,
             endpoint=endpoint,

@@ -27,6 +27,22 @@ LLAMACPP_CONTEXT_ALIGNMENT = 256
 LLAMACPP_MAX_AGGREGATE_CONTEXT = 4_294_967_040
 LLAMACPP_MAX_SEQUENCES = 256
 
+# vLLM --dtype values accepted at the API boundary and by the auto-vLLM
+# start script. Kept in one place so a dtype override can never smuggle extra
+# vLLM argv (e.g. "float16 --seed 0" is rejected, not word-split).
+SUPPORTED_VLLM_DTYPES = frozenset(
+    {
+        "auto",
+        "half",
+        "float16",
+        "bfloat16",
+        "float",
+        "float32",
+        "float8_e4m3fn",
+        "float8_e5m2",
+    }
+)
+
 
 class InferenceEngine(StrEnum):
     """Supported inference engine backends."""
@@ -36,7 +52,13 @@ class InferenceEngine(StrEnum):
 
 
 class VllmParams(BaseModel):
-    """Optional vLLM serve parameters submitted at setup time."""
+    """Optional vLLM serve parameters submitted at setup time.
+
+    The ``dtype`` field is validated against the supported vLLM dtype
+    allowlist rather than passed through verbatim, so a value such as
+    ``"float16 --seed 0"`` is rejected instead of becoming an additional
+    vLLM flag downstream.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -47,6 +69,16 @@ class VllmParams(BaseModel):
     tool_call_parser: str | None = Field(default=None, min_length=1, max_length=256)
     reasoning_parser: str | None = Field(default=None, min_length=1, max_length=256)
     dtype: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @field_validator("dtype")
+    @classmethod
+    def validate_dtype(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if value not in SUPPORTED_VLLM_DTYPES:
+            allowed = ", ".join(sorted(SUPPORTED_VLLM_DTYPES))
+            raise ValueError(f"unsupported vLLM dtype {value!r}; allowed: {allowed}")
+        return value
 
 
 class NodeStatus(StrEnum):

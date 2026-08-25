@@ -620,6 +620,16 @@ async function refreshDetail() {
       document.getElementById("setup-config-panel").style.display =
         node.self_setup ? "none" : "";
 
+      // Self-setup nodes are externally owned: QIIP must not send BMC power
+      // actions or install software on them, and the server rejects those
+      // operations outright. Hide the matching controls here.
+      document.getElementById("power-state").style.display =
+        node.self_setup ? "none" : "";
+      document.getElementById("power-actions").style.display =
+        node.self_setup ? "none" : "";
+      document.getElementById("recommendations-panel").style.display =
+        node.self_setup ? "none" : "";
+
       infoBody.textContent = "";
       var tr = document.createElement("tr");
 
@@ -1305,6 +1315,17 @@ async function handlePowerAction(action, actionBtn) {
 
 async function refreshPowerState() {
   var el = document.querySelector("#power-state span");
+  var powerStateEl = document.getElementById("power-state");
+  var powerActionsEl = document.getElementById("power-actions");
+  // Self-setup nodes are externally owned: QIIP never sends BMC power actions,
+  // so the power card is hidden once we know the node's origin.
+  if (currentDetailNode && currentDetailNode.self_setup) {
+    powerStateEl.style.display = "none";
+    powerActionsEl.style.display = "none";
+    return;
+  }
+  powerStateEl.style.display = "";
+  powerActionsEl.style.display = "";
   try {
     var resp = await fetch("/admin/nodes/" + encodeURIComponent(NODE_ID) + "/power");
     if (resp.status === 503) {
@@ -1377,7 +1398,6 @@ document.addEventListener("DOMContentLoaded", function () {
       }
     });
   }
-  fetchCatalog().then(refreshDetail);
-  refreshPowerState();
+  fetchCatalog().then(refreshDetail).then(function () { refreshPowerState(); });
   setInterval(refreshDetail, POLL_INTERVAL_MS);
 });

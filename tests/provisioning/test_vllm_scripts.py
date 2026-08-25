@@ -35,18 +35,21 @@ def _script_environment(
     *,
     vllm_bin: Path,
     process_log: Path,
+    gpu_model: str = "NVIDIA A100",
+    gpu_vram_mb: int = 81920,
+    gpu_compute_cap: str = "8.0",
 ) -> dict[str, str]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     nvidia_smi = bin_dir / "nvidia-smi"
     _write_executable(
         nvidia_smi,
-        """#!/bin/bash
+        f"""#!/bin/bash
 case "$*" in
-  *"--query-gpu=name"*) echo "NVIDIA A100" ;;
-  *"--list-gpus"*) echo "GPU 0: NVIDIA A100" ;;
-  *"--query-gpu=memory.total"*) echo "81920" ;;
-  *"--query-gpu=compute_cap"*) echo "8.0" ;;
+  *"--query-gpu=name"*) echo "{gpu_model}" ;;
+  *"--list-gpus"*) echo "GPU 0: {gpu_model}" ;;
+  *"--query-gpu=memory.total"*) echo "{gpu_vram_mb}" ;;
+  *"--query-gpu=compute_cap"*) echo "{gpu_compute_cap}" ;;
   *"--query-gpu=driver_version"*) echo "580.126.09" ;;
   *"--query-gpu=persistence_mode"*) echo "Enabled" ;;
 esac
@@ -125,9 +128,9 @@ GPU_MODEL={gpu_model!r}
 GPU_COUNT={gpu_count}
 GPU_VRAM_GB={gpu_vram_gb}
 configure_vllm_params
-printf '%s|%s|%s|%s|%s|%s\n' \
+printf '%s|%s|%s|%s|%s|%s|%s\\n' \
     "$MODEL" "$TENSOR_PARALLEL" "$GPU_MEM_UTIL" \
-    "$MAX_MODEL_LEN" "$MAX_BATCHED_TOKENS" "$EXTRA_ARGS"
+    "$MAX_MODEL_LEN" "$MAX_BATCHED_TOKENS" "$EXTRA_ARGS" "$EFFECTIVE_DTYPE"
 """,
         ],
         env=env,
@@ -422,7 +425,11 @@ while true; do sleep 1; done
         )
 
 
-def _captured_vllm_argv(tmp_path: Path, extra_env: dict[str, str] | None = None) -> str:
+def _captured_vllm_argv(
+    tmp_path: Path,
+    extra_env: dict[str, str] | None = None,
+    gpu_model: str = "NVIDIA A100",
+) -> str:
     process_log = tmp_path / "process.log"
     vllm_bin = tmp_path / "fake-vllm"
     _write_executable(
@@ -437,6 +444,7 @@ while true; do sleep 1; done
         tmp_path,
         vllm_bin=vllm_bin,
         process_log=process_log,
+        gpu_model=gpu_model,
     )
     env.update(extra_env or {})
     try:
@@ -464,11 +472,65 @@ while true; do sleep 1; done
 def test_dtype_override_is_passed_to_vllm_serve(tmp_path: Path) -> None:
     argv = _captured_vllm_argv(tmp_path, {"AUTOVLLM_DTYPE": "bfloat16"})
     assert " --dtype bfloat16" in f" {argv}"
+    assert argv.count("--dtype") == 1
 
 
 def test_empty_dtype_is_omitted_from_vllm_serve(tmp_path: Path) -> None:
     argv = _captured_vllm_argv(tmp_path)
     assert "--dtype" not in argv
+
+
+def test_t4_default_emits_single_float16_dtype(tmp_path: Path) -> None:
+    # T4 forces float16 by default; it must reach vLLM as exactly one --dtype
+    # argv value (it is no longer smuggled through EXTRA_ARGS).
+    argv = _captured_vllm_argv(tmp_path, gpu_model="Tesla T4")
+    assert " --dtype float16" in f" {argv}"
+    assert argv.count("--dtype") == 1
+
+
+def test_dtype_override_wins_over_t4_default_without_duplicate(tmp_path: Path) -> None:
+    # The reviewer-raised conflict: T4 defaults to float16 via EXTRA_ARGS and a
+    # dtype override would previously produce two --dtype flags. Now the
+    # override wins and the default is dropped: exactly one --dtype emitted.
+    argv = _captured_vllm_argv(
+        tmp_path,
+        {"AUTOVLLM_DTYPE": "bfloat16"},
+        gpu_model="Tesla T4",
+    )
+    assert argv.count("--dtype") == 1
+    assert " --dtype bfloat16" in f" {argv}"
+    assert "--dtype float16" not in argv
+
+
+def test_invalid_dtype_override_fails_before_launch(tmp_path: Path) -> None:
+    process_log = tmp_path / "process.log"
+    vllm_bin = tmp_path / "fake-vllm"
+    _write_executable(
+        vllm_bin,
+        """#!/bin/bash
+echo launched >> "$AUTOVLLM_TEST_LOG"
+""",
+    )
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=vllm_bin,
+        process_log=process_log,
+    )
+    env["AUTOVLLM_DTYPE"] = "float16 --seed 0"
+
+    result = subprocess.run(
+        ["bash", str(START_SCRIPT)],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "float16 --seed 0" in result.stderr
+    assert "unsupported vLLM dtype" in result.stderr
+    assert not process_log.exists()
 
 
 def test_hf_cache_real_directory_aborts_before_launch(tmp_path: Path) -> None:
@@ -558,19 +620,19 @@ while true; do sleep 1; done
             "NVIDIA A100",
             3,
             80,
-            ["Qwen/Qwen2.5-72B-Instruct", "3", "0.90", "32768", "32768", ""],
+            ["Qwen/Qwen2.5-72B-Instruct", "3", "0.90", "32768", "32768", "", ""],
         ),
         (
             "NVIDIA A100",
             2,
             80,
-            ["Qwen/Qwen2.5-32B-Instruct", "2", "0.90", "32768", "32768", ""],
+            ["Qwen/Qwen2.5-32B-Instruct", "2", "0.90", "32768", "32768", "", ""],
         ),
         (
             "NVIDIA A100",
             1,
             40,
-            ["Qwen/Qwen2.5-14B-Instruct", "1", "0.90", "32768", "32768", ""],
+            ["Qwen/Qwen2.5-14B-Instruct", "1", "0.90", "32768", "32768", "", ""],
         ),
         (
             "Tesla V100",
@@ -582,7 +644,8 @@ while true; do sleep 1; done
                 "0.85",
                 "8192",
                 "32768",
-                "--dtype float16",
+                "",
+                "float16",
             ],
         ),
         (
@@ -595,7 +658,8 @@ while true; do sleep 1; done
                 "0.85",
                 "8192",
                 "32768",
-                "--dtype float16",
+                "",
+                "float16",
             ],
         ),
         (
@@ -609,6 +673,7 @@ while true; do sleep 1; done
                 "4096",
                 "32768",
                 "--enforce-eager",
+                "",
             ],
         ),
         (
@@ -622,6 +687,7 @@ while true; do sleep 1; done
                 "4096",
                 "32768",
                 "--enforce-eager",
+                "",
             ],
         ),
     ],
@@ -653,7 +719,8 @@ def test_explicit_vllm_overrides_still_win() -> None:
             "AUTOVLLM_GPU_MEM_UTIL": "0.73",
             "AUTOVLLM_MAX_MODEL_LEN": "1234",
             "AUTOVLLM_MAX_BATCHED_TOKENS": "5678",
-            "AUTOVLLM_EXTRA_ARGS": "--dtype float16",
+            "AUTOVLLM_EXTRA_ARGS": "--enforce-eager",
+            "AUTOVLLM_DTYPE": "bfloat16",
         },
     ) == [
         "example/custom-model",
@@ -661,8 +728,82 @@ def test_explicit_vllm_overrides_still_win() -> None:
         "0.73",
         "1234",
         "5678",
-        "--dtype float16",
+        "--enforce-eager",
+        "bfloat16",
     ]
+
+
+def test_explicit_dtype_override_wins_over_v100_default() -> None:
+    # V100 normally defaults to float16; an explicit override must replace it
+    # rather than producing two conflicting --dtype arguments.
+    assert _configured_profile(
+        gpu_model="Tesla V100",
+        gpu_count=2,
+        gpu_vram_gb=32,
+        overrides={"AUTOVLLM_DTYPE": "bfloat16"},
+    ) == [
+        "Qwen/Qwen2.5-14B-Instruct",
+        "2",
+        "0.85",
+        "8192",
+        "32768",
+        "",
+        "bfloat16",
+    ]
+
+
+def test_invalid_dtype_override_is_rejected_by_allowlist() -> None:
+    # "float16 --seed 0" contains whitespace and is not a supported dtype; it
+    # must fail closed instead of becoming an additional vLLM flag.
+    env = os.environ.copy()
+    env["AUTOVLLM_SCRIPT_DIR"] = str(SCRIPT_ROOT / "auto-vllm")
+    env["AUTOVLLM_DTYPE"] = "float16 --seed 0"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+GPU_MODEL='NVIDIA A100'
+GPU_COUNT=1
+GPU_VRAM_GB=80
+configure_vllm_params
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "unsupported vLLM dtype 'float16 --seed 0'" in result.stderr
+
+
+def test_extra_args_containing_dtype_is_rejected() -> None:
+    env = os.environ.copy()
+    env["AUTOVLLM_SCRIPT_DIR"] = str(SCRIPT_ROOT / "auto-vllm")
+    env["AUTOVLLM_EXTRA_ARGS"] = "--enforce-eager --dtype float16"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+GPU_MODEL='NVIDIA A100'
+GPU_COUNT=1
+GPU_VRAM_GB=80
+configure_vllm_params
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "--dtype inside AUTOVLLM_EXTRA_ARGS" in result.stderr
 
 
 def test_reserved_vllm_names_are_ignored_without_compatibility_warnings() -> None:
@@ -740,7 +881,7 @@ while true; do sleep 1; done
             "AUTOVLLM_GPU_MEM_UTIL": "0.73",
             "AUTOVLLM_MAX_MODEL_LEN": "1234",
             "AUTOVLLM_MAX_BATCHED_TOKENS": "5678",
-            "AUTOVLLM_EXTRA_ARGS": "--dtype float16",
+            "AUTOVLLM_EXTRA_ARGS": "--enforce-eager",
             "AUTOVLLM_DTYPE": "bfloat16",
             "VLLM_PORT": "8123",
             "VLLM_TENSOR_PARALLEL": "99",

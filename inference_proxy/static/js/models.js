@@ -1,5 +1,12 @@
 // ponytail: vanilla fetch + DOM, same pattern as dashboard.js
 
+// Poll guards, modeled on dashboard.js: never let overlapping catalog polls
+// accumulate (the catalog request scans the NFS cache and can outlive the
+// polling interval), and never let an older response overwrite a newer one.
+let modelsPollInFlight = false;
+let modelsRequestSequence = 0;
+let modelsLastRenderedSequence = 0;
+
 function showToast(message, type) {
   const container = document.getElementById("toast-container");
   const toast = document.createElement("div");
@@ -31,14 +38,18 @@ function tr(cells) {
   return row;
 }
 
-async function fetchCatalog() {
+async function fetchCatalog(requestSequence) {
   try {
     const resp = await fetch("/admin/models/catalog");
     if (!resp.ok) throw new Error(resp.statusText);
     const data = await resp.json();
-    renderCatalog(data);
+    if (requestSequence >= modelsLastRenderedSequence) {
+      renderCatalog(data);
+    }
   } catch (err) {
-    document.getElementById("model-count").textContent = "Failed to load catalog";
+    if (requestSequence >= modelsLastRenderedSequence) {
+      document.getElementById("model-count").textContent = "Failed to load catalog";
+    }
   }
 }
 
@@ -68,12 +79,17 @@ function renderCatalog(data) {
   }
 }
 
-async function fetchDownloads() {
+async function fetchDownloads(requestSequence) {
   try {
     const resp = await fetch("/admin/models/downloads");
     if (!resp.ok) return;
     const downloads = await resp.json();
-    renderDownloads(downloads);
+    // Calls from outside the poll loop (e.g. after a download starts) carry no
+    // sequence and always render; poll calls are guarded against stale
+    // responses overwriting a newer render.
+    if (requestSequence == null || requestSequence >= modelsLastRenderedSequence) {
+      renderDownloads(downloads);
+    }
   } catch (_) {
     // silent — downloads section is supplementary
   }
@@ -154,7 +170,7 @@ document.getElementById("download-form").addEventListener("submit", async (e) =>
     document.getElementById("download-revision").value = "";
     row.style.display = "none";
     toggle.textContent = "+ New download";
-    fetchDownloads();
+    await fetchDownloads();
   } catch (err) {
     showToast("Download failed: " + err.message, "error");
   } finally {
@@ -169,9 +185,22 @@ function updateTimestamp() {
 }
 
 async function poll() {
-  await Promise.all([fetchCatalog(), fetchDownloads()]);
-  updateTimestamp();
+  if (modelsPollInFlight) return false;
+  modelsPollInFlight = true;
+  const requestSequence = ++modelsRequestSequence;
+  try {
+    await Promise.all([fetchCatalog(requestSequence), fetchDownloads(requestSequence)]);
+    if (requestSequence >= modelsLastRenderedSequence) {
+      modelsLastRenderedSequence = requestSequence;
+      updateTimestamp();
+    }
+  } finally {
+    modelsPollInFlight = false;
+  }
+  return true;
 }
 
-poll();
-setInterval(poll, POLL_INTERVAL_MS);
+document.addEventListener("DOMContentLoaded", function () {
+  poll();
+  setInterval(poll, POLL_INTERVAL_MS);
+});

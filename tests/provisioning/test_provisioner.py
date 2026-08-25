@@ -1441,6 +1441,44 @@ class TestSelfSetupRegistration:
 
         etcd.put.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_readoption_reconciles_drifted_model(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        """A self-setup node tracks one model. When the externally owned vLLM
+        is restarted with another model, re-adoption reconciles the stored
+        model instead of keeping the first reported value forever."""
+        from structlog.testing import capture_logs
+
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        registry = NodeRegistry()
+        provisioner = _make_provisioner(etcd_client=etcd, registry=registry)
+        httpx_mock.add_response(url="http://host1:8000/health", status_code=200)
+        httpx_mock.add_response(
+            url="http://host1:8000/v1/models",
+            json={"data": [{"id": "org/first"}]},
+        )
+        httpx_mock.add_response(url="http://host1:8000/health", status_code=200)
+        httpx_mock.add_response(
+            url="http://host1:8000/v1/models",
+            json={"data": [{"id": "org/second"}]},
+        )
+
+        first = await provisioner.register_self_setup("host1")
+        assert first.model == "org/first"
+        assert etcd.put.call_count == 1
+
+        with capture_logs():
+            second = await provisioner.register_self_setup("host1")
+
+        assert second.model == "org/second"
+        assert second.self_setup is True
+        stored = registry.get("host1")
+        assert stored is not None
+        assert stored.model == "org/second"
+        assert etcd.put.call_count == 2
+
 
 class TestSetupFailure:
     """D-08: setup failures retain their original typed exception."""
