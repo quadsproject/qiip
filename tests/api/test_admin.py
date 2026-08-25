@@ -2530,9 +2530,7 @@ class TestExecutePowerAction:
             )
         )
 
-        response = client.post(
-            "/admin/nodes/gpu01/power", json={"action": "ForceOff"}
-        )
+        response = client.post("/admin/nodes/gpu01/power", json={"action": "ForceOff"})
 
         assert response.status_code == 409
         assert "self-setup" in response.json()["detail"]
