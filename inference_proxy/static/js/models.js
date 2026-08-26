@@ -84,14 +84,22 @@ async function fetchDownloads(requestSequence) {
     const resp = await fetch("/admin/models/downloads");
     if (!resp.ok) return;
     const downloads = await resp.json();
-    // Calls from outside the poll loop (e.g. after a download starts) carry no
-    // sequence and always render; poll calls are guarded against stale
-    // responses overwriting a newer render.
-    if (requestSequence == null || requestSequence >= modelsLastRenderedSequence) {
+    if (requestSequence >= modelsLastRenderedSequence) {
       renderDownloads(downloads);
     }
   } catch (_) {
     // silent — downloads section is supplementary
+  }
+}
+
+// Out-of-band refresh after starting a download. It is given a newer request
+// sequence so an older in-flight periodic poll cannot pass the render guard
+// and overwrite the freshly rendered download list.
+async function refreshDownloads() {
+  const requestSequence = ++modelsRequestSequence;
+  await fetchDownloads(requestSequence);
+  if (requestSequence >= modelsLastRenderedSequence) {
+    modelsLastRenderedSequence = requestSequence;
   }
 }
 
@@ -170,7 +178,7 @@ document.getElementById("download-form").addEventListener("submit", async (e) =>
     document.getElementById("download-revision").value = "";
     row.style.display = "none";
     toggle.textContent = "+ New download";
-    await fetchDownloads();
+    await refreshDownloads();
   } catch (err) {
     showToast("Download failed: " + err.message, "error");
   } finally {

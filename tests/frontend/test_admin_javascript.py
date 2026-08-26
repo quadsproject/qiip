@@ -2091,3 +2091,45 @@ async function submit() {
         r["url"] == "/admin/models/download" and r["method"] == "POST"
         for r in result["requested"]
     )
+
+
+def test_models_manual_download_refresh_invalidates_older_poll() -> None:
+    """The out-of-band downloads refresh must advance the request sequence so
+    an older in-flight poll's response cannot pass the render guard and
+    overwrite the freshly rendered download list."""
+    result = _run_models_scenario(
+        r"""
+let downloadsRequests = 0;
+let resolveOldDownloads;
+sandbox.fetch = async function (url, options) {
+  if (url === "/admin/models/catalog") {
+    return response({ models: [], gguf_artifacts: [] });
+  }
+  if (url === "/admin/models/download" && options && options.method === "POST") {
+    return { ok: true, json: async function () { return {}; } };
+  }
+  if (url === "/admin/models/downloads") {
+    downloadsRequests += 1;
+    if (downloadsRequests === 1) {
+      return new Promise(function (resolve) { resolveOldDownloads = resolve; });
+    }
+    return response([{ repo_id: "fresh-model", status: "downloading", started_at: null }]);
+  }
+  throw new Error("unexpected URL " + url);
+};
+byId("download-repo").value = "fresh-model";
+byId("download-revision").value = "";
+(async function () {
+  const oldPoll = sandbox.poll();
+  await byId("download-form").listeners.submit({ preventDefault() {} });
+  resolveOldDownloads(response([{ repo_id: "stale-model", status: "complete", started_at: null }]));
+  await oldPoll;
+  const rows = byId("downloads-table-body").children.map(function (row) {
+    return row.children[0].textContent;
+  });
+  process.stdout.write(JSON.stringify({ downloadsRequests, rows }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {"downloadsRequests": 2, "rows": ["fresh-model"]}

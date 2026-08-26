@@ -922,27 +922,50 @@ async def execute_power_action(
     body: PowerActionRequest,
     redfish: RedfishClient | None = Depends(get_redfish_client),
     registry: NodeRegistry = Depends(get_registry),
+    provisioner: NodeProvisioner = Depends(get_provisioner),
 ) -> PowerStateResponse:
-    """Execute a power action on a node's BMC (PWR-01/02/03, D-05)."""
+    """Execute a power action on a node's BMC (PWR-01/02/03, D-05).
+
+    Power actions are host-mutating, so the hostname is reserved through the
+    host lifecycle coordinator up front and owned through the Redfish call:
+    a self-setup node is not yet registered while adoption holds the lease
+    (the ``registry.get`` below would miss it), and a concurrent setup or
+    teardown must not be power-cycled out from under itself.
+    """
     if redfish is None:
         raise HTTPException(status_code=503, detail="Redfish not configured")
     hostname = _validated_hostname(hostname)
-    node = registry.get(hostname)
-    if node is not None and node.self_setup:
+    lease = await provisioner.try_reserve_host(hostname)
+    if lease is None:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Node '{hostname}' is a self-setup vLLM instance; "
-                "QIIP does not own its hardware and cannot send BMC power actions"
+                f"Host lifecycle operation already in progress for '{hostname}'; "
+                "wait for it to finish before sending BMC power actions"
             ),
         )
     try:
-        final_state = await redfish.power_action(hostname, body.action.value)
-    except RedfishDestinationError as exc:
-        raise HTTPException(status_code=400, detail=exc.human_message) from exc
-    except RedfishError as exc:
-        raise HTTPException(status_code=502, detail=exc.human_message) from exc
-    return PowerStateResponse(hostname=hostname, power_state=final_state)
+        # Re-check under exclusive ownership: adoption can complete while we
+        # waited for the lease, so the node may now be registered as
+        # self-setup even though the earlier read would have missed it.
+        node = registry.get(hostname)
+        if node is not None and node.self_setup:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Node '{hostname}' is a self-setup vLLM instance; "
+                    "QIIP does not own its hardware and cannot send BMC power actions"
+                ),
+            )
+        try:
+            final_state = await redfish.power_action(hostname, body.action.value)
+        except RedfishDestinationError as exc:
+            raise HTTPException(status_code=400, detail=exc.human_message) from exc
+        except RedfishError as exc:
+            raise HTTPException(status_code=502, detail=exc.human_message) from exc
+        return PowerStateResponse(hostname=hostname, power_state=final_state)
+    finally:
+        lease.release()
 
 
 @admin_router.get(
@@ -957,7 +980,15 @@ async def get_recommendations(
     provisioner: NodeProvisioner = Depends(get_provisioner),
     poller: QUADSPoller | None = Depends(get_quads_poller),
 ) -> RecommendationResponse | JSONResponse:
-    """Return ranked model recommendations for a node's hardware."""
+    """Return ranked model recommendations for a node's hardware.
+
+    Recommendations can install llmfit with sudo on the host, so the hostname
+    is reserved through the host lifecycle coordinator before the ownership
+    check and held through ``runner.recommend()``: a self-setup node is not
+    yet registered while adoption holds the lease, so the ``registry.get``
+    below would otherwise let software be installed on externally owned
+    hardware.
+    """
     hostname = _validated_hostname(hostname)
     try:
         provisioner.validate_endpoint(hostname)
@@ -967,73 +998,92 @@ async def get_recommendations(
             detail=f"Node '{hostname}' is not available for recommendations",
         ) from exc
 
-    registered_node = registry.get(hostname)
-    if registered_node is not None and registered_node.self_setup:
+    lease = await provisioner.try_reserve_host(hostname)
+    if lease is None:
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Node '{hostname}' is a self-setup vLLM instance; "
-                "QIIP cannot recommend or install software on externally "
-                "owned hardware"
+                f"Host lifecycle operation already in progress for '{hostname}'; "
+                "wait for it to finish before requesting recommendations"
             ),
         )
-    registered = registered_node is not None
-    quads_available = False
-    if poller is not None:
-        inventory = {canonical_hostname(host.hostname) for host in poller.hosts}
-        available = {
-            canonical_hostname(available_host)
-            for available_host in poller.available_hostnames
-        }
-        quads_available = hostname in inventory and hostname in available
-    if not registered and not quads_available:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Node '{hostname}' is not available for recommendations",
-        )
-
     try:
-        result = await runner.recommend(hostname)
-    except LLMFitTimeoutError as exc:
-        logger.warning("llmfit_timeout", host=exc.host, timeout=exc.timeout)
-        return JSONResponse(
-            status_code=502,
-            content={"error_type": "timeout", "detail": str(exc)},
+        # Re-check under exclusive ownership: adoption can complete while we
+        # waited for the lease, so the node may now be registered as
+        # self-setup even though the earlier read would have missed it.
+        registered_node = registry.get(hostname)
+        if registered_node is not None and registered_node.self_setup:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Node '{hostname}' is a self-setup vLLM instance; "
+                    "QIIP cannot recommend or install software on externally "
+                    "owned hardware"
+                ),
+            )
+        registered = registered_node is not None
+        quads_available = False
+        if poller is not None:
+            inventory = {canonical_hostname(host.hostname) for host in poller.hosts}
+            available = {
+                canonical_hostname(available_host)
+                for available_host in poller.available_hostnames
+            }
+            quads_available = hostname in inventory and hostname in available
+        if not registered and not quads_available:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Node '{hostname}' is not available for recommendations",
+            )
+
+        try:
+            result = await runner.recommend(hostname)
+        except LLMFitTimeoutError as exc:
+            logger.warning("llmfit_timeout", host=exc.host, timeout=exc.timeout)
+            return JSONResponse(
+                status_code=502,
+                content={"error_type": "timeout", "detail": str(exc)},
+            )
+        except LLMFitParseError as exc:
+            logger.warning(
+                "llmfit_parse_error",
+                host=hostname,
+                reason=exc.reason,
+                raw_output=exc.raw_output,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error_type": "parse_error",
+                    "detail": f"Failed to parse llmfit output: {exc.reason}",
+                },
+            )
+        except SSHConnectionError as exc:
+            logger.warning(
+                "llmfit_ssh_connection_error", host=exc.host, reason=exc.reason
+            )
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error_type": "connection_error",
+                    "detail": f"SSH connection failed: {exc.reason}",
+                },
+            )
+        except RemoteCommandError as exc:
+            logger.warning(
+                "llmfit_remote_command_error",
+                host=exc.host,
+                exit_status=exc.exit_status,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error_type": "ssh_error",
+                    "detail": f"llmfit exited with status {exc.exit_status}",
+                },
+            )
+        return RecommendationResponse(
+            hostname=hostname, system=result.system, models=result.models
         )
-    except LLMFitParseError as exc:
-        logger.warning(
-            "llmfit_parse_error",
-            host=hostname,
-            reason=exc.reason,
-            raw_output=exc.raw_output,
-        )
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error_type": "parse_error",
-                "detail": f"Failed to parse llmfit output: {exc.reason}",
-            },
-        )
-    except SSHConnectionError as exc:
-        logger.warning("llmfit_ssh_connection_error", host=exc.host, reason=exc.reason)
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error_type": "connection_error",
-                "detail": f"SSH connection failed: {exc.reason}",
-            },
-        )
-    except RemoteCommandError as exc:
-        logger.warning(
-            "llmfit_remote_command_error", host=exc.host, exit_status=exc.exit_status
-        )
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error_type": "ssh_error",
-                "detail": f"llmfit exited with status {exc.exit_status}",
-            },
-        )
-    return RecommendationResponse(
-        hostname=hostname, system=result.system, models=result.models
-    )
+    finally:
+        lease.release()

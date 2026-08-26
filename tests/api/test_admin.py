@@ -2536,6 +2536,27 @@ class TestExecutePowerAction:
         assert "self-setup" in response.json()["detail"]
         mock_redfish.power_action.assert_not_awaited()
 
+    def test_power_action_returns_409_when_host_lease_is_reserved(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """Adoption holds the host lease while the node is not yet registered,
+        so a power action arriving mid-adoption must not reach externally owned
+        hardware even though the registry read would miss the node."""
+        mock_redfish = AsyncMock()
+        mock_redfish.power_action.return_value = "On"
+        app.dependency_overrides[get_redfish_client] = lambda: mock_redfish
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = None
+
+        response = client.post("/admin/nodes/gpu01/power", json={"action": "ForceOff"})
+
+        assert response.status_code == 409
+        assert "already in progress" in response.json()["detail"]
+        mock_redfish.power_action.assert_not_awaited()
+
 
 # -- Recommendation endpoint tests (API-01, API-02, API-03) --
 
@@ -2616,6 +2637,25 @@ class TestRecommendations:
 
         assert response.status_code == 409
         assert "self-setup" in response.json()["detail"]
+        mock_llmfit_runner.recommend.assert_not_awaited()
+
+    def test_recommendations_return_409_when_host_lease_is_reserved(
+        self,
+        client: TestClient,
+        mock_llmfit_runner: MagicMock,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """Adoption holds the host lease while the node is not yet registered,
+        so a recommendations request arriving mid-adoption must not run
+        llmfit (which installs with sudo) on externally owned hardware even
+        though the registry read would miss the node."""
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = None
+
+        response = client.get("/admin/nodes/gpu01/recommendations")
+
+        assert response.status_code == 409
+        assert "already in progress" in response.json()["detail"]
         mock_llmfit_runner.recommend.assert_not_awaited()
 
     def test_returns_200_with_models(
@@ -2723,6 +2763,7 @@ class TestRecommendationErrors:
         )
         provisioner = MagicMock()
         provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+        provisioner.try_reserve_host = AsyncMock(return_value=MagicMock())
         application = FastAPI()
         application.include_router(admin_router)
 
