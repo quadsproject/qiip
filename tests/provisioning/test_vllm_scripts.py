@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import subprocess
 import time
@@ -804,6 +805,30 @@ configure_vllm_params
     )
     assert result.returncode != 0
     assert "--dtype inside AUTOVLLM_EXTRA_ARGS" in result.stderr
+
+
+def test_shell_and_python_dtype_allowlists_are_identical() -> None:
+    """The auto-vLLM start script and the API boundary must accept exactly the
+    same --dtype values: the six that the pinned vLLM 0.26.0 accepts. The
+    float8_* values are KV-cache dtype settings and must never drift into
+    either allowlist."""
+    from inference_proxy.models.node import SUPPORTED_VLLM_DTYPES
+
+    match = re.search(
+        r'^SUPPORTED_VLLM_DTYPES="([^"]*)"',
+        START_SCRIPT.read_text(),
+        re.MULTILINE,
+    )
+    assert match is not None
+    assert set(match.group(1).split()) == SUPPORTED_VLLM_DTYPES
+    assert {
+        "auto",
+        "half",
+        "float16",
+        "bfloat16",
+        "float",
+        "float32",
+    } == SUPPORTED_VLLM_DTYPES
 
 
 def test_reserved_vllm_names_are_ignored_without_compatibility_warnings() -> None:

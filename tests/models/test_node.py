@@ -299,3 +299,24 @@ class TestVllmParams:
             VllmParams(reasoning_parser="")
         with pytest.raises(ValidationError):
             VllmParams(dtype="")
+
+    def test_supported_dtypes_are_accepted(self) -> None:
+        from inference_proxy.models.node import SUPPORTED_VLLM_DTYPES, VllmParams
+
+        assert (
+            frozenset({"auto", "half", "float16", "bfloat16", "float", "float32"})
+            == SUPPORTED_VLLM_DTYPES
+        )
+        for dtype in sorted(SUPPORTED_VLLM_DTYPES):
+            assert VllmParams(dtype=dtype).dtype == dtype
+
+    def test_kv_cache_float8_dtypes_are_rejected(self) -> None:
+        # float8_e4m3fn / float8_e5m2 are KV-cache dtype settings, not --dtype
+        # values; the pinned vLLM 0.26.0 rejects them at argv parse time, so
+        # QIIP must reject them at the API boundary too.
+        from inference_proxy.models.node import VllmParams
+
+        with pytest.raises(ValidationError):
+            VllmParams(dtype="float8_e4m3fn")
+        with pytest.raises(ValidationError):
+            VllmParams(dtype="float8_e5m2")

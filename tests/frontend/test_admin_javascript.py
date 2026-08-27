@@ -2133,3 +2133,43 @@ byId("download-revision").value = "";
     )
 
     assert result == {"downloadsRequests": 2, "rows": ["fresh-model"]}
+
+
+def test_models_older_manual_refresh_cannot_overwrite_newer_poll_downloads() -> None:
+    """Inverse ordering: an older manual refresh landing after a newer poll has
+    rendered its downloads (but before that poll's catalog fetch completes)
+    must not replace the newer download table."""
+    result = _run_models_scenario(
+        r"""
+let downloadsRequests = 0;
+let resolveManualDownloads;
+let resolvePollCatalog;
+sandbox.fetch = async function (url) {
+  if (url === "/admin/models/downloads") {
+    downloadsRequests += 1;
+    if (downloadsRequests === 1) {
+      return new Promise(function (resolve) { resolveManualDownloads = resolve; });
+    }
+    return response([{ repo_id: "newer-poll-download", status: "downloading", started_at: null }]);
+  }
+  if (url === "/admin/models/catalog") {
+    return new Promise(function (resolve) { resolvePollCatalog = resolve; });
+  }
+  throw new Error("unexpected URL " + url);
+};
+(async function () {
+  const manual = sandbox.refreshDownloads();
+  const poll = sandbox.poll();
+  resolveManualDownloads(response([{ repo_id: "stale-manual-download", status: "complete", started_at: null }]));
+  resolvePollCatalog(response({ models: [], gguf_artifacts: [] }));
+  await manual;
+  await poll;
+  const rows = byId("downloads-table-body").children.map(function (row) {
+    return row.children[0].textContent;
+  });
+  process.stdout.write(JSON.stringify({ downloadsRequests, rows }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {"downloadsRequests": 2, "rows": ["newer-poll-download"]}

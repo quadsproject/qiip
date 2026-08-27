@@ -3,9 +3,14 @@
 // Poll guards, modeled on dashboard.js: never let overlapping catalog polls
 // accumulate (the catalog request scans the NFS cache and can outlive the
 // polling interval), and never let an older response overwrite a newer one.
+// Catalog and downloads keep separate render generations because their fetches
+// can complete out of order: recording each generation when it renders (not at
+// the end of a poll) prevents an older response from slipping in between a
+// poll's two renders.
 let modelsPollInFlight = false;
 let modelsRequestSequence = 0;
-let modelsLastRenderedSequence = 0;
+let modelsLastCatalogRendered = 0;
+let modelsLastDownloadsRendered = 0;
 
 function showToast(message, type) {
   const container = document.getElementById("toast-container");
@@ -43,11 +48,12 @@ async function fetchCatalog(requestSequence) {
     const resp = await fetch("/admin/models/catalog");
     if (!resp.ok) throw new Error(resp.statusText);
     const data = await resp.json();
-    if (requestSequence >= modelsLastRenderedSequence) {
+    if (requestSequence >= modelsLastCatalogRendered) {
       renderCatalog(data);
+      modelsLastCatalogRendered = requestSequence;
     }
   } catch (err) {
-    if (requestSequence >= modelsLastRenderedSequence) {
+    if (requestSequence >= modelsLastCatalogRendered) {
       document.getElementById("model-count").textContent = "Failed to load catalog";
     }
   }
@@ -84,23 +90,20 @@ async function fetchDownloads(requestSequence) {
     const resp = await fetch("/admin/models/downloads");
     if (!resp.ok) return;
     const downloads = await resp.json();
-    if (requestSequence >= modelsLastRenderedSequence) {
+    if (requestSequence >= modelsLastDownloadsRendered) {
       renderDownloads(downloads);
+      modelsLastDownloadsRendered = requestSequence;
     }
   } catch (_) {
     // silent — downloads section is supplementary
   }
 }
 
-// Out-of-band refresh after starting a download. It is given a newer request
-// sequence so an older in-flight periodic poll cannot pass the render guard
-// and overwrite the freshly rendered download list.
+// Out-of-band refresh after starting a download. It is assigned a fresh
+// generation, so an older in-flight poll (or any other older download
+// response) cannot pass the downloads render guard afterwards.
 async function refreshDownloads() {
-  const requestSequence = ++modelsRequestSequence;
-  await fetchDownloads(requestSequence);
-  if (requestSequence >= modelsLastRenderedSequence) {
-    modelsLastRenderedSequence = requestSequence;
-  }
+  await fetchDownloads(++modelsRequestSequence);
 }
 
 const STATUS_BADGE = {
@@ -198,8 +201,12 @@ async function poll() {
   const requestSequence = ++modelsRequestSequence;
   try {
     await Promise.all([fetchCatalog(requestSequence), fetchDownloads(requestSequence)]);
-    if (requestSequence >= modelsLastRenderedSequence) {
-      modelsLastRenderedSequence = requestSequence;
+    // Only refresh the timestamp when this poll is the newest render for both
+    // sections; an older poll superseded by a manual refresh is not "current".
+    if (
+      requestSequence >= modelsLastCatalogRendered &&
+      requestSequence >= modelsLastDownloadsRendered
+    ) {
       updateTimestamp();
     }
   } finally {

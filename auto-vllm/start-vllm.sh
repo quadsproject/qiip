@@ -27,8 +27,10 @@ STARTUP_LOG_LINES="${AUTOVLLM_STARTUP_LOG_LINES:-40}"
 
 # vLLM --dtype values accepted by resolve_dtype. Kept as one allowlist so an
 # override such as "float16 --seed 0" fails closed instead of becoming extra
-# vLLM argv, and exactly one --dtype is ever emitted per launch.
-SUPPORTED_VLLM_DTYPES="auto half float16 bfloat16 float float32 float8_e4m3fn float8_e5m2"
+# vLLM argv, and exactly one --dtype is ever emitted per launch. These are the
+# values the pinned vLLM 0.26.0 accepts for --dtype; the float8_* KV-cache
+# dtype settings are intentionally excluded and must match node.py.
+SUPPORTED_VLLM_DTYPES="auto half float16 bfloat16 float float32"
 
 # Ignore legacy script inputs instead of leaking them into vLLM's reserved
 # environment namespace. VLLM_MODEL was an internal gateway handoff;

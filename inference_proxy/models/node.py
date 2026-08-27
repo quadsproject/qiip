@@ -29,7 +29,9 @@ LLAMACPP_MAX_SEQUENCES = 256
 
 # vLLM --dtype values accepted at the API boundary and by the auto-vLLM
 # start script. Kept in one place so a dtype override can never smuggle extra
-# vLLM argv (e.g. "float16 --seed 0" is rejected, not word-split).
+# vLLM argv (e.g. "float16 --seed 0" is rejected, not word-split). This is the
+# exact set the pinned vLLM 0.26.0 accepts for --dtype; the float8_* values are
+# KV-cache dtype settings and are intentionally excluded.
 SUPPORTED_VLLM_DTYPES = frozenset(
     {
         "auto",
@@ -38,8 +40,6 @@ SUPPORTED_VLLM_DTYPES = frozenset(
         "bfloat16",
         "float",
         "float32",
-        "float8_e4m3fn",
-        "float8_e5m2",
     }
 )
 
