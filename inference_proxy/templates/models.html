@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>QIIP - Models</title>
+    <meta name="description" content="Model catalog and downloads for the QIIP inference proxy.">
+    <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
+    <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
+</head>
+<body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    {% set dash_active = active_page == 'dashboard' %}
+    {% set models_active = active_page == 'models' %}
+    {% set chat_active = active_page == 'chat' %}
+    <nav class="top-bar" aria-label="Primary">
+        <div class="brand">
+            <img class="brand-mark" src="{{ static_asset_url(request, 'img/qiip.svg') }}" alt="QIIP" width="29" height="24">
+            <span class="brand-sep" aria-hidden="true"></span>
+            <span class="brand-sub">Inference Proxy</span>
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard" class="nav-link{{ ' nav-link-active' if dash_active else '' }}"{% if dash_active %} aria-current="page"{% endif %}>Dashboard</a>
+            <a href="/models" class="nav-link{{ ' nav-link-active' if models_active else '' }}"{% if models_active %} aria-current="page"{% endif %}>Models</a>
+            <a href="/chat" class="nav-link{{ ' nav-link-active' if chat_active else '' }}"{% if chat_active %} aria-current="page"{% endif %}>Chat</a>
+        </div>
+        <button class="theme-toggle" onclick="let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;localStorage.setItem('theme',t)" aria-label="Toggle color theme">
+            <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+            <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+        </button>
+    </nav>
+
+    <div class="dashboard">
+        <header class="dashboard-header">
+            <div>
+                <h1>Model Catalog</h1>
+                <p id="model-count">Loading model data...</p>
+            </div>
+            <div class="header-right">
+                <p id="last-updated"></p>
+            </div>
+        </header>
+
+        <main id="main-content">
+            <section class="card">
+                <h2 class="card-title">Download Model <button type="button" class="manual-setup-toggle" id="download-toggle">+ New download</button></h2>
+                <div id="download-row" style="display: none;">
+                    <form id="download-form" class="setup-form">
+                        <input type="text" id="download-repo" placeholder="e.g. meta-llama/Llama-3.1-8B-Instruct" required aria-label="Repository ID">
+                        <input type="text" id="download-revision" placeholder="Revision (optional)" aria-label="Revision">
+                        <button type="submit" id="download-btn" class="btn btn-primary">Download</button>
+                    </form>
+                </div>
+            </section>
+
+            <section class="card" id="downloads-section" style="display: none;">
+                <h2 class="card-title">Active Downloads</h2>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">Repository</th>
+                                <th scope="col">Revision</th>
+                                <th scope="col">Status</th>
+                                <th scope="col">Started</th>
+                            </tr>
+                        </thead>
+                        <tbody id="downloads-table-body"></tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="card">
+                <h2 class="card-title">Cached Models</h2>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">Repository ID</th>
+                            </tr>
+                        </thead>
+                        <tbody id="catalog-table-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td></tr>
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td></tr>
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <footer>
+        <p>QIIP Inference Proxy</p>
+    </footer>
+
+    <script>const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};</script>
+    <script src="{{ static_asset_url(request, 'js/models.js') }}"></script>
+</body>
+</html>

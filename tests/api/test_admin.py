@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from unittest.mock import ANY, AsyncMock, MagicMock, call
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import httpx
 import pytest
@@ -60,6 +61,7 @@ from inference_proxy.models.node import (
     NodeStatus,
 )
 from inference_proxy.models.quads import QUADSHost
+from inference_proxy.provisioning.host_lifecycle import HostLifecycleCoordinator
 from inference_proxy.provisioning.provisioner import (
     BackgroundOperation,
     ProvisioningCapacityError,
@@ -90,6 +92,7 @@ def _make_node(
     engine: InferenceEngine = InferenceEngine.VLLM,
     artifact_id: str | None = None,
     llamacpp_runtime: LlamaCppRuntimeState | None = None,
+    self_setup: bool = False,
 ) -> Node:
     """Create a test node with sensible defaults."""
     return Node(
@@ -101,6 +104,7 @@ def _make_node(
         engine=engine,
         artifact_id=artifact_id,
         llamacpp_runtime=llamacpp_runtime,
+        self_setup=self_setup,
     )
 
 
@@ -199,6 +203,7 @@ class TestAdminNodesPopulated:
             "gpu_model",
             "gpu_count",
             "managed",
+            "self_setup",
             "failed_step",
             "error",
         }
@@ -313,6 +318,7 @@ class TestAdminNodesPopulated:
                 "gpu_model": None,
                 "gpu_count": None,
                 "managed": True,
+                "self_setup": False,
                 "failed_step": None,
                 "error": None,
             }
@@ -548,6 +554,27 @@ class TestSetupModelPassthrough:
         call_kwargs = mock_provisioner.provision.call_args.kwargs
         assert call_kwargs["vllm_params"] is not None
         assert call_kwargs["vllm_params"].tool_call_parser == "qwen3_coder"
+
+    def test_passes_dtype_to_provisioner(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.provision = AsyncMock()
+        response = client.post(
+            "/admin/nodes/setup",
+            json={
+                "hostname": "gpu01",
+                "model": "org/model",
+                "vllm_params": {"dtype": "bfloat16"},
+            },
+        )
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args[0][0]
+        asyncio.get_event_loop().run_until_complete(coro)
+        call_kwargs = mock_provisioner.provision.call_args.kwargs
+        assert call_kwargs["vllm_params"] is not None
+        assert call_kwargs["vllm_params"].dtype == "bfloat16"
 
     def test_setup_without_model_defaults_none(
         self,
@@ -1132,6 +1159,341 @@ class TestTasksEndpoint:
         assert response.json() == []
 
 
+class TestNodePool:
+    """POST/DELETE /admin/nodes/pool for available and self-setup nodes."""
+
+    def test_register_available_pool(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.register_available = AsyncMock()
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+
+        response = client.post("/admin/nodes/pool", json={"hostname": "gpu01"})
+
+        assert response.status_code == 201
+        assert response.json() == {"hostname": "gpu01", "state": "available"}
+        mock_provisioner.register_available.assert_awaited_once_with("gpu01")
+        mock_provisioner.register_self_setup.assert_not_called()
+
+    def test_register_self_setup_adopts_running_vllm(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.register_self_setup = AsyncMock(
+            return_value=_make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+        )
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+
+        response = client.post(
+            "/admin/nodes/pool",
+            json={"hostname": "gpu01", "self_setup": True},
+        )
+
+        assert response.status_code == 201
+        assert response.json() == {
+            "hostname": "gpu01",
+            "state": "healthy",
+            "model": "org/model",
+            "self_setup": True,
+        }
+        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01")
+        mock_provisioner.register_available.assert_not_called()
+
+    def test_register_self_setup_unreachable_returns_502(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        from inference_proxy.provisioning.provisioner import SelfSetupError
+
+        mock_provisioner.register_self_setup = AsyncMock(
+            side_effect=SelfSetupError("vLLM is not reachable on gpu01")
+        )
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+
+        response = client.post(
+            "/admin/nodes/pool",
+            json={"hostname": "gpu01", "self_setup": True},
+        )
+
+        assert response.status_code == 502
+        assert "not reachable" in response.json()["detail"]
+
+    def test_duplicate_registration_returns_409(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(_make_node(node_id="gpu01"))
+        response = client.post("/admin/nodes/pool", json={"hostname": "gpu01"})
+        assert response.status_code == 409
+        mock_provisioner.register_available.assert_not_called()
+
+    def test_remove_available_unmanaged(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.remove_available = AsyncMock()
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                status=NodeStatus.AVAILABLE,
+                managed=False,
+                model="",
+            )
+        )
+
+        response = client.delete("/admin/nodes/gpu01/pool")
+
+        assert response.status_code == 200
+        assert response.json() == {"hostname": "gpu01", "removed": True}
+        mock_provisioner.remove_available.assert_awaited_once_with("gpu01")
+
+    def test_remove_healthy_self_setup(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.remove_available = AsyncMock()
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+        )
+
+        response = client.delete("/admin/nodes/gpu01/pool")
+
+        assert response.status_code == 200
+        mock_provisioner.remove_available.assert_awaited_once_with("gpu01")
+
+    def test_remove_healthy_standalone_requires_teardown(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.remove_available = AsyncMock()
+        test_registry.add(_make_node(node_id="gpu01", managed=False))
+
+        response = client.delete("/admin/nodes/gpu01/pool")
+
+        assert response.status_code == 409
+        assert "teardown" in response.json()["detail"]
+        mock_provisioner.remove_available.assert_not_called()
+
+    def test_register_returns_409_when_host_lease_is_busy(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """A setup/teardown holding the host lease blocks registration."""
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = None
+        mock_provisioner.register_self_setup = AsyncMock()
+
+        response = client.post(
+            "/admin/nodes/pool",
+            json={"hostname": "gpu01", "self_setup": True},
+        )
+
+        assert response.status_code == 409
+        assert "operation" in response.json()["detail"].lower()
+        mock_provisioner.register_self_setup.assert_not_awaited()
+
+    def test_adoption_holds_lease_during_probe_blocking_concurrent_setup(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """Adoption commits the hostname before its remote probe, so neither
+        setup nor a concurrent adoption can interleave and both 201s cannot
+        happen. The registration is reserved by the host lifecycle
+        coordinator for the whole probe."""
+        coordinator = HostLifecycleCoordinator()
+
+        async def reserve(hostname: str) -> object:
+            return await coordinator.try_acquire(hostname)
+
+        mock_provisioner.try_reserve_host.side_effect = reserve
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+
+        probes_started = threading.Event()
+        release_probes = threading.Event()
+
+        async def paused_register(hostname: str) -> Node:
+            probes_started.set()
+            while not release_probes.is_set():
+                await asyncio.sleep(0.01)
+            return _make_node(
+                node_id=hostname,
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+
+        mock_provisioner.register_self_setup = AsyncMock(side_effect=paused_register)
+
+        outcomes: dict[str, object] = {}
+
+        def first_adoption() -> None:
+            resp = client.post(
+                "/admin/nodes/pool",
+                json={"hostname": "gpu01", "self_setup": True},
+            )
+            outcomes["status"] = resp.status_code
+            outcomes["body"] = resp.json()
+
+        thread = threading.Thread(target=first_adoption)
+        thread.start()
+        assert probes_started.wait(timeout=5)
+
+        # Adoption is paused inside its probe while holding the lease:
+        # setup and a concurrent adoption must both be rejected.
+        setup_resp = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+        assert setup_resp.status_code == 409
+        assert "already in progress" in setup_resp.json()["detail"].lower()
+
+        adopt_resp = client.post(
+            "/admin/nodes/pool",
+            json={"hostname": "gpu01", "self_setup": True},
+        )
+        assert adopt_resp.status_code == 409
+
+        release_probes.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert outcomes["status"] == 201
+        assert outcomes["body"] == {
+            "hostname": "gpu01",
+            "state": "healthy",
+            "model": "org/model",
+            "self_setup": True,
+        }
+        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01")
+
+    def test_readoption_reconciles_reported_model(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """Re-adoption of an existing self-setup instance is allowed and
+        re-probes vLLM, reconciling the tracked model with what it serves
+        now (single-model contract; drift is refreshed on re-adoption)."""
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/old",
+            )
+        )
+        mock_provisioner.register_self_setup = AsyncMock(
+            return_value=_make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/new",
+            )
+        )
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+
+        response = client.post(
+            "/admin/nodes/pool",
+            json={"hostname": "gpu01", "self_setup": True},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["model"] == "org/new"
+        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01")
+
+    def test_self_setup_flag_cannot_adopt_managed_node(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """A self-setup flag never turns a managed registration into adoption."""
+        test_registry.add(_make_node(node_id="gpu01", managed=True))
+        mock_provisioner.register_self_setup = AsyncMock()
+
+        response = client.post(
+            "/admin/nodes/pool",
+            json={"hostname": "gpu01", "self_setup": True},
+        )
+
+        assert response.status_code == 409
+        assert "already registered" in response.json()["detail"]
+        mock_provisioner.register_self_setup.assert_not_awaited()
+
+    def test_remove_returns_409_when_host_lease_is_busy(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.remove_available = AsyncMock()
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                status=NodeStatus.AVAILABLE,
+                managed=False,
+            )
+        )
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = None
+
+        response = client.delete("/admin/nodes/gpu01/pool")
+
+        assert response.status_code == 409
+        assert "operation" in response.json()["detail"].lower()
+        mock_provisioner.remove_available.assert_not_awaited()
+
+    def test_remove_rechecks_registry_under_lease(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """Removal re-checks the registry while holding the lease: if the node
+        was replaced or removed by setup/teardown in the meantime, deletion is
+        skipped."""
+        mock_provisioner.remove_available = AsyncMock()
+        calls = {"count": 0}
+
+        def flaky_get(node_id: str) -> Node | None:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return _make_node(
+                    node_id=node_id,
+                    status=NodeStatus.AVAILABLE,
+                    managed=False,
+                )
+            return None
+
+        with patch.object(test_registry, "get", side_effect=flaky_get):
+            response = client.delete("/admin/nodes/gpu01/pool")
+
+        assert response.status_code == 404
+        mock_provisioner.remove_available.assert_not_awaited()
+
+
 class TestTeardownEndpoint:
     """DELETE /admin/nodes/{id} triggers teardown."""
 
@@ -1145,6 +1507,26 @@ class TestTeardownEndpoint:
         response = client.delete("/admin/nodes/gpu01")
         assert response.status_code == 202
         assert response.json() == {"task_id": "gpu01"}
+
+    def test_self_setup_node_cannot_be_torn_down(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+        )
+        response = client.delete("/admin/nodes/gpu01")
+        assert response.status_code == 409
+        assert "self-setup" in response.json()["detail"]
+        mock_provisioner.cancel_active_provision.assert_not_awaited()
+        mock_provisioner.fire_background.assert_not_called()
 
     def test_force_param_passed(
         self,
@@ -1575,6 +1957,59 @@ class TestSetupEligibility:
         assert "2 active request" in response.json()["detail"]
         assert "wait" in response.json()["detail"].lower()
         mock_provisioner.cleanup_stale_node.assert_not_awaited()
+
+    def test_self_setup_node_cannot_be_provisioned(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+        )
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 409
+        assert "self-setup" in response.json()["detail"]
+        mock_provisioner.try_reserve_host.assert_not_awaited()
+        mock_provisioner.fire_background.assert_not_called()
+
+    def test_setup_rechecks_self_setup_after_acquiring_lease(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """An adoption completing between the initial read and the lease
+        acquisition must be caught by the self_setup re-check, mirroring
+        teardown's second check. Otherwise setup would provision a host that
+        an externally owned vLLM instance was just adopted on."""
+        calls = {"count": 0}
+
+        def flaky_get(node_id: str) -> Node | None:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return None
+            return _make_node(
+                node_id=node_id,
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+
+        with patch.object(test_registry, "get", side_effect=flaky_get):
+            response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 409
+        assert "self-setup" in response.json()["detail"]
+        mock_provisioner.fire_background.assert_not_called()
+        mock_provisioner.provision.assert_not_awaited()
 
     def test_setup_returns_409_while_host_operation_is_reserved(
         self,
@@ -2076,6 +2511,52 @@ class TestExecutePowerAction:
         assert response.status_code == 502
         assert "Poll timeout" in response.json()["detail"]
 
+    def test_power_action_rejected_for_self_setup_node(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        test_registry: NodeRegistry,
+    ) -> None:
+        """QIIP never sends BMC power actions to externally owned nodes."""
+        mock_redfish = AsyncMock()
+        mock_redfish.power_action.return_value = "On"
+        app.dependency_overrides[get_redfish_client] = lambda: mock_redfish
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+        )
+
+        response = client.post("/admin/nodes/gpu01/power", json={"action": "ForceOff"})
+
+        assert response.status_code == 409
+        assert "self-setup" in response.json()["detail"]
+        mock_redfish.power_action.assert_not_awaited()
+
+    def test_power_action_returns_409_when_host_lease_is_reserved(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """Adoption holds the host lease while the node is not yet registered,
+        so a power action arriving mid-adoption must not reach externally owned
+        hardware even though the registry read would miss the node."""
+        mock_redfish = AsyncMock()
+        mock_redfish.power_action.return_value = "On"
+        app.dependency_overrides[get_redfish_client] = lambda: mock_redfish
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = None
+
+        response = client.post("/admin/nodes/gpu01/power", json={"action": "ForceOff"})
+
+        assert response.status_code == 409
+        assert "already in progress" in response.json()["detail"]
+        mock_redfish.power_action.assert_not_awaited()
+
 
 # -- Recommendation endpoint tests (API-01, API-02, API-03) --
 
@@ -2134,6 +2615,48 @@ SAMPLE_RESULT = LLMFitResult(
 
 class TestRecommendations:
     """GET /admin/nodes/{hostname}/recommendations happy path (API-01, API-02)."""
+
+    def test_self_setup_node_recommendations_rejected(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_llmfit_runner: MagicMock,
+    ) -> None:
+        """Recommendations may install llmfit with sudo on the host, so they
+        must never run against an externally owned self-setup node."""
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+        )
+
+        response = client.get("/admin/nodes/gpu01/recommendations")
+
+        assert response.status_code == 409
+        assert "self-setup" in response.json()["detail"]
+        mock_llmfit_runner.recommend.assert_not_awaited()
+
+    def test_recommendations_return_409_when_host_lease_is_reserved(
+        self,
+        client: TestClient,
+        mock_llmfit_runner: MagicMock,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """Adoption holds the host lease while the node is not yet registered,
+        so a recommendations request arriving mid-adoption must not run
+        llmfit (which installs with sudo) on externally owned hardware even
+        though the registry read would miss the node."""
+        mock_provisioner.try_reserve_host.side_effect = None
+        mock_provisioner.try_reserve_host.return_value = None
+
+        response = client.get("/admin/nodes/gpu01/recommendations")
+
+        assert response.status_code == 409
+        assert "already in progress" in response.json()["detail"]
+        mock_llmfit_runner.recommend.assert_not_awaited()
 
     def test_returns_200_with_models(
         self,
@@ -2240,6 +2763,7 @@ class TestRecommendationErrors:
         )
         provisioner = MagicMock()
         provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+        provisioner.try_reserve_host = AsyncMock(return_value=MagicMock())
         application = FastAPI()
         application.include_router(admin_router)
 

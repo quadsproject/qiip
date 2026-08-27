@@ -15,6 +15,7 @@
 <body>
     <a class="skip-link" href="#main-content">Skip to content</a>
     {% set dash_active = active_page == 'dashboard' %}
+    {% set models_active = active_page == 'models' %}
     {% set chat_active = active_page == 'chat' %}
     <nav class="top-bar" aria-label="Primary">
         <div class="brand">
@@ -24,6 +25,7 @@
         </div>
         <div class="nav-links">
             <a href="/dashboard" class="nav-link{{ ' nav-link-active' if dash_active else '' }}"{% if dash_active %} aria-current="page"{% endif %}>Dashboard</a>
+            <a href="/models" class="nav-link{{ ' nav-link-active' if models_active else '' }}"{% if models_active %} aria-current="page"{% endif %}>Models</a>
             <a href="/chat" class="nav-link{{ ' nav-link-active' if chat_active else '' }}"{% if chat_active %} aria-current="page"{% endif %}>Chat</a>
         </div>
         <button class="theme-toggle" onclick="let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;localStorage.setItem('theme',t)" aria-label="Toggle color theme">
@@ -51,6 +53,10 @@
                 <div id="manual-setup-row" style="display: none;">
                     <form id="register-form" class="setup-form">
                         <input type="text" id="register-hostname" placeholder="Enter hostname" required>
+                        <label class="standalone-label" for="register-self-setup">
+                            <input type="checkbox" id="register-self-setup">
+                            Existing vLLM instance
+                        </label>
                         <button type="submit" id="register-btn" class="btn btn-primary">Add to Pool</button>
                     </form>
                 </div>

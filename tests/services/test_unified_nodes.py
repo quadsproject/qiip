@@ -51,6 +51,7 @@ def _node(
     engine: InferenceEngine = InferenceEngine.VLLM,
     artifact_id: str | None = None,
     llamacpp_runtime: LlamaCppRuntimeState | None = None,
+    self_setup: bool = False,
 ) -> Node:
     return Node(
         node_id=node_id,
@@ -61,6 +62,7 @@ def _node(
         engine=engine,
         artifact_id=artifact_id,
         llamacpp_runtime=llamacpp_runtime,
+        self_setup=self_setup,
     )
 
 
@@ -171,6 +173,49 @@ class TestEtcdNodeStates:
         assert n.actions == ["teardown"]
         assert n.gpu_vendor == "NVIDIA"
         assert n.gpu_model == "A100"
+
+    def test_self_setup_healthy_only_allows_remove(self) -> None:
+        registry = NodeRegistry()
+        registry.add(
+            _node(
+                "gpu01",
+                status=NodeStatus.HEALTHY,
+                managed=False,
+                self_setup=True,
+            )
+        )
+        svc = _service(registry=registry, poller=_poller(hosts=[_host("gpu01")]))
+
+        n = svc.get_unified_nodes()[0]
+        assert n.self_setup is True
+        assert n.managed is False
+        assert n.actions == ["remove"]
+
+    def test_self_setup_unhealthy_only_allows_remove(self) -> None:
+        registry = NodeRegistry()
+        registry.add(
+            _node(
+                "gpu01",
+                status=NodeStatus.UNHEALTHY,
+                managed=False,
+                self_setup=True,
+            )
+        )
+        svc = _service(registry=registry, poller=_poller())
+
+        n = svc.get_unified_nodes()[0]
+        assert n.actions == ["remove"]
+        assert "teardown" not in n.actions
+
+    def test_available_unmanaged_includes_remove(self) -> None:
+        registry = NodeRegistry()
+        registry.add(
+            _node("gpu01", status=NodeStatus.AVAILABLE, managed=False, model="")
+        )
+        svc = _service(registry=registry, poller=_poller())
+
+        n = svc.get_unified_nodes()[0]
+        assert n.actions == ["setup", "remove"]
 
     def test_registered_engine_and_artifact_are_preserved(self) -> None:
         registry = NodeRegistry()

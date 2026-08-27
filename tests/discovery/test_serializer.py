@@ -118,6 +118,7 @@ class TestNodeFromEtcdMinimalJson:
         assert node.capabilities.gpu_memory == ""
         assert node.active_connections == 0
         assert node.managed is False
+        assert node.self_setup is False
 
 
 class TestNodeFromEtcdOwnership:
@@ -328,6 +329,28 @@ class TestNodeToEtcdRoundtrip:
         assert restored.engine is InferenceEngine.LLAMA_CPP
         assert restored.artifact_id == "b" * 64
         assert restored.llamacpp_runtime == _runtime_state()
+        assert restored.self_setup is False
+
+
+class TestNodeToEtcdSelfSetup:
+    def test_roundtrip_preserves_self_setup(self) -> None:
+        original = Node(
+            node_id="vllm-self",
+            endpoint="http://10.0.1.200:8000",
+            status=NodeStatus.HEALTHY,
+            model="org/model",
+            managed=False,
+            self_setup=True,
+        )
+        key, value_bytes = node_to_etcd(original, "/nodes/")
+        restored = node_from_etcd(
+            key, value_bytes, prefix="/nodes/", endpoint_policy=_ENDPOINT_POLICY
+        )
+
+        assert restored is not None
+        assert restored.self_setup is True
+        assert restored.managed is False
+        assert restored.model == "org/model"
 
 
 def test_endpoint_roundtrip_preserves_canonical_form() -> None:

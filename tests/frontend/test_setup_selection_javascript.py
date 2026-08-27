@@ -363,6 +363,7 @@ const fields = [
   { param: "max_num_batched_tokens", value: "" },
   { param: "tool_call_parser", value: "qwen3_coder" },
   { param: "reasoning_parser", value: "" },
+  { param: "dtype", value: "" },
 ];
 fields.forEach(function (f) {
   const input = new Element("input");
@@ -387,3 +388,34 @@ process.stdout.write(JSON.stringify({
     assert result["hasVllmParams"] is True
     assert result["toolCallParser"] == "qwen3_coder"
     assert result["body"]["vllm_params"] == {"tool_call_parser": "qwen3_coder"}
+
+
+def test_vllm_dtype_included_only_when_nonempty() -> None:
+    result = _run_scenario(
+        r"""
+const container = byId("vllm-params-container");
+const fields = [
+  { param: "dtype", value: "bfloat16" },
+  { param: "tool_call_parser", value: "" },
+];
+fields.forEach(function (f) {
+  const input = new Element("input");
+  input.setAttribute("data-vllm-param", f.param);
+  input.value = f.value;
+  container.appendChild(input);
+});
+
+controller.setCatalog({
+  models: [{ repo_id: "org/vllm-model" }],
+  gguf_artifacts: [],
+});
+const body = controller.buildBody({ hostname: "gpu01" });
+process.stdout.write(JSON.stringify({
+  body: body,
+  vllmParams: body ? body.vllm_params : null,
+}));
+"""
+    )
+
+    assert result["vllmParams"] == {"dtype": "bfloat16"}
+    assert result["body"]["vllm_params"] == {"dtype": "bfloat16"}

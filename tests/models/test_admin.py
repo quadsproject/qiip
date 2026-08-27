@@ -130,6 +130,13 @@ class TestRegisterRequest:
 
         req = RegisterRequest(hostname="gpu01")
         assert req.hostname == "gpu01"
+        assert req.self_setup is False
+
+    def test_self_setup_opt_in(self) -> None:
+        from inference_proxy.models.admin import RegisterRequest
+
+        req = RegisterRequest(hostname="gpu01", self_setup=True)
+        assert req.self_setup is True
 
     def test_rejects_empty_hostname(self) -> None:
         from inference_proxy.models.admin import RegisterRequest

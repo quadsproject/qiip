@@ -85,6 +85,7 @@ class TestNodeMinimalCreation:
         assert node.last_heartbeat is None
         assert node.active_connections == 0
         assert node.managed is False
+        assert node.self_setup is False
         assert node.engine is InferenceEngine.VLLM
         assert node.artifact_id is None
         assert node.llamacpp_runtime is None
@@ -129,6 +130,33 @@ class TestNodeFullCreation:
 
         with pytest.raises(ValidationError, match="must include a timezone"):
             LlamaCppRuntimeState.model_validate(payload)
+
+
+class TestNodeSelfSetup:
+    def test_self_setup_defaults_false(self) -> None:
+        node = Node(node_id="node-1", endpoint="http://10.0.1.100:8000")
+        assert node.self_setup is False
+
+    def test_self_setup_requires_unmanaged(self) -> None:
+        with pytest.raises(ValidationError, match="cannot be managed"):
+            Node(
+                node_id="node-1",
+                endpoint="http://10.0.1.100:8000",
+                managed=True,
+                self_setup=True,
+            )
+
+    def test_self_setup_unmanaged_is_valid(self) -> None:
+        node = Node(
+            node_id="node-1",
+            endpoint="http://10.0.1.100:8000",
+            managed=False,
+            self_setup=True,
+            status=NodeStatus.HEALTHY,
+            model="org/model",
+        )
+        assert node.self_setup is True
+        assert node.managed is False
 
 
 class TestLlamaCppRuntimeRequest:
@@ -256,6 +284,7 @@ class TestVllmParams:
         assert params.max_num_batched_tokens is None
         assert params.tool_call_parser is None
         assert params.reasoning_parser is None
+        assert params.dtype is None
 
     def test_rejects_invalid_values(self) -> None:
         from inference_proxy.models.node import VllmParams
@@ -268,3 +297,26 @@ class TestVllmParams:
             VllmParams(gpu_memory_utilization=1.1)
         with pytest.raises(ValidationError):
             VllmParams(reasoning_parser="")
+        with pytest.raises(ValidationError):
+            VllmParams(dtype="")
+
+    def test_supported_dtypes_are_accepted(self) -> None:
+        from inference_proxy.models.node import SUPPORTED_VLLM_DTYPES, VllmParams
+
+        assert (
+            frozenset({"auto", "half", "float16", "bfloat16", "float", "float32"})
+            == SUPPORTED_VLLM_DTYPES
+        )
+        for dtype in sorted(SUPPORTED_VLLM_DTYPES):
+            assert VllmParams(dtype=dtype).dtype == dtype
+
+    def test_kv_cache_float8_dtypes_are_rejected(self) -> None:
+        # float8_e4m3fn / float8_e5m2 are KV-cache dtype settings, not --dtype
+        # values; the pinned vLLM 0.26.0 rejects them at argv parse time, so
+        # QIIP must reject them at the API boundary too.
+        from inference_proxy.models.node import VllmParams
+
+        with pytest.raises(ValidationError):
+            VllmParams(dtype="float8_e4m3fn")
+        with pytest.raises(ValidationError):
+            VllmParams(dtype="float8_e5m2")

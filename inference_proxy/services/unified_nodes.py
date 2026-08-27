@@ -92,7 +92,9 @@ class UnifiedNodeService:
         breaker = self._cb_registry.get(node.node_id)
         task = task_map.get(node.node_id) if task_map else None
         actions = list(_STATE_ACTIONS.get(state, []))
-        if state == "available" and not node.managed:
+        if node.self_setup:
+            actions = ["remove"]
+        elif state == "available" and not node.managed:
             actions.append("remove")
         return AdminNodeResponse(
             node_id=node.node_id,
@@ -110,6 +112,7 @@ class UnifiedNodeService:
             gpu_model=host.gpu_model if host else None,
             gpu_count=host.gpu_count if host else None,
             managed=node.managed,
+            self_setup=node.self_setup,
             failed_step=task.failed_step if task else None,
             error=task.error if task else None,
         )

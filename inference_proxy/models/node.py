@@ -27,6 +27,22 @@ LLAMACPP_CONTEXT_ALIGNMENT = 256
 LLAMACPP_MAX_AGGREGATE_CONTEXT = 4_294_967_040
 LLAMACPP_MAX_SEQUENCES = 256
 
+# vLLM --dtype values accepted at the API boundary and by the auto-vLLM
+# start script. Kept in one place so a dtype override can never smuggle extra
+# vLLM argv (e.g. "float16 --seed 0" is rejected, not word-split). This is the
+# exact set the pinned vLLM 0.26.0 accepts for --dtype; the float8_* values are
+# KV-cache dtype settings and are intentionally excluded.
+SUPPORTED_VLLM_DTYPES = frozenset(
+    {
+        "auto",
+        "half",
+        "float16",
+        "bfloat16",
+        "float",
+        "float32",
+    }
+)
+
 
 class InferenceEngine(StrEnum):
     """Supported inference engine backends."""
@@ -36,7 +52,13 @@ class InferenceEngine(StrEnum):
 
 
 class VllmParams(BaseModel):
-    """Optional vLLM serve parameters submitted at setup time."""
+    """Optional vLLM serve parameters submitted at setup time.
+
+    The ``dtype`` field is validated against the supported vLLM dtype
+    allowlist rather than passed through verbatim, so a value such as
+    ``"float16 --seed 0"`` is rejected instead of becoming an additional
+    vLLM flag downstream.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -46,6 +68,17 @@ class VllmParams(BaseModel):
     max_num_batched_tokens: int | None = Field(default=None, ge=1)
     tool_call_parser: str | None = Field(default=None, min_length=1, max_length=256)
     reasoning_parser: str | None = Field(default=None, min_length=1, max_length=256)
+    dtype: str | None = Field(default=None, min_length=1, max_length=256)
+
+    @field_validator("dtype")
+    @classmethod
+    def validate_dtype(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if value not in SUPPORTED_VLLM_DTYPES:
+            allowed = ", ".join(sorted(SUPPORTED_VLLM_DTYPES))
+            raise ValueError(f"unsupported vLLM dtype {value!r}; allowed: {allowed}")
+        return value
 
 
 class NodeStatus(StrEnum):
@@ -217,6 +250,8 @@ class Node(BaseModel):
         active_connections: Number of active inference requests.
         managed: Whether the proxy owns the node lifecycle. Externally
             registered nodes must opt in explicitly.
+        self_setup: Whether the node was adopted from an already-running
+            vLLM instance. These nodes are never torn down.
     """
 
     model_config = ConfigDict(frozen=True, extra="ignore")
@@ -232,3 +267,10 @@ class Node(BaseModel):
     capabilities: NodeCapabilities = Field(default_factory=NodeCapabilities)
     active_connections: int = 0
     managed: bool = False
+    self_setup: bool = False
+
+    @model_validator(mode="after")
+    def self_setup_is_unmanaged(self) -> Node:
+        if self.self_setup and self.managed:
+            raise ValueError("self_setup nodes cannot be managed")
+        return self

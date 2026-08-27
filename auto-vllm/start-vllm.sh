@@ -10,6 +10,7 @@ MAX_MODEL_LEN_OVERRIDE="${AUTOVLLM_MAX_MODEL_LEN:-}"
 MAX_BATCHED_TOKENS_OVERRIDE="${AUTOVLLM_MAX_BATCHED_TOKENS:-}"
 TOOL_CALL_PARSER_OVERRIDE="${AUTOVLLM_TOOL_CALL_PARSER:-}"
 REASONING_PARSER_OVERRIDE="${AUTOVLLM_REASONING_PARSER:-}"
+DTYPE_OVERRIDE="${AUTOVLLM_DTYPE:-}"
 EXTRA_ARGS_OVERRIDE="${AUTOVLLM_EXTRA_ARGS:-}"
 ATTENTION_BACKEND_OVERRIDE="${AUTOVLLM_ATTENTION_BACKEND:-}"
 FLASHINFER_CACHE="${AUTOVLLM_FLASHINFER_CACHE_DIR:-/var/cache/flashinfer}"
@@ -23,6 +24,13 @@ PROC_ROOT="${AUTOVLLM_PROC_ROOT:-/proc}"
 COMMAND_PATTERN="${AUTOVLLM_COMMAND_PATTERN:-${VLLM_BIN} serve}"
 STARTUP_GRACE_PERIOD="${AUTOVLLM_STARTUP_GRACE_PERIOD:-2}"
 STARTUP_LOG_LINES="${AUTOVLLM_STARTUP_LOG_LINES:-40}"
+
+# vLLM --dtype values accepted by resolve_dtype. Kept as one allowlist so an
+# override such as "float16 --seed 0" fails closed instead of becoming extra
+# vLLM argv, and exactly one --dtype is ever emitted per launch. These are the
+# values the pinned vLLM 0.26.0 accepts for --dtype; the float8_* KV-cache
+# dtype settings are intentionally excluded and must match node.py.
+SUPPORTED_VLLM_DTYPES="auto half float16 bfloat16 float float32"
 
 # Ignore legacy script inputs instead of leaking them into vLLM's reserved
 # environment namespace. VLLM_MODEL was an internal gateway handoff;
@@ -61,6 +69,7 @@ configure_vllm_params() {
     MAX_MODEL_LEN=32768
     MAX_BATCHED_TOKENS=32768
     EXTRA_ARGS=""
+    DEFAULT_DTYPE=""
 
     case "$GPU_MODEL" in
         *"H100"*|*"A100"*)
@@ -86,7 +95,7 @@ configure_vllm_params() {
             TENSOR_PARALLEL=1
             MAX_MODEL_LEN=2048
             MAX_BATCHED_TOKENS=2048
-            EXTRA_ARGS="--dtype float16"
+            DEFAULT_DTYPE=float16
 
             if [ $GPU_VRAM_GB -le 16 ]; then
                 MODEL="Qwen/Qwen3-14B-AWQ"
@@ -102,7 +111,7 @@ configure_vllm_params() {
             TENSOR_PARALLEL=$GPU_COUNT
             GPU_MEM_UTIL=0.85
             MAX_MODEL_LEN=8192
-            EXTRA_ARGS="--dtype float16"
+            DEFAULT_DTYPE=float16
 
             if [ $total_vram -ge 96 ]; then
                 MODEL="Qwen/Qwen2.5-32B-Instruct"
@@ -141,6 +150,26 @@ configure_vllm_params() {
     MAX_MODEL_LEN="${MAX_MODEL_LEN_OVERRIDE:-$MAX_MODEL_LEN}"
     MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS_OVERRIDE:-$MAX_BATCHED_TOKENS}"
     EXTRA_ARGS="${EXTRA_ARGS_OVERRIDE:-$EXTRA_ARGS}"
+
+    # Resolve exactly one dtype: an explicit override wins over the per-GPU
+    # default (T4/V100). run_vllm emits it once, so a conflicted EXTRA_ARGS
+    # containing --dtype fails closed instead of producing two conflicting
+    # --dtype arguments.
+    EFFECTIVE_DTYPE="${DTYPE_OVERRIDE:-$DEFAULT_DTYPE}"
+    if [ -n "$EFFECTIVE_DTYPE" ]; then
+        case " $SUPPORTED_VLLM_DTYPES " in
+            *" $EFFECTIVE_DTYPE "*)
+                ;;
+            *)
+                echo "FATAL: unsupported vLLM dtype '${EFFECTIVE_DTYPE}'; allowed:${SUPPORTED_VLLM_DTYPES}" >&2
+                return 1
+                ;;
+        esac
+    fi
+    if [ -n "$EXTRA_ARGS" ] && [[ " $EXTRA_ARGS " == *--dtype* ]]; then
+        echo "FATAL: pass dtype via AUTOVLLM_DTYPE; --dtype inside AUTOVLLM_EXTRA_ARGS conflicts with the single managed dtype" >&2
+        return 1
+    fi
 }
 
 clear_script_environment() {
@@ -150,7 +179,7 @@ clear_script_environment() {
     unset AUTOVLLM_API_PORT AUTOVLLM_NFS_MOUNT_POINT AUTOVLLM_MODEL
     unset AUTOVLLM_TENSOR_PARALLEL AUTOVLLM_GPU_MEM_UTIL
     unset AUTOVLLM_MAX_MODEL_LEN AUTOVLLM_MAX_BATCHED_TOKENS AUTOVLLM_EXTRA_ARGS
-    unset AUTOVLLM_TOOL_CALL_PARSER AUTOVLLM_REASONING_PARSER
+    unset AUTOVLLM_TOOL_CALL_PARSER AUTOVLLM_REASONING_PARSER AUTOVLLM_DTYPE
     unset AUTOVLLM_SCRIPT_DIR AUTOVLLM_BIN AUTOVLLM_PID_FILE
     unset AUTOVLLM_HF_CACHE_LINK AUTOVLLM_LOG_FILE AUTOVLLM_PYTHON
     unset AUTOVLLM_PROC_ROOT AUTOVLLM_COMMAND_PATTERN
@@ -318,9 +347,17 @@ run_vllm() {
     export PATH="${venv_bin_dir}:$PATH"
 
     local tool_call_parser="${TOOL_CALL_PARSER_OVERRIDE:-hermes}"
-    local reasoning_args=""
+    local reasoning_args=()
     if [ -n "$REASONING_PARSER_OVERRIDE" ]; then
-        reasoning_args="--reasoning-parser ${REASONING_PARSER_OVERRIDE}"
+        # One element per argv value so a parser cannot smuggle extra flags
+        # through word splitting.
+        reasoning_args=(--reasoning-parser "$REASONING_PARSER_OVERRIDE")
+    fi
+    local dtype_args=()
+    if [ -n "$EFFECTIVE_DTYPE" ]; then
+        # resolve_dtype validated EFFECTIVE_DTYPE against the allowlist and
+        # computed exactly one value; emit it once as a single argv element.
+        dtype_args=(--dtype "$EFFECTIVE_DTYPE")
     fi
 
     cat <<EOF
@@ -335,6 +372,7 @@ run_vllm() {
 # Max Batched Tokens: $MAX_BATCHED_TOKENS tokens
 # Tool Call Parser:   $tool_call_parser
 # Reasoning Parser:   ${REASONING_PARSER_OVERRIDE:-(none)}
+# Dtype:              ${EFFECTIVE_DTYPE:-(none)}
 # ================================================
 
 EOF
@@ -353,8 +391,9 @@ EOF
             --max-num-batched-tokens "$MAX_BATCHED_TOKENS" \
             --enable-auto-tool-choice \
             --tool-call-parser "$tool_call_parser" \
-            ${reasoning_args} \
-            ${EXTRA_ARGS:-}
+            "${reasoning_args[@]+"${reasoning_args[@]}"}" \
+            ${EXTRA_ARGS:-} \
+            "${dtype_args[@]+"${dtype_args[@]}"}"
     fi
 
     # EXTRA_ARGS is an intentional word-split shell override.
@@ -368,8 +407,9 @@ EOF
         --max-num-batched-tokens "$MAX_BATCHED_TOKENS" \
         --enable-auto-tool-choice \
         --tool-call-parser "$tool_call_parser" \
-        ${reasoning_args} \
+        "${reasoning_args[@]+"${reasoning_args[@]}"}" \
         ${EXTRA_ARGS:-} \
+        "${dtype_args[@]+"${dtype_args[@]}"}" \
         > "$VLLM_LOG_FILE" 2>&1 &
 
     local pid=$!

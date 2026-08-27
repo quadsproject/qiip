@@ -15,6 +15,7 @@
 <body>
     <a class="skip-link" href="#main-content">Skip to content</a>
     {% set dash_active = active_page == 'dashboard' %}
+    {% set models_active = active_page == 'models' %}
     {% set chat_active = active_page == 'chat' %}
     <nav class="top-bar" aria-label="Primary">
         <div class="brand">
@@ -24,6 +25,7 @@
         </div>
         <div class="nav-links">
             <a href="/dashboard" class="nav-link{{ ' nav-link-active' if dash_active else '' }}"{% if dash_active %} aria-current="page"{% endif %}>Dashboard</a>
+            <a href="/models" class="nav-link{{ ' nav-link-active' if models_active else '' }}"{% if models_active %} aria-current="page"{% endif %}>Models</a>
             <a href="/chat" class="nav-link{{ ' nav-link-active' if chat_active else '' }}"{% if chat_active %} aria-current="page"{% endif %}>Chat</a>
         </div>
         <button class="theme-toggle" onclick="let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;localStorage.setItem('theme',t)" aria-label="Toggle color theme">
@@ -36,7 +38,7 @@
         <header class="dashboard-header">
             <div>
                 <p class="breadcrumb"><a href="/dashboard">&larr; Back to fleet</a></p>
-                <h1 id="node-title">{{ node_id }}</h1>
+                <h1><span id="node-title">{{ node_id }}</span> <span id="node-origin-tag" hidden></span></h1>
                 <p id="node-state">Loading...</p>
                 <p id="power-state"><span class="badge badge-unknown">Power: Unknown</span></p>
             </div>
@@ -112,6 +114,10 @@
                     <label class="runtime-control" for="vllm-reasoning-parser">
                         <span>Reasoning parser</span>
                         <input id="vllm-reasoning-parser" type="text" maxlength="256" data-vllm-param="reasoning_parser" placeholder="none">
+                    </label>
+                    <label class="runtime-control" for="vllm-dtype">
+                        <span>Dtype</span>
+                        <input id="vllm-dtype" type="text" maxlength="256" data-vllm-param="dtype" placeholder="auto">
                     </label>
                 </div>
             </section>

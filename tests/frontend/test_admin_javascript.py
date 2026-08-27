@@ -441,6 +441,105 @@ def _run_node_detail_scenario(scenario: str) -> dict[str, Any]:
     )
 
 
+def test_node_detail_self_setup_hides_setup_and_shows_tag() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+sandbox.fetch = async function (url) {
+  if (url === "/admin/nodes") {
+    return {
+      ok: true,
+      headers: { get() { return null; } },
+      json: async function () { return [{
+        node_id: "gpu01", state: "healthy", model: "org/model",
+        managed: false, self_setup: true, engine: "vllm",
+        endpoint: "gpu01:8000", active_connections: 0,
+        circuit_breaker_state: "closed", actions: ["remove"],
+      }]; },
+    };
+  }
+  if (url === "/admin/metrics") {
+    return { ok: true, json: async function () { return { per_node: {} }; } };
+  }
+  if (url === "/admin/provisioning/tasks") {
+    return { ok: true, json: async function () { return []; } };
+  }
+  throw new Error("unexpected URL " + url);
+};
+(async function () {
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    tag: byId("node-origin-tag").textContent,
+    tagHidden: byId("node-origin-tag").hidden,
+    tagClass: byId("node-origin-tag").className,
+    setupDisplay: byId("setup-config-panel").style.display,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "tag": "vllm-self",
+        "tagHidden": False,
+        "tagClass": "badge badge-self-setup",
+        "setupDisplay": "none",
+    }
+
+
+def _node_detail_power_visibility(self_setup: bool) -> object:
+    return _run_node_detail_scenario(
+        f"""
+sandbox.fetch = async function (url) {{
+  if (url === "/admin/nodes") {{
+    return {{
+      ok: true,
+      headers: {{ get() {{ return null; }} }},
+      json: async function () {{ return [{{
+        node_id: "gpu01", state: "healthy", model: "org/model",
+        managed: false, self_setup: {json.dumps(self_setup)}, engine: "vllm",
+        endpoint: "gpu01:8000", active_connections: 0,
+        circuit_breaker_state: "closed", actions: ["remove"],
+      }}]; }},
+    }};
+  }}
+  if (url === "/admin/metrics") {{
+    return {{ ok: true, json: async function () {{ return {{ per_node: {{}} }}; }} }};
+  }}
+  if (url === "/admin/provisioning/tasks") {{
+    return {{ ok: true, json: async function () {{ return []; }} }};
+  }}
+  throw new Error("unexpected URL " + url);
+}};
+(async function () {{
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({{
+    powerStateDisplay: byId("power-state").style.display,
+    powerActionsDisplay: byId("power-actions").style.display,
+    recsDisplay: byId("recommendations-panel").style.display,
+  }}));
+}})().catch(function (error) {{ console.error(error); process.exit(1); }});
+"""
+    )
+
+
+def test_node_detail_self_setup_hides_power_and_recommendations() -> None:
+    """Self-setup nodes are externally owned: power actions and software
+    installation (recommendations) are hidden in the UI and rejected by the
+    server."""
+    assert _node_detail_power_visibility(self_setup=True) == {
+        "powerStateDisplay": "none",
+        "powerActionsDisplay": "none",
+        "recsDisplay": "none",
+    }
+
+
+def test_node_detail_managed_node_shows_power_and_recommendations() -> None:
+    assert _node_detail_power_visibility(self_setup=False) == {
+        "powerStateDisplay": "",
+        "powerActionsDisplay": "",
+        "recsDisplay": "",
+    }
+
+
 def test_log_stream_reconnects_after_transient_drop() -> None:
     result = _run_node_detail_scenario(
         r"""
@@ -1649,3 +1748,428 @@ sandbox.fetch = async function (url) {
     )
 
     assert result == {"nodeRequests": 2, "renderedTitles": ["new-node"]}
+
+
+def test_dashboard_self_setup_badge_replaces_standalone() -> None:
+    result = _run_dashboard_scenario(
+        r"""
+sandbox.fetch = async function (url) {
+  if (url === "/admin/nodes") {
+    return response([
+      Object.assign(node("self-node", "healthy", ["remove"]), {
+        managed: false, self_setup: true, model: "org/model",
+      }),
+      Object.assign(node("pool-node", "available", ["setup", "remove"]), {
+        managed: false, self_setup: false, model: "",
+      }),
+      node("managed-node", "healthy", ["teardown"]),
+    ]);
+  }
+  if (url === "/admin/metrics") return response({ per_node: {} });
+  if (url === "/admin/quads/status") return response({ status: "connected" });
+  throw new Error("unexpected request " + url);
+};
+
+(async function () {
+  await sandbox.refreshDashboard();
+  const badges = allElements
+    .filter(function (el) {
+      return el.className === "badge badge-self-setup" ||
+        el.className === "badge badge-standalone";
+    })
+    .map(function (el) { return { className: el.className, text: el.textContent }; });
+  process.stdout.write(JSON.stringify({ badges }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "badges": [
+            {"className": "badge badge-self-setup", "text": "vllm-self"},
+            {"className": "badge badge-standalone", "text": "standalone"},
+        ]
+    }
+
+
+def test_manual_setup_self_setup_posts_flag() -> None:
+    harness = r"""
+const fs = require("fs");
+const vm = require("vm");
+const path = require("path");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const configDownloadSource = fs.readFileSync(
+  path.join(path.dirname(process.argv[1]), "config_download.js"), "utf8"
+);
+const setupSelectionSource = fs.readFileSync(
+  path.join(path.dirname(process.argv[1]), "setup_selection.js"), "utf8"
+);
+const elements = new Map();
+let captured = null;
+let onReady = null;
+
+class Element {
+  constructor(tagName) {
+    this.tagName = tagName || "div";
+    this.children = [];
+    this.listeners = {};
+    this.style = {};
+    this.value = "";
+    this.checked = false;
+    this.disabled = false;
+    this.textContent = "";
+    this.className = "";
+    this.classList = { add() {}, remove() {}, contains() { return false; } };
+  }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  appendChild(child) { this.children.push(child); return child; }
+  setAttribute() {}
+  removeAttribute() {}
+}
+
+function byId(id) {
+  if (!elements.has(id)) elements.set(id, new Element("div"));
+  return elements.get(id);
+}
+
+const sandbox = {
+  console,
+  POLL_INTERVAL_MS: 10000,
+  document: {
+    getElementById: byId,
+    addEventListener(name, callback) {
+      if (name === "DOMContentLoaded") onReady = callback;
+    },
+    querySelectorAll() { return []; },
+    createElement() { return new Element(); },
+    createTextNode(text) { return { textContent: text }; },
+  },
+  window: { location: { origin: "http://localhost:8080" } },
+  requestAnimationFrame() {},
+  setTimeout() { return 1; },
+  setInterval() { return 1; },
+  fetch: async function (url, options) {
+    if (options && options.method === "POST") {
+      captured = { url, options };
+      return { ok: true, json: async function () { return { model: "org/model" }; } };
+    }
+    return {
+      ok: true,
+      headers: { get() { return null; } },
+      json: async function () {
+        if (url === "/admin/nodes") return [];
+        if (url === "/admin/metrics") return { per_node: {} };
+        if (url === "/admin/quads/status") return { status: "unavailable" };
+        return {};
+      },
+    };
+  },
+};
+vm.createContext(sandbox);
+vm.runInContext(configDownloadSource, sandbox);
+vm.runInContext(setupSelectionSource, sandbox);
+vm.runInContext(source, sandbox);
+sandbox.showToast = function () {};
+sandbox.refreshDashboard = async function () {};
+(async function () {
+  onReady();
+  byId("register-hostname").value = "gpu01";
+  byId("register-self-setup").checked = true;
+  byId("register-self-setup").listeners.change();
+  const labeled = byId("register-btn").textContent;
+  await byId("register-form").listeners.submit({ preventDefault() {} });
+  process.stdout.write(JSON.stringify({
+    url: captured.url,
+    body: JSON.parse(captured.options.body),
+    labeled: labeled,
+    reset: byId("register-btn").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    result = _run_node(_DASHBOARD_JS, harness)
+    assert result == {
+        "url": "/admin/nodes/pool",
+        "body": {"hostname": "gpu01", "self_setup": True},
+        "labeled": "Add to Fleet",
+        "reset": "Add to Pool",
+    }
+
+
+_MODELS_JS = _ROOT / "inference_proxy/static/js/models.js"
+
+_MODELS_HARNESS = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+
+const elements = new Map();
+const allElements = [];
+
+class Element {
+  constructor(tagName) {
+    this.tagName = tagName || "div";
+    this.children = [];
+    this.listeners = {};
+    this.style = {};
+    this.value = "";
+    this.disabled = false;
+    this.firstChild = null;
+    this._textContent = "";
+    this.classList = {
+      add() {}, remove() {}, contains() { return false; },
+    };
+    allElements.push(this);
+  }
+  get textContent() { return this._textContent; }
+  set textContent(value) {
+    this._textContent = String(value);
+    if (value === "") this.children = [];
+  }
+  appendChild(child) {
+    this.children.push(child);
+    this.firstChild = this.children[0] || null;
+    return child;
+  }
+  removeChild(child) {
+    const index = this.children.indexOf(child);
+    if (index !== -1) this.children.splice(index, 1);
+    this.firstChild = this.children[0] || null;
+  }
+  addEventListener(name, cb) { this.listeners[name] = cb; }
+  remove() {}
+}
+
+function byId(id) {
+  if (!elements.has(id)) elements.set(id, new Element("div"));
+  return elements.get(id);
+}
+
+const sandbox = {
+  console,
+  POLL_INTERVAL_MS: 10000,
+  document: {
+    getElementById: byId,
+    addEventListener() {},
+    createElement(tagName) { return new Element(tagName); },
+    createTextNode(text) { const node = new Element("text"); node.textContent = text; return node; },
+  },
+  requestAnimationFrame() {},
+  setTimeout() { return 0; },
+  setInterval() { return 0; },
+  fetch: async function () { throw new Error("fetch stub not installed"); },
+};
+
+vm.createContext(sandbox);
+vm.runInContext(source, sandbox);
+sandbox.showToast = function () {};
+
+function response(data) {
+  return {
+    ok: true,
+    json: async function () { return data; },
+  };
+}
+
+__SCENARIO__
+"""
+
+
+def _run_models_scenario(scenario: str) -> dict[str, Any]:
+    return _run_node(
+        _MODELS_JS,
+        _MODELS_HARNESS.replace("__SCENARIO__", scenario),
+    )
+
+
+def test_models_poll_skips_overlapping_catalog_request() -> None:
+    """A second poll while the catalog scan is still running must not start a
+    new scan (NFS cache scans can outlive the polling interval)."""
+    result = _run_models_scenario(
+        r"""
+let catalogRequests = 0;
+const catalogResolvers = [];
+sandbox.fetch = async function (url) {
+  if (url === "/admin/models/catalog") {
+    catalogRequests += 1;
+    return new Promise(function (resolve) { catalogResolvers.push(resolve); });
+  }
+  if (url === "/admin/models/downloads") return response([]);
+  throw new Error("unexpected URL " + url);
+};
+(async function () {
+  const first = sandbox.poll();
+  const second = sandbox.poll();
+  catalogResolvers.forEach(function (resolve) {
+    resolve(response({ models: [], gguf_artifacts: [] }));
+  });
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  process.stdout.write(JSON.stringify({
+    catalogRequests,
+    firstResult,
+    secondResult,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "catalogRequests": 1,
+        "firstResult": True,
+        "secondResult": False,
+    }
+
+
+def test_models_stale_catalog_response_does_not_overwrite_newer() -> None:
+    """An older catalog response must never overwrite a newer render."""
+    result = _run_models_scenario(
+        r"""
+let catalogRequests = 0;
+let resolveOldCatalog;
+sandbox.fetch = async function (url) {
+  if (url === "/admin/models/catalog") {
+    catalogRequests += 1;
+    if (catalogRequests === 1) {
+      return new Promise(function (resolve) { resolveOldCatalog = resolve; });
+    }
+    return response({ models: [{ repo_id: "new-model" }], gguf_artifacts: [] });
+  }
+  if (url === "/admin/models/downloads") return response([]);
+  throw new Error("unexpected URL " + url);
+};
+(async function () {
+  const oldPoll = sandbox.poll();
+  vm.runInContext("modelsPollInFlight = false", sandbox);
+  await sandbox.poll();
+  resolveOldCatalog(response({ models: [{ repo_id: "old-model" }], gguf_artifacts: [] }));
+  await oldPoll;
+  const rendered = byId("catalog-table-body").children.map(function (row) {
+    return row.children[0].textContent;
+  });
+  process.stdout.write(JSON.stringify({ catalogRequests, rendered }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {"catalogRequests": 2, "rendered": ["new-model"]}
+
+
+def test_models_download_form_refreshes_downloads_after_submit() -> None:
+    """After a download starts, the downloads table must refresh even though
+    the submit handler calls fetchDownloads() outside the poll loop."""
+    result = _run_models_scenario(
+        r"""
+const requested = [];
+sandbox.fetch = async function (url, options) {
+  requested.push({ url, method: options && options.method });
+  if (url === "/admin/models/download" && options && options.method === "POST") {
+    return { ok: true, json: async function () { return {}; } };
+  }
+  if (url === "/admin/models/downloads") {
+    return response([{ repo_id: "org/model", status: "downloading", started_at: null }]);
+  }
+  throw new Error("unexpected URL " + url);
+};
+byId("download-repo").value = "org/model";
+byId("download-revision").value = "";
+async function submit() {
+  await byId("download-form").listeners.submit({ preventDefault() {} });
+}
+(async function () {
+  await submit();
+  process.stdout.write(JSON.stringify({
+    requested,
+    downloadsVisible: byId("downloads-section").style.display,
+    rows: byId("downloads-table-body").children.length,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result["rows"] == 1
+    assert result["downloadsVisible"] == ""
+    assert any(r["url"] == "/admin/models/downloads" for r in result["requested"])
+    assert any(
+        r["url"] == "/admin/models/download" and r["method"] == "POST"
+        for r in result["requested"]
+    )
+
+
+def test_models_manual_download_refresh_invalidates_older_poll() -> None:
+    """The out-of-band downloads refresh must advance the request sequence so
+    an older in-flight poll's response cannot pass the render guard and
+    overwrite the freshly rendered download list."""
+    result = _run_models_scenario(
+        r"""
+let downloadsRequests = 0;
+let resolveOldDownloads;
+sandbox.fetch = async function (url, options) {
+  if (url === "/admin/models/catalog") {
+    return response({ models: [], gguf_artifacts: [] });
+  }
+  if (url === "/admin/models/download" && options && options.method === "POST") {
+    return { ok: true, json: async function () { return {}; } };
+  }
+  if (url === "/admin/models/downloads") {
+    downloadsRequests += 1;
+    if (downloadsRequests === 1) {
+      return new Promise(function (resolve) { resolveOldDownloads = resolve; });
+    }
+    return response([{ repo_id: "fresh-model", status: "downloading", started_at: null }]);
+  }
+  throw new Error("unexpected URL " + url);
+};
+byId("download-repo").value = "fresh-model";
+byId("download-revision").value = "";
+(async function () {
+  const oldPoll = sandbox.poll();
+  await byId("download-form").listeners.submit({ preventDefault() {} });
+  resolveOldDownloads(response([{ repo_id: "stale-model", status: "complete", started_at: null }]));
+  await oldPoll;
+  const rows = byId("downloads-table-body").children.map(function (row) {
+    return row.children[0].textContent;
+  });
+  process.stdout.write(JSON.stringify({ downloadsRequests, rows }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {"downloadsRequests": 2, "rows": ["fresh-model"]}
+
+
+def test_models_older_manual_refresh_cannot_overwrite_newer_poll_downloads() -> None:
+    """Inverse ordering: an older manual refresh landing after a newer poll has
+    rendered its downloads (but before that poll's catalog fetch completes)
+    must not replace the newer download table."""
+    result = _run_models_scenario(
+        r"""
+let downloadsRequests = 0;
+let resolveManualDownloads;
+let resolvePollCatalog;
+sandbox.fetch = async function (url) {
+  if (url === "/admin/models/downloads") {
+    downloadsRequests += 1;
+    if (downloadsRequests === 1) {
+      return new Promise(function (resolve) { resolveManualDownloads = resolve; });
+    }
+    return response([{ repo_id: "newer-poll-download", status: "downloading", started_at: null }]);
+  }
+  if (url === "/admin/models/catalog") {
+    return new Promise(function (resolve) { resolvePollCatalog = resolve; });
+  }
+  throw new Error("unexpected URL " + url);
+};
+(async function () {
+  const manual = sandbox.refreshDownloads();
+  const poll = sandbox.poll();
+  resolveManualDownloads(response([{ repo_id: "stale-manual-download", status: "complete", started_at: null }]));
+  resolvePollCatalog(response({ models: [], gguf_artifacts: [] }));
+  await manual;
+  await poll;
+  const rows = byId("downloads-table-body").children.map(function (row) {
+    return row.children[0].textContent;
+  });
+  process.stdout.write(JSON.stringify({ downloadsRequests, rows }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {"downloadsRequests": 2, "rows": ["newer-poll-download"]}

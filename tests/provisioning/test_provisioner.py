@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import asyncssh
 import httpx
 import pytest
+from pytest_httpx import HTTPXMock
 
 from inference_proxy.config.settings import (
     LLMFitSettings,
@@ -57,7 +58,9 @@ from inference_proxy.provisioning.provisioner import (
     PreflightError,
     ProvisioningError,
     ProvisioningIdentity,
+    SelfSetupError,
     _parse_llamacpp_runtime_fit,
+    served_vllm_model_id,
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -344,6 +347,7 @@ def test_script_env_prefix_exact() -> None:
         max_num_batched_tokens=4096,
         tool_call_parser="mistral",
         reasoning_parser="deepseek_r1",
+        dtype="bfloat16",
     )
     assert provisioner._start_script_env("org/model", vllm_params=vllm_params) == {
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
@@ -355,6 +359,7 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_MAX_BATCHED_TOKENS": "4096",
         "AUTOVLLM_TOOL_CALL_PARSER": "mistral",
         "AUTOVLLM_REASONING_PARSER": "deepseek_r1",
+        "AUTOVLLM_DTYPE": "bfloat16",
         "HF_TOKEN": "hf secret",
     }
     assert provisioner._start_script_env("org/model", vllm_params=VllmParams()) == {
@@ -1340,6 +1345,139 @@ class TestNodeRegistration:
 
         etcd.put.assert_called_once()
         assert "lease_id" not in etcd.put.call_args.kwargs
+
+
+class TestSelfSetupRegistration:
+    """Adopt an already-running vLLM instance without owning its lifecycle."""
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            ({"data": [{"id": "org/model"}]}, "org/model"),
+            ({"data": [{"id": "  org/model  "}]}, "org/model"),
+            ({"data": []}, None),
+            ({"data": [{"id": ""}]}, None),
+            ({"object": "list"}, None),
+            ("not-an-object", None),
+        ],
+    )
+    def test_served_vllm_model_id(self, payload: object, expected: str | None) -> None:
+        assert served_vllm_model_id(payload) == expected
+
+    @pytest.mark.asyncio
+    async def test_registers_detected_model(self, httpx_mock: HTTPXMock) -> None:
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        registry = NodeRegistry()
+        provisioner = _make_provisioner(etcd_client=etcd, registry=registry)
+        httpx_mock.add_response(url="http://host1:8000/health", status_code=200)
+        httpx_mock.add_response(
+            url="http://host1:8000/v1/models",
+            json={"data": [{"id": "org/qwen", "owned_by": "vllm"}]},
+        )
+
+        node = await provisioner.register_self_setup("host1")
+
+        assert node.self_setup is True
+        assert node.managed is False
+        assert node.status is NodeStatus.HEALTHY
+        assert node.model == "org/qwen"
+        assert node.engine is InferenceEngine.VLLM
+        etcd.grant_node_lease.assert_not_called()
+        etcd.put.assert_called_once()
+        stored = registry.get("host1")
+        assert stored is not None
+        assert stored.model == "org/qwen"
+        assert stored.self_setup is True
+
+    @pytest.mark.asyncio
+    async def test_health_failure_does_not_register(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        registry = NodeRegistry()
+        provisioner = _make_provisioner(etcd_client=etcd, registry=registry)
+        httpx_mock.add_response(url="http://host1:8000/health", status_code=503)
+
+        with pytest.raises(SelfSetupError, match="health check failed"):
+            await provisioner.register_self_setup("host1")
+
+        etcd.put.assert_not_called()
+        assert registry.get("host1") is None
+
+    @pytest.mark.asyncio
+    async def test_missing_models_does_not_register(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        registry = NodeRegistry()
+        provisioner = _make_provisioner(etcd_client=etcd, registry=registry)
+        httpx_mock.add_response(url="http://host1:8000/health", status_code=200)
+        httpx_mock.add_response(
+            url="http://host1:8000/v1/models",
+            json={"data": []},
+        )
+
+        with pytest.raises(SelfSetupError, match="reported no models"):
+            await provisioner.register_self_setup("host1")
+
+        etcd.put.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unreachable_does_not_register(self, httpx_mock: HTTPXMock) -> None:
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        registry = NodeRegistry()
+        provisioner = _make_provisioner(etcd_client=etcd, registry=registry)
+        httpx_mock.add_exception(
+            httpx.ConnectError("refused"),
+            url="http://host1:8000/health",
+        )
+
+        with pytest.raises(SelfSetupError, match="not reachable"):
+            await provisioner.register_self_setup("host1")
+
+        etcd.put.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_readoption_reconciles_drifted_model(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        """A self-setup node tracks one model. When the externally owned vLLM
+        is restarted with another model, re-adoption reconciles the stored
+        model instead of keeping the first reported value forever."""
+        from structlog.testing import capture_logs
+
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        registry = NodeRegistry()
+        provisioner = _make_provisioner(etcd_client=etcd, registry=registry)
+        httpx_mock.add_response(url="http://host1:8000/health", status_code=200)
+        httpx_mock.add_response(
+            url="http://host1:8000/v1/models",
+            json={"data": [{"id": "org/first"}]},
+        )
+        httpx_mock.add_response(url="http://host1:8000/health", status_code=200)
+        httpx_mock.add_response(
+            url="http://host1:8000/v1/models",
+            json={"data": [{"id": "org/second"}]},
+        )
+
+        first = await provisioner.register_self_setup("host1")
+        assert first.model == "org/first"
+        assert etcd.put.call_count == 1
+
+        with capture_logs():
+            second = await provisioner.register_self_setup("host1")
+
+        assert second.model == "org/second"
+        assert second.self_setup is True
+        stored = registry.get("host1")
+        assert stored is not None
+        assert stored.model == "org/second"
+        assert etcd.put.call_count == 2
 
 
 class TestSetupFailure:

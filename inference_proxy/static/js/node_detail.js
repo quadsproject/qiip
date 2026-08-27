@@ -113,9 +113,17 @@ var ACTION_CONFIG = {
   remove: {
     method: "DELETE", url: function (id) { return "/admin/nodes/" + id + "/pool"; },
     body: null, confirm: true, danger: false,
-    confirmMsg: function (id) { return "Remove " + id + " from the available pool?"; },
+    confirmMsg: function (id, node) {
+      return node && node.self_setup
+        ? "Remove " + id + " from the fleet? The existing vLLM instance will keep running."
+        : "Remove " + id + " from the available pool?";
+    },
     label: "Remove", pendingLabel: "Removing…", css: "btn-secondary",
-    successMsg: function (id) { return id + " removed from pool"; },
+    successMsg: function (id, node) {
+      return node && node.self_setup
+        ? id + " removed from fleet"
+        : id + " removed from pool";
+    },
   },
 };
 
@@ -125,7 +133,7 @@ async function handleAction(action, nodeId, node, onStart) {
   if (config.confirm) {
     var ok = await confirmDialog({
       title: config.label,
-      message: config.confirmMsg(nodeId),
+      message: config.confirmMsg(nodeId, node),
       confirmLabel: config.label,
       danger: config.danger,
     });
@@ -145,7 +153,7 @@ async function handleAction(action, nodeId, node, onStart) {
   try {
     var resp = await fetch(config.url(nodeId), options);
     if (resp.ok) {
-      showToast(config.successMsg(nodeId), "success");
+      showToast(config.successMsg(nodeId, node), "success");
       resetLogStreamState();
     } else {
       var data = await resp.json().catch(function () { return { detail: "HTTP " + resp.status }; });
@@ -156,7 +164,7 @@ async function handleAction(action, nodeId, node, onStart) {
   }
 }
 
-var ALL_ACTIONS = ["setup", "teardown", "retry", "cancel", "force_teardown"];
+var ALL_ACTIONS = ["setup", "teardown", "retry", "cancel", "force_teardown", "remove"];
 
 // ponytail: shared dropdown chrome (trigger + menu) reused by node actions and power controls
 function buildActionMenu(items) {
@@ -212,7 +220,9 @@ function buildDropdownGroup(trigger, menu) {
 }
 
 function createActionsDropdown(nodeId, enabledActions, node) {
-  var items = ALL_ACTIONS.map(function (action) {
+  var items = ALL_ACTIONS.filter(function (action) {
+    return action !== "remove" || enabledActions.indexOf("remove") !== -1;
+  }).map(function (action) {
     var config = ACTION_CONFIG[action];
     return {
       label: config.label,
@@ -541,6 +551,25 @@ async function submitLlamaCppRelaunch() {
   renderLlamaCppRuntime(currentDetailNode, currentRelaunchObservation);
 }
 
+function renderOriginTag(node) {
+  var tag = document.getElementById("node-origin-tag");
+  if (!tag) return;
+  if (node && node.self_setup) {
+    tag.className = "badge badge-self-setup";
+    tag.textContent = "vllm-self";
+    tag.hidden = false;
+    return;
+  }
+  if (node && node.managed === false) {
+    tag.className = "badge badge-standalone";
+    tag.textContent = "standalone";
+    tag.hidden = false;
+    return;
+  }
+  tag.textContent = "";
+  tag.hidden = true;
+}
+
 async function refreshDetail() {
   var stateEl = document.getElementById("node-state");
   var infoBody = document.getElementById("node-info-body");
@@ -578,11 +607,28 @@ async function refreshDetail() {
       renderTableMessage(infoBody, 9, "Node not found in registry");
       document.getElementById("node-actions").textContent = "";
       document.getElementById("config-download-panel").style.display = "none";
+      document.getElementById("setup-config-panel").style.display = "";
+      var missingTag = document.getElementById("node-origin-tag");
+      missingTag.textContent = "";
+      missingTag.hidden = true;
       renderLlamaCppRuntime(null, currentRelaunchObservation);
     } else {
       stateEl.textContent = node.state;
       setupSelection.setPreferredNode(node);
       renderLlamaCppRuntime(node, currentRelaunchObservation);
+      renderOriginTag(node);
+      document.getElementById("setup-config-panel").style.display =
+        node.self_setup ? "none" : "";
+
+      // Self-setup nodes are externally owned: QIIP must not send BMC power
+      // actions or install software on them, and the server rejects those
+      // operations outright. Hide the matching controls here.
+      document.getElementById("power-state").style.display =
+        node.self_setup ? "none" : "";
+      document.getElementById("power-actions").style.display =
+        node.self_setup ? "none" : "";
+      document.getElementById("recommendations-panel").style.display =
+        node.self_setup ? "none" : "";
 
       infoBody.textContent = "";
       var tr = document.createElement("tr");
@@ -1269,6 +1315,17 @@ async function handlePowerAction(action, actionBtn) {
 
 async function refreshPowerState() {
   var el = document.querySelector("#power-state span");
+  var powerStateEl = document.getElementById("power-state");
+  var powerActionsEl = document.getElementById("power-actions");
+  // Self-setup nodes are externally owned: QIIP never sends BMC power actions,
+  // so the power card is hidden once we know the node's origin.
+  if (currentDetailNode && currentDetailNode.self_setup) {
+    powerStateEl.style.display = "none";
+    powerActionsEl.style.display = "none";
+    return;
+  }
+  powerStateEl.style.display = "";
+  powerActionsEl.style.display = "";
   try {
     var resp = await fetch("/admin/nodes/" + encodeURIComponent(NODE_ID) + "/power");
     if (resp.status === 503) {
@@ -1341,7 +1398,6 @@ document.addEventListener("DOMContentLoaded", function () {
       }
     });
   }
-  fetchCatalog().then(refreshDetail);
-  refreshPowerState();
+  fetchCatalog().then(refreshDetail).then(function () { refreshPowerState(); });
   setInterval(refreshDetail, POLL_INTERVAL_MS);
 });

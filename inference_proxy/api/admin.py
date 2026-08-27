@@ -74,6 +74,7 @@ from inference_proxy.provisioning.provisioner import (
     ProvisioningIdentity,
     RelaunchPreconditionError,
     RelaunchValidationError,
+    SelfSetupError,
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -292,22 +293,82 @@ async def register_node(
     registry: NodeRegistry = Depends(get_registry),
     provisioner: NodeProvisioner = Depends(get_provisioner),
 ) -> JSONResponse:
-    """Register a node in the available pool without provisioning."""
+    """Register a node in the available pool, or adopt a running vLLM instance.
+
+    Registration is a host-mutating operation, so the hostname is reserved
+    through the host lifecycle coordinator before any remote probe (self-setup
+    adoption) or fleet write. The registry is re-checked while holding the
+    lease so adoption cannot race with setup, teardown, or another concurrent
+    registration for the same hostname.
+
+    Re-adoption of an existing self-setup instance is allowed: it re-probes
+    the live vLLM server and reconciles the tracked model with what vLLM
+    currently serves (see ``NodeProvisioner.register_self_setup``).
+    """
     hostname = canonical_hostname(body.hostname)
     node = registry.get(hostname)
-    if node is not None:
+    if node is not None and (not body.self_setup or not node.self_setup):
         raise HTTPException(
-            status_code=409, detail=f"Node '{hostname}' is already registered"
+            status_code=409,
+            detail=(
+                f"Node '{hostname}' is already registered"
+                + (
+                    "; re-adoption requires the existing registration to be "
+                    "a self-setup vLLM instance"
+                    if body.self_setup
+                    else ""
+                )
+            ),
         )
     try:
         provisioner.validate_endpoint(hostname)
     except EndpointValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    await provisioner.register_available(hostname)
-    return JSONResponse(
-        status_code=201,
-        content={"hostname": hostname, "state": "available"},
-    )
+
+    lease = await provisioner.try_reserve_host(hostname)
+    if lease is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Host lifecycle operation already in progress for '{hostname}'; "
+                "wait for it to finish before retrying registration"
+            ),
+        )
+    try:
+        # Re-check under exclusive ownership: setup, teardown, or a concurrent
+        # registration may have claimed the host while we validated the endpoint.
+        node = registry.get(hostname)
+        if node is not None and (not body.self_setup or not node.self_setup):
+            raise HTTPException(
+                status_code=409, detail=f"Node '{hostname}' is already registered"
+            )
+        if body.self_setup:
+            if node is not None:
+                logger.info(
+                    "self_setup_re_adoption_started",
+                    hostname=hostname,
+                    previous_model=node.model,
+                )
+            try:
+                adopted = await provisioner.register_self_setup(hostname)
+            except SelfSetupError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+            return JSONResponse(
+                status_code=201,
+                content={
+                    "hostname": hostname,
+                    "state": adopted.status.value,
+                    "model": adopted.model,
+                    "self_setup": True,
+                },
+            )
+        await provisioner.register_available(hostname)
+        return JSONResponse(
+            status_code=201,
+            content={"hostname": hostname, "state": "available"},
+        )
+    finally:
+        lease.release()
 
 
 @admin_router.delete("/nodes/{node_id}/pool")
@@ -316,23 +377,45 @@ async def remove_from_pool(
     registry: NodeRegistry = Depends(get_registry),
     provisioner: NodeProvisioner = Depends(get_provisioner),
 ) -> JSONResponse:
-    """Remove a manually registered node from the available pool."""
+    """Remove a manually registered node from the fleet."""
     hostname = _validated_hostname(node_id)
     node = registry.get(hostname)
     if node is None:
         raise HTTPException(status_code=404, detail=f"Node '{hostname}' not found")
-    if node.status != NodeStatus.AVAILABLE:
+
+    # Removal deletes registry and etcd state, so it must hold the host
+    # lifecycle lease and re-check the node before deleting: otherwise setup,
+    # teardown, or another registration could own the same hostname.
+    lease = await provisioner.try_reserve_host(hostname)
+    if lease is None:
         raise HTTPException(
             status_code=409,
-            detail=f"Node '{hostname}' is {node.status.value}; use teardown instead",
+            detail=(
+                f"Host lifecycle operation already in progress for '{hostname}'; "
+                "wait for it to finish before retrying removal"
+            ),
         )
-    if node.managed:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Node '{hostname}' is managed; use teardown instead",
-        )
-    await provisioner.remove_available(hostname)
-    return JSONResponse(content={"hostname": hostname, "removed": True})
+    try:
+        node = registry.get(hostname)
+        if node is None:
+            raise HTTPException(status_code=404, detail=f"Node '{hostname}' not found")
+        if node.self_setup:
+            await provisioner.remove_available(hostname)
+            return JSONResponse(content={"hostname": hostname, "removed": True})
+        if node.status != NodeStatus.AVAILABLE:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Node '{hostname}' is {node.status.value}; use teardown instead",
+            )
+        if node.managed:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Node '{hostname}' is managed; use teardown instead",
+            )
+        await provisioner.remove_available(hostname)
+        return JSONResponse(content={"hostname": hostname, "removed": True})
+    finally:
+        lease.release()
 
 
 @admin_router.post("/nodes/setup", status_code=202)
@@ -356,6 +439,14 @@ async def setup_node(
         fields_set=sorted(body.model_fields_set),
     )
     initial_node = registry.get(hostname)
+    if initial_node is not None and initial_node.self_setup:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Node '{hostname}' is a self-setup vLLM instance; "
+                "remove it from the fleet instead of provisioning"
+            ),
+        )
     selection = _effective_setup_selection(body, initial_node)
 
     try:
@@ -393,6 +484,17 @@ async def setup_node(
 
         node = registry.get(hostname)
         selection = _effective_setup_selection(body, node, fallback=selection)
+        if node is not None and node.self_setup:
+            # Re-checked under exclusive ownership: adoption can complete after
+            # the initial read at the top of this handler, and teardown performs
+            # the same second check. A self-setup node can never be provisioned.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Node '{hostname}' is a self-setup vLLM instance; "
+                    "remove it from the fleet instead of provisioning"
+                ),
+            )
         if node is not None and node.status in _SETUP_REJECTED_STATUSES:
             raise HTTPException(
                 status_code=409,
@@ -668,6 +770,15 @@ async def teardown_node(
     """Trigger teardown of a node (runs in background)."""
     node_id = canonical_hostname(node_id)
     cancelled_identity: ProvisioningIdentity | None = None
+    existing = registry.get(node_id)
+    if existing is not None and existing.self_setup:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Node '{node_id}' is a self-setup vLLM instance; "
+                "remove it from the fleet instead of tearing it down"
+            ),
+        )
 
     if recovery_engine is not None:
         if not force:
@@ -713,6 +824,14 @@ async def teardown_node(
     transferred = False
     try:
         registered_node = registry.get(node_id)
+        if registered_node is not None and registered_node.self_setup:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Node '{node_id}' is a self-setup vLLM instance; "
+                    "remove it from the fleet instead of tearing it down"
+                ),
+            )
         if recovery_engine is not None and registered_node is not None:
             raise HTTPException(
                 status_code=409,
@@ -802,18 +921,51 @@ async def execute_power_action(
     hostname: str,
     body: PowerActionRequest,
     redfish: RedfishClient | None = Depends(get_redfish_client),
+    registry: NodeRegistry = Depends(get_registry),
+    provisioner: NodeProvisioner = Depends(get_provisioner),
 ) -> PowerStateResponse:
-    """Execute a power action on a node's BMC (PWR-01/02/03, D-05)."""
+    """Execute a power action on a node's BMC (PWR-01/02/03, D-05).
+
+    Power actions are host-mutating, so the hostname is reserved through the
+    host lifecycle coordinator up front and owned through the Redfish call:
+    a self-setup node is not yet registered while adoption holds the lease
+    (the ``registry.get`` below would miss it), and a concurrent setup or
+    teardown must not be power-cycled out from under itself.
+    """
     if redfish is None:
         raise HTTPException(status_code=503, detail="Redfish not configured")
     hostname = _validated_hostname(hostname)
+    lease = await provisioner.try_reserve_host(hostname)
+    if lease is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Host lifecycle operation already in progress for '{hostname}'; "
+                "wait for it to finish before sending BMC power actions"
+            ),
+        )
     try:
-        final_state = await redfish.power_action(hostname, body.action.value)
-    except RedfishDestinationError as exc:
-        raise HTTPException(status_code=400, detail=exc.human_message) from exc
-    except RedfishError as exc:
-        raise HTTPException(status_code=502, detail=exc.human_message) from exc
-    return PowerStateResponse(hostname=hostname, power_state=final_state)
+        # Re-check under exclusive ownership: adoption can complete while we
+        # waited for the lease, so the node may now be registered as
+        # self-setup even though the earlier read would have missed it.
+        node = registry.get(hostname)
+        if node is not None and node.self_setup:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Node '{hostname}' is a self-setup vLLM instance; "
+                    "QIIP does not own its hardware and cannot send BMC power actions"
+                ),
+            )
+        try:
+            final_state = await redfish.power_action(hostname, body.action.value)
+        except RedfishDestinationError as exc:
+            raise HTTPException(status_code=400, detail=exc.human_message) from exc
+        except RedfishError as exc:
+            raise HTTPException(status_code=502, detail=exc.human_message) from exc
+        return PowerStateResponse(hostname=hostname, power_state=final_state)
+    finally:
+        lease.release()
 
 
 @admin_router.get(
@@ -828,7 +980,15 @@ async def get_recommendations(
     provisioner: NodeProvisioner = Depends(get_provisioner),
     poller: QUADSPoller | None = Depends(get_quads_poller),
 ) -> RecommendationResponse | JSONResponse:
-    """Return ranked model recommendations for a node's hardware."""
+    """Return ranked model recommendations for a node's hardware.
+
+    Recommendations can install llmfit with sudo on the host, so the hostname
+    is reserved through the host lifecycle coordinator before the ownership
+    check and held through ``runner.recommend()``: a self-setup node is not
+    yet registered while adoption holds the lease, so the ``registry.get``
+    below would otherwise let software be installed on externally owned
+    hardware.
+    """
     hostname = _validated_hostname(hostname)
     try:
         provisioner.validate_endpoint(hostname)
@@ -838,63 +998,92 @@ async def get_recommendations(
             detail=f"Node '{hostname}' is not available for recommendations",
         ) from exc
 
-    registered = registry.get(hostname) is not None
-    quads_available = False
-    if poller is not None:
-        inventory = {canonical_hostname(host.hostname) for host in poller.hosts}
-        available = {
-            canonical_hostname(available_host)
-            for available_host in poller.available_hostnames
-        }
-        quads_available = hostname in inventory and hostname in available
-    if not registered and not quads_available:
+    lease = await provisioner.try_reserve_host(hostname)
+    if lease is None:
         raise HTTPException(
-            status_code=404,
-            detail=f"Node '{hostname}' is not available for recommendations",
+            status_code=409,
+            detail=(
+                f"Host lifecycle operation already in progress for '{hostname}'; "
+                "wait for it to finish before requesting recommendations"
+            ),
         )
-
     try:
-        result = await runner.recommend(hostname)
-    except LLMFitTimeoutError as exc:
-        logger.warning("llmfit_timeout", host=exc.host, timeout=exc.timeout)
-        return JSONResponse(
-            status_code=502,
-            content={"error_type": "timeout", "detail": str(exc)},
+        # Re-check under exclusive ownership: adoption can complete while we
+        # waited for the lease, so the node may now be registered as
+        # self-setup even though the earlier read would have missed it.
+        registered_node = registry.get(hostname)
+        if registered_node is not None and registered_node.self_setup:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Node '{hostname}' is a self-setup vLLM instance; "
+                    "QIIP cannot recommend or install software on externally "
+                    "owned hardware"
+                ),
+            )
+        registered = registered_node is not None
+        quads_available = False
+        if poller is not None:
+            inventory = {canonical_hostname(host.hostname) for host in poller.hosts}
+            available = {
+                canonical_hostname(available_host)
+                for available_host in poller.available_hostnames
+            }
+            quads_available = hostname in inventory and hostname in available
+        if not registered and not quads_available:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Node '{hostname}' is not available for recommendations",
+            )
+
+        try:
+            result = await runner.recommend(hostname)
+        except LLMFitTimeoutError as exc:
+            logger.warning("llmfit_timeout", host=exc.host, timeout=exc.timeout)
+            return JSONResponse(
+                status_code=502,
+                content={"error_type": "timeout", "detail": str(exc)},
+            )
+        except LLMFitParseError as exc:
+            logger.warning(
+                "llmfit_parse_error",
+                host=hostname,
+                reason=exc.reason,
+                raw_output=exc.raw_output,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error_type": "parse_error",
+                    "detail": f"Failed to parse llmfit output: {exc.reason}",
+                },
+            )
+        except SSHConnectionError as exc:
+            logger.warning(
+                "llmfit_ssh_connection_error", host=exc.host, reason=exc.reason
+            )
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error_type": "connection_error",
+                    "detail": f"SSH connection failed: {exc.reason}",
+                },
+            )
+        except RemoteCommandError as exc:
+            logger.warning(
+                "llmfit_remote_command_error",
+                host=exc.host,
+                exit_status=exc.exit_status,
+            )
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error_type": "ssh_error",
+                    "detail": f"llmfit exited with status {exc.exit_status}",
+                },
+            )
+        return RecommendationResponse(
+            hostname=hostname, system=result.system, models=result.models
         )
-    except LLMFitParseError as exc:
-        logger.warning(
-            "llmfit_parse_error",
-            host=hostname,
-            reason=exc.reason,
-            raw_output=exc.raw_output,
-        )
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error_type": "parse_error",
-                "detail": f"Failed to parse llmfit output: {exc.reason}",
-            },
-        )
-    except SSHConnectionError as exc:
-        logger.warning("llmfit_ssh_connection_error", host=exc.host, reason=exc.reason)
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error_type": "connection_error",
-                "detail": f"SSH connection failed: {exc.reason}",
-            },
-        )
-    except RemoteCommandError as exc:
-        logger.warning(
-            "llmfit_remote_command_error", host=exc.host, exit_status=exc.exit_status
-        )
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error_type": "ssh_error",
-                "detail": f"llmfit exited with status {exc.exit_status}",
-            },
-        )
-    return RecommendationResponse(
-        hostname=hostname, system=result.system, models=result.models
-    )
+    finally:
+        lease.release()

@@ -657,6 +657,11 @@ h1 {
   white-space: nowrap;
 }
 
+.standalone-label input[type="checkbox"] {
+  margin: 0;
+  accent-color: var(--primary);
+}
+
 /* --- Tables --- */
 .table-wrap { overflow-x: auto; }
 
@@ -769,14 +774,16 @@ tbody tr:last-child td { border-bottom: none; }
   color: var(--primary);
 }
 
-.badge-standalone {
+.badge-standalone,
+.badge-self-setup {
   background: var(--bg);
   color: var(--text-light);
   border: 1px solid var(--border-strong);
   font-size: 0.625rem;
 }
 
-.badge-standalone::before { display: none; }
+.badge-standalone::before,
+.badge-self-setup::before { display: none; }
 
 /* --- Buttons --- */
 .btn {
