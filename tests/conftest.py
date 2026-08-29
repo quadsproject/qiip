@@ -27,6 +27,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+from inference_proxy.auth.dependencies import get_auth_store
+from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import (
     get_catalog_service,
     get_circuit_breaker_registry,
@@ -44,6 +46,7 @@ from inference_proxy.config.dependencies import (
 )
 from inference_proxy.config.settings import (
     AdminSettings,
+    AuthSettings,
     EtcdSettings,
     HuggingFaceSettings,
     RoutingSettings,
@@ -62,7 +65,7 @@ from inference_proxy.services.unified_nodes import UnifiedNodeService
 
 
 @pytest.fixture
-def test_settings() -> Settings:
+def test_settings(tmp_path: Path) -> Settings:
     """Return a Settings instance with test-safe defaults."""
     return Settings(
         etcd=EtcdSettings(
@@ -74,7 +77,19 @@ def test_settings() -> Settings:
             password=SecretStr(_TEST_ADMIN_PASSWORD),
         ),
         huggingface=HuggingFaceSettings(cache_dir=str(_TEST_HF_CACHE)),
+        auth=AuthSettings(
+            db_path=tmp_path / "qiip-test-auth.db",
+            session_secret=SecretStr("test-session-secret"),
+        ),
     )
+
+
+@pytest.fixture
+def auth_store(tmp_path: Path) -> Generator[AuthStore, None, None]:
+    """Return a fresh SQLite-backed auth store for a single test."""
+    store = AuthStore(tmp_path / "qiip-test-auth-store.db")
+    yield store
+    store.close()
 
 
 @pytest.fixture
@@ -136,6 +151,7 @@ def app(
     node_selector: NodeSelector,
     circuit_breaker_registry: CircuitBreakerRegistry,
     request_metrics: RequestMetrics,
+    auth_store: AuthStore,
 ) -> Generator[FastAPI, None, None]:
     """Create a FastAPI app with test settings, registry, and proxy client injected."""
     application = create_app(settings=test_settings)
@@ -147,6 +163,9 @@ def app(
     application.state.quads_poller = None
     application.state.quads_client = None
     application.state.redfish_client = None
+    application.state.auth_store = auth_store
+    application.state.oauth = None
+    application.dependency_overrides[get_auth_store] = lambda: auth_store
     application.dependency_overrides[get_proxy_client] = lambda: proxy_client
     application.dependency_overrides[get_quads_client] = lambda: None
     application.dependency_overrides[get_quads_poller] = lambda: None

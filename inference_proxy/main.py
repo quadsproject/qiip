@@ -26,15 +26,21 @@ os.environ["HF_HUB_DISABLE_XET"] = "1"
 
 import httpx
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.sessions import SessionMiddleware
 
 from inference_proxy.api.admin import admin_router
+from inference_proxy.api.auth import auth_router
 from inference_proxy.api.chat import chat_router
 from inference_proxy.api.dashboard import dashboard_router
+from inference_proxy.api.errors import ApiAuthError
 from inference_proxy.api.middleware import RequestLoggingMiddleware
+from inference_proxy.api.profile import profile_router
 from inference_proxy.api.routes import router
+from inference_proxy.auth.oauth import build_google_oauth
+from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.logging import configure_logging
 from inference_proxy.config.settings import Settings
@@ -49,6 +55,7 @@ from inference_proxy.huggingface.catalog import ModelCatalogService
 from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.endpoint import EndpointPolicy
+from inference_proxy.models.openai import ErrorDetail, ErrorResponse
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.provisioning.ssh_client import SSHClient
@@ -278,6 +285,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             request_metrics = RequestMetrics()
             app.state.request_metrics = request_metrics
 
+            auth_store = AuthStore(resolved_settings.auth.db_path)
+            app.state.auth_store = auth_store
+            resources.callback(_safe_sync_cleanup, "auth store", auth_store.close)
+
+            if resolved_settings.oauth.enabled:
+                app.state.oauth = build_google_oauth(resolved_settings.oauth)
+                logger.info("google oauth enabled")
+            else:
+                app.state.oauth = None
+                logger.info("google oauth disabled")
+
             ssh_client = SSHClient(resolved_settings.ssh)
 
             llmfit_runner = LLMFitRunner(
@@ -478,6 +496,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     application.add_middleware(RequestLoggingMiddleware)
 
+    if resolved_settings.auth.session_secret is not None:
+        application.add_middleware(
+            SessionMiddleware,
+            secret_key=resolved_settings.auth.session_secret.get_secret_value(),
+            session_cookie=resolved_settings.auth.session_cookie,
+            max_age=resolved_settings.auth.session_ttl_seconds,
+            same_site="lax",
+            https_only=False,
+        )
+
+    async def _api_auth_error_handler(
+        _request: Request,
+        exc: Exception,
+    ) -> JSONResponse:
+        """Render token-auth failures as an OpenAI-compatible 401 body."""
+        if not isinstance(exc, ApiAuthError):
+            raise exc
+        return JSONResponse(
+            status_code=401,
+            content=ErrorResponse(
+                error=ErrorDetail(
+                    message=exc.message,
+                    type="invalid_request_error",
+                    code="invalid_api_key",
+                )
+            ).model_dump(),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    application.add_exception_handler(ApiAuthError, _api_auth_error_handler)
+
     @application.get("/health")
     async def health() -> JSONResponse:
         """Return gateway health status with registered node count."""
@@ -493,6 +542,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(admin_router)
     application.include_router(dashboard_router)
     application.include_router(chat_router)
+    application.include_router(auth_router)
+    application.include_router(profile_router)
 
     static_dir = Path(__file__).resolve().parent / "static"
     application.mount("/static", StaticFiles(directory=str(static_dir)), name="static")

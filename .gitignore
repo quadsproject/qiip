@@ -18,6 +18,12 @@ build/
 # Type checking
 .mypy_cache/
 
+# Local SQLite auth store (runtime data, default under data/)
+data/
+*.db
+*.db-wal
+*.db-shm
+
 # Testing
 .pytest_cache/
 .coverage

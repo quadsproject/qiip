@@ -50,7 +50,11 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Background model downloads** -- concurrent HuggingFace downloads with status tracking; duplicate-safe and re-downloadable after completion or failure
 - **Hardware-aware model recommendations** -- runs llmfit via SSH on a target host to produce ranked, runtime-normalized recommendations with fit levels, throughput, memory estimates, and typed GGUF sources; auto-installs the binary on first use
 - **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
-- **Admin authentication** -- HTTP Basic required on all `/admin/*` endpoints and `/dashboard*` pages; inference API remains public
+- **Admin authentication** -- HTTP Basic required on all `/admin/*` endpoints and `/dashboard*` pages
+- **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
+- **User API tokens** -- each user can mint `qiip_...` bearer tokens on their profile page to call `/v1/chat/completions` and `/v1/completions`; tokens are stored as SHA-256 digests and can be revoked at any time
+- **Config-gated inference auth** -- `/v1` requests carrying a valid bearer token are always validated; requiring a token for every `/v1` request (`auth.enforce_api_tokens`) is optional and off by default, so existing public deployments are not broken
+- **Token usage tracking** -- token-authenticated requests record OpenAI token usage per token/model for reporting on the profile page
 - **Backend endpoint allowlist** -- configurable hostname wildcard, CIDR network, and port allowlists; rejects non-matching registrations with loopback-only defaults
 - **Client config downloads** -- one-click download of OpenCode CLI and Pi coding agent configuration files from the dashboard and node detail pages; dashboard configs point at the proxy for load-balanced access, node detail configs point at individual backend endpoints
 
@@ -74,6 +78,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Upgrade requirements](#upgrade-requirements)
   - [Server launch](#server-launch)
   - [Admin authentication](#admin-authentication)
+  - [User authentication (Google OAuth)](#user-authentication-google-oauth)
   - [etcd](#etcd)
   - [Routing](#routing)
   - [SSH and provisioning commands](#ssh-and-provisioning-commands)
@@ -219,6 +224,22 @@ Public endpoints:
 | `POST` | `/v1/completions` | Text completion (OpenAI-compatible) |
 | `GET` | `/v1/models` | List models available across healthy nodes |
 | `GET` | `/chat` | Browser chat playground |
+| `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage |
+| `GET` | `/auth/login` | Start Google OAuth sign-in (302 to Google) |
+| `GET` | `/auth/callback` | Google redirect target; signs the session cookie |
+| `POST` | `/auth/logout` | Clear the session cookie |
+| `GET` | `/auth/me` | JSON identity of the signed-in user (401 when anonymous) |
+
+User-session-protected profile endpoints (require `auth.session_secret` and a
+signed-in session):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/profile/me` | Public identity of the signed-in user |
+| `GET` | `/profile/tokens` | List the user's API tokens (prefix only) |
+| `POST` | `/profile/tokens` | Mint a token; returns the raw secret exactly once |
+| `DELETE` | `/profile/tokens/{id}` | Revoke a token |
+| `GET` | `/profile/usage` | Aggregated usage per token/model plus headline totals |
 
 HTTP Basic-protected administrative endpoints:
 
@@ -244,8 +265,10 @@ HTTP Basic-protected administrative endpoints:
 ### Administrative access
 
 All `/admin/*` API endpoints and `/dashboard*` pages require the shared HTTP
-Basic credentials configured below. The inference API, chat page, and health
-endpoint remain public. For example:
+Basic credentials configured below. The inference API, chat page, profile page,
+and health endpoint are public; the inference API may additionally require a
+user API token (see [User authentication (Google OAuth)](#user-authentication-google-oauth)).
+For example:
 
 ```bash
 curl -u "$INFERENCE_PROXY_ADMIN__USERNAME:$INFERENCE_PROXY_ADMIN__PASSWORD" \
@@ -429,6 +452,51 @@ Both values are required at startup. Existing deployments must configure them
 before upgrading. Credentials are accepted only through HTTP Basic and must be
 protected by TLS whenever clients do not reach the gateway over a trusted
 network.
+
+### User authentication (Google OAuth)
+
+User accounts are optional and off by default. When enabled, users sign in with
+their Google account on `/profile`, mint personal `qiip_...` bearer tokens, and
+track per-token inference usage. User data and token digests live in a SQLite
+database (`auth.db_path`); nothing is ever stored in the session cookie except
+the signed user id and expiry.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INFERENCE_PROXY_OAUTH__CLIENT_ID` | required (to enable) | Google OAuth 2.0 client id |
+| `INFERENCE_PROXY_OAUTH__CLIENT_SECRET` | required (to enable) | Google OAuth 2.0 client secret, stored as a masked secret |
+| `INFERENCE_PROXY_OAUTH__REDIRECT_URI` | required (to enable) | Absolute `http(s)://` callback URI, e.g. `https://gateway.example.com/auth/callback` |
+| `INFERENCE_PROXY_OAUTH__ALLOWED_DOMAINS` | `[]` | JSON array of hosted domains allowed to sign in; empty allows any Google account |
+| `INFERENCE_PROXY_AUTH__DB_PATH` | `data/qiip.db` | SQLite file holding users, token digests, and usage |
+| `INFERENCE_PROXY_AUTH__SESSION_SECRET` | required with OAuth | Long random secret signing the session cookie |
+| `INFERENCE_PROXY_AUTH__SESSION_COOKIE` | `qiip_session` | Session cookie name (alphanumeric plus `_` and `-`) |
+| `INFERENCE_PROXY_AUTH__SESSION_TTL_SECONDS` | `43200` | Session lifetime (300 to 7 days) |
+| `INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS` | `false` | Require a valid bearer token for every `/v1` inference request |
+| `INFERENCE_PROXY_AUTH__REQUIRE_EMAIL_VERIFICATION` | `true` | Reject Google accounts whose email is not verified |
+
+Enablement and guardrails:
+
+- Enable OAuth by configuring all three `OAUTH__*` credential variables; they
+  are validated all-or-none. `auth.session_secret` is then required, and
+  `auth.enforce_api_tokens` is only allowed while OAuth is enabled (users need a
+  way to mint tokens).
+- Google user accounts are keyed by their stable `sub` claim, so a renamed email
+  still resolves to the same account.
+- `/v1` behavior (AUTH-03): a bearer token that is presented is always
+  validated, even when enforcement is off — an invalid or revoked token is
+  rejected with an OpenAI-shaped `401 invalid_api_key`. Enforcement only decides
+  what happens when no token is presented. Set
+  `INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS=true` to require a token and keep
+  the default to preserve fully public `/v1` deployments.
+- `/v1/models`, `/health`, and the chat playground stay public in both modes.
+- Anonymously reached `/v1` requests are proxied but not attributed; only
+  token-authenticated calls record per-token usage (AUTH-04).
+
+Upgrading an existing deployment: with user auth disabled (the default) nothing
+changes. To roll out tokens without waking an oversight surface, first deploy
+with OAuth enabled but `enforce_api_tokens` left `false`, then flip enforcement
+once users have minted tokens. Rotate `auth.session_secret` to log every session
+out at once.
 
 ### etcd
 

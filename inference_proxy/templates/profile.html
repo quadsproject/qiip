@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>QIIP - Profile</title>
+    <meta name="description" content="Sign in with your Google account and manage API tokens for the QIIP inference proxy.">
+    <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
+    <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
+</head>
+<body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    {% set dash_active = active_page == 'dashboard' %}
+    {% set models_active = active_page == 'models' %}
+    {% set chat_active = active_page == 'chat' %}
+    {% set profile_active = active_page == 'profile' %}
+    <nav class="top-bar" aria-label="Primary">
+        <div class="brand">
+            <img class="brand-mark" src="{{ static_asset_url(request, 'img/qiip.svg') }}" alt="QIIP" width="29" height="24">
+            <span class="brand-sep" aria-hidden="true"></span>
+            <span class="brand-sub">Inference Proxy</span>
+        </div>
+        <div class="nav-links">
+            <a href="/dashboard" class="nav-link{{ ' nav-link-active' if dash_active else '' }}"{% if dash_active %} aria-current="page"{% endif %}>Dashboard</a>
+            <a href="/models" class="nav-link{{ ' nav-link-active' if models_active else '' }}"{% if models_active %} aria-current="page"{% endif %}>Models</a>
+            <a href="/chat" class="nav-link{{ ' nav-link-active' if chat_active else '' }}"{% if chat_active %} aria-current="page"{% endif %}>Chat</a>
+            <a href="/profile" class="nav-link{{ ' nav-link-active' if profile_active else '' }}"{% if profile_active %} aria-current="page"{% endif %}>Profile</a>
+        </div>
+        <button class="theme-toggle" onclick="let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;localStorage.setItem('theme',t)" aria-label="Toggle color theme">
+            <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+            <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+        </button>
+    </nav>
+
+    <div class="dashboard">
+        <header class="dashboard-header">
+            <div>
+                <h1>Profile</h1>
+                <p id="profile-status">Checking sign-in state...</p>
+            </div>
+            <div class="header-right">
+                <p id="last-updated"></p>
+                <p id="poll-warning"></p>
+            </div>
+        </header>
+
+        <main id="main-content">
+            <div id="error-banner" class="profile-error" hidden></div>
+
+            <!-- Shown when the visitor is anonymous or OAuth is disabled -->
+            <section class="card" id="auth-gate" hidden>
+                <h2 class="card-title">Sign in</h2>
+                <p class="muted-status" id="auth-gate-message">Sign in with your Google account to create API tokens for the inference API.</p>
+                <p style="margin: 12px 0 0 0;">
+                    <a id="sign-in-btn" class="btn btn-primary" href="/auth/login">Sign in with Google</a>
+                </p>
+            </section>
+
+            <!-- Shown once signed in -->
+            <div id="profile-content" hidden>
+                <section class="card">
+                    <h2 class="card-title">Account</h2>
+                    <div class="profile-user-row">
+                        <img id="user-avatar" class="profile-avatar" alt="" width="48" height="48">
+                        <div>
+                            <p class="profile-name" id="user-name"></p>
+                            <p class="muted-status" id="user-email"></p>
+                        </div>
+                        <button type="button" id="logout-btn" class="btn btn-neutral">Sign out</button>
+                    </div>
+                </section>
+
+                <section class="card">
+                    <h2 class="card-title">API Tokens <button type="button" class="manual-setup-toggle" id="token-toggle">+ New token</button></h2>
+                    <form id="token-form" class="setup-form" hidden>
+                        <input type="text" id="token-name" placeholder="Token name (e.g. ci-job, laptop)" maxlength="100" required aria-label="Token name">
+                        <button type="submit" id="token-create-btn" class="btn btn-primary">Create</button>
+                    </form>
+                    <div id="token-secret" class="token-secret-box" hidden>
+                        <p class="muted-status">Copy this token now — it is shown only once.</p>
+                        <code id="token-secret-value"></code>
+                        <button type="button" id="token-copy-btn" class="btn btn-neutral btn-sm">Copy</button>
+                        <p class="muted-status">Use it as <code>Authorization: Bearer &lt;token&gt;</code> on requests to <code>/v1/chat/completions</code> and <code>/v1/completions</code>.</p>
+                    </div>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th scope="col">Name</th>
+                                    <th scope="col">Prefix</th>
+                                    <th scope="col">Created</th>
+                                    <th scope="col">Last used</th>
+                                    <th scope="col">Status</th>
+                                    <th scope="col">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tokens-table-body">
+                                <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+
+                <section class="card">
+                    <h2 class="card-title">Usage</h2>
+                    <p class="muted-status" id="usage-totals">Loading usage...</p>
+                    <div class="table-wrap">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th scope="col">Token</th>
+                                    <th scope="col">Model</th>
+                                    <th scope="col">Endpoint</th>
+                                    <th scope="col">Requests</th>
+                                    <th scope="col">Prompt tokens</th>
+                                    <th scope="col">Completion tokens</th>
+                                    <th scope="col">Total tokens</th>
+                                </tr>
+                            </thead>
+                            <tbody id="usage-table-body">
+                                <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <footer>
+        <p>QIIP Inference Proxy</p>
+    </footer>
+
+    <script src="{{ static_asset_url(request, 'js/profile.js') }}"></script>
+</body>
+</html>

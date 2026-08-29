@@ -1047,3 +1047,54 @@ footer p { margin: 0; }
   .skip-link { transition: none; }
   .skeleton-bar { animation: none; opacity: 0.6; }
 }
+
+/* --- Profile page --- */
+.profile-error {
+  background: var(--danger-bg, #3a1d1d);
+  color: var(--danger-fg, #ff8f8f);
+  border: 1px solid var(--danger-border, #7a3232);
+  border-radius: 10px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+}
+
+.profile-user-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.profile-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--surface-2, #26292e);
+}
+
+.profile-user-row .profile-name { margin: 0; font-weight: 600; }
+.profile-user-row .muted-status { margin: 0.125rem 0 0 0; }
+.profile-user-row .btn { margin-left: auto; }
+
+.token-secret-box {
+  margin: 0.75rem 0;
+  padding: 0.875rem 1rem;
+  border: 1px solid var(--border, #3a3f47);
+  border-radius: 10px;
+  background: var(--surface-1, #1c1f24);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.token-secret-box code {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.875rem;
+  word-break: break-all;
+  padding: 0.25rem 0.5rem;
+  background: var(--surface-2, #26292e);
+  border-radius: 6px;
+}
+
+.token-secret-box p { flex-basis: 100%; margin: 0; }
