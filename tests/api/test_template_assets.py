@@ -48,6 +48,13 @@ def _versioned_path(path: str) -> str:
                 "js/chat.js",
             ),
         ),
+        (
+            "/profile",
+            (
+                "css/dashboard.css",
+                "js/profile.js",
+            ),
+        ),
     ],
 )
 def test_templates_bind_each_asset_url_to_its_contents(

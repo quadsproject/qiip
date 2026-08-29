@@ -16,11 +16,13 @@ from inference_proxy.config.settings import (
     DEFAULT_LLAMACPP_VERSION,
     DEFAULT_LLMFIT_VERSION,
     AdminSettings,
+    AuthSettings,
     DashboardSettings,
     EtcdSettings,
     HuggingFaceSettings,
     LLMFitSettings,
     LoggingSettings,
+    OAuthSettings,
     ProvisioningSettings,
     QUADSSettings,
     RedfishSettings,
@@ -824,3 +826,150 @@ def test_env_example_covers_every_application_setting_exactly_once() -> None:
 
     assert len(occurrences) == len(set(occurrences)), "duplicate .env.example entry"
     assert set(occurrences) == expected
+
+
+class TestOAuthSettings:
+    def test_defaults_to_disabled(self) -> None:
+        oauth = OAuthSettings()
+
+        assert oauth.enabled is False
+        assert oauth.allowed_domains == []
+        assert oauth.client_id is None
+
+    def test_enabled_requires_full_credential_triple(self) -> None:
+        oauth = OAuthSettings(
+            client_id="123.apps.googleusercontent.com",
+            client_secret=SecretStr("secret"),
+            redirect_uri="https://proxy.example.com/auth/callback",
+        )
+
+        assert oauth.enabled is True
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"client_id": "abc"},
+            {"client_secret": SecretStr("s")},
+            {"redirect_uri": "https://host/auth/callback"},
+            {
+                "client_id": "abc",
+                "client_secret": SecretStr("s"),
+            },
+            {
+                "client_id": "abc",
+                "redirect_uri": "https://host/auth/callback",
+            },
+            {
+                "client_secret": SecretStr("s"),
+                "redirect_uri": "https://host/auth/callback",
+            },
+        ],
+    )
+    def test_partial_credentials_rejected(self, kwargs: dict[str, str]) -> None:
+        with pytest.raises(ValidationError, match="configured together"):
+            OAuthSettings(**kwargs)
+
+    def test_blank_client_id_treated_as_unset(self) -> None:
+        oauth = OAuthSettings(client_id="   ")
+
+        assert oauth.client_id is None
+        assert oauth.enabled is False
+
+    @pytest.mark.parametrize(
+        "bad_uri",
+        [
+            "ftp://host/auth/callback",
+            "https://user:pass@host/auth/callback",
+            "https://host/auth/callback#frag",
+            "/relative",
+            "https://",
+            "https://host/\x07",
+        ],
+    )
+    def test_redirect_uri_must_be_clean_http_url(self, bad_uri: str) -> None:
+        with pytest.raises(ValidationError, match="redirect_uri"):
+            OAuthSettings(
+                client_id="abc",
+                client_secret=SecretStr("s"),
+                redirect_uri=bad_uri,
+            )
+
+    def test_allowed_domains_load_from_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("INFERENCE_PROXY_OAUTH__ALLOWED_DOMAINS", '["example.com"]')
+
+        settings = Settings(_env_file=None)
+
+        assert settings.oauth.allowed_domains == ["example.com"]
+
+
+class TestAuthSettings:
+    def test_defaults(self) -> None:
+        auth = AuthSettings()
+
+        assert auth.enforce_api_tokens is False
+        assert auth.require_email_verification is True
+        assert auth.session_secret is None
+        assert auth.session_cookie == "qiip_session"
+        assert auth.session_ttl_seconds == 43_200
+        assert auth.db_path == Path("data/qiip.db")
+
+    def test_invalid_session_cookie_name_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="session_cookie"):
+            AuthSettings(session_cookie="bad cookie name;x")
+
+    def test_session_secret_is_masked(self) -> None:
+        auth = AuthSettings(session_secret=SecretStr("hush"))
+
+        assert "hush" not in repr(auth)
+        assert auth.model_dump()["session_secret"] != "hush"
+
+
+class TestAuthRootValidators:
+    _OAUTH_ENV = {
+        "INFERENCE_PROXY_OAUTH__CLIENT_ID": "123.apps.googleusercontent.com",
+        "INFERENCE_PROXY_OAUTH__CLIENT_SECRET": "s3cret",
+        "INFERENCE_PROXY_OAUTH__REDIRECT_URI": "https://proxy.example.com/auth/callback",
+    }
+
+    def test_oauth_requires_session_secret(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for key, value in self._OAUTH_ENV.items():
+            monkeypatch.setenv(key, value)
+
+        with pytest.raises(ValidationError, match="session_secret"):
+            Settings(_env_file=None)
+
+    def test_oauth_and_session_secret_is_valid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for key, value in self._OAUTH_ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("INFERENCE_PROXY_AUTH__SESSION_SECRET", "cookie-secret")
+
+        settings = Settings(_env_file=None)
+
+        assert settings.oauth.enabled is True
+        assert settings.auth.session_secret is not None
+
+    def test_enforce_api_tokens_requires_oauth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS", "true")
+
+        with pytest.raises(ValidationError, match="enforce_api_tokens"):
+            Settings(_env_file=None)
+
+    def test_enforce_api_tokens_valid_with_oauth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for key, value in self._OAUTH_ENV.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setenv("INFERENCE_PROXY_AUTH__SESSION_SECRET", "cookie-secret")
+        monkeypatch.setenv("INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS", "true")
+
+        settings = Settings(_env_file=None)
+
+        assert settings.auth.enforce_api_tokens is True

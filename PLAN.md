@@ -590,6 +590,39 @@ class AutoScaler:
 - **Network Policies**: Fine-grained network access control
 - **Secrets Management**: Secure credential storage and rotation
 
+##### User Authentication (Google OAuth) — Implemented (issue #41)
+
+Gateway user accounts were added as the config-gated, offline-friendly first
+authentication tier for the inference API:
+
+- **Sign-in (AUTH-01)**: Users sign in via Google OAuth 2.0 (OpenID Connect,
+  email + profile scopes) through `/auth/login` → `/auth/callback`. Accounts are
+  keyed by the stable Google `sub` claim; a verified email is required by
+  default and an optional hosted-domain allowlist is enforced. Sessions ride a
+  signed cookie (`auth.session_secret` + `auth.session_ttl_seconds`), with the
+  user id stored rather than re-verified per request.
+- **Personal API tokens (AUTH-02)**: The `/profile` page (session-protected)
+  mints `qiip_...` bearer tokens for use against
+  `/v1/chat/completions` and `/v1/completions`. Tokens are generated with
+  `secrets.token_urlsafe(32)`, shown once at creation, and stored only as a
+  SHA-256 digest; listing returns just the public `qiip_######` prefix. Tokens
+  are revocable individually.
+- **Gateway enforcement (AUTH-03)**: Tokens are always validated when
+  presented, and enforcement of a bearer requirement for anonymous `/v1`
+  requests is config-gated (`auth.enforce_api_tokens`, off by default) so
+  existing public deployments are not broken. `/v1/models`, `/health`, and the
+  chat playground remain public.
+- **Usage tracking (AUTH-04)**: Successful token-authenticated inference
+  requests record OpenAI usage (prompt/completion/total tokens) per token,
+  model, and endpoint in the SQLite auth store; `/profile/usage` surfaces the
+  aggregation.
+
+Persistence is SQLite via the stdlib `sqlite3` module (`auth.db_path`, default
+`data/qiip.db`) — intentionally no new services. The admin/operator HTTP Basic
+layer is unchanged and separate from user accounts; there is no shared admin
+credential exposure on the public profile surface. Remaining security roadmap
+items (mTLS, service mesh auth, secrets vault) stay on the roadmap above.
+
 ### Phase 3: Platform Evolution
 
 #### Multi-Tenancy Support

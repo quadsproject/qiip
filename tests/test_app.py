@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from inference_proxy.config.settings import (
+    OAuthSettings,
     QUADSSettings,
     RedfishSettings,
     RoutingSettings,
@@ -581,3 +582,70 @@ class TestGetRegistryDependency:
         mock_request.app = app
         result = get_registry(mock_request)
         assert isinstance(result, NodeRegistry)
+
+
+class TestLifespanOAuthWiring:
+    """Lifespan prepares the auth store and (optionally) the OAuth client."""
+
+    def _etcd_mock(self, mock_etcd_cls: MagicMock) -> None:
+        mock_client = MagicMock()
+        mock_client.get_snapshot.return_value = EtcdSnapshot((), 1)
+        mock_client.prefix = "/nodes/"
+        mock_etcd_cls.return_value = mock_client
+
+    @patch("inference_proxy.main.EtcdWatcher")
+    @patch("inference_proxy.main.EtcdClient")
+    def test_lifespan_creates_auth_store(
+        self,
+        mock_etcd_cls: MagicMock,
+        _mock_watcher_cls: MagicMock,
+        test_settings: Settings,
+    ) -> None:
+        """The lifespan persists sessions/tokens into a SQLite auth store."""
+        self._etcd_mock(mock_etcd_cls)
+
+        from inference_proxy.main import create_app
+
+        app = create_app(settings=test_settings)
+        with TestClient(app):
+            assert app.state.auth_store is not None
+        # Clean shutdown does not blow up while closing the store.
+        assert app.state.auth_store is not None
+
+    @patch("inference_proxy.main.EtcdWatcher")
+    @patch("inference_proxy.main.EtcdClient")
+    def test_lifespan_wires_oauth_when_enabled(
+        self,
+        mock_etcd_cls: MagicMock,
+        _mock_watcher_cls: MagicMock,
+        test_settings: Settings,
+    ) -> None:
+        self._etcd_mock(mock_etcd_cls)
+        oauth = OAuthSettings(
+            client_id="123.apps.googleusercontent.com",
+            client_secret=SecretStr("s3cret"),
+            redirect_uri="https://proxy.example.com/auth/callback",
+        )
+        settings = test_settings.model_copy(update={"oauth": oauth})
+
+        from inference_proxy.main import create_app
+
+        app = create_app(settings=settings)
+        with TestClient(app):
+            assert app.state.oauth is not None
+
+    @patch("inference_proxy.main.EtcdWatcher")
+    @patch("inference_proxy.main.EtcdClient")
+    def test_lifespan_leaves_oauth_none_when_disabled(
+        self,
+        mock_etcd_cls: MagicMock,
+        _mock_watcher_cls: MagicMock,
+        test_settings: Settings,
+    ) -> None:
+        self._etcd_mock(mock_etcd_cls)
+
+        from inference_proxy.main import create_app
+
+        app = create_app(settings=test_settings)
+        with TestClient(app):
+            assert app.state.oauth is None

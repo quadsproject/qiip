@@ -448,6 +448,105 @@ class HuggingFaceSettings(BaseModel):
         return normalized
 
 
+class OAuthSettings(BaseModel):
+    """Google OAuth (OpenID Connect) configuration.
+
+    Enabled only when ``client_id``, ``client_secret``, and
+    ``redirect_uri`` are all set; any partial configuration is rejected so
+    a half-configured deployment fails closed instead of half-enabling a
+    login surface. When disabled, /auth endpoints are inert (404) and the
+    inference API remains purely anonymous unless tokens are provisioned
+    out of band.
+
+    ``allowed_domains`` optionally restricts sign-in to Google Workspace
+    hosted domains (the OIDC ``hd`` claim); when empty, any Google
+    account is accepted.
+    """
+
+    client_id: str | None = None
+    client_secret: SecretStr | None = None
+    redirect_uri: str | None = None
+    allowed_domains: list[str] = Field(default_factory=list)
+
+    @property
+    def enabled(self) -> bool:
+        """Return True when the full OAuth credential triple is set."""
+        return (
+            self.client_id is not None
+            and self.client_secret is not None
+            and self.redirect_uri is not None
+        )
+
+    @field_validator("client_id", mode="before")
+    @classmethod
+    def blank_client_id_is_none(cls, value: object) -> object:
+        """Treat empty strings as unset so provisioning stays predictable."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("redirect_uri", mode="after")
+    @classmethod
+    def redirect_uri_is_http_url(cls, value: str | None) -> str | None:
+        """Require an absolute HTTP(S) callback URL when provided."""
+        if value is None:
+            return None
+        if any(ord(character) < 32 for character in value):
+            raise ValueError("oauth.redirect_uri must not contain control characters")
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+            raise ValueError("oauth.redirect_uri must be an absolute HTTP(S) URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("oauth.redirect_uri must not contain credentials")
+        if parsed.fragment:
+            raise ValueError("oauth.redirect_uri must not contain a fragment")
+        return value
+
+    @model_validator(mode="after")
+    def credentials_are_all_or_none(self) -> Self:
+        """Reject partial OAuth configuration instead of failing at runtime."""
+        present = {
+            field
+            for field in ("client_id", "client_secret", "redirect_uri")
+            if getattr(self, field) is not None
+        }
+        if present and len(present) != 3:
+            raise ValueError(
+                "oauth.client_id, oauth.client_secret, and oauth.redirect_uri "
+                "must be configured together"
+            )
+        return self
+
+
+class AuthSettings(BaseModel):
+    """User identity, session, and API-token configuration.
+
+    ``db_path`` is the SQLite database backing the user/token/usage store
+    (AUTH-01). ``session_secret`` signs the browser session cookie and is
+    required before OAuth (which needs server-side state) can be enabled.
+
+    ``enforce_api_tokens`` gates whether /v1 inference requests must carry
+    a valid bearer token (AUTH-03). When False (the default) tokens are
+    still validated whenever presented, but anonymous inference keeps
+    working so existing public deployments are not broken.
+    """
+
+    db_path: Path = Path("data/qiip.db")
+    session_secret: SecretStr | None = None
+    session_cookie: str = "qiip_session"
+    session_ttl_seconds: int = Field(default=43_200, ge=300, le=7 * 86_400)
+    enforce_api_tokens: bool = False
+    require_email_verification: bool = True
+
+    @field_validator("session_cookie", mode="after")
+    @classmethod
+    def session_cookie_is_safe_name(cls, value: str) -> str:
+        """Keep the cookie name within the HTTP token-token/\"__Host-\" rules."""
+        if any(character in value for character in ' \t\r\n()<>@,;:\\"/[]?={}'):
+            raise ValueError("auth.session_cookie contains invalid characters")
+        return value
+
+
 class RedfishSettings(BaseModel):
     """Redfish BMC configuration.
 
@@ -539,6 +638,25 @@ class Settings(BaseSettings):
     redfish: RedfishSettings = RedfishSettings()
     llmfit: LLMFitSettings = LLMFitSettings()
     huggingface: HuggingFaceSettings
+    auth: AuthSettings = AuthSettings()
+    oauth: OAuthSettings = OAuthSettings()
+
+    @model_validator(mode="after")
+    def oauth_requires_session_secret(self) -> Self:
+        """OAuth state rides the signed session cookie (AUTH-02)."""
+        if self.oauth.enabled and self.auth.session_secret is None:
+            raise ValueError("auth.session_secret is required when oauth is enabled")
+        return self
+
+    @model_validator(mode="after")
+    def token_enforcement_requires_user_provisioning(self) -> Self:
+        """Do not lock the inference API without a way to mint tokens."""
+        if self.auth.enforce_api_tokens and not self.oauth.enabled:
+            raise ValueError(
+                "auth.enforce_api_tokens requires oauth to be enabled so "
+                "users can create tokens"
+            )
+        return self
 
     @model_validator(mode="after")
     def provisioned_port_is_allowed(self) -> Self:

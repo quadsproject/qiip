@@ -15,6 +15,20 @@ from inference_proxy.models.openai import ErrorDetail, ErrorResponse
 logger = structlog.get_logger()
 
 
+class ApiAuthError(Exception):
+    """Raised when a /v1 request fails API-token authentication.
+
+    The gateway converts this into an OpenAI-compatible ``invalid_api_key``
+    401 response via a registered exception handler, so clients that speak
+    the OpenAI error shape see the expected body and ``WWW-Authenticate:
+    Bearer`` challenge.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
 def map_proxy_error(exc: Exception) -> tuple[int, ErrorResponse]:
     """Map a proxy exception to an OpenAI-compatible error response.
 

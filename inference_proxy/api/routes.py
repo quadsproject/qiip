@@ -36,6 +36,9 @@ from inference_proxy.api.errors import (
     model_unavailable_error,
     no_nodes_error,
 )
+from inference_proxy.auth.dependencies import get_api_auth, get_auth_store
+from inference_proxy.auth.models import TokenAuth
+from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import (
     get_circuit_breaker_registry,
     get_node_selector,
@@ -149,6 +152,61 @@ def _response_content(response: httpx.Response) -> Any:
         return {"raw": response.text}
 
 
+def _extract_usage(payload: Any) -> tuple[int, int, int] | None:
+    """Extract OpenAI ``usage`` token counts from a response payload.
+
+    Returns ``(prompt, completion, total)`` or None when the payload is not
+    a dict or carries no usable usage counters.
+    """
+    if not isinstance(payload, dict):
+        return None
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+    total_tokens = usage.get("total_tokens")
+    if (
+        not isinstance(prompt_tokens, int)
+        or not isinstance(completion_tokens, int)
+        or not isinstance(total_tokens, int)
+    ):
+        return None
+    return prompt_tokens, completion_tokens, total_tokens
+
+
+def _extract_usage_from_data(data: str) -> tuple[int, int, int] | None:
+    """Extract usage from an SSE ``data`` JSON payload (AUTH-04)."""
+    try:
+        payload = json.loads(data)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return _extract_usage(payload)
+
+
+async def _record_usage(
+    store: AuthStore,
+    auth: TokenAuth,
+    *,
+    model: str,
+    endpoint: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    total_tokens: int,
+) -> None:
+    """Persist one token-attributed usage row off the event loop."""
+    await asyncio.to_thread(
+        store.record_usage,
+        user_id=auth.user.id,
+        token_id=auth.token.id,
+        model=model or "",
+        endpoint=endpoint,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+    )
+
+
 async def _close_streaming_attempt(
     stack: AsyncExitStack,
     reservation: NodeReservation,
@@ -204,8 +262,38 @@ async def _stream_events(
     url: str,
     circuit_breaker_registry: CircuitBreakerRegistry,
     node_selector: NodeSelector,
+    usage_store: AuthStore | None = None,
+    usage_auth: TokenAuth | None = None,
+    model: str = "",
+    endpoint: str = "",
 ) -> AsyncGenerator[bytes, None]:
-    """Relay one established upstream stream without attempting failover."""
+    """Relay one established upstream stream without attempting failover.
+
+    When a bearer token authenticates the request, the OpenAI ``usage``
+    carried by the final streamed chunk is recorded once for usage
+    tracking (AUTH-04). The recorded usage is the last non-empty usage
+    observation, matching the OpenAI convention that the final chunk is
+    authoritative.
+    """
+    usage: tuple[int, int, int] | None = None
+    recorded = False
+
+    async def _flush() -> None:
+        nonlocal recorded
+        if recorded or usage_store is None or usage_auth is None:
+            return
+        recorded = True
+        prompt, completion, total = usage or (0, 0, 0)
+        await _record_usage(
+            usage_store,
+            usage_auth,
+            model=model,
+            endpoint=endpoint,
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            total_tokens=total,
+        )
+
     try:
         async for sse in session.event_source.aiter_sse():
             if sse.data == "[DONE]":
@@ -213,8 +301,13 @@ async def _stream_events(
                 circuit_breaker_registry.get_or_create(
                     node.node_id,
                 ).record_success()
+                await _flush()
                 return
+            found = _extract_usage_from_data(sse.data)
+            if found is not None:
+                usage = found
             yield format_sse_event(data_str=sse.data)
+        await _flush()
     except Exception as exc:
         logger.error("streaming proxy error", error=str(exc), url=url)
         _record_failure_and_trip(
@@ -224,6 +317,7 @@ async def _stream_events(
         )
         _, error_resp = map_proxy_error(exc)
         error_json = json.dumps(error_resp.model_dump())
+        await _flush()
         yield format_sse_event(data_str=error_json)
         yield format_sse_event(data_str="[DONE]")
     finally:
@@ -239,6 +333,8 @@ async def _proxy_non_streaming(
     request_metrics: RequestMetrics,
     max_attempts: int = 3,
     starlette_request: StarletteRequest | None = None,
+    usage_store: AuthStore | None = None,
+    usage_auth: TokenAuth | None = None,
 ) -> JSONResponse:
     """Forward a non-streaming request with retry-on-failover.
 
@@ -248,6 +344,9 @@ async def _proxy_non_streaming(
 
     ``max_attempts`` includes the initial request. Each retry goes to a
     different node.
+
+    When a bearer token authenticates the request, OpenAI usage from the
+    successful backend response is recorded for usage tracking (AUTH-04).
     """
     model = body.get("model")
     excluded: set[str] = set()
@@ -291,6 +390,23 @@ async def _proxy_non_streaming(
             if response.is_success:
                 circuit_breaker_registry.get_or_create(node.node_id).record_success()
             content = _response_content(response)
+            if (
+                response.is_success
+                and usage_store is not None
+                and usage_auth is not None
+            ):
+                usage = _extract_usage(content)
+                if usage is not None:
+                    prompt_tokens, completion_tokens, total_tokens = usage
+                    await _record_usage(
+                        usage_store,
+                        usage_auth,
+                        model=body.get("model") or "",
+                        endpoint=endpoint_path,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                    )
             return JSONResponse(content=content, status_code=response.status_code)
         except Exception as exc:
             retryable = _is_retryable(exc)
@@ -337,11 +453,16 @@ async def chat_completions(
     ),
     request_metrics: RequestMetrics = Depends(get_request_metrics),
     settings: Settings = Depends(get_settings),
+    usage_store: AuthStore = Depends(get_auth_store),
+    usage_auth: TokenAuth | None = Depends(get_api_auth),
 ) -> JSONResponse | EventSourceResponse:
     """Proxy a chat completion request to a vLLM backend.
 
     When ``stream`` is true, returns an SSE stream of token chunks.
     Otherwise, returns the full JSON response from the backend.
+
+    A valid ``Authorization: Bearer <token>`` header (AUTH-03) authenticates
+    the request for usage tracking; enforcement is config-gated.
     """
     body = request.model_dump(exclude_none=True)
     # Keep top-level optional parameters clean while preserving the distinction
@@ -361,6 +482,8 @@ async def chat_completions(
             starlette_request=starlette_request,
             max_attempts=settings.routing.max_attempts,
             handshake_timeout=settings.routing.timeout,
+            usage_store=usage_store,
+            usage_auth=usage_auth,
         )
     return await _proxy_non_streaming(
         "/v1/chat/completions",
@@ -371,6 +494,8 @@ async def chat_completions(
         request_metrics=request_metrics,
         max_attempts=settings.routing.max_attempts,
         starlette_request=starlette_request,
+        usage_store=usage_store,
+        usage_auth=usage_auth,
     )
 
 
@@ -385,11 +510,16 @@ async def text_completions(
     ),
     request_metrics: RequestMetrics = Depends(get_request_metrics),
     settings: Settings = Depends(get_settings),
+    usage_store: AuthStore = Depends(get_auth_store),
+    usage_auth: TokenAuth | None = Depends(get_api_auth),
 ) -> JSONResponse | EventSourceResponse:
     """Proxy a text completion request to a vLLM backend.
 
     When ``stream`` is true, returns an SSE stream of token chunks.
     Otherwise, returns the full JSON response from the backend.
+
+    A valid ``Authorization: Bearer <token>`` header (AUTH-03) authenticates
+    the request for usage tracking; enforcement is config-gated.
     """
     body = request.model_dump(exclude_none=True)
     if request.stream:
@@ -403,6 +533,8 @@ async def text_completions(
             starlette_request=starlette_request,
             max_attempts=settings.routing.max_attempts,
             handshake_timeout=settings.routing.timeout,
+            usage_store=usage_store,
+            usage_auth=usage_auth,
         )
     return await _proxy_non_streaming(
         "/v1/completions",
@@ -413,6 +545,8 @@ async def text_completions(
         request_metrics=request_metrics,
         max_attempts=settings.routing.max_attempts,
         starlette_request=starlette_request,
+        usage_store=usage_store,
+        usage_auth=usage_auth,
     )
 
 
@@ -458,6 +592,8 @@ async def _stream_completion(
     starlette_request: StarletteRequest | None = None,
     max_attempts: int = 3,
     handshake_timeout: float = 30,
+    usage_store: AuthStore | None = None,
+    usage_auth: TokenAuth | None = None,
 ) -> JSONResponse | EventSourceResponse:
     """Establish a backend SSE stream, then expose it to the client.
 
@@ -583,6 +719,10 @@ async def _stream_completion(
                 url,
                 circuit_breaker_registry,
                 node_selector,
+                usage_store=usage_store,
+                usage_auth=usage_auth,
+                model=body.get("model") or "",
+                endpoint=endpoint_path,
             ),
             background=BackgroundTask(session.close),
         )
