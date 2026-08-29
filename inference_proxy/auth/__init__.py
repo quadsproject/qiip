@@ -5,7 +5,9 @@ per-account, never reissued); API tokens are stored as SHA-256 digests so
 a database read never exposes a usable credential (AUTH-02).
 
 Per AUTH-03: /v1 inference requests may authenticate with a bearer token;
-enforcement is config-gated so existing public deployments are not broken.
+a valid token is always accepted, while ``auth.enforce_api_tokens`` (off by
+default) decides whether an absent or invalid token is rejected or simply
+treated as anonymous, so existing public deployments are not broken.
 Per AUTH-04: token-minted requests record OpenAI ``usage`` into the store
 for per-token/per-model usage reporting on the profile page.
 """

@@ -1,7 +1,8 @@
 """Behavioral coverage for /v1 bearer-token auth and usage recording.
 
-AUTH-03: tokens are always validated when presented; enforcement of
-anonymous /v1 inference is config-gated (off by default).
+AUTH-03: a valid bearer token is always accepted; with enforcement off an
+absent or invalid token simply means anonymous, with enforcement on the
+request is rejected with an OpenAI 401.
 AUTH-04: token-authenticated requests record OpenAI usage per token.
 """
 
@@ -134,7 +135,7 @@ class TestAnonymousInferenceByDefault:
         assert auth_store.get_usage_summary(1) == []
 
 
-class TestInvalidTokenRejected:
+class TestInvalidTokenWhenNotEnforced:
     @pytest.mark.parametrize(
         "headers",
         [
@@ -142,21 +143,18 @@ class TestInvalidTokenRejected:
             {"Authorization": "Bearer not-even-qiip"},
         ],
     )
-    def test_invalid_bearer_rejected_with_openai_401(
+    def test_invalid_bearer_treated_as_anonymous_when_not_enforced(
         self,
         client: TestClient,
-        httpx_mock: HTTPXMock,
         headers: dict[str, str],
     ) -> None:
+        # Enforcement off means anonymous traffic is allowed, so an invalid
+        # presented token is treated as anonymous (never a hard 401).
         response = client.post("/v1/chat/completions", json=_BODY, headers=headers)
 
-        assert response.status_code == 401
-        body = response.json()
-        assert body["error"]["type"] == "invalid_request_error"
-        assert body["error"]["code"] == "invalid_api_key"
-        assert response.headers["www-authenticate"] == "Bearer"
-        # No backend was contacted.
-        assert len(httpx_mock.get_requests()) == 0
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "no_nodes"
+        assert "www-authenticate" not in response.headers
 
     def test_basic_credentials_are_treated_as_anonymous_not_rejected(
         self,
@@ -330,6 +328,29 @@ class TestEnforcementEnabled:
 
         assert response.status_code == 401
         assert response.json()["error"]["code"] == "invalid_api_key"
+
+    def test_invalid_token_rejected_when_enforced(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        test_settings: Settings,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        self._enable(app, test_settings)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json=_BODY,
+            headers={"Authorization": "Bearer qiip_totally-made-up"},
+        )
+
+        assert response.status_code == 401
+        body = response.json()
+        assert body["error"]["type"] == "invalid_request_error"
+        assert body["error"]["code"] == "invalid_api_key"
+        assert response.headers["www-authenticate"] == "Bearer"
+        # No backend was contacted.
+        assert len(httpx_mock.get_requests()) == 0
 
     def test_valid_token_still_allowed(
         self,
