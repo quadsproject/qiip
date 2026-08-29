@@ -53,7 +53,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Admin authentication** -- HTTP Basic required on all `/admin/*` endpoints and `/dashboard*` pages
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
 - **User API tokens** -- each user can mint `qiip_...` bearer tokens on their profile page to call `/v1/chat/completions` and `/v1/completions`; tokens are stored as SHA-256 digests and can be revoked at any time
-- **Config-gated inference auth** -- `/v1` requests carrying a valid bearer token are always validated; requiring a token for every `/v1` request (`auth.enforce_api_tokens`) is optional and off by default, so existing public deployments are not broken
+- **Config-gated inference auth** -- a valid `qiip_...` bearer token is always accepted on `/v1`; requiring a token for every `/v1` request (`auth.enforce_api_tokens`) is optional and off by default, so existing public deployments keep serving anonymous requests unchanged
 - **Token usage tracking** -- token-authenticated requests record OpenAI token usage per token/model for reporting on the profile page
 - **Backend endpoint allowlist** -- configurable hostname wildcard, CIDR network, and port allowlists; rejects non-matching registrations with loopback-only defaults
 - **Client config downloads** -- one-click download of OpenCode CLI and Pi coding agent configuration files from the dashboard and node detail pages; dashboard configs point at the proxy for load-balanced access, node detail configs point at individual backend endpoints
@@ -482,12 +482,15 @@ Enablement and guardrails:
   way to mint tokens).
 - Google user accounts are keyed by their stable `sub` claim, so a renamed email
   still resolves to the same account.
-- `/v1` behavior (AUTH-03): a bearer token that is presented is always
-  validated, even when enforcement is off — an invalid or revoked token is
-  rejected with an OpenAI-shaped `401 invalid_api_key`. Enforcement only decides
-  what happens when no token is presented. Set
-  `INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS=true` to require a token and keep
-  the default to preserve fully public `/v1` deployments.
+- `/v1` behavior (AUTH-03): a valid `qiip_...` bearer token is always
+  accepted and attributes usage. What happens without a usable token is set
+  by `auth.enforce_api_tokens`. With it `false` (the default), an absent,
+  invalid, or unknown bearer token simply means an anonymous request — no
+  token is ever *required*. With it `true`, absent or invalid tokens are
+  rejected with an OpenAI-shaped `401 invalid_api_key`. Keep the default to
+  preserve fully public `/v1` deployments; set
+  `INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS=true` once you want to require a
+  token.
 - `/v1/models`, `/health`, and the chat playground stay public in both modes.
 - Anonymously reached `/v1` requests are proxied but not attributed; only
   token-authenticated calls record per-token usage (AUTH-04).

@@ -70,12 +70,14 @@ async def get_api_auth(
 ) -> TokenAuth | None:
     """Authenticate a /v1 bearer token, applying configured enforcement.
 
-    * A ``Authorization: Bearer <token>`` header is always validated; a
-      malformed/unknown/revoked token is rejected with 401 even when
-      enforcement is off (fail closed on an explicitly bad credential).
-    * With no token and ``auth.enforce_api_tokens`` False (default) the
-      request proceeds anonymously (None).
-    * With no token and enforcement on, the request is rejected with 401.
+    * A valid ``Authorization: Bearer <token>`` is always accepted and
+      attributes usage (AUTH-04).
+    * ``auth.enforce_api_tokens`` (AUTH-03) decides what happens when there
+      is no usable token. With it False (the default) an absent or invalid
+      token simply means anonymous: enforcement-off deployments already
+      permit anonymous traffic, so an invalid presented token is treated as
+      anonymous rather than rejected. With enforcement on, absent or
+      invalid tokens are rejected with 401.
 
     Rejections raise ``ApiAuthError`` so the /v1 error handler can emit an
     OpenAI-compatible ``invalid_api_key`` body.
@@ -85,10 +87,15 @@ async def get_api_auth(
     presented = scheme.lower() == "bearer" and bool(raw_token.strip())
 
     if presented:
-        auth = await asyncio.to_thread(store.resolve_token, raw_token.strip())
-        if auth is None:
-            raise ApiAuthError("Invalid API token")
-        return auth
+        raw_token = raw_token.strip()
+        if settings.auth.enforce_api_tokens:
+            auth = await asyncio.to_thread(store.resolve_token, raw_token)
+            if auth is None:
+                raise ApiAuthError("Invalid API token")
+            return auth
+        # Enforcement off: resolve for attribution, but never hard-fail on a
+        # bad token (anonymous traffic is already permitted in this mode).
+        return await asyncio.to_thread(store.resolve_token, raw_token)
 
     if settings.auth.enforce_api_tokens:
         raise ApiAuthError("Authentication required for inference requests")

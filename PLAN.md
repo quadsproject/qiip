@@ -607,10 +607,11 @@ authentication tier for the inference API:
   `secrets.token_urlsafe(32)`, shown once at creation, and stored only as a
   SHA-256 digest; listing returns just the public `qiip_######` prefix. Tokens
   are revocable individually.
-- **Gateway enforcement (AUTH-03)**: Tokens are always validated when
-  presented, and enforcement of a bearer requirement for anonymous `/v1`
-  requests is config-gated (`auth.enforce_api_tokens`, off by default) so
-  existing public deployments are not broken. `/v1/models`, `/health`, and the
+- **Gateway enforcement (AUTH-03)**: A valid bearer token is always
+  accepted. Enforcement is config-gated (`auth.enforce_api_tokens`, off by
+  default): when off, an absent or invalid token simply means an anonymous
+  request, so existing public deployments are not broken; when on, absent or
+  invalid tokens are rejected with 401. `/v1/models`, `/health`, and the
   chat playground remain public.
 - **Usage tracking (AUTH-04)**: Successful token-authenticated inference
   requests record OpenAI usage (prompt/completion/total tokens) per token,
