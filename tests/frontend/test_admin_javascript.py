@@ -352,7 +352,7 @@ const sandbox = {
     createElement(tagName) { return new Element(tagName); },
     createTextNode(text) { const node = new Element("text"); node.textContent = text; return node; },
   },
-  window: { confirm() { return true; } },
+  window: { confirm() { return true; }, location: { origin: "http://localhost:8080" } },
   confirmDialog: async function () { return true; },
   requestAnimationFrame() {},
   setTimeout(callback, delay) {

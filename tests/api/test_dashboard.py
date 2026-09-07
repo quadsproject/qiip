@@ -351,6 +351,12 @@ class TestNodeDetailPage:
         response = client.get("/dashboard/nodes/test-node")
         assert 'id="config-download-panel"' in response.text
 
+    def test_node_detail_omits_endpoint_column(self, client: TestClient) -> None:
+        """Node detail info table no longer exposes the raw node endpoint."""
+        response = client.get("/dashboard/nodes/test-node")
+        assert response.status_code == 200
+        assert '<th scope="col">Endpoint</th>' not in response.text
+
     def test_contains_config_download_js(self, client: TestClient) -> None:
         """Page loads config_download.js."""
         response = client.get("/dashboard/nodes/test-node")

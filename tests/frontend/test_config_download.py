@@ -235,21 +235,21 @@ class TestConfigFileContents:
 
 
 class TestBaseUrlUsage:
-    """Dashboard uses proxy origin; node detail uses node.endpoint."""
+    """Dashboard and node detail both use the proxy origin for config."""
 
     def test_dashboard_uses_window_location_origin(self) -> None:
         source = _DASHBOARD_JS.read_text()
         assert "createConfigDropdown(" in source
         assert "window.location.origin" in source
 
-    def test_node_detail_uses_node_endpoint(self) -> None:
+    def test_node_detail_uses_window_location_for_config(self) -> None:
         source = _NODE_DETAIL_JS.read_text()
-        assert "createConfigDropdown(node.endpoint," in source
+        assert "createConfigDropdown(window.location.origin," in source
 
     def test_dashboard_does_not_use_node_endpoint_for_config(self) -> None:
         source = _DASHBOARD_JS.read_text()
         assert "createConfigDropdown(node.endpoint" not in source
 
-    def test_node_detail_does_not_use_window_location_for_config(self) -> None:
+    def test_node_detail_does_not_use_node_endpoint_for_config(self) -> None:
         source = _NODE_DETAIL_JS.read_text()
-        assert "createConfigDropdown(window.location" not in source
+        assert "createConfigDropdown(node.endpoint" not in source
