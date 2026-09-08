@@ -14,26 +14,7 @@
 </head>
 <body>
     <a class="skip-link" href="#main-content">Skip to content</a>
-    {% set dash_active = active_page == 'dashboard' %}
-    {% set models_active = active_page == 'models' %}
-    {% set chat_active = active_page == 'chat' %}
-    <nav class="top-bar" aria-label="Primary">
-        <div class="brand">
-            <img class="brand-mark" src="{{ static_asset_url(request, 'img/qiip.svg') }}" alt="QIIP" width="29" height="24">
-            <span class="brand-sep" aria-hidden="true"></span>
-            <span class="brand-sub">Inference Proxy</span>
-        </div>
-        <div class="nav-links">
-            <a href="/dashboard" class="nav-link{{ ' nav-link-active' if dash_active else '' }}"{% if dash_active %} aria-current="page"{% endif %}>Dashboard</a>
-            <a href="/models" class="nav-link{{ ' nav-link-active' if models_active else '' }}"{% if models_active %} aria-current="page"{% endif %}>Models</a>
-            <a href="/chat" class="nav-link{{ ' nav-link-active' if chat_active else '' }}"{% if chat_active %} aria-current="page"{% endif %}>Chat</a>
-            <a href="/profile" class="nav-link">Profile</a>
-        </div>
-        <button class="theme-toggle" onclick="let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;localStorage.setItem('theme',t)" aria-label="Toggle color theme">
-            <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
-            <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
-        </button>
-    </nav>
+    {% include "partials/navbar.html" %}
 
     <div class="dashboard">
         <header class="dashboard-header">
