@@ -16,9 +16,7 @@ from fastapi.testclient import TestClient
 
 from inference_proxy.api.templating import templates
 
-_TEMPLATES_DIR = (
-    Path(__file__).resolve().parents[2] / "inference_proxy" / "templates"
-)
+_TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "inference_proxy" / "templates"
 _PARTIAL = _TEMPLATES_DIR / "partials" / "navbar.html"
 
 _ALL_PAGES = (
@@ -62,24 +60,39 @@ class TestNavbarActiveState:
 
     def test_dashboard_marks_dashboard_active(self, client: TestClient) -> None:
         response = client.get("/dashboard")
-        assert '<a href="/dashboard" class="nav-link nav-link-active" aria-current="page">Dashboard</a>' in response.text
+        assert (
+            '<a href="/dashboard" class="nav-link nav-link-active" aria-current="page">Dashboard</a>'
+            in response.text
+        )
 
     def test_node_detail_marks_dashboard_active(self, client: TestClient) -> None:
         """Node detail is part of the dashboard section, so Dashboard stays active."""
         response = client.get("/dashboard/nodes/test-node")
-        assert '<a href="/dashboard" class="nav-link nav-link-active" aria-current="page">Dashboard</a>' in response.text
+        assert (
+            '<a href="/dashboard" class="nav-link nav-link-active" aria-current="page">Dashboard</a>'
+            in response.text
+        )
 
     def test_models_marks_models_active(self, client: TestClient) -> None:
         response = client.get("/models")
-        assert '<a href="/models" class="nav-link nav-link-active" aria-current="page">Models</a>' in response.text
+        assert (
+            '<a href="/models" class="nav-link nav-link-active" aria-current="page">Models</a>'
+            in response.text
+        )
 
     def test_chat_marks_chat_active(self, client: TestClient) -> None:
         response = client.get("/chat")
-        assert '<a href="/chat" class="nav-link nav-link-active" aria-current="page">Chat</a>' in response.text
+        assert (
+            '<a href="/chat" class="nav-link nav-link-active" aria-current="page">Chat</a>'
+            in response.text
+        )
 
     def test_profile_marks_profile_active(self, client: TestClient) -> None:
         response = client.get("/profile")
-        assert '<a href="/profile" class="nav-link nav-link-active" aria-current="page">Profile</a>' in response.text
+        assert (
+            '<a href="/profile" class="nav-link nav-link-active" aria-current="page">Profile</a>'
+            in response.text
+        )
 
 
 class TestNavbarIsSingleSourceOfTruth:
@@ -121,7 +134,7 @@ class TestNavbarIsSingleSourceOfTruth:
         """Pages must not re-define the nav markup (this is what caused the drift)."""
         text = (_TEMPLATES_DIR / template).read_text()
         assert '<nav class="top-bar"' not in text
-        assert "class=\"nav-link" not in text
+        assert 'class="nav-link' not in text
 
 
 class TestNavbarRendersDirectly:
