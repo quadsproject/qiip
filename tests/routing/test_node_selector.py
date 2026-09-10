@@ -373,3 +373,47 @@ class TestScopeFilters:
         selector, _, _ = _make_selector([private])
         assert not selector.has_model("llama-3", owner="alice@example.com")
         assert selector.has_model("llama-3", owner=None)
+
+
+class TestOwnerCaseInsensitive:
+    """Owner matching compares emails caselessly (deep review)."""
+
+    def test_owner_reaches_owned_node_any_case(self) -> None:
+        owned = Node(
+            node_id="node-1",
+            endpoint="http://10.0.1.100:8000",
+            status=NodeStatus.HEALTHY,
+            model="llama-3",
+            owner="Alice@Example.com",
+        )
+        selector, _, _ = _make_selector([owned])
+
+        result = selector.select(model="llama-3", owner="alice@example.com")
+
+        assert result is not None
+        assert result.node_id == "node-1"
+
+    def test_other_owner_cannot_reach(self) -> None:
+        owned = Node(
+            node_id="node-1",
+            endpoint="http://10.0.1.100:8000",
+            status=NodeStatus.HEALTHY,
+            model="llama-3",
+            owner="Alice@Example.com",
+        )
+        selector, _, _ = _make_selector([owned])
+
+        assert selector.select(model="llama-3", owner="bob@example.com") is None
+        assert not selector.has_model("llama-3", owner="bob@example.com")
+
+    def test_has_model_matches_caselessly(self) -> None:
+        owned = Node(
+            node_id="node-1",
+            endpoint="http://10.0.1.100:8000",
+            status=NodeStatus.HEALTHY,
+            model="llama-3",
+            owner="Alice@Example.com",
+        )
+        selector, _, _ = _make_selector([owned])
+
+        assert selector.has_model("llama-3", owner="alice@example.com")

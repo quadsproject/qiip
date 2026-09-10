@@ -44,6 +44,24 @@ class NodeReservation:
         self._selector._release(self.node.node_id)
 
 
+def _in_scope(
+    node: Node,
+    allowed_node_ids: frozenset[str] | None,
+    owner: str | None,
+) -> bool:
+    """Return True when *node* is reachable under the given scope filters.
+
+    ``allowed_node_ids`` pins to specific node ids; ``owner`` restricts to
+    unowned nodes and nodes owned by that email (compared caselessly).
+    ``None`` filters disable the corresponding check.
+    """
+    if allowed_node_ids is not None and node.node_id not in allowed_node_ids:
+        return False
+    return not (
+        owner is not None and node.owner and node.owner.lower() != owner.lower()
+    )
+
+
 class NodeSelector:
     """Least-connections node selector with model-aware filtering.
 
@@ -144,12 +162,9 @@ class NodeSelector:
                 return None
 
         # Apply endpoint pin (scoped token: never escape the pin, even on retry)
-        if allowed_node_ids is not None:
-            healthy = [n for n in healthy if n.node_id in allowed_node_ids]
-
-        # Apply owner isolation (owned nodes are private to their owner + admin)
-        if owner is not None:
-            healthy = [n for n in healthy if not n.owner or n.owner == owner]
+        # and owner isolation (owned nodes are private to their owner + admin)
+        if allowed_node_ids is not None or owner is not None:
+            healthy = [n for n in healthy if _in_scope(n, allowed_node_ids, owner)]
 
         if (allowed_node_ids is not None or owner is not None) and not healthy:
             logger.debug(
@@ -221,8 +236,6 @@ class NodeSelector:
             ``True`` if at least one reachable node serves the model.
         """
         nodes = self._registry.get_all()
-        if allowed_node_ids is not None:
-            nodes = [n for n in nodes if n.node_id in allowed_node_ids]
-        if owner is not None:
-            nodes = [n for n in nodes if not n.owner or n.owner == owner]
+        if allowed_node_ids is not None or owner is not None:
+            nodes = [n for n in nodes if _in_scope(n, allowed_node_ids, owner)]
         return any(n.model == model for n in nodes)

@@ -21,6 +21,26 @@ from inference_proxy.models.node import (
     VllmParams,
 )
 
+_HOSTNAME_RE = re.compile(r"[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?")
+
+
+def clean_hostname(value: str) -> str:
+    """Strip and validate a hostname (shared by request models)."""
+    value = value.strip()
+    if not value or len(value) > 253:
+        raise ValueError("hostname must be 1-253 characters")
+    if not _HOSTNAME_RE.fullmatch(value):
+        raise ValueError("hostname contains invalid characters")
+    return value
+
+
+def clean_owner(value: str) -> str:
+    """Strip, lowercase, and validate an owner email (shared by models)."""
+    value = value.strip().lower()
+    if value and value.count("@") != 1:
+        raise ValueError("owner must be an email address")
+    return value
+
 
 class AdminNodeResponse(BaseModel):
     """Admin API response for a single registered node.
@@ -80,20 +100,12 @@ class RegisterRequest(BaseModel):
     @field_validator("hostname")
     @classmethod
     def validate_hostname(cls, v: str) -> str:
-        v = v.strip()
-        if not v or len(v) > 253:
-            raise ValueError("hostname must be 1-253 characters")
-        if not re.fullmatch(r"[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?", v):
-            raise ValueError("hostname contains invalid characters")
-        return v
+        return clean_hostname(v)
 
     @field_validator("owner")
     @classmethod
     def validate_owner(cls, v: str) -> str:
-        v = v.strip()
-        if v and v.count("@") != 1:
-            raise ValueError("owner must be an email address")
-        return v
+        return clean_owner(v)
 
 
 class OwnerUpdateRequest(BaseModel):
@@ -106,10 +118,7 @@ class OwnerUpdateRequest(BaseModel):
     @field_validator("owner")
     @classmethod
     def validate_owner(cls, v: str) -> str:
-        v = v.strip()
-        if v and v.count("@") != 1:
-            raise ValueError("owner must be an email address")
-        return v
+        return clean_owner(v)
 
 
 class SetupRequest(BaseModel):
@@ -128,20 +137,12 @@ class SetupRequest(BaseModel):
     @field_validator("hostname")
     @classmethod
     def validate_hostname(cls, v: str) -> str:
-        v = v.strip()
-        if not v or len(v) > 253:
-            raise ValueError("hostname must be 1-253 characters")
-        if not re.fullmatch(r"[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?", v):
-            raise ValueError("hostname contains invalid characters")
-        return v
+        return clean_hostname(v)
 
     @field_validator("owner")
     @classmethod
     def validate_owner(cls, v: str) -> str:
-        v = v.strip()
-        if v and v.count("@") != 1:
-            raise ValueError("owner must be an email address")
-        return v
+        return clean_owner(v)
 
     @model_validator(mode="after")
     def validate_engine_selection(self) -> SetupRequest:

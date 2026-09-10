@@ -32,11 +32,14 @@ def allowed_node_ids(
 
     Anonymous requests and admin full-access tokens are unpinned; a
     token with an endpoint scope is pinned to its stored hostnames.
+    An explicit empty list pins to nothing (no reachable endpoints).
     """
     if auth is None or is_full_access(auth.user.email, settings):
         return None
     scope = auth.token.endpoint_scope
-    return frozenset(scope) if scope else None
+    if scope is None:
+        return None
+    return frozenset(scope)
 
 
 def scope_owner(auth: TokenAuth | None, settings: Settings) -> str | None:
@@ -49,7 +52,25 @@ def scope_owner(auth: TokenAuth | None, settings: Settings) -> str | None:
         return ""
     if is_full_access(auth.user.email, settings):
         return None
-    return auth.user.email
+    return auth.user.email.lower()
+
+
+def auth_scope(
+    auth: TokenAuth | None,
+    settings: Settings,
+) -> tuple[frozenset[str] | None, str | None]:
+    """Resolve both selection filters for *auth* in one admin check.
+
+    Returns ``(allowed_node_ids, owner)``; callers use the pair
+    together for node selection.
+    """
+    if auth is None:
+        return (None, "")
+    if is_full_access(auth.user.email, settings):
+        return (None, None)
+    scope = auth.token.endpoint_scope
+    allowed = frozenset(scope) if scope is not None else None
+    return (allowed, auth.user.email.lower())
 
 
 def pickable_endpoints(
@@ -63,8 +84,9 @@ def pickable_endpoints(
     anything.
     """
     admin = is_full_access(user_email, settings)
+    email = user_email.lower()
     pickable = []
     for node in nodes:
-        if admin or not node.owner or node.owner == user_email:
+        if admin or not node.owner or node.owner.lower() == email:
             pickable.append(node.node_id)
     return sorted(pickable)

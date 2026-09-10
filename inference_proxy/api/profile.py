@@ -98,7 +98,8 @@ async def create_token(
     may route to: an unknown hostname is rejected (400) and a node owned by
     someone else is rejected (403). Admins may pin any registered node.
     """
-    if settings.auth.enforce_sso_whitelist and not is_full_access(user.email, settings):
+    admin = is_full_access(user.email, settings)
+    if settings.auth.enforce_sso_whitelist and not admin:
         try:
             allowed = await enforce_allowlist(user.email, allowlist)
         except AllowlistUnavailableError:
@@ -110,7 +111,7 @@ async def create_token(
                 status_code=403, detail="User is not in the SSO whitelist"
             )
     if body.endpoints is not None:
-        admin = is_full_access(user.email, settings)
+        email = user.email.lower()
         for hostname in body.endpoints:
             node = registry.get(hostname)
             if node is None:
@@ -118,7 +119,7 @@ async def create_token(
                     status_code=400,
                     detail=f"Endpoint '{hostname}' is not a registered node",
                 )
-            if not admin and node.owner and node.owner != user.email:
+            if not admin and node.owner and node.owner.lower() != email:
                 raise HTTPException(
                     status_code=403,
                     detail=f"Endpoint '{hostname}' is owned by another user",
@@ -136,8 +137,9 @@ async def list_pickable_endpoints(
     registry: NodeRegistry = Depends(get_registry),
 ) -> list[dict[str, str]]:
     """List endpoints the signed-in user may pin a token to."""
-    pickable = pickable_endpoints(user.email, settings, registry.get_all())
-    by_id = {node.node_id: node for node in registry.get_all()}
+    nodes = registry.get_all()
+    pickable = pickable_endpoints(user.email, settings, nodes)
+    by_id = {node.node_id: node for node in nodes}
     return [{"node_id": node_id, "model": by_id[node_id].model} for node_id in pickable]
 
 

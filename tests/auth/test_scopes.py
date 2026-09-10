@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from inference_proxy.auth.models import ApiToken, TokenAuth, User
 from inference_proxy.auth.scopes import (
     allowed_node_ids,
+    auth_scope,
     is_full_access,
     pickable_endpoints,
     scope_owner,
@@ -112,3 +113,50 @@ class TestPickableEndpoints:
             self._nodes(),
         )
         assert got == ["mine-1", "shared-1", "theirs-1"]
+
+
+class TestAuthScope:
+    """Combined (allowed, owner) resolver -- one admin check per request."""
+
+    def test_scoped_token_gets_pin_and_owner(self) -> None:
+        allowed, owner = auth_scope(_auth(scopes=["gpu01"]), _settings())
+        assert allowed == frozenset({"gpu01"})
+        assert owner == "alice@example.com"
+
+    def test_admin_gets_no_filters(self) -> None:
+        allowed, owner = auth_scope(
+            _auth(email="ops@example.com"), _settings(["ops@example.com"])
+        )
+        assert allowed is None
+        assert owner is None
+
+    def test_anonymous_gets_unowned_only(self) -> None:
+        assert auth_scope(None, _settings()) == (None, "")
+
+    def test_unscoped_token_gets_owner_only(self) -> None:
+        allowed, owner = auth_scope(_auth(), _settings())
+        assert allowed is None
+        assert owner == "alice@example.com"
+
+    def test_empty_scope_pins_to_nothing(self) -> None:
+        allowed, owner = auth_scope(_auth(scopes=[]), _settings())
+        assert allowed == frozenset()
+        assert owner == "alice@example.com"
+
+
+class TestEmptyScopeDistinctFromFull:
+    """[] must mean pinned-to-nothing, never unrestricted (contra review)."""
+
+    def test_allowed_node_ids_empty_scope_is_not_none(self) -> None:
+        assert allowed_node_ids(_auth(scopes=[]), _settings()) == frozenset()
+
+    def test_allowed_node_ids_none_scope_is_unrestricted(self) -> None:
+        assert allowed_node_ids(_auth(), _settings()) is None
+
+    def test_pickable_endpoints_matches_owner_caselessly(self) -> None:
+        node = Node(
+            node_id="gpu01",
+            endpoint="http://gpu01:8000",
+            owner="Alice@Example.com",
+        )
+        assert pickable_endpoints("alice@example.com", _settings(), [node]) == ["gpu01"]

@@ -93,6 +93,7 @@ def _make_node(
     artifact_id: str | None = None,
     llamacpp_runtime: LlamaCppRuntimeState | None = None,
     self_setup: bool = False,
+    owner: str = "",
 ) -> Node:
     """Create a test node with sensible defaults."""
     return Node(
@@ -105,6 +106,7 @@ def _make_node(
         artifact_id=artifact_id,
         llamacpp_runtime=llamacpp_runtime,
         self_setup=self_setup,
+        owner=owner,
     )
 
 
@@ -3144,3 +3146,75 @@ class TestUpdateNodeOwner:
 
         assert response.status_code == 422
         mock_provisioner.update_node_owner.assert_not_called()
+
+
+class TestOwnerPreservation:
+    """Re-adoption and setup retry must not wipe an existing owner."""
+
+    def test_re_adoption_preserves_existing_owner(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                self_setup=True,
+                managed=False,
+                owner="alice@example.com",
+            )
+        )
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+        mock_provisioner.register_self_setup = AsyncMock(
+            return_value=_make_node(
+                node_id="gpu01",
+                self_setup=True,
+                managed=False,
+                model="org/model",
+                owner="alice@example.com",
+            )
+        )
+
+        response = client.post(
+            "/admin/nodes/pool",
+            json={"hostname": "gpu01", "self_setup": True},
+        )
+
+        assert response.status_code == 201
+        mock_provisioner.register_self_setup.assert_awaited_once_with(
+            "gpu01", owner="alice@example.com"
+        )
+
+    def test_setup_retry_preserves_existing_owner(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                status=NodeStatus.AVAILABLE,
+                owner="alice@example.com",
+            )
+        )
+        lease = MagicMock(hostname="gpu01")
+        mock_provisioner.try_reserve_host.return_value = lease
+        mock_provisioner.cleanup_stale_node = AsyncMock()
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+        mock_provisioner.provision.assert_awaited_once_with(
+            "gpu01",
+            managed=True,
+            model="llama-3",
+            engine=ANY,
+            artifact_id=None,
+            vllm_params=None,
+            lifecycle_lease=ANY,
+            owner="alice@example.com",
+        )

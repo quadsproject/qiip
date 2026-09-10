@@ -9,7 +9,6 @@ and circuit breaker state for the operations dashboard.
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -42,6 +41,7 @@ from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.llmfit.errors import LLMFitParseError, LLMFitTimeoutError
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.admin import (
+    _HOSTNAME_RE,
     AdminMetricsResponse,
     AdminNodeResponse,
     DownloadRequest,
@@ -127,8 +127,6 @@ _SETUP_RETRYABLE_STATUSES = frozenset(
     }
 )
 
-# Regex from SetupRequest.validate_hostname — reused for path-parameter validation
-_HOSTNAME_RE = re.compile(r"[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?")
 _SETUP_SELECTION_FIELDS = frozenset({"engine", "model", "artifact_id"})
 
 
@@ -350,10 +348,15 @@ async def register_node(
                     hostname=hostname,
                     previous_model=node.model,
                 )
+            # Only override an already-registered owner when the request
+            # explicitly supplies one; a bare re-adoption must not wipe it.
+            owner = (
+                body.owner
+                if "owner" in body.model_fields_set
+                else (node.owner if node else "")
+            )
             try:
-                adopted = await provisioner.register_self_setup(
-                    hostname, owner=body.owner
-                )
+                adopted = await provisioner.register_self_setup(hostname, owner=owner)
             except SelfSetupError as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             return JSONResponse(
@@ -582,6 +585,14 @@ async def setup_node(
         # single-worker guard for clear duplicate-setup responses.
         pending_hosts.add(hostname)
 
+        # Retrying setup must not wipe an owner established by registration;
+        # only an explicit owner in the request overrides it.
+        setup_owner = (
+            body.owner
+            if "owner" in body.model_fields_set
+            else (initial_node.owner if initial_node is not None else "")
+        )
+
         async def _provision_and_cleanup() -> None:
             try:
                 if selection.llamacpp_request is None:
@@ -593,7 +604,7 @@ async def setup_node(
                         artifact_id=selection.artifact_id,
                         vllm_params=selection.vllm_params,
                         lifecycle_lease=lease,
-                        owner=body.owner,
+                        owner=setup_owner,
                     )
                 else:
                     await provisioner.provision(
@@ -604,7 +615,7 @@ async def setup_node(
                         artifact_id=selection.artifact_id,
                         llamacpp_request=selection.llamacpp_request,
                         lifecycle_lease=lease,
-                        owner=body.owner,
+                        owner=setup_owner,
                     )
             finally:
                 pending_hosts.discard(hostname)

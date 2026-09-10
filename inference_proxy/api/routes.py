@@ -38,7 +38,7 @@ from inference_proxy.api.errors import (
 )
 from inference_proxy.auth.dependencies import get_api_auth, get_auth_store
 from inference_proxy.auth.models import TokenAuth
-from inference_proxy.auth.scopes import allowed_node_ids, scope_owner
+from inference_proxy.auth.scopes import auth_scope
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import (
     get_circuit_breaker_registry,
@@ -57,7 +57,11 @@ from inference_proxy.models.openai import (
 )
 from inference_proxy.proxy.client import ProxyClient
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
-from inference_proxy.routing.node_selector import NodeReservation, NodeSelector
+from inference_proxy.routing.node_selector import (
+    NodeReservation,
+    NodeSelector,
+    _in_scope,
+)
 from inference_proxy.routing.request_metrics import RequestMetrics
 
 logger = structlog.get_logger()
@@ -79,13 +83,7 @@ def _select_error(
     - 503 model_unavailable: nodes serve the model but all are draining/unhealthy
     """
     all_nodes = node_selector._registry.get_all()
-    scoped: list[Node] = []
-    for node in all_nodes:
-        if allowed_node_ids is not None and node.node_id not in allowed_node_ids:
-            continue
-        if owner is not None and node.owner and node.owner != owner:
-            continue
-        scoped.append(node)
+    scoped = [node for node in all_nodes if _in_scope(node, allowed_node_ids, owner)]
     if not scoped:
         return no_nodes_error()
     if model:
@@ -487,8 +485,7 @@ async def chat_completions(
     body["messages"] = [
         message.model_dump(exclude_unset=True) for message in request.messages
     ]
-    allowed = allowed_node_ids(usage_auth, settings)
-    owner = scope_owner(usage_auth, settings)
+    allowed, owner = auth_scope(usage_auth, settings)
     if request.stream:
         return await _stream_completion(
             endpoint_path="/v1/chat/completions",
@@ -544,8 +541,7 @@ async def text_completions(
     the request for usage tracking; enforcement is config-gated.
     """
     body = request.model_dump(exclude_none=True)
-    allowed = allowed_node_ids(usage_auth, settings)
-    owner = scope_owner(usage_auth, settings)
+    allowed, owner = auth_scope(usage_auth, settings)
     if request.stream:
         return await _stream_completion(
             endpoint_path="/v1/completions",
@@ -586,13 +582,16 @@ async def list_models(
 
     Aggregates model names from all healthy registered nodes,
     deduplicating by model name.  DRAINING nodes are excluded so
-    clients only see models that can accept new requests.
+    clients only see models that can accept new requests.  Nodes owned
+    by a user are private (RFE #107) and their models are not listed.
     """
     nodes = node_selector._registry.get_all()
     models_seen: dict[str, dict[str, str | int]] = {}
 
     for node in nodes:
         if node.status != NodeStatus.HEALTHY:
+            continue
+        if node.owner:
             continue
         if node.model and node.model not in models_seen:
             models_seen[node.model] = {

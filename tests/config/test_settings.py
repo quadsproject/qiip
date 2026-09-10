@@ -1027,7 +1027,7 @@ class TestAuthSettings:
         auth = AuthSettings(
             sso_whitelist_extra_users=[" Alice@example.com ", "bob@other.com"]
         )
-        assert auth.sso_whitelist_extra_users == ["Alice@example.com", "bob@other.com"]
+        assert auth.sso_whitelist_extra_users == ["alice@example.com", "bob@other.com"]
 
     def test_sso_whitelist_extra_domains_must_be_plain(self) -> None:
         with pytest.raises(ValidationError, match="domains"):
@@ -1155,7 +1155,7 @@ class TestAdminFullAccessSetting:
             admin_only_tokens_full_access=[" Ops@example.com ", "alice@example.com"]
         )
         assert auth.admin_only_tokens_full_access == [
-            "Ops@example.com",
+            "ops@example.com",
             "alice@example.com",
         ]
 

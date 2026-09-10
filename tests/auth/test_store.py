@@ -358,3 +358,19 @@ class TestEndpointScope:
         created = store.create_token(user.id, "migrated", endpoint_scope=["h1"])
         assert created.endpoint_scope == ["h1"]
         store.close()
+
+
+class TestScopeSerialization:
+    """endpoint_scope NULL vs "[]" roundtrip (contra review)."""
+
+    def test_dump_distinguishes_none_from_empty(self) -> None:
+        from inference_proxy.auth.store import _dump_scopes
+
+        assert _dump_scopes(None) is None
+        assert _dump_scopes([]) == "[]"
+
+    def test_empty_scope_roundtrips_as_empty(self) -> None:
+        from inference_proxy.auth.store import _load_scopes
+
+        assert _load_scopes("[]") == []
+        assert _load_scopes(None) is None

@@ -108,8 +108,14 @@ def _generate_token() -> str:
 
 
 def _dump_scopes(scopes: list[str] | None) -> str | None:
-    """Serialize an endpoint scope to its TEXT column value (None = full)."""
-    return json.dumps(scopes) if scopes else None
+    """Serialize an endpoint scope to its TEXT column value.
+
+    ``None`` (full access) becomes NULL; an empty list is serialized as
+    ``"[]"`` so "pinned to nothing" stays distinct from "unrestricted".
+    """
+    if scopes is None:
+        return None
+    return json.dumps(scopes)
 
 
 def _load_scopes(raw: str | None) -> list[str] | None:

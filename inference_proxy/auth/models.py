@@ -10,6 +10,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from inference_proxy.models.admin import _HOSTNAME_RE
+
 
 class User(BaseModel):
     """A Google-authenticated user row.
@@ -110,7 +112,7 @@ class CreateTokenRequest(BaseModel):
     @field_validator("endpoints")
     @classmethod
     def endpoints_are_hostnames(cls, value: list[str] | None) -> list[str] | None:
-        """Require clean hostnames; an empty list is rejected (None = full)."""
+        """Require registered-node hostnames; empty list rejected (None = full)."""
         if value is None:
             return None
         if not value:
@@ -118,11 +120,7 @@ class CreateTokenRequest(BaseModel):
         cleaned: list[str] = []
         for item in value:
             normalized = item.strip()
-            if (
-                not normalized
-                or any(ord(char) < 32 or char.isspace() for char in normalized)
-                or any(char in normalized for char in "/:@")
-            ):
+            if not _HOSTNAME_RE.fullmatch(normalized):
                 raise ValueError("endpoint scope entries must be hostnames")
             if normalized not in cleaned:
                 cleaned.append(normalized)
