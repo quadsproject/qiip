@@ -16,6 +16,8 @@ from inference_proxy.models.admin import (
     AdminMetricsResponse,
     AdminNodeResponse,
     DownloadRequest,
+    OwnerUpdateRequest,
+    RegisterRequest,
     SetupRequest,
 )
 from inference_proxy.models.node import InferenceEngine
@@ -237,3 +239,28 @@ class TestDownloadRequest:
                 repo_id="org/model",
                 gguf=GGUFDownloadSpec(files=("model.gguf",), entrypoint="model.gguf"),
             )
+
+
+class TestOwnerFields:
+    """Owner field validation on register/setup/patch models (RFE #107)."""
+
+    def test_register_owner_must_be_email(self) -> None:
+        with pytest.raises(ValidationError, match="owner"):
+            RegisterRequest(hostname="gpu01", owner="not-an-email")
+        req = RegisterRequest(hostname="gpu01", owner=" alice@example.com ")
+        assert req.owner == "alice@example.com"
+        assert RegisterRequest(hostname="gpu01").owner == ""
+
+    def test_setup_owner_must_be_email(self) -> None:
+        with pytest.raises(ValidationError, match="owner"):
+            SetupRequest(hostname="gpu01", owner="not-an-email")
+        assert SetupRequest(hostname="gpu01").owner == ""
+
+    def test_owner_update_accepts_empty_to_clear(self) -> None:
+        req = OwnerUpdateRequest(owner="")
+        assert req.owner == ""
+        with pytest.raises(ValidationError, match="owner"):
+            OwnerUpdateRequest(owner="not-an-email")
+        assert (
+            OwnerUpdateRequest(owner=" alice@example.com ").owner == "alice@example.com"
+        )

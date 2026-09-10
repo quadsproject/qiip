@@ -417,3 +417,82 @@ class TestBuildGoogleOAuth:
 
         with pytest.raises(ValueError, match="disabled"):
             build_google_oauth(OAuthSettings())
+
+
+class TestOAuthCallbackAdminBypass:
+    """Admin full-access list bypasses the callback whitelist gate (RFE #107)."""
+
+    @staticmethod
+    def _admin_enforced_settings(test_settings: Settings) -> Settings:
+        auth = test_settings.auth.model_copy(
+            update={
+                "sso_whitelist_url": "https://allowlist.example.com/list.json",
+                "enforce_sso_whitelist": True,
+                "admin_only_tokens_full_access": ["ops@example.com"],
+            }
+        )
+        return test_settings.model_copy(deep=True, update={"auth": auth})
+
+    def test_admin_not_on_whitelist_still_signs_in(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        auth_store: AuthStore,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        app.dependency_overrides[get_auth_plugin] = lambda: make_fake_auth_plugin(
+            userinfo={
+                "sub": "sub-ops",
+                "email": "ops@example.com",
+                "email_verified": True,
+                "name": "Ops",
+                "picture": "",
+            }
+        )
+        app.dependency_overrides[get_settings] = lambda: (
+            TestOAuthCallbackAdminBypass._admin_enforced_settings(test_settings)
+        )
+        app.dependency_overrides[get_sso_allowlist] = lambda: FakeAllowlist(
+            allowed=False
+        )
+        client = TestClient(app)
+
+        response = client.get(
+            "/auth/callback?code=code&state=state", follow_redirects=False
+        )
+
+        assert response.status_code == 302
+        assert "error=" not in response.headers["location"]
+        user = (
+            auth_store.get_user_by_email("ops@example.com")
+            if hasattr(auth_store, "get_user_by_email")
+            else None
+        )
+        assert (
+            user is not None
+            or auth_store._conn.execute(
+                "SELECT COUNT(*) FROM users WHERE email = 'ops@example.com'"
+            ).fetchone()[0]
+            == 1
+        )
+
+    def test_non_admin_still_redirected_error(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        app.dependency_overrides[get_auth_plugin] = lambda: make_fake_auth_plugin()
+        app.dependency_overrides[get_settings] = lambda: (
+            TestOAuthCallbackAdminBypass._admin_enforced_settings(test_settings)
+        )
+        app.dependency_overrides[get_sso_allowlist] = lambda: FakeAllowlist(
+            allowed=False
+        )
+        client = TestClient(app)
+
+        response = client.get(
+            "/auth/callback?code=code&state=state", follow_redirects=False
+        )
+
+        assert "error=not_whitelisted" in response.headers["location"]

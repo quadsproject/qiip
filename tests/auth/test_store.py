@@ -281,3 +281,80 @@ class TestStoreLifecycle:
     def test_close_is_idempotent(self, auth_store: AuthStore) -> None:
         auth_store.close()
         auth_store.close()
+
+
+class TestEndpointScope:
+    """Per-token endpoint scoping (RFE #107)."""
+
+    def _user(self, store: AuthStore) -> User:
+        return store.upsert_google_user(**_GOOGLE)
+
+    def test_create_with_scope_roundtrips(self, auth_store: AuthStore) -> None:
+        user = self._user(auth_store)
+        created = auth_store.create_token(
+            user.id, "pinned", endpoint_scope=["host-a", "host-b"]
+        )
+
+        assert created.endpoint_scope == ["host-a", "host-b"]
+        resolved = auth_store.resolve_token(created.token)
+        assert resolved is not None
+        assert resolved.token.endpoint_scope == ["host-a", "host-b"]
+        listed = auth_store.list_tokens(user.id)
+        assert listed[0].endpoint_scope == ["host-a", "host-b"]
+
+    def test_unscoped_token_is_none(self, auth_store: AuthStore) -> None:
+        user = self._user(auth_store)
+        created = auth_store.create_token(user.id, "open")
+
+        assert created.endpoint_scope is None
+        resolved = auth_store.resolve_token(created.token)
+        assert resolved is not None
+        assert resolved.token.endpoint_scope is None
+
+    def test_existing_db_gets_scope_column(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db_path = tmp_path / "old.db"
+        # Simulate a pre-scope database: create the old tokens table shape
+        # by pointing a fresh store at a hand-built schema.
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                google_sub  TEXT    NOT NULL UNIQUE,
+                email       TEXT    NOT NULL UNIQUE,
+                name        TEXT    NOT NULL DEFAULT '',
+                picture     TEXT    NOT NULL DEFAULT '',
+                created_at  TEXT    NOT NULL,
+                updated_at  TEXT    NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS tokens (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name         TEXT    NOT NULL,
+                token_hash   TEXT    NOT NULL UNIQUE,
+                prefix       TEXT    NOT NULL,
+                created_at   TEXT    NOT NULL,
+                last_used_at TEXT,
+                revoked      INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO users (google_sub, email, name, picture, created_at, updated_at) "
+            "VALUES ('sub-1', 'alice@example.com', 'Alice', '', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        store = AuthStore(db_path)
+        columns = [row[1] for row in store._conn.execute("PRAGMA table_info(tokens)")]
+        assert "endpoint_scope" in columns
+        user = store.get_user(1)
+        assert user is not None
+        created = store.create_token(user.id, "migrated", endpoint_scope=["h1"])
+        assert created.endpoint_scope == ["h1"]
+        store.close()

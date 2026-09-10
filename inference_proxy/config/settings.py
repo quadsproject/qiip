@@ -557,6 +557,25 @@ class AuthSettings(BaseModel):
     sso_whitelist_cache_file: Path | None = None
     sso_whitelist_extra_users: list[str] = Field(default_factory=list)
     sso_whitelist_extra_domains: list[str] = Field(default_factory=list)
+    admin_only_tokens_full_access: list[str] = Field(default_factory=list)
+
+    @field_validator("admin_only_tokens_full_access")
+    @classmethod
+    def admin_only_tokens_full_access_are_emails(cls, value: list[str]) -> list[str]:
+        """Require valid email addresses for the full-access trust list."""
+        for item in value:
+            normalized = item.strip()
+            if not normalized or any(
+                ord(char) < 32 or char.isspace() for char in normalized
+            ):
+                raise ValueError(
+                    "auth.admin_only_tokens_full_access entries must be emails"
+                )
+            if normalized.count("@") != 1:
+                raise ValueError(
+                    "auth.admin_only_tokens_full_access entries must be emails"
+                )
+        return [item.strip() for item in value]
 
     @field_validator("sso_whitelist_extra_users")
     @classmethod

@@ -17,6 +17,7 @@ below anything WAL-mode SQLite cannot absorb on one process.
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import sqlite3
 import threading
@@ -49,14 +50,15 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS tokens (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    name         TEXT    NOT NULL,
-    token_hash   TEXT    NOT NULL UNIQUE,
-    prefix       TEXT    NOT NULL,
-    created_at   TEXT    NOT NULL,
-    last_used_at TEXT,
-    revoked      INTEGER NOT NULL DEFAULT 0
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name            TEXT    NOT NULL,
+    token_hash      TEXT    NOT NULL UNIQUE,
+    prefix          TEXT    NOT NULL,
+    created_at      TEXT    NOT NULL,
+    last_used_at    TEXT,
+    revoked         INTEGER NOT NULL DEFAULT 0,
+    endpoint_scope  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS usage (
@@ -105,6 +107,26 @@ def _generate_token() -> str:
     return f"{TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
 
 
+def _dump_scopes(scopes: list[str] | None) -> str | None:
+    """Serialize an endpoint scope to its TEXT column value (None = full)."""
+    return json.dumps(scopes) if scopes else None
+
+
+def _load_scopes(raw: str | None) -> list[str] | None:
+    """Parse the endpoint_scope column (None = full access)."""
+    if raw is None:
+        return None
+    try:
+        scopes = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(scopes, list) or not all(
+        isinstance(item, str) for item in scopes
+    ):
+        return None
+    return scopes
+
+
 class AuthStore:
     """Thread-safe SQLite store for identities, tokens, and usage.
 
@@ -122,7 +144,21 @@ class AuthStore:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(_SCHEMA)
+            self._migrate()
         logger.info("auth store opened", db_path=str(db_path))
+
+    def _migrate(self) -> None:
+        """Apply additive migrations to pre-existing databases.
+
+        ``CREATE TABLE IF NOT EXISTS`` handles fresh databases; tables
+        created before a column existed need a guarded ALTER here.
+        """
+        columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(tokens)").fetchall()
+        }
+        if "endpoint_scope" not in columns:
+            self._conn.execute("ALTER TABLE tokens ADD COLUMN endpoint_scope TEXT")
 
     def close(self) -> None:
         """Close the underlying connection (idempotent)."""
@@ -201,10 +237,17 @@ class AuthStore:
     # API tokens
     # ------------------------------------------------------------------
 
-    def create_token(self, user_id: int, name: str) -> CreatedToken:
+    def create_token(
+        self,
+        user_id: int,
+        name: str,
+        endpoint_scope: list[str] | None = None,
+    ) -> CreatedToken:
         """Mint a token, store its digest, and return the raw secret once.
 
-        Raises ``KeyError`` when *user_id* does not exist.
+        *endpoint_scope* is an optional list of node hostnames the token
+        may route to; ``None`` means full access. Raises ``KeyError`` when
+        *user_id* does not exist.
         """
         raw = _generate_token()
         now = _iso(_utcnow())
@@ -216,10 +259,18 @@ class AuthStore:
                 raise KeyError(user_id)
             cursor = self._conn.execute(
                 """
-                INSERT INTO tokens (user_id, name, token_hash, prefix, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO tokens
+                    (user_id, name, token_hash, prefix, created_at, endpoint_scope)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, name, _hash_token(raw), raw[: len(TOKEN_PREFIX) + 8], now),
+                (
+                    user_id,
+                    name,
+                    _hash_token(raw),
+                    raw[: len(TOKEN_PREFIX) + 8],
+                    now,
+                    _dump_scopes(endpoint_scope),
+                ),
             )
             self._conn.commit()
             row = self._conn.execute(
@@ -417,4 +468,5 @@ class AuthStore:
             created_at=_parse_iso(row["created_at"]),
             last_used_at=_parse_iso(row["last_used_at"]),
             revoked=bool(row["revoked"]),
+            endpoint_scope=_load_scopes(row["endpoint_scope"]),
         )

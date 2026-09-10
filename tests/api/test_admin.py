@@ -206,6 +206,7 @@ class TestAdminNodesPopulated:
             "self_setup",
             "failed_step",
             "error",
+            "owner",
         }
         assert set(node.keys()) == expected
         assert "last_heartbeat" not in node
@@ -313,6 +314,7 @@ class TestAdminNodesPopulated:
                 "artifact_id": None,
                 "llamacpp_runtime": None,
                 "state": "failed",
+                "owner": "",
                 "actions": ["setup", "teardown"],
                 "gpu_vendor": None,
                 "gpu_model": None,
@@ -532,6 +534,7 @@ class TestSetupModelPassthrough:
             artifact_id=None,
             vllm_params=None,
             lifecycle_lease=ANY,
+            owner="",
         )
 
     def test_passes_vllm_params_to_provisioner(
@@ -594,6 +597,7 @@ class TestSetupModelPassthrough:
             artifact_id=None,
             vllm_params=None,
             lifecycle_lease=ANY,
+            owner="",
         )
 
     def test_unknown_llamacpp_artifact_fails_before_host_reservation(
@@ -650,6 +654,7 @@ class TestSetupModelPassthrough:
             artifact_id=artifact_id,
             vllm_params=None,
             lifecycle_lease=ANY,
+            owner="",
         )
         assert mock_provisioner.fire_background.call_args.kwargs[
             "provisioning_identity"
@@ -693,6 +698,7 @@ class TestSetupModelPassthrough:
             artifact_id=artifact_id,
             llamacpp_request=request,
             lifecycle_lease=ANY,
+            owner="",
         )
 
     def test_implicit_vllm_retry_inherits_persisted_model(
@@ -1174,7 +1180,7 @@ class TestNodePool:
 
         assert response.status_code == 201
         assert response.json() == {"hostname": "gpu01", "state": "available"}
-        mock_provisioner.register_available.assert_awaited_once_with("gpu01")
+        mock_provisioner.register_available.assert_awaited_once_with("gpu01", owner="")
         mock_provisioner.register_self_setup.assert_not_called()
 
     def test_register_self_setup_adopts_running_vllm(
@@ -1204,7 +1210,7 @@ class TestNodePool:
             "model": "org/model",
             "self_setup": True,
         }
-        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01")
+        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01", owner="")
         mock_provisioner.register_available.assert_not_called()
 
     def test_register_self_setup_unreachable_returns_502(
@@ -1336,7 +1342,8 @@ class TestNodePool:
         probes_started = threading.Event()
         release_probes = threading.Event()
 
-        async def paused_register(hostname: str) -> Node:
+        async def paused_register(hostname: str, owner: str = "") -> Node:
+            del owner
             probes_started.set()
             while not release_probes.is_set():
                 await asyncio.sleep(0.01)
@@ -1385,7 +1392,7 @@ class TestNodePool:
             "model": "org/model",
             "self_setup": True,
         }
-        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01")
+        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01", owner="")
 
     def test_readoption_reconciles_reported_model(
         self,
@@ -1421,7 +1428,7 @@ class TestNodePool:
 
         assert response.status_code == 201
         assert response.json()["model"] == "org/new"
-        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01")
+        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01", owner="")
 
     def test_self_setup_flag_cannot_adopt_managed_node(
         self,
@@ -1940,6 +1947,7 @@ class TestSetupEligibility:
             artifact_id=None,
             vllm_params=None,
             lifecycle_lease=ANY,
+            owner="",
         )
 
     def test_draining_node_with_connections_is_rejected_actionably(
@@ -2069,6 +2077,7 @@ class TestSetupEligibility:
             artifact_id: str | None = None,
             vllm_params: object = None,
             lifecycle_lease: object,
+            owner: str = "",
         ) -> None:
             assert hostname == "gpu01"
             assert managed is True
@@ -3083,3 +3092,55 @@ class TestModelCatalog:
             "invalid_artifact_count": 4,
             "cache_warning_count": 5,
         }
+
+
+class TestUpdateNodeOwner:
+    """PATCH /admin/nodes/{node_id}/owner (RFE #107)."""
+
+    def test_patch_owner_updates_node(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        node = _make_node(node_id="gpu01", endpoint="http://gpu01:8000")
+        updated = node.model_copy(update={"owner": "alice@example.com"})
+        mock_provisioner.update_node_owner = AsyncMock(return_value=updated)
+
+        response = client.patch(
+            "/admin/nodes/gpu01/owner",
+            json={"owner": "alice@example.com"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "node_id": "gpu01",
+            "owner": "alice@example.com",
+        }
+        mock_provisioner.update_node_owner.assert_awaited_once_with(
+            "gpu01", "alice@example.com"
+        )
+
+    def test_patch_owner_unknown_node_404(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.update_node_owner = AsyncMock(side_effect=KeyError("gpu01"))
+
+        response = client.patch(
+            "/admin/nodes/gpu01/owner", json={"owner": "alice@example.com"}
+        )
+
+        assert response.status_code == 404
+
+    def test_patch_owner_invalid_email_422(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        response = client.patch(
+            "/admin/nodes/gpu01/owner", json={"owner": "not-an-email"}
+        )
+
+        assert response.status_code == 422
+        mock_provisioner.update_node_owner.assert_not_called()

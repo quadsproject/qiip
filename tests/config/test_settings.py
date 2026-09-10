@@ -1145,3 +1145,24 @@ class TestAuthRootValidators:
         settings = Settings(_env_file=None)
 
         assert settings.auth.enforce_api_tokens is True
+
+
+class TestAdminFullAccessSetting:
+    """admin_only_tokens_full_access validation (RFE #107)."""
+
+    def test_valid_emails_accepted_and_stripped(self) -> None:
+        auth = AuthSettings(
+            admin_only_tokens_full_access=[" Ops@example.com ", "alice@example.com"]
+        )
+        assert auth.admin_only_tokens_full_access == [
+            "Ops@example.com",
+            "alice@example.com",
+        ]
+
+    def test_invalid_entries_rejected(self) -> None:
+        for bad in ("not-an-email", "a @b.com", ""):
+            with pytest.raises(ValidationError, match="full_access"):
+                AuthSettings(admin_only_tokens_full_access=[bad])
+
+    def test_default_is_empty(self) -> None:
+        assert AuthSettings().admin_only_tokens_full_access == []

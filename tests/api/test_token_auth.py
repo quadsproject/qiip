@@ -396,3 +396,158 @@ class TestEnforcementEnabled:
         response = client.get("/v1/models")
 
         assert response.status_code == 200
+
+
+class TestEndpointScoping:
+    """Endpoint pin and owner isolation on /v1 routing (RFE #107)."""
+
+    @staticmethod
+    def _seed(test_registry: NodeRegistry) -> None:
+        test_registry.add(
+            Node(
+                node_id="node-1",
+                endpoint="10.0.1.100:8000",
+                status=NodeStatus.HEALTHY,
+                model="llama-3",
+                owner="alice@example.com",
+            )
+        )
+        test_registry.add(
+            Node(
+                node_id="node-2",
+                endpoint="10.0.1.200:8000",
+                status=NodeStatus.HEALTHY,
+                model="mistral",
+                owner="",
+            )
+        )
+
+    def test_scoped_token_only_reaches_pinned_node(
+        self,
+        app: FastAPI,
+        test_registry: NodeRegistry,
+        auth_store: AuthStore,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        self._seed(test_registry)
+        user = auth_store.upsert_google_user(
+            google_sub="sub-alice",
+            email="alice@example.com",
+            name="Alice",
+            picture="",
+        )
+        created = auth_store.create_token(user.id, "pinned", endpoint_scope=["node-1"])
+        httpx_mock.add_response(
+            url="http://10.0.1.100:8000/v1/chat/completions",
+            json={"id": "x", "object": "chat.completion"},
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json=_BODY,
+            headers={"Authorization": f"Bearer {created.token}"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["id"] == "x"
+        # The mistral-only node-2 was never consulted for a llama-3 request;
+        # a pinned token with no reachable node for the model gets an error.
+        pinned_only = auth_store.create_token(
+            user.id, "pinned2", endpoint_scope=["node-2"]
+        )
+        response = client.post(
+            "/v1/chat/completions",
+            json=_BODY,
+            headers={"Authorization": f"Bearer {pinned_only.token}"},
+        )
+        # llama-3 exists but only on a node the token may not reach
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "model_not_found"
+
+    def test_owner_isolation_blocks_other_users(
+        self,
+        app: FastAPI,
+        test_registry: NodeRegistry,
+        auth_store: AuthStore,
+    ) -> None:
+        self._seed(test_registry)
+        bob = auth_store.upsert_google_user(
+            google_sub="sub-bob",
+            email="bob@example.com",
+            name="Bob",
+            picture="",
+        )
+        created = auth_store.create_token(bob.id, "ci")
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={**_BODY, "model": "llama-3"},
+            headers={"Authorization": f"Bearer {created.token}"},
+        )
+
+        # node-1 is alice's; bob's token cannot route to it, so the
+        # model is not reachable for him
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "model_not_found"
+
+    def test_anonymous_cannot_reach_owned_node(
+        self,
+        app: FastAPI,
+        test_registry: NodeRegistry,
+    ) -> None:
+        test_registry.add(
+            Node(
+                node_id="node-1",
+                endpoint="10.0.1.100:8000",
+                status=NodeStatus.HEALTHY,
+                model="llama-3",
+                owner="alice@example.com",
+            )
+        )
+        client = TestClient(app)
+
+        response = client.post("/v1/chat/completions", json=_BODY)
+
+        assert response.status_code == 503
+
+    def test_admin_token_reaches_owned_node(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        test_registry: NodeRegistry,
+        auth_store: AuthStore,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        self._seed(test_registry)
+        admin_settings = test_settings.model_copy(
+            deep=True,
+            update={
+                "auth": test_settings.auth.model_copy(
+                    update={"admin_only_tokens_full_access": ["ops@example.com"]}
+                )
+            },
+        )
+        app.dependency_overrides[get_settings] = lambda: admin_settings
+        ops = auth_store.upsert_google_user(
+            google_sub="sub-ops",
+            email="ops@example.com",
+            name="Ops",
+            picture="",
+        )
+        created = auth_store.create_token(ops.id, "admin")
+        httpx_mock.add_response(
+            url="http://10.0.1.100:8000/v1/chat/completions",
+            json={"id": "admin-ok"},
+        )
+        client = TestClient(app)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json=_BODY,
+            headers={"Authorization": f"Bearer {created.token}"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["id"] == "admin-ok"

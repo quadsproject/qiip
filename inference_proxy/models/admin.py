@@ -51,6 +51,7 @@ class AdminNodeResponse(BaseModel):
     self_setup: bool = False
     failed_step: str | None = None
     error: str | None = None
+    owner: str = ""
 
 
 class AdminMetricsResponse(BaseModel):
@@ -74,6 +75,7 @@ class RegisterRequest(BaseModel):
 
     hostname: str
     self_setup: bool = False
+    owner: str = ""
 
     @field_validator("hostname")
     @classmethod
@@ -83,6 +85,30 @@ class RegisterRequest(BaseModel):
             raise ValueError("hostname must be 1-253 characters")
         if not re.fullmatch(r"[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?", v):
             raise ValueError("hostname contains invalid characters")
+        return v
+
+    @field_validator("owner")
+    @classmethod
+    def validate_owner(cls, v: str) -> str:
+        v = v.strip()
+        if v and v.count("@") != 1:
+            raise ValueError("owner must be an email address")
+        return v
+
+
+class OwnerUpdateRequest(BaseModel):
+    """Request body for PATCH /admin/nodes/{node_id}/owner."""
+
+    model_config = ConfigDict(frozen=True)
+
+    owner: str = ""
+
+    @field_validator("owner")
+    @classmethod
+    def validate_owner(cls, v: str) -> str:
+        v = v.strip()
+        if v and v.count("@") != 1:
+            raise ValueError("owner must be an email address")
         return v
 
 
@@ -97,6 +123,7 @@ class SetupRequest(BaseModel):
     engine: InferenceEngine = InferenceEngine.VLLM
     artifact_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     vllm_params: VllmParams | None = None
+    owner: str = ""
 
     @field_validator("hostname")
     @classmethod
@@ -106,6 +133,14 @@ class SetupRequest(BaseModel):
             raise ValueError("hostname must be 1-253 characters")
         if not re.fullmatch(r"[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?", v):
             raise ValueError("hostname contains invalid characters")
+        return v
+
+    @field_validator("owner")
+    @classmethod
+    def validate_owner(cls, v: str) -> str:
+        v = v.strip()
+        if v and v.count("@") != 1:
+            raise ValueError("owner must be an email address")
         return v
 
     @model_validator(mode="after")

@@ -229,3 +229,62 @@ class TestGetAuthPlugin:
         _app, request = _app_with_state(auth_plugin=plugin)
 
         assert get_auth_plugin(request) is plugin
+
+
+class TestGetApiAuthAdminBypass:
+    """Admin full-access list bypasses the use-time whitelist gate (RFE #107)."""
+
+    @staticmethod
+    def _admin_settings(test_settings: Settings) -> Settings:
+        auth = test_settings.auth.model_copy(
+            update={
+                "enforce_sso_whitelist": True,
+                "sso_whitelist_url": "https://allowlist.example.com/list.json",
+                "admin_only_tokens_full_access": ["ops@example.com"],
+            }
+        )
+        return test_settings.model_copy(deep=True, update={"auth": auth})
+
+    async def test_admin_token_bypasses_denied_whitelist(
+        self, test_settings: Settings, auth_store: AuthStore
+    ) -> None:
+        user = auth_store.upsert_google_user(
+            google_sub="sub-ops",
+            email="ops@example.com",
+            name="Ops",
+            picture="",
+        )
+        token = auth_store.create_token(user.id, "admin").token
+        request = MagicMock()
+        request.headers.get.return_value = f"Bearer {token}"
+
+        result = await get_api_auth(
+            request,
+            self._admin_settings(test_settings),
+            auth_store,
+            FakeAllowlist(allowed=False),
+        )
+
+        assert result is not None
+        assert result.user.email == "ops@example.com"
+
+    async def test_non_admin_still_denied(
+        self, test_settings: Settings, auth_store: AuthStore
+    ) -> None:
+        user = auth_store.upsert_google_user(
+            google_sub="sub-alice",
+            email="alice@example.com",
+            name="Alice",
+            picture="",
+        )
+        token = auth_store.create_token(user.id, "ci").token
+        request = MagicMock()
+        request.headers.get.return_value = f"Bearer {token}"
+
+        with pytest.raises(ApiAuthError):
+            await get_api_auth(
+                request,
+                self._admin_settings(test_settings),
+                auth_store,
+                FakeAllowlist(allowed=False),
+            )

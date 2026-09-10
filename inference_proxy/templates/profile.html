@@ -57,6 +57,13 @@
                     <h2 class="card-title">API Tokens <button type="button" class="manual-setup-toggle" id="token-toggle">+ New token</button></h2>
                     <form id="token-form" class="setup-form" hidden>
                         <input type="text" id="token-name" placeholder="Token name (e.g. ci-job, laptop)" maxlength="100" required aria-label="Token name">
+                        <div class="form-field">
+                            <label for="token-endpoints">Pin to endpoints (optional)</label>
+                            <select id="token-endpoints" multiple aria-label="Pin to endpoints">
+                                <option value="" disabled>No registered endpoints</option>
+                            </select>
+                            <p class="muted-status">Leave empty for full access to every endpoint you may reach.</p>
+                        </div>
                         <button type="submit" id="token-create-btn" class="btn btn-primary">Create</button>
                     </form>
                     <div id="token-secret" class="token-secret-box" hidden>
@@ -74,6 +81,7 @@
                                     <th scope="col">Created</th>
                                     <th scope="col">Last used</th>
                                     <th scope="col">Status</th>
+                                    <th scope="col">Scope</th>
                                     <th scope="col">Actions</th>
                                 </tr>
                             </thead>

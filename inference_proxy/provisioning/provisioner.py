@@ -1298,7 +1298,7 @@ class NodeProvisioner:
                     await keepalive
             self._log_buffer.mark_complete(hostname)
 
-    async def register_available(self, hostname: str) -> None:
+    async def register_available(self, hostname: str, owner: str = "") -> None:
         """Register a hostname as available in the node pool (no provisioning)."""
         endpoint = self.validate_endpoint(hostname)
         node = Node(
@@ -1306,13 +1306,14 @@ class NodeProvisioner:
             endpoint=endpoint,
             status=NodeStatus.AVAILABLE,
             managed=False,
+            owner=owner,
         )
         key, value = node_to_etcd(node, self._etcd_client.prefix)
         await asyncio.to_thread(self._etcd_client.put, key, value)
         if self._registry is not None:
             self._registry.add(node)
 
-    async def register_self_setup(self, hostname: str) -> Node:
+    async def register_self_setup(self, hostname: str, owner: str = "") -> Node:
         """Adopt an already-running vLLM instance into the fleet.
 
         Probes ``/health`` and ``/v1/models`` immediately, then registers the
@@ -1344,6 +1345,7 @@ class NodeProvisioner:
             last_heartbeat=datetime.now(UTC),
             managed=False,
             self_setup=True,
+            owner=owner,
         )
         key, value = node_to_etcd(node, self._etcd_client.prefix)
         await asyncio.to_thread(self._etcd_client.put, key, value)
@@ -1356,6 +1358,50 @@ class NodeProvisioner:
             key=key,
         )
         return node
+
+    async def update_node_owner(self, hostname: str, owner: str) -> Node:
+        """Set the owner of a registered node, preserving its etcd lease.
+
+        Uses a CAS on the record revision so a concurrent status/liveness
+        write is never clobbered; retries a bounded number of times, then
+        raises ``ProvisioningError``.
+        """
+        key = f"{self._etcd_client.prefix}{hostname}"
+        record = await asyncio.to_thread(self._etcd_client.get_record, key)
+        if record is None:
+            raise KeyError(hostname)
+        for _attempt in range(3):
+            node = node_from_etcd(
+                record.key,
+                record.value,
+                self._etcd_client.prefix,
+                endpoint_policy=self._endpoint_policy,
+            )
+            if node is None:
+                raise ProvisioningError(
+                    f"Node {hostname!r} has an invalid etcd registration"
+                )
+            replacement = node.model_copy(update={"owner": owner})
+            _, value = node_to_etcd(replacement, self._etcd_client.prefix)
+            new_revision = await asyncio.to_thread(
+                self._etcd_client.replace_if_revision,
+                key,
+                value,
+                expected_mod_revision=record.mod_revision,
+                lease_id=record.lease_id,
+            )
+            if new_revision is not None:
+                if self._registry is not None:
+                    self._registry.add(replacement)
+                logger.info("node_owner_updated", hostname=hostname, owner=owner)
+                return replacement
+            fresh = await asyncio.to_thread(self._etcd_client.get_record, key)
+            if fresh is None:
+                raise ProvisioningError(
+                    f"Node {hostname!r} disappeared during owner update"
+                )
+            record = fresh
+        raise ProvisioningError(f"Node {hostname!r} kept changing during owner update")
 
     async def _discover_running_vllm_model(self, endpoint: str, hostname: str) -> str:
         """Health-check an existing vLLM server and return the served model id."""
@@ -1438,6 +1484,7 @@ class NodeProvisioner:
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
         vllm_params: VllmParams | None = None,
         lifecycle_lease: HostLifecycleLease | None = None,
+        owner: str = "",
     ) -> None:
         """Provision *hostname* under the shared host lifecycle coordinator."""
         # Validate before acquiring the lifecycle lease or touching the host.
@@ -1469,6 +1516,7 @@ class NodeProvisioner:
                     engine=engine,
                     artifact=artifact,
                     vllm_params=vllm_params,
+                    owner=owner,
                 )
             else:
                 await self._provision(
@@ -1478,6 +1526,7 @@ class NodeProvisioner:
                     engine=engine,
                     artifact=artifact,
                     llamacpp_request=llamacpp_request,
+                    owner=owner,
                 )
         except asyncio.CancelledError:
             self._log(hostname, "error", "Provisioning cancelled by teardown")
@@ -1502,6 +1551,7 @@ class NodeProvisioner:
         artifact: ResolvedGGUFArtifact | None = None,
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
         vllm_params: VllmParams | None = None,
+        owner: str = "",
     ) -> None:
         """Run full provisioning sequence on *hostname*.
 
@@ -1630,6 +1680,7 @@ class NodeProvisioner:
                 engine=engine,
                 artifact_id=artifact_id,
                 llamacpp_runtime=llamacpp_runtime,
+                owner=owner,
             )
             await self._update_state(
                 hostname, ProvisioningStep.COMPLETE, started_at=provision_started_at
@@ -2017,6 +2068,7 @@ class NodeProvisioner:
         artifact_id: str | None = None,
         llamacpp_runtime: LlamaCppRuntimeState | None = None,
         self_setup: bool = False,
+        owner: str = "",
     ) -> None:
         """Register node in etcd with correct fields (D-11, D-12)."""
         node = Node(
@@ -2030,6 +2082,7 @@ class NodeProvisioner:
             last_heartbeat=datetime.now(UTC),
             managed=managed,
             self_setup=self_setup,
+            owner=owner,
         )
         key, value = node_to_etcd(node, self._etcd_client.prefix)
         # ponytail: etcd3gw is sync, asyncio.to_thread wraps it (Pitfall 5)

@@ -70,6 +70,8 @@ class NodeSelector:
         self,
         model: str | None = None,
         exclude_node_ids: set[str] | None = None,
+        allowed_node_ids: frozenset[str] | None = None,
+        owner: str | None = None,
     ) -> Node | None:
         """Select the optimal node for a request.
 
@@ -80,18 +82,25 @@ class NodeSelector:
             exclude_node_ids: If provided, skip nodes whose ``node_id``
                 is in this set.  Used by retry logic to avoid re-selecting
                 a node that already failed for the current request.
+            allowed_node_ids: If provided, restrict selection to these
+                node ids (a token's endpoint pin; ``None`` = no pin).
+            owner: If provided, restrict selection to unowned nodes and
+                nodes owned by this email.  ``None`` = admin (no owner
+                restriction); ``""`` = anonymous (unowned only).
 
         Returns:
             The healthy ``Node`` with the fewest active connections,
             or ``None`` if no suitable nodes are available.
         """
         with self._registry.locked():
-            return self._select_locked(model, exclude_node_ids)
+            return self._select_locked(model, exclude_node_ids, allowed_node_ids, owner)
 
     def select_and_reserve(
         self,
         model: str | None = None,
         exclude_node_ids: set[str] | None = None,
+        allowed_node_ids: frozenset[str] | None = None,
+        owner: str | None = None,
     ) -> NodeReservation | None:
         """Atomically select a healthy node and reserve one connection.
 
@@ -101,7 +110,7 @@ class NodeSelector:
         reservation and waits for it.
         """
         with self._registry.locked():
-            node = self._select_locked(model, exclude_node_ids)
+            node = self._select_locked(model, exclude_node_ids, allowed_node_ids, owner)
             if node is None:
                 return None
             self._tracker.increment(node.node_id)
@@ -111,6 +120,8 @@ class NodeSelector:
         self,
         model: str | None,
         exclude_node_ids: set[str] | None,
+        allowed_node_ids: frozenset[str] | None = None,
+        owner: str | None = None,
     ) -> Node | None:
         """Select a node while the caller holds the registry lock."""
         nodes = self._registry.get_all()
@@ -131,6 +142,22 @@ class NodeSelector:
                     excluded=len(exclude_node_ids),
                 )
                 return None
+
+        # Apply endpoint pin (scoped token: never escape the pin, even on retry)
+        if allowed_node_ids is not None:
+            healthy = [n for n in healthy if n.node_id in allowed_node_ids]
+
+        # Apply owner isolation (owned nodes are private to their owner + admin)
+        if owner is not None:
+            healthy = [n for n in healthy if not n.owner or n.owner == owner]
+
+        if (allowed_node_ids is not None or owner is not None) and not healthy:
+            logger.debug(
+                "no healthy nodes within scope",
+                allowed=len(allowed_node_ids) if allowed_node_ids else None,
+                owner=owner,
+            )
+            return None
 
         # Apply model filter if specified (D-05: exact string match)
         if model is not None:
@@ -170,19 +197,32 @@ class NodeSelector:
             self._tracker.decrement(node_id)
             drain_cleanup.sweep_drained_nodes(self._registry, self._tracker)
 
-    def has_model(self, model: str) -> bool:
-        """Check whether any registered node serves the given model.
+    def has_model(
+        self,
+        model: str,
+        allowed_node_ids: frozenset[str] | None = None,
+        owner: str | None = None,
+    ) -> bool:
+        """Check whether a node the caller may reach serves the model.
 
         Considers all nodes regardless of status -- a DRAINING or
         UNHEALTHY node still counts as "model exists" for the purpose
         of distinguishing 404 (model not found) from 503 (model
-        temporarily unavailable).
+        temporarily unavailable). Scope filters are applied so the
+        answer reflects what *this* caller can reach.
 
         Args:
             model: The model name to check for.
+            allowed_node_ids: Restrict to these node ids (endpoint pin).
+            owner: Restrict to unowned nodes and nodes owned by this
+                email (``None`` = admin, ``""`` = anonymous).
 
         Returns:
-            ``True`` if at least one node serves the model.
+            ``True`` if at least one reachable node serves the model.
         """
         nodes = self._registry.get_all()
+        if allowed_node_ids is not None:
+            nodes = [n for n in nodes if n.node_id in allowed_node_ids]
+        if owner is not None:
+            nodes = [n for n in nodes if not n.owner or n.owner == owner]
         return any(n.model == model for n in nodes)

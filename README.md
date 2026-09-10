@@ -480,6 +480,7 @@ the signed user id and expiry.
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_CACHE_FILE` | unset | Optional flat-file cache of the last successful document (warm start + inspection, atomically replaced) |
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_EXTRA_USERS` | `[]` | Extra emails always allowed, merged over the fetched document |
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_EXTRA_DOMAINS` | `[]` | Extra domains where any username is allowed, merged over the fetched document |
+| `INFERENCE_PROXY_AUTH__ADMIN_ONLY_TOKENS_FULL_ACCESS` | `[]` | Emails whose tokens bypass endpoint scoping, owner isolation, and the SSO whitelist gate; they may pin tokens to any endpoint |
 
 Enablement and guardrails:
 
@@ -547,6 +548,30 @@ SSO whitelist (per-domain user filtering):
 - The whitelist governs the user identity, not anonymous traffic: while
   `enforce_api_tokens` is `false`, `/v1` still accepts requests without a
   token. Combine both flags to fully gate inference.
+
+Endpoint scoping (per-token pins and owner isolation):
+
+- A token may be pinned at creation to one or more endpoint hostnames
+  (`POST /profile/tokens` with `endpoints: ["host1.example.com"]`, selected
+  via the profile page). A pinned token routes only to those nodes — node
+  selection and retry/failover stay inside the pin — and requests whose
+  model exists only off-pin get the normal 404/503 error mapping.
+- Nodes may carry an `owner` (email) set at registration
+  (`POST /admin/nodes/pool`, `POST /admin/nodes/setup`) or later with
+  `PATCH /admin/nodes/{node_id}/owner` (empty string clears it). An owned
+  node is reachable only by that owner's tokens and admin full-access
+  tokens; unowned nodes stay shared. Node selection and `/v1` routing are
+  filtered accordingly for every caller, including anonymous requests, so
+  owned endpoints are never reached by other users' tokens or by
+  anonymous traffic.
+- `admin_only_tokens_full_access` is a small static trust list of emails.
+  Those users' tokens bypass the endpoint pin, owner isolation, and the SSO
+  whitelist gate (login, mint, and use time), and may pin tokens to any
+  endpoint. Tokens are still required and OAuth sign-in still applies.
+- Scoping is enforced at the gateway. Node detail pages and dashboards are
+  admin-only (HTTP Basic), but backend origins are operator-visible
+  surface: keep backends of owned nodes off untrusted networks, because a
+  direct backend URL bypasses the gateway entirely.
 
 Upgrading an existing deployment: with user auth disabled (the default) nothing
 changes. To roll out tokens without waking an oversight surface, first deploy

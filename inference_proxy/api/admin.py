@@ -48,6 +48,7 @@ from inference_proxy.models.admin import (
     DownloadStatusResponse,
     LlamaCppRelaunchRequest,
     LlamaCppRelaunchResponse,
+    OwnerUpdateRequest,
     PowerActionRequest,
     PowerStateResponse,
     QUADSStatusResponse,
@@ -350,7 +351,9 @@ async def register_node(
                     previous_model=node.model,
                 )
             try:
-                adopted = await provisioner.register_self_setup(hostname)
+                adopted = await provisioner.register_self_setup(
+                    hostname, owner=body.owner
+                )
             except SelfSetupError as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             return JSONResponse(
@@ -362,7 +365,7 @@ async def register_node(
                     "self_setup": True,
                 },
             )
-        await provisioner.register_available(hostname)
+        await provisioner.register_available(hostname, owner=body.owner)
         return JSONResponse(
             status_code=201,
             content={"hostname": hostname, "state": "available"},
@@ -416,6 +419,25 @@ async def remove_from_pool(
         return JSONResponse(content={"hostname": hostname, "removed": True})
     finally:
         lease.release()
+
+
+@admin_router.patch("/nodes/{node_id}/owner")
+async def update_node_owner(
+    node_id: str,
+    body: OwnerUpdateRequest,
+    provisioner: NodeProvisioner = Depends(get_provisioner),
+) -> JSONResponse:
+    """Assign (or clear) the endpoint owner for a registered node."""
+    hostname = _validated_hostname(node_id)
+    try:
+        node = await provisioner.update_node_owner(hostname, body.owner)
+    except KeyError:
+        raise HTTPException(
+            status_code=404, detail=f"Node '{hostname}' not found"
+        ) from None
+    except ProvisioningError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return JSONResponse(content={"node_id": node.node_id, "owner": node.owner})
 
 
 @admin_router.post("/nodes/setup", status_code=202)
@@ -571,6 +593,7 @@ async def setup_node(
                         artifact_id=selection.artifact_id,
                         vllm_params=selection.vllm_params,
                         lifecycle_lease=lease,
+                        owner=body.owner,
                     )
                 else:
                     await provisioner.provision(
@@ -581,6 +604,7 @@ async def setup_node(
                         artifact_id=selection.artifact_id,
                         llamacpp_request=selection.llamacpp_request,
                         lifecycle_lease=lease,
+                        owner=body.owner,
                     )
             finally:
                 pending_hosts.discard(hostname)

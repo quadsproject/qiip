@@ -11,6 +11,7 @@ from inference_proxy.auth.dependencies import get_auth_plugin, get_sso_allowlist
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.settings import Settings
+from inference_proxy.discovery.registry import NodeRegistry
 
 from .conftest import FakeAllowlist, FakeAuthPluginBuilder
 
@@ -241,3 +242,158 @@ class TestTokenMintWhitelist:
         response = client.post("/profile/tokens", json={"name": "ci"})
 
         assert response.status_code == 503
+
+
+class TestTokenEndpointScope:
+    """Endpoint pinning at mint time and pickable endpoint listing (RFE #107)."""
+
+    @staticmethod
+    def _seed_nodes(test_registry: NodeRegistry) -> None:
+        from inference_proxy.models.node import Node
+
+        test_registry.add(
+            Node(node_id="shared-1", endpoint="10.0.0.1:8000", model="llama-3")
+        )
+        test_registry.add(
+            Node(
+                node_id="mine-1",
+                endpoint="10.0.0.2:8000",
+                model="mistral",
+                owner="alice@example.com",
+            )
+        )
+        test_registry.add(
+            Node(
+                node_id="theirs-1",
+                endpoint="10.0.0.3:8000",
+                model="mixtral",
+                owner="bob@example.com",
+            )
+        )
+
+    def test_mint_with_endpoints_creates_scoped_token(
+        self, profile_client: TestClient, test_registry: NodeRegistry
+    ) -> None:
+        self._seed_nodes(test_registry)
+        response = profile_client.post(
+            "/profile/tokens",
+            json={"name": "pinned", "endpoints": ["mine-1", "shared-1"]},
+        )
+
+        assert response.status_code == 201
+        assert response.json()["endpoint_scope"] == ["mine-1", "shared-1"]
+        listed = profile_client.get("/profile/tokens").json()
+        assert listed[0]["endpoint_scope"] == ["mine-1", "shared-1"]
+
+    def test_mint_unknown_endpoint_rejected(
+        self, profile_client: TestClient, test_registry: NodeRegistry
+    ) -> None:
+        response = profile_client.post(
+            "/profile/tokens", json={"name": "x", "endpoints": ["nope.example.com"]}
+        )
+
+        assert response.status_code == 400
+
+    def test_mint_other_users_endpoint_rejected(
+        self, profile_client: TestClient, test_registry: NodeRegistry
+    ) -> None:
+        self._seed_nodes(test_registry)
+        response = profile_client.post(
+            "/profile/tokens", json={"name": "x", "endpoints": ["theirs-1"]}
+        )
+
+        assert response.status_code == 403
+
+    def test_endpoints_lists_pickable(
+        self, profile_client: TestClient, test_registry: NodeRegistry
+    ) -> None:
+        self._seed_nodes(test_registry)
+        response = profile_client.get("/profile/endpoints")
+
+        assert response.status_code == 200
+        assert [e["node_id"] for e in response.json()] == ["mine-1", "shared-1"]
+        assert response.json()[0]["model"] == "mistral"
+
+    def test_admin_pins_any_endpoint(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        test_registry: NodeRegistry,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        self._seed_nodes(test_registry)
+        admin_settings = test_settings.model_copy(
+            deep=True,
+            update={
+                "auth": test_settings.auth.model_copy(
+                    update={"admin_only_tokens_full_access": ["ops@example.com"]}
+                )
+            },
+        )
+        app.dependency_overrides[get_auth_plugin] = lambda: make_fake_auth_plugin(
+            userinfo={
+                "sub": "sub-ops",
+                "email": "ops@example.com",
+                "email_verified": True,
+                "name": "Ops",
+                "picture": "",
+            }
+        )
+        app.dependency_overrides[get_settings] = lambda: admin_settings
+        client = TestClient(app)
+        assert (
+            client.get(
+                "/auth/callback?code=code&state=state", follow_redirects=False
+            ).status_code
+            == 302
+        )
+
+        response = client.post(
+            "/profile/tokens", json={"name": "admin", "endpoints": ["theirs-1"]}
+        )
+
+        assert response.status_code == 201
+        assert response.json()["endpoint_scope"] == ["theirs-1"]
+
+    def test_admin_bypasses_mint_whitelist(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        enforced = test_settings.model_copy(
+            deep=True,
+            update={
+                "auth": test_settings.auth.model_copy(
+                    update={
+                        "sso_whitelist_url": "https://allowlist.example.com/list.json",
+                        "enforce_sso_whitelist": True,
+                        "admin_only_tokens_full_access": ["ops@example.com"],
+                    }
+                )
+            },
+        )
+        app.dependency_overrides[get_auth_plugin] = lambda: make_fake_auth_plugin(
+            userinfo={
+                "sub": "sub-ops",
+                "email": "ops@example.com",
+                "email_verified": True,
+                "name": "Ops",
+                "picture": "",
+            }
+        )
+        app.dependency_overrides[get_settings] = lambda: enforced
+        app.dependency_overrides[get_sso_allowlist] = lambda: FakeAllowlist(
+            allowed=False
+        )
+        client = TestClient(app)
+        assert (
+            client.get(
+                "/auth/callback?code=code&state=state", follow_redirects=False
+            ).status_code
+            == 302
+        )
+
+        response = client.post("/profile/tokens", json={"name": "ci"})
+
+        assert response.status_code == 201
