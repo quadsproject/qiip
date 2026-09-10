@@ -737,12 +737,14 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
     assert result.returncode == 0, result.stderr
     operations = operation_log.read_text().splitlines()
     assert operations[0] == (
-        "dnf -y install kernel-devel-5.14.0-test kernel-headers-5.14.0-test "
-        "cmake gcc gcc-c++ make wget nfs-utils elfutils-libelf-devel "
+        "dnf -y install kernel-devel-5.14.0-test kernel-headers-5.14.0-test"
+    )
+    assert operations[1] == (
+        "dnf -y install cmake gcc gcc-c++ make wget nfs-utils elfutils-libelf-devel "
         "python3.12 python3.12-devel"
     )
-    assert operations[1] == "dnf -y update --exclude=kernel*"
-    assert operations[2] == "dnf -y install dnf-plugins-core"
+    assert operations[2] == "dnf -y update --exclude=kernel*"
+    assert operations[3] == "dnf -y install dnf-plugins-core"
     assert "ninja" not in "\n".join(operations)
 
 
