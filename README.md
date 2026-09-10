@@ -475,7 +475,11 @@ the signed user id and expiry.
 | `INFERENCE_PROXY_AUTH__REQUIRE_EMAIL_VERIFICATION` | `true` | Reject Google accounts whose email is not verified |
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_URL` | unset | HTTPS URL returning a per-domain JSON whitelist, e.g. `{"example.com": ["alice", "bob"]}` |
 | `INFERENCE_PROXY_AUTH__ENFORCE_SSO_WHITELIST` | `false` | Gate SSO users on the per-domain username whitelist |
-| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_REFRESH_SECONDS` | `300` | Cache TTL for the fetched whitelist (60 to 86400) |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_POLL_INTERVAL` | `hourly` | Refresh cadence: `hourly` (top of the hour) or `daily` |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_POLL_TIME` | unset | `HH:MM` wall-clock refresh time; required with `daily` (server local time) |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_CACHE_FILE` | unset | Optional flat-file cache of the last successful document (warm start + inspection, atomically replaced) |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_EXTRA_USERS` | `[]` | Extra emails always allowed, merged over the fetched document |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_EXTRA_DOMAINS` | `[]` | Extra domains where any username is allowed, merged over the fetched document |
 
 Enablement and guardrails:
 
@@ -510,6 +514,16 @@ SSO whitelist (per-domain user filtering):
 - Domain-level control is the existing `oauth.allowed_domains` gate
   (`domain_not_allowed` at sign-in); the whitelist adds username-level
   filtering inside allowed domains.
+- Caching: the fetched document is held in memory and refreshed at the
+  configured cadence (hourly at the top of the hour, or daily at
+  `sso_whitelist_poll_time` in the server's local time) on the first
+  check after the window. The optional `sso_whitelist_cache_file` persists
+  the last successful document: it seeds a cold start and is atomically
+  replaced on refresh, and is only authoritative inside the current refresh
+  window. `sso_whitelist_extra_users` (emails) and
+  `sso_whitelist_extra_domains` (any username in the domain) are granted
+  locally on top of the fetched document, so specific accounts or domains
+  can be opened without touching the remote payload.
 - Enforcement points when the flag is on:
   1. `/auth/callback`: a user not on the list is redirected with
      `error=not_whitelisted` before any user row is created or session is
@@ -517,11 +531,13 @@ SSO whitelist (per-domain user filtering):
   2. `POST /profile/tokens`: minting is denied with 403.
   3. `/v1` token resolution: an already-minted token whose owner is no
      longer listed is rejected with 401, so removals take effect on the
-     next request (within the refresh TTL).
+     next request (within the refresh window).
 - Failure semantics are fail closed: if the URL is unreachable, returns a
   non-200, or the document is invalid/oversized, minting returns 503, the
   callback redirects with `error=allowlist_unavailable`, and presented
-  tokens are rejected. Stale cached data is never served after the TTL.
+  tokens are rejected. Stale cached data is never served past the refresh
+  window; a fetch failure enters a 30s cooldown so an outage does not queue
+  a fetch per request.
 - The whitelist governs the user identity, not anonymous traffic: while
   `enforce_api_tokens` is `false`, `/v1` still accepts requests without a
   token. Combine both flags to fully gate inference.

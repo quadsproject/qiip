@@ -916,7 +916,11 @@ class TestAuthSettings:
         assert auth.db_path == Path("data/qiip.db")
         assert auth.sso_whitelist_url is None
         assert auth.enforce_sso_whitelist is False
-        assert auth.sso_whitelist_refresh_seconds == 300
+        assert auth.sso_whitelist_poll_interval == "hourly"
+        assert auth.sso_whitelist_poll_time is None
+        assert auth.sso_whitelist_cache_file is None
+        assert auth.sso_whitelist_extra_users == []
+        assert auth.sso_whitelist_extra_domains == []
 
     def test_invalid_session_cookie_name_rejected(self) -> None:
         with pytest.raises(ValidationError, match="session_cookie"):
@@ -965,9 +969,48 @@ class TestAuthSettings:
             == "https://allowlist.example.com/list.json"
         )
 
-    def test_sso_whitelist_refresh_bounds(self) -> None:
-        with pytest.raises(ValidationError, match="refresh"):
-            AuthSettings(sso_whitelist_refresh_seconds=10)
+    def test_sso_whitelist_poll_time_validated(self) -> None:
+        with pytest.raises(ValidationError, match="HH:MM"):
+            AuthSettings(sso_whitelist_poll_time="25:00")
+        with pytest.raises(ValidationError, match="HH:MM"):
+            AuthSettings(sso_whitelist_poll_time="5am")
+
+        assert (
+            AuthSettings(
+                sso_whitelist_poll_interval="daily",
+                sso_whitelist_poll_time="05:00",
+            ).sso_whitelist_poll_time
+            == "05:00"
+        )
+
+    def test_sso_whitelist_daily_requires_time(self) -> None:
+        with pytest.raises(ValidationError, match="poll_time"):
+            AuthSettings(sso_whitelist_poll_interval="daily")
+
+    def test_sso_whitelist_hourly_rejects_time(self) -> None:
+        with pytest.raises(ValidationError, match="daily"):
+            AuthSettings(
+                sso_whitelist_poll_interval="hourly",
+                sso_whitelist_poll_time="05:00",
+            )
+
+    def test_sso_whitelist_extra_users_must_be_emails(self) -> None:
+        with pytest.raises(ValidationError, match="emails"):
+            AuthSettings(sso_whitelist_extra_users=["not-an-email"])
+
+        auth = AuthSettings(
+            sso_whitelist_extra_users=[" Alice@example.com ", "bob@other.com"]
+        )
+        assert auth.sso_whitelist_extra_users == ["Alice@example.com", "bob@other.com"]
+
+    def test_sso_whitelist_extra_domains_must_be_plain(self) -> None:
+        with pytest.raises(ValidationError, match="domains"):
+            AuthSettings(sso_whitelist_extra_domains=["user@example.com"])
+        with pytest.raises(ValidationError, match="domains"):
+            AuthSettings(sso_whitelist_extra_domains=["  "])
+
+        auth = AuthSettings(sso_whitelist_extra_domains=[" Example.com "])
+        assert auth.sso_whitelist_extra_domains == ["Example.com"]
 
 
 class TestSSOWhitelistRootValidators:

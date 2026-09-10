@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import AsyncIterator
+from datetime import datetime, timedelta
+from pathlib import Path
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -23,7 +27,7 @@ _DOCUMENT = {"example.com": ["alice", "bob"]}
 async def allowlist() -> AsyncIterator[SSOAllowlist]:
     """Yield an allowlist backed by a real client; pytest_httpx intercepts."""
     client = httpx.AsyncClient(follow_redirects=False)
-    yield SSOAllowlist(_URL, 300, client)
+    yield SSOAllowlist(_URL, "hourly", None, client)
     await client.aclose()
 
 
@@ -107,7 +111,17 @@ class TestSSOAllowlist:
         with pytest.raises(AllowlistUnavailableError):
             await allowlist.is_allowed("alice@example.com")
 
-    async def test_cache_used_within_ttl(
+    async def test_invalid_utf8_fails_closed(
+        self, allowlist: SSOAllowlist, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(url=_URL, content=b"\xff\xfe")
+
+        with pytest.raises(AllowlistUnavailableError):
+            await allowlist.is_allowed("alice@example.com")
+
+
+class TestSSOAllowlistCache:
+    async def test_cache_used_within_window(
         self, allowlist: SSOAllowlist, httpx_mock: HTTPXMock
     ) -> None:
         httpx_mock.add_response(url=_URL, json=_DOCUMENT)
@@ -125,6 +139,30 @@ class TestSSOAllowlist:
         assert await allowlist.is_allowed("bob@example.com") is False
         assert len(httpx_mock.get_requests()) == 1
 
+    async def test_stale_cache_refreshes(
+        self, allowlist: SSOAllowlist, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(url=_URL, json=_DOCUMENT)
+        httpx_mock.add_response(
+            url=_URL,
+            json={"example.com": ["alice", "bob", "carol"]},
+        )
+        assert await allowlist.is_allowed("carol@example.com") is False
+        allowlist._next_refresh = time.time() - 1  # force stale
+        assert await allowlist.is_allowed("carol@example.com") is True
+        assert len(httpx_mock.get_requests()) == 2
+
+    async def test_stale_cache_failure_does_not_serve_stale_data(
+        self, allowlist: SSOAllowlist, httpx_mock: HTTPXMock
+    ) -> None:
+        httpx_mock.add_response(url=_URL, json=_DOCUMENT)
+        assert await allowlist.is_allowed("alice@example.com") is True
+        allowlist._next_refresh = time.time() - 1  # force stale
+        httpx_mock.add_response(url=_URL, status_code=503)
+
+        with pytest.raises(AllowlistUnavailableError):
+            await allowlist.is_allowed("alice@example.com")
+
     async def test_failure_cooldown_avoids_retry_storm(
         self, allowlist: SSOAllowlist, httpx_mock: HTTPXMock
     ) -> None:
@@ -136,34 +174,100 @@ class TestSSOAllowlist:
             await allowlist.is_allowed("bob@example.com")
         assert len(httpx_mock.get_requests()) == 1
 
-    async def test_invalid_utf8_fails_closed(
-        self, allowlist: SSOAllowlist, httpx_mock: HTTPXMock
-    ) -> None:
-        httpx_mock.add_response(url=_URL, content=b"\xff\xfe")
 
-        with pytest.raises(AllowlistUnavailableError):
-            await allowlist.is_allowed("alice@example.com")
+class TestSSOAllowlistSchedule:
+    def test_hourly_boundary_rolls_to_next_hour(self) -> None:
+        allowlist = SSOAllowlist(_URL, "hourly", None, MagicMock())
+        now = datetime.now().replace(minute=30, second=0, microsecond=0).timestamp()
+        expected = datetime.fromtimestamp(now).replace(
+            minute=0, second=0, microsecond=0
+        ) + timedelta(hours=1)
 
-    async def test_stale_cache_refreshes(
-        self, allowlist: SSOAllowlist, httpx_mock: HTTPXMock
-    ) -> None:
-        httpx_mock.add_response(url=_URL, json=_DOCUMENT)
-        httpx_mock.add_response(
-            url=_URL,
-            json={"example.com": ["alice", "bob", "carol"]},
+        assert allowlist._next_refresh_at(now) == expected.timestamp()
+
+    def test_daily_boundary_rolls_to_tomorrow_when_passed(self) -> None:
+        now = datetime.now().replace(hour=23, minute=30, second=0, microsecond=0)
+        allowlist = SSOAllowlist(_URL, "daily", "05:00", MagicMock())
+        expected = now.replace(hour=5, minute=0, second=0, microsecond=0) + timedelta(
+            days=1
         )
-        assert await allowlist.is_allowed("carol@example.com") is False
-        allowlist._loaded_at = time.monotonic() - 301  # force stale
-        assert await allowlist.is_allowed("carol@example.com") is True
-        assert len(httpx_mock.get_requests()) == 2
 
-    async def test_stale_cache_failure_does_not_serve_stale_data(
-        self, allowlist: SSOAllowlist, httpx_mock: HTTPXMock
+        assert allowlist._next_refresh_at(now.timestamp()) == expected.timestamp()
+
+    def test_daily_boundary_stays_today_when_future(self) -> None:
+        now = datetime.now().replace(hour=3, minute=0, second=0, microsecond=0)
+        allowlist = SSOAllowlist(_URL, "daily", "05:00", MagicMock())
+        expected = now.replace(hour=5, minute=0, second=0, microsecond=0)
+
+        assert allowlist._next_refresh_at(now.timestamp()) == expected.timestamp()
+
+
+class TestSSOAllowlistCacheFile:
+    async def test_seed_loaded_without_network(
+        self, tmp_path: Path, httpx_mock: HTTPXMock
     ) -> None:
-        httpx_mock.add_response(url=_URL, json=_DOCUMENT)
-        assert await allowlist.is_allowed("alice@example.com") is True
-        allowlist._loaded_at = time.monotonic() - 301  # force stale
-        httpx_mock.add_response(url=_URL, status_code=503)
+        cache = tmp_path / "whitelist.json"
+        cache.write_text('{"example.com": ["alice"]}', encoding="utf-8")
+        client = httpx.AsyncClient(follow_redirects=False)
+        allowlist = SSOAllowlist(_URL, "hourly", None, client, cache_file=cache)
 
-        with pytest.raises(AllowlistUnavailableError):
-            await allowlist.is_allowed("alice@example.com")
+        assert await allowlist.is_allowed("alice@example.com") is True
+        assert len(httpx_mock.get_requests()) == 0
+        await client.aclose()
+
+    async def test_refresh_overwrites_cache_file(
+        self, tmp_path: Path, httpx_mock: HTTPXMock
+    ) -> None:
+        cache = tmp_path / "whitelist.json"
+        client = httpx.AsyncClient(follow_redirects=False)
+        allowlist = SSOAllowlist(_URL, "hourly", None, client, cache_file=cache)
+        httpx_mock.add_response(url=_URL, json={"example.com": ["alice", "bob"]})
+
+        assert await allowlist.is_allowed("bob@example.com") is True
+        assert cache.exists()
+        assert json.loads(cache.read_text(encoding="utf-8")) == {
+            "example.com": ["alice", "bob"]
+        }
+        await client.aclose()
+
+    async def test_corrupt_seed_ignored(
+        self, tmp_path: Path, httpx_mock: HTTPXMock
+    ) -> None:
+        cache = tmp_path / "whitelist.json"
+        cache.write_text("not json", encoding="utf-8")
+        client = httpx.AsyncClient(follow_redirects=False)
+        allowlist = SSOAllowlist(_URL, "hourly", None, client, cache_file=cache)
+        httpx_mock.add_response(url=_URL, json=_DOCUMENT)
+
+        assert await allowlist.is_allowed("alice@example.com") is True
+        assert len(httpx_mock.get_requests()) == 1
+        await client.aclose()
+
+
+class TestSSOAllowlistExtras:
+    async def test_extra_user_allowed_without_document(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        client = httpx.AsyncClient(follow_redirects=False)
+        allowlist = SSOAllowlist(
+            _URL,
+            "hourly",
+            None,
+            client,
+            extra_users=("carol@example.com", " DAVE@Other.com "),
+        )
+
+        assert await allowlist.is_allowed("carol@example.com") is True
+        assert await allowlist.is_allowed("dave@other.com") is True
+        assert len(httpx_mock.get_requests()) == 0
+        await client.aclose()
+
+    async def test_extra_domain_catches_all_users(self, httpx_mock: HTTPXMock) -> None:
+        client = httpx.AsyncClient(follow_redirects=False)
+        allowlist = SSOAllowlist(
+            _URL, "hourly", None, client, extra_domains=("Lab.example.com",)
+        )
+
+        assert await allowlist.is_allowed("anyone@lab.example.com") is True
+        assert len(httpx_mock.get_requests()) == 0
+        await client.aclose()

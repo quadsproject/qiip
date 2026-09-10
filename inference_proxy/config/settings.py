@@ -9,7 +9,7 @@ import ipaddress
 import re
 from pathlib import Path
 from string import Formatter
-from typing import Self
+from typing import Literal, Self
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -540,7 +540,71 @@ class AuthSettings(BaseModel):
     require_email_verification: bool = True
     sso_whitelist_url: str | None = None
     enforce_sso_whitelist: bool = False
-    sso_whitelist_refresh_seconds: int = Field(default=300, ge=60, le=86_400)
+    sso_whitelist_poll_interval: Literal["hourly", "daily"] = "hourly"
+    sso_whitelist_poll_time: str | None = None
+    sso_whitelist_cache_file: Path | None = None
+    sso_whitelist_extra_users: list[str] = Field(default_factory=list)
+    sso_whitelist_extra_domains: list[str] = Field(default_factory=list)
+
+    @field_validator("sso_whitelist_extra_users")
+    @classmethod
+    def sso_whitelist_extra_users_are_emails(cls, value: list[str]) -> list[str]:
+        """Require valid email addresses for local user grants."""
+        for item in value:
+            normalized = item.strip()
+            if not normalized or any(ord(char) < 32 for char in item):
+                raise ValueError(
+                    "auth.sso_whitelist_extra_users entries must be emails"
+                )
+            if normalized.count("@") != 1:
+                raise ValueError(
+                    "auth.sso_whitelist_extra_users entries must be emails"
+                )
+        return [item.strip() for item in value]
+
+    @field_validator("sso_whitelist_extra_domains")
+    @classmethod
+    def sso_whitelist_extra_domains_are_plain(cls, value: list[str]) -> list[str]:
+        """Require plain domain names for local domain grants."""
+        for item in value:
+            normalized = item.strip()
+            if not normalized or any(ord(char) < 32 for char in item) or "@" in item:
+                raise ValueError(
+                    "auth.sso_whitelist_extra_domains entries must be domains"
+                )
+        return [item.strip() for item in value]
+
+    @field_validator("sso_whitelist_poll_time")
+    @classmethod
+    def sso_whitelist_poll_time_is_hhmm(cls, value: str | None) -> str | None:
+        """Require an HH:MM wall-clock time when a daily schedule is used."""
+        if value is None:
+            return value
+        if re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", value) is None:
+            raise ValueError(
+                "auth.sso_whitelist_poll_time must be an HH:MM wall-clock time"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def sso_whitelist_poll_time_pairs_with_interval(self) -> Self:
+        """Daily polling needs a time; hourly never uses one."""
+        if (
+            self.sso_whitelist_poll_interval == "daily"
+            and self.sso_whitelist_poll_time is None
+        ):
+            raise ValueError(
+                "auth.sso_whitelist_poll_time is required when "
+                "auth.sso_whitelist_poll_interval is daily"
+            )
+        if (
+            self.sso_whitelist_poll_interval == "hourly"
+            and self.sso_whitelist_poll_time is not None
+        ):
+            raise ValueError(
+                "auth.sso_whitelist_poll_time is only used with a daily poll interval"
+            )
+        return self
 
     @field_validator("sso_whitelist_url", mode="after")
     @classmethod
