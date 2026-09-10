@@ -60,7 +60,7 @@ from inference_proxy.provisioning.provisioner import (
     ProvisioningIdentity,
     SelfSetupError,
     _parse_llamacpp_runtime_fit,
-    served_vllm_model_id,
+    served_model_id,
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -1348,7 +1348,7 @@ class TestNodeRegistration:
 
 
 class TestSelfSetupRegistration:
-    """Adopt an already-running vLLM instance without owning its lifecycle."""
+    """Adopt an already-running OpenAI-compatible server without owning its lifecycle."""
 
     @pytest.mark.parametrize(
         ("payload", "expected"),
@@ -1361,8 +1361,8 @@ class TestSelfSetupRegistration:
             ("not-an-object", None),
         ],
     )
-    def test_served_vllm_model_id(self, payload: object, expected: str | None) -> None:
-        assert served_vllm_model_id(payload) == expected
+    def test_served_model_id(self, payload: object, expected: str | None) -> None:
+        assert served_model_id(payload) == expected
 
     @pytest.mark.asyncio
     async def test_registers_detected_model(self, httpx_mock: HTTPXMock) -> None:
@@ -1391,20 +1391,26 @@ class TestSelfSetupRegistration:
         assert stored.self_setup is True
 
     @pytest.mark.asyncio
-    async def test_health_failure_does_not_register(
-        self, httpx_mock: HTTPXMock
-    ) -> None:
+    async def test_health_failure_is_best_effort(self, httpx_mock: HTTPXMock) -> None:
+        """A missing/failing /health never blocks adoption when /v1/models works.
+
+        Many OpenAI-compatible servers do not expose /health.
+        """
         etcd = MagicMock()
         etcd.prefix = "/nodes/"
         registry = NodeRegistry()
         provisioner = _make_provisioner(etcd_client=etcd, registry=registry)
         httpx_mock.add_response(url="http://host1:8000/health", status_code=503)
+        httpx_mock.add_response(
+            url="http://host1:8000/v1/models",
+            json={"data": [{"id": "org/qwen"}]},
+        )
 
-        with pytest.raises(SelfSetupError, match="health check failed"):
-            await provisioner.register_self_setup("host1")
+        node = await provisioner.register_self_setup("host1")
 
-        etcd.put.assert_not_called()
-        assert registry.get("host1") is None
+        assert node.model == "org/qwen"
+        etcd.put.assert_called_once()
+        assert registry.get("host1") is not None
 
     @pytest.mark.asyncio
     async def test_missing_models_does_not_register(
@@ -1434,6 +1440,10 @@ class TestSelfSetupRegistration:
         httpx_mock.add_exception(
             httpx.ConnectError("refused"),
             url="http://host1:8000/health",
+        )
+        httpx_mock.add_exception(
+            httpx.ConnectError("refused"),
+            url="http://host1:8000/v1/models",
         )
 
         with pytest.raises(SelfSetupError, match="not reachable"):

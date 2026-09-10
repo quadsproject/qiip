@@ -138,13 +138,13 @@ class ProvisioningError(Exception):
 
 
 class SelfSetupError(Exception):
-    """Raised when an already-running vLLM instance cannot be adopted."""
+    """Raised when an already-running OpenAI-compatible server cannot be adopted."""
 
 
-def served_vllm_model_id(payload: object) -> str | None:
+def served_model_id(payload: object) -> str | None:
     """Return the primary OpenAI-compatible model id from a ``/v1/models`` body.
 
-    Self-setup adoption tracks exactly one model: the first entry vLLM
+    Self-setup adoption tracks exactly one model: the first entry the server
     reports. Additional aliases and LoRA entries are intentionally not
     tracked (single-model contract). Re-adoption re-probes the live server
     and reconciles the stored model, so an external restart with another
@@ -1313,20 +1313,23 @@ class NodeProvisioner:
             self._registry.add(node)
 
     async def register_self_setup(self, hostname: str) -> Node:
-        """Adopt an already-running vLLM instance into the fleet.
+        """Adopt an already-running OpenAI-compatible server into the fleet.
 
-        Probes ``/health`` and ``/v1/models`` immediately, then registers the
-        detected model in etcd. QIIP never owns this node's lifecycle.
+        Adoption is based on the OpenAI-compatible contract (``GET
+        /v1/models``); ``/health`` is probed best-effort only. This works for
+        any OpenAI-compatible backend (vLLM, llama.cpp, TGI, SGLang, Ollama's
+        shim, a remote gateway, ...), then registers the detected model in
+        etcd. QIIP never owns this node's lifecycle.
 
         Single-model contract: a self-setup node tracks exactly one model —
-        the primary id vLLM reports first on ``/v1/models``. Aliases and LoRA
-        entries are ignored by design. Re-adoption re-probes the live server
-        and reconciles the stored model, so drift from an external restart
-        with another primary model is refreshed on each re-adoption instead of
-        silently keeping the first reported model forever.
+        the primary id the server reports first on ``/v1/models``. Aliases and
+        LoRA entries are ignored by design. Re-adoption re-probes the live
+        server and reconciles the stored model, so drift from an external
+        restart with another primary model is refreshed on each re-adoption
+        instead of silently keeping the first reported model forever.
         """
         endpoint = self.validate_endpoint(hostname)
-        model = await self._discover_running_vllm_model(endpoint, hostname)
+        model = await self._discover_running_model(endpoint, hostname)
         prior = self._registry.get(hostname) if self._registry is not None else None
         if prior is not None and prior.self_setup and prior.model != model:
             logger.warning(
@@ -1357,43 +1360,56 @@ class NodeProvisioner:
         )
         return node
 
-    async def _discover_running_vllm_model(self, endpoint: str, hostname: str) -> str:
-        """Health-check an existing vLLM server and return the served model id."""
+    async def _discover_running_model(self, endpoint: str, hostname: str) -> str:
+        """Probe an OpenAI-compatible server and return its served model id.
+
+        Adoption is based on the OpenAI-compatible contract (``GET
+        /v1/models``). ``/health`` is probed best-effort only — many
+        OpenAI-compatible servers do not expose it — so a missing or failing
+        health endpoint never blocks adoption.
+        """
         health_url = build_backend_url(endpoint, "/health")
         models_url = build_backend_url(endpoint, "/v1/models")
         timeout = httpx.Timeout(_SELF_SETUP_PROBE_TIMEOUT)
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                health = await client.get(health_url)
-                if health.status_code != 200:
-                    raise SelfSetupError(
-                        f"vLLM health check failed on {hostname}: "
-                        f"HTTP {health.status_code}"
+                # Best-effort: /health is optional for OpenAI-compatible servers.
+                try:
+                    health = await client.get(health_url)
+                    if health.status_code != 200:
+                        logger.debug(
+                            "self_setup_health_unavailable",
+                            hostname=hostname,
+                            status_code=health.status_code,
+                        )
+                except httpx.HTTPError as exc:
+                    logger.debug(
+                        "self_setup_health_probe_failed",
+                        hostname=hostname,
+                        error=str(exc),
                     )
                 models = await client.get(models_url)
                 if models.status_code != 200:
                     raise SelfSetupError(
-                        f"vLLM model discovery failed on {hostname}: "
+                        f"OpenAI-compatible model discovery failed on {hostname}: "
                         f"HTTP {models.status_code}"
                     )
                 try:
                     payload: object = models.json()
                 except ValueError as exc:
                     raise SelfSetupError(
-                        f"vLLM model list on {hostname} was not valid JSON"
+                        f"model list on {hostname} was not valid JSON"
                     ) from exc
         except SelfSetupError:
             raise
         except httpx.TimeoutException as exc:
-            raise SelfSetupError(f"vLLM health check timed out on {hostname}") from exc
+            raise SelfSetupError(f"model discovery timed out on {hostname}") from exc
         except httpx.HTTPError as exc:
-            raise SelfSetupError(f"vLLM is not reachable on {hostname}") from exc
+            raise SelfSetupError(f"{hostname} is not reachable") from exc
 
-        model = served_vllm_model_id(payload)
+        model = served_model_id(payload)
         if model is None:
-            raise SelfSetupError(
-                f"vLLM on {hostname} is healthy but reported no models"
-            )
+            raise SelfSetupError(f"{hostname} responded but reported no models")
         return model
 
     async def remove_available(self, hostname: str) -> None:
