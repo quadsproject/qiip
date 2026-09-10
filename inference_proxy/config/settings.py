@@ -5,10 +5,11 @@ nested env var resolution works correctly through the root Settings class.
 Only the root Settings class inherits from BaseSettings.
 """
 
+import ipaddress
 import re
 from pathlib import Path
 from string import Formatter
-from typing import Self
+from typing import Literal, Self
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -549,6 +550,112 @@ class AuthSettings(BaseModel):
     session_ttl_seconds: int = Field(default=43_200, ge=300, le=7 * 86_400)
     enforce_api_tokens: bool = False
     require_email_verification: bool = True
+    sso_whitelist_url: str | None = None
+    enforce_sso_whitelist: bool = False
+    sso_whitelist_poll_interval: Literal["hourly", "daily"] = "hourly"
+    sso_whitelist_poll_time: str | None = None
+    sso_whitelist_cache_file: Path | None = None
+    sso_whitelist_extra_users: list[str] = Field(default_factory=list)
+    sso_whitelist_extra_domains: list[str] = Field(default_factory=list)
+
+    @field_validator("sso_whitelist_extra_users")
+    @classmethod
+    def sso_whitelist_extra_users_are_emails(cls, value: list[str]) -> list[str]:
+        """Require valid email addresses for local user grants."""
+        for item in value:
+            normalized = item.strip()
+            if not normalized or any(
+                ord(char) < 32 or char.isspace() for char in normalized
+            ):
+                raise ValueError(
+                    "auth.sso_whitelist_extra_users entries must be emails"
+                )
+            if normalized.count("@") != 1:
+                raise ValueError(
+                    "auth.sso_whitelist_extra_users entries must be emails"
+                )
+        return [item.strip() for item in value]
+
+    @field_validator("sso_whitelist_extra_domains")
+    @classmethod
+    def sso_whitelist_extra_domains_are_plain(cls, value: list[str]) -> list[str]:
+        """Require plain domain names for local domain grants."""
+        for item in value:
+            normalized = item.strip()
+            if (
+                not normalized
+                or any(ord(char) < 32 or char.isspace() for char in normalized)
+                or "@" in item
+            ):
+                raise ValueError(
+                    "auth.sso_whitelist_extra_domains entries must be domains"
+                )
+        return [item.strip() for item in value]
+
+    @field_validator("sso_whitelist_poll_time")
+    @classmethod
+    def sso_whitelist_poll_time_is_hhmm(cls, value: str | None) -> str | None:
+        """Require an HH:MM wall-clock time when a daily schedule is used."""
+        if value is None:
+            return value
+        if re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", value) is None:
+            raise ValueError(
+                "auth.sso_whitelist_poll_time must be an HH:MM wall-clock time"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def sso_whitelist_poll_time_pairs_with_interval(self) -> Self:
+        """Daily polling needs a time; hourly never uses one."""
+        if (
+            self.sso_whitelist_poll_interval == "daily"
+            and self.sso_whitelist_poll_time is None
+        ):
+            raise ValueError(
+                "auth.sso_whitelist_poll_time is required when "
+                "auth.sso_whitelist_poll_interval is daily"
+            )
+        if (
+            self.sso_whitelist_poll_interval == "hourly"
+            and self.sso_whitelist_poll_time is not None
+        ):
+            raise ValueError(
+                "auth.sso_whitelist_poll_time is only used with a daily poll interval"
+            )
+        return self
+
+    @field_validator("sso_whitelist_url", mode="after")
+    @classmethod
+    def sso_whitelist_url_is_https(cls, value: str | None) -> str | None:
+        """Require an absolute HTTPS URL so the list cannot be tampered with."""
+        if value is None:
+            return None
+        if any(ord(character) < 32 for character in value):
+            raise ValueError(
+                "auth.sso_whitelist_url must not contain control characters"
+            )
+        parsed = urlsplit(value)
+        if parsed.scheme != "https" or parsed.hostname is None:
+            raise ValueError("auth.sso_whitelist_url must be an absolute HTTPS URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("auth.sso_whitelist_url must not contain credentials")
+        if parsed.fragment:
+            raise ValueError("auth.sso_whitelist_url must not contain a fragment")
+        hostname = parsed.hostname.lower()
+        if hostname == "localhost" or hostname.endswith(".localhost"):
+            raise ValueError(
+                "auth.sso_whitelist_url must not point at a localhost host"
+            )
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            address = None
+        if address is not None and not address.is_global:
+            raise ValueError(
+                "auth.sso_whitelist_url must not point at a private, "
+                "loopback, or link-local host"
+            )
+        return value
 
     @field_validator("session_cookie", mode="after")
     @classmethod
@@ -621,6 +728,32 @@ class RedfishSettings(BaseModel):
         return self
 
 
+class PluginSettings(BaseModel):
+    """Plugin loading configuration.
+
+    ``external_dir`` mirrors QUADS ``/opt/quads/plugins`` and is opt-in
+    (``None`` disables external scanning). External plugin modules execute
+    arbitrary code at startup as the service user, so only point this at a
+    directory you own or root owns that is not group/world-writable.
+    ``disabled`` holds fully-qualified plugin names (e.g. ``auth.google``)
+    that are never loaded. ``config`` maps a plugin name to its own config
+    dict (env JSON), e.g. ``{"myplugin": {"api_key": "..."}}``.
+    """
+
+    external_dir: Path | None = Field(
+        default=None,
+        description="Optional directory scanned for external plugins.",
+    )
+    disabled: list[str] = Field(
+        default_factory=list,
+        description="Fully-qualified plugin names that are never loaded.",
+    )
+    config: dict[str, dict[str, object]] = Field(
+        default_factory=dict,
+        description="Per-plugin configuration keyed by plugin name.",
+    )
+
+
 class Settings(BaseSettings):
     """Root application settings.
 
@@ -652,6 +785,7 @@ class Settings(BaseSettings):
     huggingface: HuggingFaceSettings
     auth: AuthSettings = AuthSettings()
     oauth: OAuthSettings = OAuthSettings()
+    plugins: PluginSettings = PluginSettings()
 
     @model_validator(mode="after")
     def oauth_requires_session_secret(self) -> Self:
@@ -667,6 +801,27 @@ class Settings(BaseSettings):
             raise ValueError(
                 "auth.enforce_api_tokens requires oauth to be enabled so "
                 "users can create tokens"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def sso_whitelist_is_all_or_none(self) -> Self:
+        """Whitelist settings are paired: never a silently dead allowlist.
+
+        ``enforce_sso_whitelist`` without a URL would deny everyone at the
+        first gate; a URL without enforcement would run a dead whitelist.
+        Both directions fail fast.
+        """
+        has_url = self.auth.sso_whitelist_url is not None
+        if self.auth.enforce_sso_whitelist and not has_url:
+            raise ValueError(
+                "auth.sso_whitelist_url is required when "
+                "auth.enforce_sso_whitelist is enabled"
+            )
+        if has_url and not self.auth.enforce_sso_whitelist:
+            raise ValueError(
+                "auth.enforce_sso_whitelist is required when "
+                "auth.sso_whitelist_url is set"
             )
         return self
 

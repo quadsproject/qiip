@@ -1,10 +1,11 @@
-"""Google OAuth login/logout and current-user endpoints.
+"""OAuth login/logout and current-user endpoints.
 
 Flow (RFC 6749 Authorization Code + OIDC):
 
-    /auth/login    -> 302 to Google's authorization endpoint
-    /auth/callback -> Google redirects back with a code; we exchange it,
-                      verify/upsert the user, and sign the session cookie
+    /auth/login    -> 302 to the provider's authorization endpoint
+    /auth/callback -> provider redirects back with a code; the auth plugin
+                      exchanges it, this router verifies/upserts the user,
+                      and signs the session cookie
     /auth/logout   -> clears the session cookie
     /auth/me       -> JSON identity for the signed-in user (or 401)
 
@@ -16,16 +17,21 @@ leaves the user on a bare error screen.
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated, cast
+from typing import Annotated
 
 import structlog
-from authlib.integrations.starlette_client import OAuth, OAuthError
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
+from inference_proxy.auth.allowlist import (
+    AllowlistUnavailableError,
+    SSOAllowlist,
+    enforce_allowlist,
+)
 from inference_proxy.auth.dependencies import (
+    get_auth_plugin,
     get_auth_store,
-    get_oauth_client,
+    get_sso_allowlist,
     require_profile_user,
 )
 from inference_proxy.auth.models import PublicUser, User
@@ -37,6 +43,7 @@ from inference_proxy.auth.session import (
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.settings import Settings
+from inference_proxy.plugins.interfaces.auth import AuthCallbackError, AuthPlugin
 
 logger = structlog.get_logger()
 
@@ -53,10 +60,10 @@ def _error_redirect(error: str) -> RedirectResponse:
 @auth_router.get("/login")
 async def oauth_login(
     request: Request,
-    oauth: Annotated[OAuth, Depends(get_oauth_client)],
+    auth: Annotated[AuthPlugin, Depends(get_auth_plugin)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> RedirectResponse:
-    """Start the Google Authorization Code flow (302 to Google).
+    """Start the provider Authorization Code flow (302 to the provider).
 
     When a session already exists the request short-circuits to the profile
     page instead of forcing a re-authentication round-trip.
@@ -64,43 +71,44 @@ async def oauth_login(
     if get_session_user_id(request) is not None:
         return RedirectResponse(_PROFILE_HOME, status_code=302)
     redirect_uri = settings.oauth.redirect_uri
-    return cast(
-        RedirectResponse,
-        await oauth.google.authorize_redirect(request, redirect_uri),
-    )
+    if redirect_uri is None:
+        raise HTTPException(
+            status_code=503, detail="OAuth redirect URI is not configured"
+        )
+    return await auth.start_login(request, redirect_uri)
 
 
 @auth_router.get("/callback")
 async def oauth_callback(
     request: Request,
-    oauth: Annotated[OAuth, Depends(get_oauth_client)],
+    auth: Annotated[AuthPlugin, Depends(get_auth_plugin)],
     store: Annotated[AuthStore, Depends(get_auth_store)],
     settings: Annotated[Settings, Depends(get_settings)],
+    allowlist: Annotated[SSOAllowlist | None, Depends(get_sso_allowlist)] = None,
 ) -> RedirectResponse:
-    """Handle Google's post-login redirect, upsert the user, sign the session.
+    """Handle the provider's post-login redirect, upsert the user, sign the session.
 
-    Verification performed against the verified ID-token claims (authlib
-    validates the JWT signature, issuer, audience, and nonce/state):
-    email presence, optional email-verification requirement, and the
-    optional hosted-domain allowlist.
+    The auth plugin validates the ID-token claims (authlib validates the
+    JWT signature, issuer, audience, and nonce/state) and returns a
+    normalized identity. Policy applied here is provider-neutral: email
+    presence, optional email-verification requirement, the optional
+    hosted-domain allowlist, and the optional SSO user whitelist. The
+    whitelist check runs before the user row is created and before the
+    session is signed, so a denied login never persists an account; an
+    unavailable whitelist fails closed with a redirect.
     """
     try:
-        token = await oauth.google.authorize_access_token(request)
-    except OAuthError as exc:
-        logger.warning(
-            "oauth callback rejected",
-            error=exc.error,
-            description=exc.description,
-        )
-        return _error_redirect("login_failed")
+        identity = await auth.complete_login(request)
+    except AuthCallbackError as exc:
+        logger.warning("oauth callback rejected", code=exc.code)
+        return _error_redirect(exc.code)
 
-    userinfo = token.get("userinfo") or {}
-    email = userinfo.get("email")
-    if not isinstance(email, str) or not email:
-        logger.warning("oauth callback missing email", userinfo=userinfo)
+    email = identity.email
+    if not email or not identity.sub:
+        logger.warning("oauth callback empty identity")
         return _error_redirect("no_profile")
 
-    if settings.auth.require_email_verification and not userinfo.get("email_verified"):
+    if settings.auth.require_email_verification and not identity.email_verified:
         logger.warning("oauth callback unverified email", email=email)
         return _error_redirect("unverified_email")
 
@@ -110,19 +118,24 @@ async def oauth_callback(
         logger.warning("oauth callback domain not allowed", email=email)
         return _error_redirect("domain_not_allowed")
 
-    name = userinfo.get("name") or ""
-    picture = userinfo.get("picture") or ""
-    google_sub = userinfo.get("sub")
-    if not isinstance(google_sub, str) or not google_sub:
-        logger.warning("oauth callback missing subject", email=email)
-        return _error_redirect("no_profile")
+    if settings.auth.enforce_sso_whitelist:
+        try:
+            allowed = await enforce_allowlist(email, allowlist)
+        except AllowlistUnavailableError:
+            logger.warning("oauth callback whitelist unavailable", email=email)
+            return _error_redirect("allowlist_unavailable")
+        if not allowed:
+            logger.warning("oauth callback user not whitelisted", email=email)
+            return _error_redirect("not_whitelisted")
 
+    # ponytail: google is the only provider; scope the stored subject by
+    # issuer when a second auth provider lands (store keyed by google_sub).
     user = await asyncio.to_thread(
         store.upsert_google_user,
-        google_sub=google_sub,
+        google_sub=identity.sub,
         email=email,
-        name=name if isinstance(name, str) else "",
-        picture=picture if isinstance(picture, str) else "",
+        name=identity.name,
+        picture=identity.picture,
     )
     set_session_user(request, user.id, settings.auth.session_ttl_seconds)
     logger.info("user signed in", user_id=user.id, email=email)
@@ -130,9 +143,18 @@ async def oauth_callback(
 
 
 @auth_router.post("/logout")
-async def oauth_logout(request: Request) -> RedirectResponse:
-    """Clear the session cookie (POST-only to avoid trivially CSRF'd logouts)."""
-    clear_session_user(request)
+async def oauth_logout(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> RedirectResponse:
+    """Clear the session cookie (POST-only to avoid trivially CSRF'd logouts).
+
+    When sessions are not configured (``auth.session_secret`` unset) there
+    is no cookie to clear; redirect home instead of touching the session
+    machinery that is absent.
+    """
+    if settings.auth.session_secret is not None:
+        clear_session_user(request)
     return RedirectResponse(_PROFILE_HOME, status_code=302)
 
 

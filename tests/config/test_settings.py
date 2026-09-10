@@ -938,6 +938,13 @@ class TestAuthSettings:
         assert auth.session_cookie == "qiip_session"
         assert auth.session_ttl_seconds == 43_200
         assert auth.db_path == Path("data/qiip.db")
+        assert auth.sso_whitelist_url is None
+        assert auth.enforce_sso_whitelist is False
+        assert auth.sso_whitelist_poll_interval == "hourly"
+        assert auth.sso_whitelist_poll_time is None
+        assert auth.sso_whitelist_cache_file is None
+        assert auth.sso_whitelist_extra_users == []
+        assert auth.sso_whitelist_extra_domains == []
 
     def test_invalid_session_cookie_name_rejected(self) -> None:
         with pytest.raises(ValidationError, match="session_cookie"):
@@ -948,6 +955,147 @@ class TestAuthSettings:
 
         assert "hush" not in repr(auth)
         assert auth.model_dump()["session_secret"] != "hush"
+
+    def test_sso_whitelist_url_must_be_https(self) -> None:
+        with pytest.raises(ValidationError, match="HTTPS"):
+            AuthSettings(sso_whitelist_url="http://allowlist.example.com/users.json")
+
+        with pytest.raises(ValidationError, match="HTTPS"):
+            AuthSettings(sso_whitelist_url="ftp://host/list.json")
+
+    def test_sso_whitelist_url_rejects_credentials_and_fragment(self) -> None:
+        with pytest.raises(ValidationError, match="credentials"):
+            AuthSettings(sso_whitelist_url="https://user:pass@host/list.json")
+
+        with pytest.raises(ValidationError, match="fragment"):
+            AuthSettings(sso_whitelist_url="https://host/list.json#frag")
+
+    def test_sso_whitelist_url_rejects_non_public_ip_host(self) -> None:
+        for url in (
+            "https://127.0.0.1/list.json",
+            "https://10.0.0.5/list.json",
+            "https://169.254.169.254/list.json",
+        ):
+            with pytest.raises(ValidationError, match="private"):
+                AuthSettings(sso_whitelist_url=url)
+
+        for url in (
+            "https://localhost/list.json",
+            "https://svc.localhost/list.json",
+        ):
+            with pytest.raises(ValidationError, match="localhost"):
+                AuthSettings(sso_whitelist_url=url)
+
+        assert (
+            AuthSettings(
+                sso_whitelist_url="https://allowlist.example.com/list.json"
+            ).sso_whitelist_url
+            == "https://allowlist.example.com/list.json"
+        )
+
+    def test_sso_whitelist_poll_time_validated(self) -> None:
+        with pytest.raises(ValidationError, match="HH:MM"):
+            AuthSettings(sso_whitelist_poll_time="25:00")
+        with pytest.raises(ValidationError, match="HH:MM"):
+            AuthSettings(sso_whitelist_poll_time="5am")
+
+        assert (
+            AuthSettings(
+                sso_whitelist_poll_interval="daily",
+                sso_whitelist_poll_time="05:00",
+            ).sso_whitelist_poll_time
+            == "05:00"
+        )
+
+    def test_sso_whitelist_daily_requires_time(self) -> None:
+        with pytest.raises(ValidationError, match="poll_time"):
+            AuthSettings(sso_whitelist_poll_interval="daily")
+
+    def test_sso_whitelist_hourly_rejects_time(self) -> None:
+        with pytest.raises(ValidationError, match="daily"):
+            AuthSettings(
+                sso_whitelist_poll_interval="hourly",
+                sso_whitelist_poll_time="05:00",
+            )
+
+    def test_sso_whitelist_extra_users_must_be_emails(self) -> None:
+        with pytest.raises(ValidationError, match="emails"):
+            AuthSettings(sso_whitelist_extra_users=["not-an-email"])
+        with pytest.raises(ValidationError, match="emails"):
+            AuthSettings(sso_whitelist_extra_users=["a @b.com"])
+
+        auth = AuthSettings(
+            sso_whitelist_extra_users=[" Alice@example.com ", "bob@other.com"]
+        )
+        assert auth.sso_whitelist_extra_users == ["Alice@example.com", "bob@other.com"]
+
+    def test_sso_whitelist_extra_domains_must_be_plain(self) -> None:
+        with pytest.raises(ValidationError, match="domains"):
+            AuthSettings(sso_whitelist_extra_domains=["user@example.com"])
+        with pytest.raises(ValidationError, match="domains"):
+            AuthSettings(sso_whitelist_extra_domains=["  "])
+        with pytest.raises(ValidationError, match="domains"):
+            AuthSettings(sso_whitelist_extra_domains=["exa mple.com"])
+
+        auth = AuthSettings(sso_whitelist_extra_domains=[" Example.com "])
+        assert auth.sso_whitelist_extra_domains == ["Example.com"]
+
+
+class TestSSOWhitelistRootValidators:
+    def test_enforce_requires_url(self) -> None:
+        settings = Settings(
+            admin=AdminSettings(username="u", password=SecretStr("p")),
+            huggingface=HuggingFaceSettings(cache_dir="/tmp/hf"),
+        )
+        enforced = settings.model_copy(
+            deep=True,
+            update={
+                "auth": settings.auth.model_copy(update={"enforce_sso_whitelist": True})
+            },
+        )
+
+        with pytest.raises(ValidationError, match="sso_whitelist_url"):
+            Settings(
+                admin=settings.admin,
+                huggingface=settings.huggingface,
+                auth=enforced.auth,
+            )
+
+    def test_url_requires_enforcement(self) -> None:
+        settings = Settings(
+            admin=AdminSettings(username="u", password=SecretStr("p")),
+            huggingface=HuggingFaceSettings(cache_dir="/tmp/hf"),
+        )
+        with_url = settings.model_copy(
+            deep=True,
+            update={
+                "auth": settings.auth.model_copy(
+                    update={
+                        "sso_whitelist_url": "https://host/list.json",
+                    }
+                )
+            },
+        )
+
+        with pytest.raises(ValidationError, match="enforce_sso_whitelist"):
+            Settings(
+                admin=settings.admin,
+                huggingface=settings.huggingface,
+                auth=with_url.auth,
+            )
+
+    def test_paired_settings_valid(self) -> None:
+        settings = Settings(
+            admin=AdminSettings(username="u", password=SecretStr("p")),
+            huggingface=HuggingFaceSettings(cache_dir="/tmp/hf"),
+            auth=AuthSettings(
+                session_secret=SecretStr("cookie-secret"),
+                sso_whitelist_url="https://host/list.json",
+                enforce_sso_whitelist=True,
+            ),
+        )
+
+        assert settings.auth.enforce_sso_whitelist is True
 
 
 class TestAuthRootValidators:
