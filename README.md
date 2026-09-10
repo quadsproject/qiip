@@ -552,9 +552,11 @@ follow later).
 | `INFERENCE_PROXY_PLUGINS__CONFIG` | `{}` | Per-plugin config keyed by plugin name, e.g. `{"myplugin":{"api_key":"..."}}` (JSON object) |
 
 External plugins are trusted code: discovery imports and executes them with
-the service user's privileges. They can never silently replace a built-in
-plugin with the same registered name; use a distinct name or disable the
-built-in first.
+the service user's privileges. They can never share a registered name with a
+built-in plugin, so to make an external plugin the active implementation of a
+category, give it a distinct name (e.g. `auth.okta`) and disable the built-in
+(`INFERENCE_PROXY_PLUGINS__DISABLED=["auth.google"]`); the built-in keeps its
+name and wins on any collision.
 
 ### SSH and provisioning commands
 
