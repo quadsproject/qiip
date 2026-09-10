@@ -102,7 +102,7 @@ const ACTION_CONFIG = {
     confirm: true,
     confirmMsg: (nodeId, node) =>
       node && node.self_setup
-        ? `Remove ${nodeId} from the fleet? The existing vLLM instance will keep running.`
+        ? `Remove ${nodeId} from the fleet? The existing server will keep running.`
         : `Remove ${nodeId} from the available pool?`,
     danger: false,
     label: "Remove",
@@ -493,7 +493,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }
   });
 
-  // Registration form handler — adds node to pool or adopts a running vLLM
+  // Registration form handler — adds node to pool or adopts a running server
   const form = document.getElementById("register-form");
   const selfSetup = document.getElementById("register-self-setup");
   const registerBtn = document.getElementById("register-btn");

@@ -292,7 +292,7 @@ async def register_node(
     registry: NodeRegistry = Depends(get_registry),
     provisioner: NodeProvisioner = Depends(get_provisioner),
 ) -> JSONResponse:
-    """Register a node in the available pool, or adopt a running vLLM instance.
+    """Register a node in the pool, or adopt a running OpenAI-compatible server.
 
     Registration is a host-mutating operation, so the hostname is reserved
     through the host lifecycle coordinator before any remote probe (self-setup
@@ -301,7 +301,7 @@ async def register_node(
     registration for the same hostname.
 
     Re-adoption of an existing self-setup instance is allowed: it re-probes
-    the live vLLM server and reconciles the tracked model with what vLLM
+    the live server and reconciles the tracked model with what the server
     currently serves (see ``NodeProvisioner.register_self_setup``).
     """
     hostname = canonical_hostname(body.hostname)
@@ -313,7 +313,7 @@ async def register_node(
                 f"Node '{hostname}' is already registered"
                 + (
                     "; re-adoption requires the existing registration to be "
-                    "a self-setup vLLM instance"
+                    "a self-setup instance"
                     if body.self_setup
                     else ""
                 )
@@ -468,7 +468,7 @@ async def setup_node(
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Node '{hostname}' is a self-setup vLLM instance; "
+                f"Node '{hostname}' is a self-setup instance; "
                 "remove it from the fleet instead of provisioning"
             ),
         )
@@ -516,7 +516,7 @@ async def setup_node(
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"Node '{hostname}' is a self-setup vLLM instance; "
+                    f"Node '{hostname}' is a self-setup instance; "
                     "remove it from the fleet instead of provisioning"
                 ),
             )
@@ -817,7 +817,7 @@ async def teardown_node(
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Node '{node_id}' is a self-setup vLLM instance; "
+                f"Node '{node_id}' is a self-setup instance; "
                 "remove it from the fleet instead of tearing it down"
             ),
         )
@@ -870,7 +870,7 @@ async def teardown_node(
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"Node '{node_id}' is a self-setup vLLM instance; "
+                    f"Node '{node_id}' is a self-setup instance; "
                     "remove it from the fleet instead of tearing it down"
                 ),
             )
@@ -995,7 +995,7 @@ async def execute_power_action(
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"Node '{hostname}' is a self-setup vLLM instance; "
+                    f"Node '{hostname}' is a self-setup instance; "
                     "QIIP does not own its hardware and cannot send BMC power actions"
                 ),
             )
@@ -1058,7 +1058,7 @@ async def get_recommendations(
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"Node '{hostname}' is a self-setup vLLM instance; "
+                    f"Node '{hostname}' is a self-setup instance; "
                     "QIIP cannot recommend or install software on externally "
                     "owned hardware"
                 ),

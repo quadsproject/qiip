@@ -279,10 +279,10 @@ class TestSetupForm:
         assert 'id="register-btn"' in response.text
 
     def test_contains_self_setup_checkbox(self, client: TestClient) -> None:
-        """Manual setup can adopt an existing vLLM instance."""
+        """Manual setup can adopt an existing OpenAI-compatible server."""
         response = client.get("/dashboard")
         assert 'id="register-self-setup"' in response.text
-        assert "Existing vLLM instance" in response.text
+        assert "Existing OpenAI-compatible server" in response.text
 
     def test_model_selection_not_on_dashboard(self, client: TestClient) -> None:
         """Model/engine selection removed from dashboard manual setup."""
