@@ -39,7 +39,6 @@ from inference_proxy.api.errors import ApiAuthError
 from inference_proxy.api.middleware import RequestLoggingMiddleware
 from inference_proxy.api.profile import profile_router
 from inference_proxy.api.routes import router
-from inference_proxy.auth.oauth import build_google_oauth
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.logging import configure_logging
@@ -56,6 +55,8 @@ from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.openai import ErrorDetail, ErrorResponse
+from inference_proxy.plugins.interfaces.auth import AuthPlugin
+from inference_proxy.plugins.manager import PluginManager
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.provisioning.ssh_client import SSHClient
@@ -289,12 +290,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.auth_store = auth_store
             resources.callback(_safe_sync_cleanup, "auth store", auth_store.close)
 
-            if resolved_settings.oauth.enabled:
-                app.state.oauth = build_google_oauth(resolved_settings.oauth)
-                logger.info("google oauth enabled")
+            plugin_manager = PluginManager(resolved_settings)
+            plugin_manager.initialize()
+            app.state.plugin_manager = plugin_manager
+            auth_plugins = plugin_manager.get_plugins_by_type(AuthPlugin)
+            if len(auth_plugins) > 1:
+                logger.warning(
+                    "multiple auth plugins loaded; using the first",
+                    plugins=[plugin.name for plugin in auth_plugins],
+                )
+            auth_plugin = auth_plugins[0] if auth_plugins else None
+            if auth_plugin is not None:
+                app.state.auth_plugin = auth_plugin
+                logger.info("auth plugin loaded", plugin=auth_plugin.name)
             else:
-                app.state.oauth = None
-                logger.info("google oauth disabled")
+                app.state.auth_plugin = None
+                logger.info("auth plugin not loaded (disabled or unconfigured)")
 
             ssh_client = SSHClient(resolved_settings.ssh)
 

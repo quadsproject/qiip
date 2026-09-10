@@ -538,6 +538,24 @@ provisioning vLLM port must also appear in the endpoint port allowlist. Setup
 requests whose generated backend endpoint is not allowed fail before any
 power, SSH, or installation work and name the allowlist setting to update.
 
+### Plugins
+
+QIIP uses a QUADS-style plugin architecture: category interfaces (currently
+`auth`), built-in implementations, and an optional external plugin directory.
+Plugins are configured through environment variables only (a YAML config may
+follow later).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INFERENCE_PROXY_PLUGINS__EXTERNAL_DIR` | unset | Optional directory scanned for external (downstream/third-party) plugins; module code executes at startup as the service user, so the directory must be root/user-owned and not group/world-writable |
+| `INFERENCE_PROXY_PLUGINS__DISABLED` | `[]` | Fully-qualified plugin names that are never loaded, e.g. `["auth.google"]` (JSON array) |
+| `INFERENCE_PROXY_PLUGINS__CONFIG` | `{}` | Per-plugin config keyed by plugin name, e.g. `{"myplugin":{"api_key":"..."}}` (JSON object) |
+
+External plugins are trusted code: discovery imports and executes them with
+the service user's privileges. They can never silently replace a built-in
+plugin with the same registered name; use a distinct name or disable the
+built-in first.
+
 ### SSH and provisioning commands
 
 | Variable | Default | Description |

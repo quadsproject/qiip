@@ -1,4 +1,4 @@
-"""End-to-end tests for the Google OAuth login flow (via a fake client)."""
+"""End-to-end tests for the OAuth login flow (via a fake auth plugin)."""
 
 from __future__ import annotations
 
@@ -9,19 +9,19 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from inference_proxy.auth.dependencies import get_oauth_client
+from inference_proxy.auth.dependencies import get_auth_plugin
 from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.settings import OAuthSettings, Settings
 
-from .conftest import FakeOAuth, FakeOAuthBuilder
+from .conftest import FakeAuthPluginBuilder
 
 
-def _client_with_oauth(
+def _client_with_auth(
     app: FastAPI,
-    oauth: FakeOAuth,
+    auth: object,
     settings: Settings,
 ) -> TestClient:
-    app.dependency_overrides[get_oauth_client] = lambda: oauth
+    app.dependency_overrides[get_auth_plugin] = lambda: auth
     app.dependency_overrides[get_settings] = lambda: settings
     return TestClient(app)
 
@@ -31,9 +31,15 @@ class TestOAuthLogin:
         self,
         app: FastAPI,
         test_settings: Settings,
-        make_fake_oauth: FakeOAuthBuilder,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
     ) -> None:
-        client = _client_with_oauth(app, make_fake_oauth(), test_settings)
+        oauth = OAuthSettings(
+            client_id="123.apps.googleusercontent.com",
+            client_secret=SecretStr("s3cret"),
+            redirect_uri="https://proxy.example.com/auth/callback",
+        )
+        settings = test_settings.model_copy(update={"oauth": oauth})
+        client = _client_with_auth(app, make_fake_auth_plugin(), settings)
 
         response = client.get("/auth/login", follow_redirects=False)
 
@@ -51,13 +57,35 @@ class TestOAuthLogin:
 
 
 class TestOAuthCallback:
+    def test_callback_empty_identity_rejected(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+    ) -> None:
+        from inference_proxy.plugins.interfaces.auth import AuthIdentity
+
+        from .conftest import FakeAuthPlugin
+
+        class EmptyIdentityPlugin(FakeAuthPlugin):
+            async def complete_login(self, request: object) -> AuthIdentity:
+                return AuthIdentity(sub="", email="", email_verified=True)
+
+        app.dependency_overrides[get_auth_plugin] = lambda: EmptyIdentityPlugin()
+        client = TestClient(app)
+
+        response = client.get(
+            "/auth/callback?code=code&state=state", follow_redirects=False
+        )
+
+        assert "error=no_profile" in response.headers["location"]
+
     def test_callback_signs_in_user_and_sets_session(
         self,
         app: FastAPI,
         test_settings: Settings,
-        make_fake_oauth: FakeOAuthBuilder,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
     ) -> None:
-        client = _client_with_oauth(app, make_fake_oauth(), test_settings)
+        client = _client_with_auth(app, make_fake_auth_plugin(), test_settings)
 
         response = client.get(
             "/auth/callback?code=code&state=state", follow_redirects=False
@@ -75,10 +103,10 @@ class TestOAuthCallback:
         self,
         app: FastAPI,
         test_settings: Settings,
-        make_fake_oauth: FakeOAuthBuilder,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
     ) -> None:
-        client = _client_with_oauth(
-            app, make_fake_oauth(error="access_denied"), test_settings
+        client = _client_with_auth(
+            app, make_fake_auth_plugin(error="access_denied"), test_settings
         )
 
         response = client.get(
@@ -92,11 +120,11 @@ class TestOAuthCallback:
         self,
         app: FastAPI,
         test_settings: Settings,
-        make_fake_oauth: FakeOAuthBuilder,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
     ) -> None:
-        client = _client_with_oauth(
+        client = _client_with_auth(
             app,
-            make_fake_oauth(
+            make_fake_auth_plugin(
                 {
                     "sub": "s1",
                     "email": "nobody@example.com",
@@ -116,9 +144,9 @@ class TestOAuthCallback:
         self,
         app: FastAPI,
         test_settings: Settings,
-        make_fake_oauth: FakeOAuthBuilder,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
     ) -> None:
-        client = _client_with_oauth(app, make_fake_oauth(userinfo={}), test_settings)
+        client = _client_with_auth(app, make_fake_auth_plugin({}), test_settings)
 
         response = client.get(
             "/auth/callback?code=code&state=state", follow_redirects=False
@@ -130,7 +158,7 @@ class TestOAuthCallback:
         self,
         app: FastAPI,
         test_settings: Settings,
-        make_fake_oauth: FakeOAuthBuilder,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
     ) -> None:
         restricted = test_settings.model_copy(
             deep=True,
@@ -140,9 +168,9 @@ class TestOAuthCallback:
                 )
             },
         )
-        client = _client_with_oauth(
+        client = _client_with_auth(
             app,
-            make_fake_oauth(
+            make_fake_auth_plugin(
                 {
                     "sub": "s2",
                     "email": "alice@example.com",
@@ -157,9 +185,9 @@ class TestOAuthCallback:
         )
         assert "error=domain_not_allowed" in response.headers["location"]
 
-        allowed_client = _client_with_oauth(
+        allowed_client = _client_with_auth(
             app,
-            make_fake_oauth(
+            make_fake_auth_plugin(
                 {
                     "sub": "s3",
                     "email": "bob@allowed.example.com",
@@ -204,9 +232,9 @@ class TestAuthMe:
         self,
         app: FastAPI,
         test_settings: Settings,
-        make_fake_oauth: FakeOAuthBuilder,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
     ) -> None:
-        client = _client_with_oauth(app, make_fake_oauth(), test_settings)
+        client = _client_with_auth(app, make_fake_auth_plugin(), test_settings)
         assert (
             client.get(
                 "/auth/callback?code=code&state=state", follow_redirects=False
@@ -226,9 +254,9 @@ class TestOAuthLogout:
         self,
         app: FastAPI,
         test_settings: Settings,
-        make_fake_oauth: FakeOAuthBuilder,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
     ) -> None:
-        client = _client_with_oauth(app, make_fake_oauth(), test_settings)
+        client = _client_with_auth(app, make_fake_auth_plugin(), test_settings)
         assert (
             client.get(
                 "/auth/callback?code=code&state=state",
@@ -246,7 +274,7 @@ class TestOAuthLogout:
 
 class TestBuildGoogleOAuth:
     def test_registers_google_client_with_credentials(self) -> None:
-        from inference_proxy.auth.oauth import build_google_oauth
+        from inference_proxy.plugins.builtin.auth.google import build_google_oauth
 
         settings = OAuthSettings(
             client_id="123.apps.googleusercontent.com",
@@ -259,7 +287,7 @@ class TestBuildGoogleOAuth:
         assert oauth.google.client_id == "123.apps.googleusercontent.com"
 
     def test_disabled_settings_rejected(self) -> None:
-        from inference_proxy.auth.oauth import build_google_oauth
+        from inference_proxy.plugins.builtin.auth.google import build_google_oauth
 
         with pytest.raises(ValueError, match="disabled"):
             build_google_oauth(OAuthSettings())

@@ -1,4 +1,4 @@
-"""Unit tests for auth FastAPI dependencies (store/oauth resolution)."""
+"""Unit tests for auth FastAPI dependencies (store/plugin resolution)."""
 
 from __future__ import annotations
 
@@ -6,11 +6,12 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from authlib.integrations.starlette_client import OAuth
 from fastapi import FastAPI, HTTPException
 
-from inference_proxy.auth.dependencies import get_auth_store, get_oauth_client
+from inference_proxy.auth.dependencies import get_auth_plugin, get_auth_store
 from inference_proxy.auth.store import AuthStore
+
+from .conftest import FakeAuthPlugin
 
 
 def _app_with_state(
@@ -41,17 +42,26 @@ class TestGetAuthStore:
         store.close()
 
 
-class TestGetOAuthClient:
-    def test_missing_oauth_raises_404(self) -> None:
+class TestGetAuthPlugin:
+    def test_missing_plugin_raises_404(self) -> None:
         _app, request = _app_with_state()
 
         with pytest.raises(HTTPException) as exc_info:
-            get_oauth_client(request)
+            get_auth_plugin(request)
 
         assert exc_info.value.status_code == 404
 
-    def test_present_oauth_returned(self) -> None:
-        oauth = OAuth()
-        _app, request = _app_with_state(oauth=oauth)
+    def test_unconfigured_present_plugin_raises_404(self) -> None:
+        plugin = FakeAuthPlugin(error="access_denied")
+        _app, request = _app_with_state(auth_plugin=plugin)
 
-        assert get_oauth_client(request) is oauth
+        with pytest.raises(HTTPException) as exc_info:
+            get_auth_plugin(request)
+
+        assert exc_info.value.status_code == 404
+
+    def test_present_plugin_returned(self) -> None:
+        plugin = FakeAuthPlugin()
+        _app, request = _app_with_state(auth_plugin=plugin)
+
+        assert get_auth_plugin(request) is plugin
