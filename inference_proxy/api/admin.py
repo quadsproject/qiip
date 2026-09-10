@@ -586,11 +586,18 @@ async def setup_node(
         pending_hosts.add(hostname)
 
         # Retrying setup must not wipe an owner established by registration;
-        # only an explicit owner in the request overrides it.
+        # only an explicit owner in the request overrides it. Prefer the
+        # post-lease node snapshot (a concurrent register/owner PATCH may have
+        # committed between the initial read and lease acquisition); fall back
+        # to the initial snapshot only if the node vanished under the lease.
         setup_owner = (
             body.owner
             if "owner" in body.model_fields_set
-            else (initial_node.owner if initial_node is not None else "")
+            else (
+                node.owner
+                if node is not None
+                else (initial_node.owner if initial_node is not None else "")
+            )
         )
 
         async def _provision_and_cleanup() -> None:
