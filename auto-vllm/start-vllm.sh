@@ -90,6 +90,24 @@ configure_vllm_params() {
             GPU_MEM_UTIL=0.90
             ;;
 
+        *"A30"*|*"A40"*)
+            # Ampere data-center cards (A30 24GB, A40 48GB). Not covered by the
+            # A100/H100 branch: that branch assumes >=48GB per card and would
+            # pick a model too large to leave any room for the KV cache here.
+            echo "Ampere data-center GPU detected: tuning model to available VRAM"
+            TENSOR_PARALLEL=$GPU_COUNT
+            GPU_MEM_UTIL=0.90
+            MAX_MODEL_LEN=32768
+
+            if [ $total_vram -ge 80 ]; then
+                MODEL="Qwen/Qwen2.5-32B-Instruct"
+            elif [ $total_vram -ge 40 ]; then
+                MODEL="Qwen/Qwen2.5-14B-Instruct"
+            else
+                MODEL="Qwen/Qwen2.5-7B-Instruct"
+            fi
+            ;;
+
         *"T4"*)
             echo "Tesla T4 detected: optimizing for memory efficiency"
             TENSOR_PARALLEL=1

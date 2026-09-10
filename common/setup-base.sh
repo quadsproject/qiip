@@ -55,8 +55,24 @@ soft_step() {
 run_system_update() {
     local running_kernel
     running_kernel=$(uname -r)
-    sudo dnf -y install kernel-devel-"${running_kernel}" kernel-headers-"${running_kernel}" \
-        cmake gcc gcc-c++ make wget nfs-utils elfutils-libelf-devel \
+    # The NVIDIA driver builds a kernel module against headers that match the
+    # RUNNING kernel exactly. Installing a different version silently yields a
+    # module that fails to compile ("Unable to find the kernel source tree"),
+    # so require an exact match and fail loudly with a fix hint rather than
+    # degrade to whatever version the repos happen to carry.
+    if rpm -q "kernel-devel-${running_kernel}" "kernel-headers-${running_kernel}" &>/dev/null; then
+        echo "kernel-devel/headers for ${running_kernel} already installed"
+    elif ! sudo dnf -y install \
+        "kernel-devel-${running_kernel}" "kernel-headers-${running_kernel}"; then
+        echo "FATAL: kernel-devel/kernel-headers for the running kernel ${running_kernel} are not available in the configured repositories." >&2
+        echo "The NVIDIA driver cannot build its kernel module without headers matching the running kernel." >&2
+        echo "Fix by either:" >&2
+        echo "  1. Booting a kernel whose -devel/-headers ARE installed or available" >&2
+        echo "     (e.g. 'grubby --set-default /boot/vmlinuz-<version>' then reboot), or" >&2
+        echo "  2. Enabling the repository that provides kernel-devel-${running_kernel}." >&2
+        return 1
+    fi
+    sudo dnf -y install cmake gcc gcc-c++ make wget nfs-utils elfutils-libelf-devel \
         python3.12 python3.12-devel
     sudo dnf -y update '--exclude=kernel*'
 }
