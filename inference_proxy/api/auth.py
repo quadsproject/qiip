@@ -143,9 +143,18 @@ async def oauth_callback(
 
 
 @auth_router.post("/logout")
-async def oauth_logout(request: Request) -> RedirectResponse:
-    """Clear the session cookie (POST-only to avoid trivially CSRF'd logouts)."""
-    clear_session_user(request)
+async def oauth_logout(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> RedirectResponse:
+    """Clear the session cookie (POST-only to avoid trivially CSRF'd logouts).
+
+    When sessions are not configured (``auth.session_secret`` unset) there
+    is no cookie to clear; redirect home instead of touching the session
+    machinery that is absent.
+    """
+    if settings.auth.session_secret is not None:
+        clear_session_user(request)
     return RedirectResponse(_PROFILE_HOME, status_code=302)
 
 
