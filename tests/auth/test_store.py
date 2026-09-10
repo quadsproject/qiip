@@ -374,3 +374,11 @@ class TestScopeSerialization:
 
         assert _load_scopes("[]") == []
         assert _load_scopes(None) is None
+
+    def test_malformed_scope_fails_closed(self) -> None:
+        from inference_proxy.auth.store import _load_scopes
+
+        assert _load_scopes("not json") == []
+        assert _load_scopes('{"a": 1}') == []
+        assert _load_scopes("42") == []
+        assert _load_scopes("[1, 2]") == []

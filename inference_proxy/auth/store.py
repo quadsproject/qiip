@@ -119,17 +119,22 @@ def _dump_scopes(scopes: list[str] | None) -> str | None:
 
 
 def _load_scopes(raw: str | None) -> list[str] | None:
-    """Parse the endpoint_scope column (None = full access)."""
+    """Parse the endpoint_scope column.
+
+    ``None`` (NULL) means full access; a malformed or non-list value is
+    parsed as ``[]`` (pinned to nothing) so a corrupt row never silently
+    widens a pinned token to unrestricted access.
+    """
     if raw is None:
         return None
     try:
         scopes = json.loads(raw)
     except json.JSONDecodeError:
-        return None
+        return []
     if not isinstance(scopes, list) or not all(
         isinstance(item, str) for item in scopes
     ):
-        return None
+        return []
     return scopes
 
 
