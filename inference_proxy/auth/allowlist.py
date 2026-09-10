@@ -222,16 +222,25 @@ class SSOAllowlist:
             ) from exc
 
     def _load_seed(self) -> None:
-        """Load the flat-file cache as a cold-start seed (never overrides a fetch)."""
+        """Load the flat-file cache as a cold-start seed (never overrides a fetch).
+
+        The seed is only served inside its own freshness window: the next
+        refresh is derived from the file's mtime (clamped to now), so an
+        aged file triggers an immediate refetch instead of being served as
+        fresh for a full window after a restart.
+        """
         if self._cache_file is None or not self._cache_file.is_file():
             return
         try:
+            mtime = self._cache_file.stat().st_mtime
             raw = json.loads(self._cache_file.read_text(encoding="utf-8"))
             self._domains = _normalize_document(raw)
             self._loaded = True
+            self._next_refresh = max(self._next_refresh_at(mtime), time.time())
             logger.info(
                 "sso whitelist cache file loaded",
                 path=str(self._cache_file),
+                age_seconds=round(time.time() - mtime),
             )
         except (OSError, ValueError, TypeError):
             logger.warning(
