@@ -7,7 +7,12 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from inference_proxy.auth.dependencies import get_auth_plugin, get_sso_allowlist
 from inference_proxy.auth.store import AuthStore
+from inference_proxy.config.dependencies import get_settings
+from inference_proxy.config.settings import Settings
+
+from .conftest import FakeAllowlist, FakeAuthPluginBuilder
 
 
 class TestProfilePage:
@@ -142,3 +147,97 @@ class TestUsageSummary:
         client = TestClient(app)
 
         assert client.get("/profile/usage").status_code == 401
+
+
+class TestTokenMintWhitelist:
+    """SSO whitelist gate on POST /profile/tokens (fail closed)."""
+
+    @staticmethod
+    def _enforced_settings(test_settings: Settings) -> Settings:
+        auth = test_settings.auth.model_copy(
+            update={
+                "sso_whitelist_url": "https://allowlist.example.com/list.json",
+                "enforce_sso_whitelist": True,
+            }
+        )
+        return test_settings.model_copy(deep=True, update={"auth": auth})
+
+    def _signed_in_client(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        mint_allowlist: object,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> TestClient:
+        app.dependency_overrides[get_auth_plugin] = lambda: make_fake_auth_plugin()
+        app.dependency_overrides[get_settings] = lambda: (
+            TestTokenMintWhitelist._enforced_settings(test_settings)
+        )
+        # Sign in with an allow-all list; the mint-time gate uses the
+        # allowlist under test afterwards.
+        app.dependency_overrides[get_sso_allowlist] = lambda: FakeAllowlist(
+            allowed=True
+        )
+        client = TestClient(app)
+        assert (
+            client.get(
+                "/auth/callback?code=code&state=state", follow_redirects=False
+            ).status_code
+            == 302
+        )
+        app.dependency_overrides[get_sso_allowlist] = lambda: mint_allowlist
+        return client
+
+    def test_whitelisted_user_can_mint(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        client = self._signed_in_client(
+            app, test_settings, FakeAllowlist(allowed=True), make_fake_auth_plugin
+        )
+
+        response = client.post("/profile/tokens", json={"name": "ci"})
+
+        assert response.status_code == 201
+
+    def test_denied_user_cannot_mint(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        client = self._signed_in_client(
+            app, test_settings, FakeAllowlist(allowed=False), make_fake_auth_plugin
+        )
+
+        response = client.post("/profile/tokens", json={"name": "ci"})
+
+        assert response.status_code == 403
+
+    def test_unavailable_allowlist_blocks_mint(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        client = self._signed_in_client(
+            app, test_settings, FakeAllowlist(raises=True), make_fake_auth_plugin
+        )
+
+        response = client.post("/profile/tokens", json={"name": "ci"})
+
+        assert response.status_code == 503
+
+    def test_missing_allowlist_blocks_mint(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        client = self._signed_in_client(app, test_settings, None, make_fake_auth_plugin)
+
+        response = client.post("/profile/tokens", json={"name": "ci"})
+
+        assert response.status_code == 503

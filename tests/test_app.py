@@ -585,7 +585,7 @@ class TestGetRegistryDependency:
 
 
 class TestLifespanOAuthWiring:
-    """Lifespan prepares the auth store and (optionally) the OAuth client."""
+    """Lifespan prepares the auth store and (optionally) the auth plugin."""
 
     def _etcd_mock(self, mock_etcd_cls: MagicMock) -> None:
         mock_client = MagicMock()
@@ -629,10 +629,13 @@ class TestLifespanOAuthWiring:
         settings = test_settings.model_copy(update={"oauth": oauth})
 
         from inference_proxy.main import create_app
+        from inference_proxy.plugins.interfaces.auth import AuthPlugin
 
         app = create_app(settings=settings)
         with TestClient(app):
-            assert app.state.oauth is not None
+            assert app.state.auth_plugin is not None
+            assert isinstance(app.state.auth_plugin, AuthPlugin)
+            assert app.state.plugin_manager is not None
 
     @patch("inference_proxy.main.EtcdWatcher")
     @patch("inference_proxy.main.EtcdClient")
@@ -648,4 +651,5 @@ class TestLifespanOAuthWiring:
 
         app = create_app(settings=test_settings)
         with TestClient(app):
-            assert app.state.oauth is None
+            assert app.state.auth_plugin is None
+            assert app.state.plugin_manager is not None

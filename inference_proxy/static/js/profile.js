@@ -12,6 +12,9 @@
       "This Google account has an unverified email address and cannot sign in.",
     domain_not_allowed:
       "This Google account is not in the allowed domains for this gateway.",
+    not_whitelisted: "This account is not on the gateway whitelist.",
+    allowlist_unavailable:
+      "The whitelist service is unavailable. Please try again later.",
   };
 
   const $ = (id) => document.getElementById(id);

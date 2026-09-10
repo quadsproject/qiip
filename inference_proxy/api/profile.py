@@ -18,7 +18,16 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from inference_proxy.api.templating import templates
-from inference_proxy.auth.dependencies import get_auth_store, require_profile_user
+from inference_proxy.auth.allowlist import (
+    AllowlistUnavailableError,
+    SSOAllowlist,
+    enforce_allowlist,
+)
+from inference_proxy.auth.dependencies import (
+    get_auth_store,
+    get_sso_allowlist,
+    require_profile_user,
+)
 from inference_proxy.auth.models import (
     CreatedToken,
     CreateTokenRequest,
@@ -27,6 +36,8 @@ from inference_proxy.auth.models import (
     User,
 )
 from inference_proxy.auth.store import AuthStore
+from inference_proxy.config.dependencies import get_settings
+from inference_proxy.config.settings import Settings
 
 profile_router = APIRouter(prefix="/profile", tags=["profile"])
 
@@ -69,8 +80,28 @@ async def create_token(
     body: CreateTokenRequest,
     user: Annotated[User, Depends(require_profile_user)],
     store: Annotated[AuthStore, Depends(get_auth_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    allowlist: Annotated[SSOAllowlist | None, Depends(get_sso_allowlist)] = None,
 ) -> CreatedToken:
-    """Mint an API token; returns the raw secret exactly once (AUTH-02)."""
+    """Mint an API token; returns the raw secret exactly once (AUTH-02).
+
+    When ``auth.enforce_sso_whitelist`` is on, the signed-in user must be on
+    the fetched per-domain allowlist; otherwise 403. An unavailable
+    whitelist fails closed with 503. Tokens are the only credential accepted
+    on /v1, so this gate plus the use-time re-check in ``get_api_auth``
+    bounds inference access to allowlist members.
+    """
+    if settings.auth.enforce_sso_whitelist:
+        try:
+            allowed = await enforce_allowlist(user.email, allowlist)
+        except AllowlistUnavailableError:
+            raise HTTPException(
+                status_code=503, detail="SSO whitelist is unavailable"
+            ) from None
+        if not allowed:
+            raise HTTPException(
+                status_code=403, detail="User is not in the SSO whitelist"
+            )
     created = await asyncio.to_thread(store.create_token, user.id, body.name)
     return created
 

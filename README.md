@@ -473,6 +473,13 @@ the signed user id and expiry.
 | `INFERENCE_PROXY_AUTH__SESSION_TTL_SECONDS` | `43200` | Session lifetime (300 to 7 days) |
 | `INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS` | `false` | Require a valid bearer token for every `/v1` inference request |
 | `INFERENCE_PROXY_AUTH__REQUIRE_EMAIL_VERIFICATION` | `true` | Reject Google accounts whose email is not verified |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_URL` | unset | HTTPS URL returning a per-domain JSON whitelist, e.g. `{"example.com": ["alice", "bob"]}` |
+| `INFERENCE_PROXY_AUTH__ENFORCE_SSO_WHITELIST` | `false` | Gate SSO users on the per-domain username whitelist |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_POLL_INTERVAL` | `hourly` | Refresh cadence: `hourly` (top of the hour) or `daily` |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_POLL_TIME` | unset | `HH:MM` wall-clock refresh time; required with `daily` (server local time) |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_CACHE_FILE` | unset | Optional flat-file cache of the last successful document (warm start + inspection, atomically replaced) |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_EXTRA_USERS` | `[]` | Extra emails always allowed, merged over the fetched document |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_EXTRA_DOMAINS` | `[]` | Extra domains where any username is allowed, merged over the fetched document |
 
 Enablement and guardrails:
 
@@ -494,6 +501,52 @@ Enablement and guardrails:
 - `/v1/models`, `/health`, and the chat playground stay public in both modes.
 - Anonymously reached `/v1` requests are proxied but not attributed; only
   token-authenticated calls record per-token usage (AUTH-04).
+
+SSO whitelist (per-domain user filtering):
+
+- `sso_whitelist_url` and `enforce_sso_whitelist` must be set together;
+  either one without the other fails startup (a silently dead allowlist is
+  worse than none). The URL must be HTTPS, is fetched with a 5s/10s timeout,
+  does not follow redirects, and is capped at 1 MiB. The document maps
+  domains to username lists:
+  `{"example.com": ["alice", "bob"], "lab.example.com": ["carol"]}`.
+  Matching is case-insensitive on both the domain and the username. The
+  payload can live anywhere reachable over HTTPS: a static file, an S3
+  object, a config repo, or output from an LDAP/group export; the guard
+  rejects literal non-global IP addresses and `localhost` names, and DNS
+  names are operator-trusted (TLS still verified). Local grants do not
+  require the remote feed at all (`sso_whitelist_extra_users` /
+  `sso_whitelist_extra_domains`).
+- Domain-level control is the existing `oauth.allowed_domains` gate
+  (`domain_not_allowed` at sign-in); the whitelist adds username-level
+  filtering inside allowed domains.
+- Caching: the fetched document is held in memory and refreshed at the
+  configured cadence (hourly at the top of the hour, or daily at
+  `sso_whitelist_poll_time` in the server's local time) on the first
+  check after the window. The optional `sso_whitelist_cache_file` persists
+  the last successful document: it seeds a cold start and is atomically
+  replaced on refresh, and is only authoritative inside the current refresh
+  window. `sso_whitelist_extra_users` (emails) and
+  `sso_whitelist_extra_domains` (any username in the domain) are granted
+  locally on top of the fetched document, so specific accounts or domains
+  can be opened without touching the remote payload.
+- Enforcement points when the flag is on:
+  1. `/auth/callback`: a user not on the list is redirected with
+     `error=not_whitelisted` before any user row is created or session is
+     signed.
+  2. `POST /profile/tokens`: minting is denied with 403.
+  3. `/v1` token resolution: an already-minted token whose owner is no
+     longer listed is rejected with 401, so removals take effect on the
+     next request (within the refresh window).
+- Failure semantics are fail closed: if the URL is unreachable, returns a
+  non-200, or the document is invalid/oversized, minting returns 503, the
+  callback redirects with `error=allowlist_unavailable`, and presented
+  tokens are rejected. Stale cached data is never served past the refresh
+  window; a fetch failure enters a 30s cooldown so an outage does not queue
+  a fetch per request.
+- The whitelist governs the user identity, not anonymous traffic: while
+  `enforce_api_tokens` is `false`, `/v1` still accepts requests without a
+  token. Combine both flags to fully gate inference.
 
 Upgrading an existing deployment: with user auth disabled (the default) nothing
 changes. To roll out tokens without waking an oversight surface, first deploy
@@ -537,6 +590,26 @@ DNS endpoints must match an exact hostname or `*.suffix` rule. The configured
 provisioning vLLM port must also appear in the endpoint port allowlist. Setup
 requests whose generated backend endpoint is not allowed fail before any
 power, SSH, or installation work and name the allowlist setting to update.
+
+### Plugins
+
+QIIP uses a QUADS-style plugin architecture: category interfaces (currently
+`auth`), built-in implementations, and an optional external plugin directory.
+Plugins are configured through environment variables only (a YAML config may
+follow later).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INFERENCE_PROXY_PLUGINS__EXTERNAL_DIR` | unset | Optional directory scanned for external (downstream/third-party) plugins; module code executes at startup as the service user, so the directory must be root/user-owned and not group/world-writable |
+| `INFERENCE_PROXY_PLUGINS__DISABLED` | `[]` | Fully-qualified plugin names that are never loaded, e.g. `["auth.google"]` (JSON array) |
+| `INFERENCE_PROXY_PLUGINS__CONFIG` | `{}` | Per-plugin config keyed by plugin name, e.g. `{"myplugin":{"api_key":"..."}}` (JSON object) |
+
+External plugins are trusted code: discovery imports and executes them with
+the service user's privileges. They can never share a registered name with a
+built-in plugin, so to make an external plugin the active implementation of a
+category, give it a distinct name (e.g. `auth.okta`) and disable the built-in
+(`INFERENCE_PROXY_PLUGINS__DISABLED=["auth.google"]`); the built-in keeps its
+name and wins on any collision.
 
 ### SSH and provisioning commands
 
