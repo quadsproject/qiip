@@ -321,7 +321,7 @@ async def register_node(
             ),
         )
     try:
-        provisioner.validate_endpoint(hostname)
+        provisioner.validate_endpoint(hostname, body.port)
     except EndpointValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -350,7 +350,7 @@ async def register_node(
                     previous_model=node.model,
                 )
             try:
-                adopted = await provisioner.register_self_setup(hostname)
+                adopted = await provisioner.register_self_setup(hostname, body.port)
             except SelfSetupError as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             return JSONResponse(
@@ -362,7 +362,7 @@ async def register_node(
                     "self_setup": True,
                 },
             )
-        await provisioner.register_available(hostname)
+        await provisioner.register_available(hostname, body.port)
         return JSONResponse(
             status_code=201,
             content={"hostname": hostname, "state": "available"},
