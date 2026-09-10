@@ -325,14 +325,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 app.state.sso_allowlist = SSOAllowlist(
                     url=resolved_settings.auth.sso_whitelist_url,
-                    refresh_seconds=(
-                        resolved_settings.auth.sso_whitelist_refresh_seconds
-                    ),
+                    poll_interval=(resolved_settings.auth.sso_whitelist_poll_interval),
+                    poll_time=resolved_settings.auth.sso_whitelist_poll_time,
                     client=allowlist_http,
+                    cache_file=resolved_settings.auth.sso_whitelist_cache_file,
+                    extra_users=tuple(resolved_settings.auth.sso_whitelist_extra_users),
+                    extra_domains=tuple(
+                        resolved_settings.auth.sso_whitelist_extra_domains
+                    ),
                 )
                 logger.info(
                     "sso whitelist configured",
                     enforce=resolved_settings.auth.enforce_sso_whitelist,
+                    poll_interval=(resolved_settings.auth.sso_whitelist_poll_interval),
+                    cache_file=(
+                        str(resolved_settings.auth.sso_whitelist_cache_file)
+                        if resolved_settings.auth.sso_whitelist_cache_file is not None
+                        else None
+                    ),
                 )
             else:
                 app.state.sso_allowlist = None
