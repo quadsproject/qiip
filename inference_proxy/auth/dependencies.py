@@ -2,7 +2,7 @@
 
 Split responsibilities:
 
-* ``get_auth_store`` / ``get_oauth_client`` read the prepared singletons
+* ``get_auth_store`` / ``get_auth_plugin`` read the prepared singletons
   from ``app.state`` (created during the application lifespan).
 * ``require_profile_user`` authenticates the browser session cookie for the
   profile surface.
@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 from typing import Annotated
 
-from authlib.integrations.starlette_client import OAuth
 from fastapi import Depends, HTTPException, Request
 
 from inference_proxy.api.errors import ApiAuthError
@@ -24,6 +23,7 @@ from inference_proxy.auth.session import get_session_user_id
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.settings import Settings
+from inference_proxy.plugins.interfaces.auth import AuthPlugin
 
 
 def get_auth_store(request: Request) -> AuthStore:
@@ -34,12 +34,12 @@ def get_auth_store(request: Request) -> AuthStore:
     return store
 
 
-def get_oauth_client(request: Request) -> OAuth:
-    """Return the lifespan-created OAuth client, or 404 when disabled."""
-    oauth = getattr(request.app.state, "oauth", None)
-    if not isinstance(oauth, OAuth):
+def get_auth_plugin(request: Request) -> AuthPlugin:
+    """Return the lifespan-loaded auth plugin, or 404 when unconfigured."""
+    plugin = getattr(request.app.state, "auth_plugin", None)
+    if not isinstance(plugin, AuthPlugin) or not plugin.is_configured():
         raise HTTPException(status_code=404, detail="OAuth is not configured")
-    return oauth
+    return plugin
 
 
 async def require_profile_user(

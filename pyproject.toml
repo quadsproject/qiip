@@ -77,6 +77,7 @@ plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
 # authlib ships no type stubs; its public API is exercised through a thin
-# integration layer (auth/oauth.py) that keeps the untyped surface minimal.
+# integration layer (plugins/builtin/auth/google.py) that keeps the
+# untyped surface minimal.
 module = ["authlib.*"]
 ignore_missing_imports = true

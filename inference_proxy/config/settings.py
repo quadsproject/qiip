@@ -609,6 +609,32 @@ class RedfishSettings(BaseModel):
         return self
 
 
+class PluginSettings(BaseModel):
+    """Plugin loading configuration.
+
+    ``external_dir`` mirrors QUADS ``/opt/quads/plugins`` and is opt-in
+    (``None`` disables external scanning). External plugin modules execute
+    arbitrary code at startup as the service user, so only point this at a
+    directory you own or root owns that is not group/world-writable.
+    ``disabled`` holds fully-qualified plugin names (e.g. ``auth.google``)
+    that are never loaded. ``config`` maps a plugin name to its own config
+    dict (env JSON), e.g. ``{"myplugin": {"api_key": "..."}}``.
+    """
+
+    external_dir: Path | None = Field(
+        default=None,
+        description="Optional directory scanned for external plugins.",
+    )
+    disabled: list[str] = Field(
+        default_factory=list,
+        description="Fully-qualified plugin names that are never loaded.",
+    )
+    config: dict[str, dict[str, object]] = Field(
+        default_factory=dict,
+        description="Per-plugin configuration keyed by plugin name.",
+    )
+
+
 class Settings(BaseSettings):
     """Root application settings.
 
@@ -640,6 +666,7 @@ class Settings(BaseSettings):
     huggingface: HuggingFaceSettings
     auth: AuthSettings = AuthSettings()
     oauth: OAuthSettings = OAuthSettings()
+    plugins: PluginSettings = PluginSettings()
 
     @model_validator(mode="after")
     def oauth_requires_session_secret(self) -> Self:
