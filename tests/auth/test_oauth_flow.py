@@ -222,6 +222,22 @@ class TestAuthMe:
 
 
 class TestOAuthLogout:
+    def test_logout_without_sessions_redirects(self, test_settings: Settings) -> None:
+        from inference_proxy.main import create_app
+
+        no_session = test_settings.model_copy(
+            deep=True,
+            update={
+                "auth": test_settings.auth.model_copy(update={"session_secret": None})
+            },
+        )
+        client = TestClient(create_app(settings=no_session))
+
+        response = client.post("/auth/logout", follow_redirects=False)
+
+        assert response.status_code == 302
+        assert response.headers["location"] == "/profile"
+
     def test_logout_clears_session(
         self,
         app: FastAPI,
