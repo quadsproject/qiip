@@ -5,6 +5,7 @@ nested env var resolution works correctly through the root Settings class.
 Only the root Settings class inherits from BaseSettings.
 """
 
+import ipaddress
 import re
 from pathlib import Path
 from string import Formatter
@@ -537,6 +538,42 @@ class AuthSettings(BaseModel):
     session_ttl_seconds: int = Field(default=43_200, ge=300, le=7 * 86_400)
     enforce_api_tokens: bool = False
     require_email_verification: bool = True
+    sso_whitelist_url: str | None = None
+    enforce_sso_whitelist: bool = False
+    sso_whitelist_refresh_seconds: int = Field(default=300, ge=60, le=86_400)
+
+    @field_validator("sso_whitelist_url", mode="after")
+    @classmethod
+    def sso_whitelist_url_is_https(cls, value: str | None) -> str | None:
+        """Require an absolute HTTPS URL so the list cannot be tampered with."""
+        if value is None:
+            return None
+        if any(ord(character) < 32 for character in value):
+            raise ValueError(
+                "auth.sso_whitelist_url must not contain control characters"
+            )
+        parsed = urlsplit(value)
+        if parsed.scheme != "https" or parsed.hostname is None:
+            raise ValueError("auth.sso_whitelist_url must be an absolute HTTPS URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("auth.sso_whitelist_url must not contain credentials")
+        if parsed.fragment:
+            raise ValueError("auth.sso_whitelist_url must not contain a fragment")
+        hostname = parsed.hostname.lower()
+        if hostname == "localhost" or hostname.endswith(".localhost"):
+            raise ValueError(
+                "auth.sso_whitelist_url must not point at a localhost host"
+            )
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            address = None
+        if address is not None and not address.is_global:
+            raise ValueError(
+                "auth.sso_whitelist_url must not point at a private, "
+                "loopback, or link-local host"
+            )
+        return value
 
     @field_validator("session_cookie", mode="after")
     @classmethod
@@ -682,6 +719,27 @@ class Settings(BaseSettings):
             raise ValueError(
                 "auth.enforce_api_tokens requires oauth to be enabled so "
                 "users can create tokens"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def sso_whitelist_is_all_or_none(self) -> Self:
+        """Whitelist settings are paired: never a silently dead allowlist.
+
+        ``enforce_sso_whitelist`` without a URL would deny everyone at the
+        first gate; a URL without enforcement would run a dead whitelist.
+        Both directions fail fast.
+        """
+        has_url = self.auth.sso_whitelist_url is not None
+        if self.auth.enforce_sso_whitelist and not has_url:
+            raise ValueError(
+                "auth.sso_whitelist_url is required when "
+                "auth.enforce_sso_whitelist is enabled"
+            )
+        if has_url and not self.auth.enforce_sso_whitelist:
+            raise ValueError(
+                "auth.enforce_sso_whitelist is required when "
+                "auth.sso_whitelist_url is set"
             )
         return self
 

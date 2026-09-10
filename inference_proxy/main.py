@@ -39,6 +39,7 @@ from inference_proxy.api.errors import ApiAuthError
 from inference_proxy.api.middleware import RequestLoggingMiddleware
 from inference_proxy.api.profile import profile_router
 from inference_proxy.api.routes import router
+from inference_proxy.auth.allowlist import SSOAllowlist
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.logging import configure_logging
@@ -306,6 +307,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 app.state.auth_plugin = None
                 logger.info("auth plugin not loaded (disabled or unconfigured)")
+
+            if resolved_settings.auth.sso_whitelist_url is not None:
+                allowlist_http = httpx.AsyncClient(
+                    timeout=httpx.Timeout(
+                        connect=5.0,
+                        read=10.0,
+                        write=5.0,
+                        pool=5.0,
+                    ),
+                    follow_redirects=False,
+                )
+                resources.push_async_callback(
+                    _safe_async_cleanup,
+                    "allowlist HTTP client",
+                    allowlist_http.aclose,
+                )
+                app.state.sso_allowlist = SSOAllowlist(
+                    url=resolved_settings.auth.sso_whitelist_url,
+                    refresh_seconds=(
+                        resolved_settings.auth.sso_whitelist_refresh_seconds
+                    ),
+                    client=allowlist_http,
+                )
+                logger.info(
+                    "sso whitelist configured",
+                    enforce=resolved_settings.auth.enforce_sso_whitelist,
+                )
+            else:
+                app.state.sso_allowlist = None
 
             ssh_client = SSHClient(resolved_settings.ssh)
 

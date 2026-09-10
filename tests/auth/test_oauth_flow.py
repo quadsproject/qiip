@@ -9,11 +9,12 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from inference_proxy.auth.dependencies import get_auth_plugin
+from inference_proxy.auth.dependencies import get_auth_plugin, get_sso_allowlist
+from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.settings import OAuthSettings, Settings
 
-from .conftest import FakeAuthPluginBuilder
+from .conftest import FakeAllowlist, FakeAuthPluginBuilder
 
 
 def _client_with_auth(
@@ -200,6 +201,115 @@ class TestOAuthCallback:
             "/auth/callback?code=code&state=state", follow_redirects=False
         )
         assert allowed.headers["location"] == "/profile"
+
+
+class TestOAuthCallbackWhitelist:
+    """Callback gate: whitelist enforced before user upsert and session."""
+
+    @staticmethod
+    def _enforced_settings(test_settings: Settings) -> Settings:
+        auth = test_settings.auth.model_copy(
+            update={
+                "sso_whitelist_url": "https://allowlist.example.com/list.json",
+                "enforce_sso_whitelist": True,
+            }
+        )
+        return test_settings.model_copy(deep=True, update={"auth": auth})
+
+    def _client(
+        self,
+        app: FastAPI,
+        settings: Settings,
+        allowlist: object,
+        auth: object,
+    ) -> TestClient:
+        app.dependency_overrides[get_auth_plugin] = lambda: auth
+        app.dependency_overrides[get_settings] = lambda: settings
+        app.dependency_overrides[get_sso_allowlist] = lambda: allowlist
+        return TestClient(app)
+
+    def test_not_whitelisted_rejected_without_user_row(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        auth_store: AuthStore,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        client = self._client(
+            app,
+            TestOAuthCallbackWhitelist._enforced_settings(test_settings),
+            FakeAllowlist(allowed=False),
+            make_fake_auth_plugin(),
+        )
+
+        response = client.get(
+            "/auth/callback?code=code&state=state", follow_redirects=False
+        )
+
+        assert "error=not_whitelisted" in response.headers["location"]
+        count = auth_store._conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        assert count == 0
+
+    def test_whitelisted_user_signs_in(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        client = self._client(
+            app,
+            TestOAuthCallbackWhitelist._enforced_settings(test_settings),
+            FakeAllowlist(allowed=True),
+            make_fake_auth_plugin(),
+        )
+
+        response = client.get(
+            "/auth/callback?code=code&state=state", follow_redirects=False
+        )
+
+        assert response.headers["location"] == "/profile"
+        assert client.get("/auth/me").status_code == 200
+
+    def test_unavailable_allowlist_fails_closed(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        auth_store: AuthStore,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        client = self._client(
+            app,
+            TestOAuthCallbackWhitelist._enforced_settings(test_settings),
+            FakeAllowlist(raises=True),
+            make_fake_auth_plugin(),
+        )
+
+        response = client.get(
+            "/auth/callback?code=code&state=state", follow_redirects=False
+        )
+
+        assert "error=allowlist_unavailable" in response.headers["location"]
+        count = auth_store._conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        assert count == 0
+
+    def test_missing_allowlist_fails_closed(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        client = self._client(
+            app,
+            TestOAuthCallbackWhitelist._enforced_settings(test_settings),
+            None,
+            make_fake_auth_plugin(),
+        )
+
+        response = client.get(
+            "/auth/callback?code=code&state=state", follow_redirects=False
+        )
+
+        assert "error=allowlist_unavailable" in response.headers["location"]
 
 
 class TestAuthMe:

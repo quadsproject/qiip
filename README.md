@@ -473,6 +473,9 @@ the signed user id and expiry.
 | `INFERENCE_PROXY_AUTH__SESSION_TTL_SECONDS` | `43200` | Session lifetime (300 to 7 days) |
 | `INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS` | `false` | Require a valid bearer token for every `/v1` inference request |
 | `INFERENCE_PROXY_AUTH__REQUIRE_EMAIL_VERIFICATION` | `true` | Reject Google accounts whose email is not verified |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_URL` | unset | HTTPS URL returning a per-domain JSON whitelist, e.g. `{"example.com": ["alice", "bob"]}` |
+| `INFERENCE_PROXY_AUTH__ENFORCE_SSO_WHITELIST` | `false` | Gate SSO users on the per-domain username whitelist |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_REFRESH_SECONDS` | `300` | Cache TTL for the fetched whitelist (60 to 86400) |
 
 Enablement and guardrails:
 
@@ -494,6 +497,34 @@ Enablement and guardrails:
 - `/v1/models`, `/health`, and the chat playground stay public in both modes.
 - Anonymously reached `/v1` requests are proxied but not attributed; only
   token-authenticated calls record per-token usage (AUTH-04).
+
+SSO whitelist (per-domain user filtering):
+
+- `sso_whitelist_url` and `enforce_sso_whitelist` must be set together;
+  either one without the other fails startup (a silently dead allowlist is
+  worse than none). The URL must be HTTPS, is fetched with a 5s/10s timeout,
+  does not follow redirects, and is capped at 1 MiB. The document maps
+  domains to username lists:
+  `{"example.com": ["alice", "bob"], "lab.example.com": ["carol"]}`.
+  Matching is case-insensitive on both the domain and the username.
+- Domain-level control is the existing `oauth.allowed_domains` gate
+  (`domain_not_allowed` at sign-in); the whitelist adds username-level
+  filtering inside allowed domains.
+- Enforcement points when the flag is on:
+  1. `/auth/callback`: a user not on the list is redirected with
+     `error=not_whitelisted` before any user row is created or session is
+     signed.
+  2. `POST /profile/tokens`: minting is denied with 403.
+  3. `/v1` token resolution: an already-minted token whose owner is no
+     longer listed is rejected with 401, so removals take effect on the
+     next request (within the refresh TTL).
+- Failure semantics are fail closed: if the URL is unreachable, returns a
+  non-200, or the document is invalid/oversized, minting returns 503, the
+  callback redirects with `error=allowlist_unavailable`, and presented
+  tokens are rejected. Stale cached data is never served after the TTL.
+- The whitelist governs the user identity, not anonymous traffic: while
+  `enforce_api_tokens` is `false`, `/v1` still accepts requests without a
+  token. Combine both flags to fully gate inference.
 
 Upgrading an existing deployment: with user auth disabled (the default) nothing
 changes. To roll out tokens without waking an oversight surface, first deploy
