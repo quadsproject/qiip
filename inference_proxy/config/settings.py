@@ -486,6 +486,18 @@ class OAuthSettings(BaseModel):
             return None
         return value
 
+    @field_validator("client_secret", mode="before")
+    @classmethod
+    def blank_client_secret_is_none(cls, value: object) -> object:
+        """Treat empty/whitespace secrets as unset so provisioning stays predictable."""
+        if isinstance(value, SecretStr):
+            if not value.get_secret_value().strip():
+                return None
+            return value
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("redirect_uri", mode="after")
     @classmethod
     def redirect_uri_is_http_url(cls, value: str | None) -> str | None:

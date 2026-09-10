@@ -875,6 +875,30 @@ class TestOAuthSettings:
         assert oauth.client_id is None
         assert oauth.enabled is False
 
+    def test_blank_client_secret_treated_as_unset(self) -> None:
+        oauth = OAuthSettings(client_secret=SecretStr(""))
+        blank_secret = OAuthSettings(client_secret=SecretStr("   "))
+
+        assert oauth.client_secret is None
+        assert oauth.enabled is False
+        assert blank_secret.client_secret is None
+        assert blank_secret.enabled is False
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_blank_client_secret_str_treated_as_unset(self, value: str) -> None:
+        oauth = OAuthSettings(client_secret=value)
+
+        assert oauth.client_secret is None
+        assert oauth.enabled is False
+
+    def test_blank_secret_with_other_credentials_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="configured together"):
+            OAuthSettings(
+                client_id="abc",
+                client_secret=SecretStr("  "),
+                redirect_uri="https://host/auth/callback",
+            )
+
     @pytest.mark.parametrize(
         "bad_uri",
         [
