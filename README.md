@@ -510,7 +510,13 @@ SSO whitelist (per-domain user filtering):
   does not follow redirects, and is capped at 1 MiB. The document maps
   domains to username lists:
   `{"example.com": ["alice", "bob"], "lab.example.com": ["carol"]}`.
-  Matching is case-insensitive on both the domain and the username.
+  Matching is case-insensitive on both the domain and the username. The
+  payload can live anywhere reachable over HTTPS: a static file, an S3
+  object, a config repo, or output from an LDAP/group export; the guard
+  rejects literal non-global IP addresses and `localhost` names, and DNS
+  names are operator-trusted (TLS still verified). Local grants do not
+  require the remote feed at all (`sso_whitelist_extra_users` /
+  `sso_whitelist_extra_domains`).
 - Domain-level control is the existing `oauth.allowed_domains` gate
   (`domain_not_allowed` at sign-in); the whitelist adds username-level
   filtering inside allowed domains.

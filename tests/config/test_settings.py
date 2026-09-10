@@ -997,6 +997,8 @@ class TestAuthSettings:
     def test_sso_whitelist_extra_users_must_be_emails(self) -> None:
         with pytest.raises(ValidationError, match="emails"):
             AuthSettings(sso_whitelist_extra_users=["not-an-email"])
+        with pytest.raises(ValidationError, match="emails"):
+            AuthSettings(sso_whitelist_extra_users=["a @b.com"])
 
         auth = AuthSettings(
             sso_whitelist_extra_users=[" Alice@example.com ", "bob@other.com"]
@@ -1008,6 +1010,8 @@ class TestAuthSettings:
             AuthSettings(sso_whitelist_extra_domains=["user@example.com"])
         with pytest.raises(ValidationError, match="domains"):
             AuthSettings(sso_whitelist_extra_domains=["  "])
+        with pytest.raises(ValidationError, match="domains"):
+            AuthSettings(sso_whitelist_extra_domains=["exa mple.com"])
 
         auth = AuthSettings(sso_whitelist_extra_domains=[" Example.com "])
         assert auth.sso_whitelist_extra_domains == ["Example.com"]

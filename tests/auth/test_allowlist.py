@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
@@ -228,6 +229,21 @@ class TestSSOAllowlistCacheFile:
         assert json.loads(cache.read_text(encoding="utf-8")) == {
             "example.com": ["alice", "bob"]
         }
+        await client.aclose()
+
+    async def test_stale_seed_triggers_immediate_refetch(
+        self, tmp_path: Path, httpx_mock: HTTPXMock
+    ) -> None:
+        cache = tmp_path / "whitelist.json"
+        cache.write_text('{"example.com": ["alice"]}', encoding="utf-8")
+        old = time.time() - 72 * 3600
+        os.utime(cache, (old, old))
+        client = httpx.AsyncClient(follow_redirects=False)
+        allowlist = SSOAllowlist(_URL, "daily", "05:00", client, cache_file=cache)
+        httpx_mock.add_response(url=_URL, json={"example.com": ["alice", "bob"]})
+
+        assert await allowlist.is_allowed("alice@example.com") is True
+        assert len(httpx_mock.get_requests()) == 1
         await client.aclose()
 
     async def test_corrupt_seed_ignored(

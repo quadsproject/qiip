@@ -552,7 +552,9 @@ class AuthSettings(BaseModel):
         """Require valid email addresses for local user grants."""
         for item in value:
             normalized = item.strip()
-            if not normalized or any(ord(char) < 32 for char in item):
+            if not normalized or any(
+                ord(char) < 32 or char.isspace() for char in normalized
+            ):
                 raise ValueError(
                     "auth.sso_whitelist_extra_users entries must be emails"
                 )
@@ -568,7 +570,11 @@ class AuthSettings(BaseModel):
         """Require plain domain names for local domain grants."""
         for item in value:
             normalized = item.strip()
-            if not normalized or any(ord(char) < 32 for char in item) or "@" in item:
+            if (
+                not normalized
+                or any(ord(char) < 32 or char.isspace() for char in normalized)
+                or "@" in item
+            ):
                 raise ValueError(
                     "auth.sso_whitelist_extra_domains entries must be domains"
                 )
