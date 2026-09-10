@@ -333,6 +333,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     extra_domains=tuple(
                         resolved_settings.auth.sso_whitelist_extra_domains
                     ),
+                    default_domain=resolved_settings.auth.sso_whitelist_default_domain,
                 )
                 logger.info(
                     "sso whitelist configured",
