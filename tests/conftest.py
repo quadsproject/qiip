@@ -165,6 +165,7 @@ def app(
     application.state.redfish_client = None
     application.state.auth_store = auth_store
     application.state.auth_plugin = None
+    application.state.sso_allowlist = None
     application.dependency_overrides[get_auth_store] = lambda: auth_store
     application.dependency_overrides[get_proxy_client] = lambda: proxy_client
     application.dependency_overrides[get_quads_client] = lambda: None

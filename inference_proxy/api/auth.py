@@ -23,9 +23,15 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 
+from inference_proxy.auth.allowlist import (
+    AllowlistUnavailableError,
+    SSOAllowlist,
+    enforce_allowlist,
+)
 from inference_proxy.auth.dependencies import (
     get_auth_plugin,
     get_auth_store,
+    get_sso_allowlist,
     require_profile_user,
 )
 from inference_proxy.auth.models import PublicUser, User
@@ -78,14 +84,18 @@ async def oauth_callback(
     auth: Annotated[AuthPlugin, Depends(get_auth_plugin)],
     store: Annotated[AuthStore, Depends(get_auth_store)],
     settings: Annotated[Settings, Depends(get_settings)],
+    allowlist: Annotated[SSOAllowlist | None, Depends(get_sso_allowlist)] = None,
 ) -> RedirectResponse:
     """Handle the provider's post-login redirect, upsert the user, sign the session.
 
     The auth plugin validates the ID-token claims (authlib validates the
     JWT signature, issuer, audience, and nonce/state) and returns a
     normalized identity. Policy applied here is provider-neutral: email
-    presence, optional email-verification requirement, and the optional
-    hosted-domain allowlist.
+    presence, optional email-verification requirement, the optional
+    hosted-domain allowlist, and the optional SSO user whitelist. The
+    whitelist check runs before the user row is created and before the
+    session is signed, so a denied login never persists an account; an
+    unavailable whitelist fails closed with a redirect.
     """
     try:
         identity = await auth.complete_login(request)
@@ -107,6 +117,16 @@ async def oauth_callback(
     if allowed_domains and domain not in allowed_domains:
         logger.warning("oauth callback domain not allowed", email=email)
         return _error_redirect("domain_not_allowed")
+
+    if settings.auth.enforce_sso_whitelist:
+        try:
+            allowed = await enforce_allowlist(email, allowlist)
+        except AllowlistUnavailableError:
+            logger.warning("oauth callback whitelist unavailable", email=email)
+            return _error_redirect("allowlist_unavailable")
+        if not allowed:
+            logger.warning("oauth callback user not whitelisted", email=email)
+            return _error_redirect("not_whitelisted")
 
     # ponytail: google is the only provider; scope the stored subject by
     # issuer when a second auth provider lands (store keyed by google_sub).

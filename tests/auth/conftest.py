@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse
 from fastapi.testclient import TestClient
 
+from inference_proxy.auth.allowlist import AllowlistUnavailableError
 from inference_proxy.auth.dependencies import get_auth_plugin
 from inference_proxy.plugins.interfaces.auth import (
     AuthCallbackError,
@@ -79,6 +80,19 @@ class FakeAuthPlugin(AuthPlugin):
             name=name if isinstance(name, str) else "",
             picture=picture if isinstance(picture, str) else "",
         )
+
+
+class FakeAllowlist:
+    """Scripted SSOAllowlist: allow/deny everything, or raise unavailable."""
+
+    def __init__(self, allowed: bool = True, raises: bool = False) -> None:
+        self._allowed = allowed
+        self._raises = raises
+
+    async def is_allowed(self, _email: str) -> bool:
+        if self._raises:
+            raise AllowlistUnavailableError("scripted failure")
+        return self._allowed
 
 
 FakeAuthPluginBuilder = Callable[..., FakeAuthPlugin]
