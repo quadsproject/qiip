@@ -504,16 +504,20 @@ document.addEventListener("DOMContentLoaded", function () {
   form.addEventListener("submit", async function (e) {
     e.preventDefault();
     const input = document.getElementById("register-hostname");
+    const portInput = document.getElementById("register-port");
     const btn = document.getElementById("register-btn");
     const hostname = input.value.trim();
     if (!hostname) return;
     const adoptExisting = selfSetup.checked;
+    const body = { hostname, self_setup: adoptExisting };
+    const port = portInput.value.trim();
+    if (port) body.port = Number(port);
     btn.disabled = true;
     try {
       const resp = await fetch("/admin/nodes/pool", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ hostname, self_setup: adoptExisting }),
+        body: JSON.stringify(body),
       });
       if (resp.ok) {
         const data = await resp.json().catch(function () { return {}; });
@@ -528,6 +532,7 @@ document.addEventListener("DOMContentLoaded", function () {
           showToast(`${hostname} added to pool`, "success");
         }
         input.value = "";
+        portInput.value = "";
         selfSetup.checked = false;
         syncRegisterLabel();
         setTimeout(function () { btn.disabled = false; }, 2000);

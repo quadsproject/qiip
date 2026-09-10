@@ -414,9 +414,9 @@ class NodeProvisioner:
     def log_buffer(self) -> ProvisioningLogBuffer:
         return self._log_buffer
 
-    def validate_endpoint(self, hostname: str) -> str:
+    def validate_endpoint(self, hostname: str, port: int | None = None) -> str:
         """Return the canonical provisioned endpoint or fail with a config hint."""
-        candidate = f"{hostname}:{self._settings.vllm_port}"
+        candidate = f"{hostname}:{port or self._settings.vllm_port}"
         try:
             return self._endpoint_policy.normalize(candidate)
         except EndpointValidationError as exc:
@@ -1298,9 +1298,9 @@ class NodeProvisioner:
                     await keepalive
             self._log_buffer.mark_complete(hostname)
 
-    async def register_available(self, hostname: str, owner: str = "") -> None:
+    async def register_available(self, hostname: str, port: int | None = None, owner: str = "") -> None:
         """Register a hostname as available in the node pool (no provisioning)."""
-        endpoint = self.validate_endpoint(hostname)
+        endpoint = self.validate_endpoint(hostname, port)
         node = Node(
             node_id=hostname,
             endpoint=endpoint,
@@ -1313,8 +1313,8 @@ class NodeProvisioner:
         if self._registry is not None:
             self._registry.add(node)
 
-    async def register_self_setup(self, hostname: str, owner: str = "") -> Node:
-        """Adopt an already-running vLLM instance into the fleet.
+    async def register_self_setup(self, hostname: str, port: int | None = None, owner: str = "") -> Node:
+        """Adopt an already-running OpenAI-compatible server into the fleet.
 
         Adoption is based on the OpenAI-compatible contract (``GET
         /v1/models``); ``/health`` is probed best-effort only. This works for
@@ -1329,7 +1329,7 @@ class NodeProvisioner:
         restart with another primary model is refreshed on each re-adoption
         instead of silently keeping the first reported model forever.
         """
-        endpoint = self.validate_endpoint(hostname)
+        endpoint = self.validate_endpoint(hostname, port)
         model = await self._discover_running_model(endpoint, hostname)
         prior = self._registry.get(hostname) if self._registry is not None else None
         if prior is not None and prior.self_setup and prior.model != model:
