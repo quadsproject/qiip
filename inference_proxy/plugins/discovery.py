@@ -44,7 +44,8 @@ class PluginDiscovery:
     symlink; files must not be group/world-writable; an untrusted path is
     skipped with a warning. Plugins listed in *disabled* are never imported
     at all. External plugins can never shadow a built-in plugin of the same
-    key.
+    key (a warning is logged and the built-in wins); to replace a built-in,
+    disable it and register the external plugin under a distinct name.
     """
 
     def __init__(
