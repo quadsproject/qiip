@@ -893,6 +893,7 @@ async def test_llamacpp_custom_request_reaches_the_provisioning_body() -> None:
         engine=InferenceEngine.LLAMA_CPP,
         artifact=_artifact(),
         llamacpp_request=request,
+        owner="",
     )
     lease.release.assert_called_once_with()
 

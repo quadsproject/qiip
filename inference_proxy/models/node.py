@@ -252,6 +252,9 @@ class Node(BaseModel):
             registered nodes must opt in explicitly.
         self_setup: Whether the node was adopted from an already-running
             vLLM instance. These nodes are never torn down.
+        owner: Email of the endpoint owner. Empty means shared (any user
+            may route to it); an owner restricts routing to that user's
+            tokens and admin full-access tokens.
     """
 
     model_config = ConfigDict(frozen=True, extra="ignore")
@@ -268,6 +271,7 @@ class Node(BaseModel):
     active_connections: int = 0
     managed: bool = False
     self_setup: bool = False
+    owner: str = ""
 
     @model_validator(mode="after")
     def self_setup_is_unmanaged(self) -> Node:

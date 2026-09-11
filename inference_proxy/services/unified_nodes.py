@@ -113,6 +113,7 @@ class UnifiedNodeService:
             gpu_count=host.gpu_count if host else None,
             managed=node.managed,
             self_setup=node.self_setup,
+            owner=node.owner,
             failed_step=task.failed_step if task else None,
             error=task.error if task else None,
         )

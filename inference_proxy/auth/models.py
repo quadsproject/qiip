@@ -10,6 +10,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from inference_proxy.models.admin import _HOSTNAME_RE
+
 
 class User(BaseModel):
     """A Google-authenticated user row.
@@ -52,6 +54,7 @@ class ApiToken(BaseModel):
     created_at: datetime
     last_used_at: datetime | None
     revoked: bool
+    endpoint_scope: list[str] | None = None
 
 
 class CreatedToken(ApiToken):
@@ -74,6 +77,7 @@ class PublicToken(BaseModel):
     created_at: datetime
     last_used_at: datetime | None
     revoked: bool
+    endpoint_scope: list[str] | None = None
 
     @classmethod
     def from_token(cls, token: ApiToken) -> PublicToken:
@@ -85,6 +89,7 @@ class PublicToken(BaseModel):
             created_at=token.created_at,
             last_used_at=token.last_used_at,
             revoked=token.revoked,
+            endpoint_scope=token.endpoint_scope,
         )
 
 
@@ -94,6 +99,7 @@ class CreateTokenRequest(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     name: str = Field(min_length=1, max_length=100)
+    endpoints: list[str] | None = None
 
     @field_validator("name")
     @classmethod
@@ -102,6 +108,23 @@ class CreateTokenRequest(BaseModel):
         if value != value.strip():
             raise ValueError("token name must not have surrounding whitespace")
         return value
+
+    @field_validator("endpoints")
+    @classmethod
+    def endpoints_are_hostnames(cls, value: list[str] | None) -> list[str] | None:
+        """Require registered-node hostnames; empty list rejected (None = full)."""
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("endpoint scope must not be empty")
+        cleaned: list[str] = []
+        for item in value:
+            normalized = item.strip()
+            if not _HOSTNAME_RE.fullmatch(normalized):
+                raise ValueError("endpoint scope entries must be hostnames")
+            if normalized not in cleaned:
+                cleaned.append(normalized)
+        return cleaned
 
 
 class TokenUsage(BaseModel):

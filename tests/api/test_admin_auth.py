@@ -145,6 +145,7 @@ class TestAdminBasicAuthentication:
             artifact_id=None,
             vllm_params=None,
             lifecycle_lease=ANY,
+            owner="",
         )
 
     def test_every_admin_route_declares_auth_dependency(self, app: FastAPI) -> None:

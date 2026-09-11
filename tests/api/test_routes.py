@@ -34,6 +34,7 @@ def _make_node(
     endpoint: str = "10.0.1.100:8000",
     status: NodeStatus = NodeStatus.HEALTHY,
     model: str = "llama-3",
+    owner: str = "",
 ) -> Node:
     """Create a test node with sensible defaults."""
     return Node(
@@ -41,6 +42,7 @@ def _make_node(
         endpoint=endpoint,
         status=status,
         model=model,
+        owner=owner,
     )
 
 
@@ -451,6 +453,27 @@ class TestListModels:
         data = response.json()
         assert len(data["data"]) == 1
         assert data["data"][0]["id"] == "llama-3"
+
+    def test_list_models_hides_owned_nodes(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+    ) -> None:
+        """Owner-private node models are not listed publicly (contra review)."""
+        test_registry.add(_make_node(node_id="node-1", model="llama-3"))
+        test_registry.add(
+            _make_node(
+                node_id="node-2",
+                endpoint="10.0.1.101:8000",
+                model="private-model",
+                owner="alice@example.com",
+            )
+        )
+
+        response = client.get("/v1/models")
+
+        assert response.status_code == 200
+        assert [m["id"] for m in response.json()["data"]] == ["llama-3"]
 
 
 # ---------------------------------------------------------------------------

@@ -113,7 +113,7 @@
       const row = document.createElement("tr");
       const td = document.createElement("td");
       td.textContent = "No tokens yet. Create one to start tracking usage.";
-      td.colSpan = 6;
+      td.colSpan = 7;
       td.className = "muted-status";
       row.appendChild(td);
       body.appendChild(row);
@@ -126,6 +126,13 @@
       row.appendChild(tdCell(token.revoked ? "-" : formatDate(token.created_at)));
       row.appendChild(tdCell(token.last_used_at ? formatDate(token.last_used_at) : "never"));
       row.appendChild(tdCell(token.revoked ? "revoked" : "active"));
+      row.appendChild(
+        tdCell(
+          token.endpoint_scope && token.endpoint_scope.length
+            ? token.endpoint_scope.join(", ")
+            : "Full access"
+        )
+      );
       const actions = document.createElement("td");
       actions.appendChild(revokeButton(token));
       row.appendChild(actions);
@@ -149,24 +156,61 @@
     loadTokens();
   }
 
+  async function loadEndpoints() {
+    const select = $("token-endpoints");
+    clearChildren(select);
+    try {
+      const resp = await fetch("/profile/endpoints");
+      if (resp.ok) {
+        const endpoints = await resp.json();
+        if (endpoints.length === 0) {
+          const option = document.createElement("option");
+          option.value = "";
+          option.textContent = "No endpoints available to pin";
+          option.disabled = true;
+          select.appendChild(option);
+          return;
+        }
+        for (const endpoint of endpoints) {
+          const option = document.createElement("option");
+          option.value = endpoint.node_id;
+          option.textContent = endpoint.model
+            ? endpoint.node_id + " (" + endpoint.model + ")"
+            : endpoint.node_id;
+          select.appendChild(option);
+        }
+      }
+    } catch (_err) {
+      // leave the empty option in place; scoping is optional
+    }
+  }
+
   function wireTokenForm() {
     const toggle = $("token-toggle");
     const form = $("token-form");
     toggle.addEventListener("click", () => {
       form.hidden = !form.hidden;
-      if (!form.hidden) $("token-name").focus();
+      if (!form.hidden) {
+        loadEndpoints();
+        $("token-name").focus();
+      }
     });
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const name = $("token-name").value.trim();
       if (!name) return;
+      const selected = Array.from($("token-endpoints").selectedOptions).map(
+        (option) => option.value
+      );
+      const body = { name: name };
+      if (selected.length > 0) body.endpoints = selected;
       const button = $("token-create-btn");
       button.disabled = true;
       try {
         const resp = await fetch("/profile/tokens", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name: name }),
+          body: JSON.stringify(body),
         });
         if (resp.status === 401) return showSignInRequired();
         if (!resp.ok) {

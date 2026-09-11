@@ -25,6 +25,7 @@ from inference_proxy.auth.allowlist import (
     enforce_allowlist,
 )
 from inference_proxy.auth.models import TokenAuth, User
+from inference_proxy.auth.scopes import is_full_access
 from inference_proxy.auth.session import get_session_user_id
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import get_settings
@@ -130,9 +131,12 @@ async def _enforce_sso_whitelist(
 
     Applies whenever ``enforce_sso_whitelist`` is on, independent of
     ``enforce_api_tokens``: a presented credential must belong to a current
-    allowlist member. Fail closed on an unavailable whitelist.
+    allowlist member. Fail closed on an unavailable whitelist. The admin
+    full-access trust list bypasses this gate (RFE #107).
     """
     if not settings.auth.enforce_sso_whitelist:
+        return
+    if is_full_access(auth.user.email, settings):
         return
     try:
         allowed = await enforce_allowlist(auth.user.email, allowlist)

@@ -35,9 +35,11 @@ from inference_proxy.auth.models import (
     PublicUser,
     User,
 )
+from inference_proxy.auth.scopes import is_full_access, pickable_endpoints
 from inference_proxy.auth.store import AuthStore
-from inference_proxy.config.dependencies import get_settings
+from inference_proxy.config.dependencies import get_registry, get_settings
 from inference_proxy.config.settings import Settings
+from inference_proxy.discovery.registry import NodeRegistry
 
 profile_router = APIRouter(prefix="/profile", tags=["profile"])
 
@@ -81,6 +83,7 @@ async def create_token(
     user: Annotated[User, Depends(require_profile_user)],
     store: Annotated[AuthStore, Depends(get_auth_store)],
     settings: Annotated[Settings, Depends(get_settings)],
+    registry: NodeRegistry = Depends(get_registry),
     allowlist: Annotated[SSOAllowlist | None, Depends(get_sso_allowlist)] = None,
 ) -> CreatedToken:
     """Mint an API token; returns the raw secret exactly once (AUTH-02).
@@ -90,8 +93,13 @@ async def create_token(
     whitelist fails closed with 503. Tokens are the only credential accepted
     on /v1, so this gate plus the use-time re-check in ``get_api_auth``
     bounds inference access to allowlist members.
+
+    An optional ``endpoints`` pin must reference registered nodes the user
+    may route to: an unknown hostname is rejected (400) and a node owned by
+    someone else is rejected (403). Admins may pin any registered node.
     """
-    if settings.auth.enforce_sso_whitelist:
+    admin = is_full_access(user.email, settings)
+    if settings.auth.enforce_sso_whitelist and not admin:
         try:
             allowed = await enforce_allowlist(user.email, allowlist)
         except AllowlistUnavailableError:
@@ -102,8 +110,37 @@ async def create_token(
             raise HTTPException(
                 status_code=403, detail="User is not in the SSO whitelist"
             )
-    created = await asyncio.to_thread(store.create_token, user.id, body.name)
+    if body.endpoints is not None:
+        email = user.email.lower()
+        for hostname in body.endpoints:
+            node = registry.get(hostname)
+            if node is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Endpoint '{hostname}' is not a registered node",
+                )
+            if not admin and node.owner and node.owner.lower() != email:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Endpoint '{hostname}' is owned by another user",
+                )
+    created = await asyncio.to_thread(
+        store.create_token, user.id, body.name, body.endpoints
+    )
     return created
+
+
+@profile_router.get("/endpoints")
+async def list_pickable_endpoints(
+    user: Annotated[User, Depends(require_profile_user)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    registry: NodeRegistry = Depends(get_registry),
+) -> list[dict[str, str]]:
+    """List endpoints the signed-in user may pin a token to."""
+    nodes = registry.get_all()
+    pickable = pickable_endpoints(user.email, settings, nodes)
+    by_id = {node.node_id: node for node in nodes}
+    return [{"node_id": node_id, "model": by_id[node_id].model} for node_id in pickable]
 
 
 @profile_router.delete("/tokens/{token_id}")

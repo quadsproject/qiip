@@ -269,3 +269,151 @@ class TestHasModel:
         selector, _, _ = _make_selector([node])
 
         assert selector.has_model("llama-3") is True
+
+
+class TestScopeFilters:
+    """Endpoint pin and owner isolation filters (RFE #107)."""
+
+    def test_pin_restricts_to_allowed_nodes(self) -> None:
+        node_a = _make_node("node-a", "http://10.0.1.100:8000")
+        node_b = _make_node("node-b", "http://10.0.1.200:8000")
+        selector, _, _ = _make_selector([node_a, node_b])
+
+        result = selector.select_and_reserve(allowed_node_ids=frozenset({"node-b"}))
+
+        assert result is not None
+        assert result.node.node_id == "node-b"
+
+    def test_pin_with_no_matching_node_returns_none(self) -> None:
+        node_a = _make_node("node-a", "http://10.0.1.100:8000")
+        selector, _, _ = _make_selector([node_a])
+
+        result = selector.select(allowed_node_ids=frozenset({"elsewhere"}))
+
+        assert result is None
+
+    def test_failover_stays_inside_pin(self) -> None:
+        node_a = _make_node("node-a", "http://10.0.1.100:8000")
+        node_b = _make_node("node-b", "http://10.0.1.200:8000")
+        selector, _, _ = _make_selector([node_a, node_b])
+        allowed = frozenset({"node-a", "node-b"})
+
+        # Excluding node-a (a failed retry) still selects node-b
+        result = selector.select(exclude_node_ids={"node-a"}, allowed_node_ids=allowed)
+
+        assert result is not None
+        assert result.node_id == "node-b"
+
+    def test_exclude_is_intersected_with_pin(self) -> None:
+        node_a = _make_node("node-a", "http://10.0.1.100:8000")
+        selector, _, _ = _make_selector([node_a])
+        allowed = frozenset({"node-a"})
+
+        result = selector.select(exclude_node_ids={"node-a"}, allowed_node_ids=allowed)
+
+        assert result is None
+
+    def test_owner_filter_excludes_other_users_nodes(self) -> None:
+        shared = _make_node("shared", "http://10.0.1.100:8000")
+        mine = Node(
+            node_id="mine",
+            endpoint="http://10.0.1.200:8000",
+            status=NodeStatus.HEALTHY,
+            owner="alice@example.com",
+        )
+        theirs = Node(
+            node_id="theirs",
+            endpoint="http://10.0.1.300:8000",
+            status=NodeStatus.HEALTHY,
+            owner="bob@example.com",
+        )
+        selector, _, _ = _make_selector([shared, mine, theirs])
+
+        result = selector.select(owner="alice@example.com")
+        assert result is not None
+        assert result.node_id in {"shared", "mine"}
+
+    def test_anonymous_only_reaches_unowned(self) -> None:
+        mine = Node(
+            node_id="mine",
+            endpoint="http://10.0.1.200:8000",
+            status=NodeStatus.HEALTHY,
+            owner="alice@example.com",
+        )
+        selector, _, _ = _make_selector([mine])
+
+        assert selector.select(owner="") is None
+
+    def test_admin_bypasses_owner_filter(self) -> None:
+        theirs = Node(
+            node_id="theirs",
+            endpoint="http://10.0.1.300:8000",
+            status=NodeStatus.HEALTHY,
+            owner="bob@example.com",
+        )
+        selector, _, _ = _make_selector([theirs])
+
+        result = selector.select(owner=None)
+        assert result is not None
+        assert result.node_id == "theirs"
+
+    def test_has_model_respects_scope(self) -> None:
+        node_a = _make_node("node-a", "http://10.0.1.100:8000", model="llama-3")
+        node_b = _make_node("node-b", "http://10.0.1.200:8000", model="mistral")
+        selector, _, _ = _make_selector([node_a, node_b])
+
+        assert selector.has_model("llama-3")
+        assert not selector.has_model("llama-3", allowed_node_ids=frozenset({"node-b"}))
+        private = Node(
+            node_id="node-c",
+            endpoint="http://10.0.1.300:8000",
+            model="llama-3",
+            owner="bob@example.com",
+        )
+        selector, _, _ = _make_selector([private])
+        assert not selector.has_model("llama-3", owner="alice@example.com")
+        assert selector.has_model("llama-3", owner=None)
+
+
+class TestOwnerCaseInsensitive:
+    """Owner matching compares emails caselessly (deep review)."""
+
+    def test_owner_reaches_owned_node_any_case(self) -> None:
+        owned = Node(
+            node_id="node-1",
+            endpoint="http://10.0.1.100:8000",
+            status=NodeStatus.HEALTHY,
+            model="llama-3",
+            owner="Alice@Example.com",
+        )
+        selector, _, _ = _make_selector([owned])
+
+        result = selector.select(model="llama-3", owner="alice@example.com")
+
+        assert result is not None
+        assert result.node_id == "node-1"
+
+    def test_other_owner_cannot_reach(self) -> None:
+        owned = Node(
+            node_id="node-1",
+            endpoint="http://10.0.1.100:8000",
+            status=NodeStatus.HEALTHY,
+            model="llama-3",
+            owner="Alice@Example.com",
+        )
+        selector, _, _ = _make_selector([owned])
+
+        assert selector.select(model="llama-3", owner="bob@example.com") is None
+        assert not selector.has_model("llama-3", owner="bob@example.com")
+
+    def test_has_model_matches_caselessly(self) -> None:
+        owned = Node(
+            node_id="node-1",
+            endpoint="http://10.0.1.100:8000",
+            status=NodeStatus.HEALTHY,
+            model="llama-3",
+            owner="Alice@Example.com",
+        )
+        selector, _, _ = _make_selector([owned])
+
+        assert selector.has_model("llama-3", owner="alice@example.com")

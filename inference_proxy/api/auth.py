@@ -35,6 +35,7 @@ from inference_proxy.auth.dependencies import (
     require_profile_user,
 )
 from inference_proxy.auth.models import PublicUser, User
+from inference_proxy.auth.scopes import is_full_access
 from inference_proxy.auth.session import (
     clear_session_user,
     get_session_user_id,
@@ -118,7 +119,7 @@ async def oauth_callback(
         logger.warning("oauth callback domain not allowed", email=email)
         return _error_redirect("domain_not_allowed")
 
-    if settings.auth.enforce_sso_whitelist:
+    if settings.auth.enforce_sso_whitelist and not is_full_access(email, settings):
         try:
             allowed = await enforce_allowlist(email, allowlist)
         except AllowlistUnavailableError:

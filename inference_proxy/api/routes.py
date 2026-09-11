@@ -38,6 +38,7 @@ from inference_proxy.api.errors import (
 )
 from inference_proxy.auth.dependencies import get_api_auth, get_auth_store
 from inference_proxy.auth.models import TokenAuth
+from inference_proxy.auth.scopes import auth_scope
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import (
     get_circuit_breaker_registry,
@@ -56,7 +57,11 @@ from inference_proxy.models.openai import (
 )
 from inference_proxy.proxy.client import ProxyClient
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
-from inference_proxy.routing.node_selector import NodeReservation, NodeSelector
+from inference_proxy.routing.node_selector import (
+    NodeReservation,
+    NodeSelector,
+    _in_scope,
+)
 from inference_proxy.routing.request_metrics import RequestMetrics
 
 logger = structlog.get_logger()
@@ -67,20 +72,23 @@ router = APIRouter()
 def _select_error(
     model: str | None,
     node_selector: NodeSelector,
+    allowed_node_ids: frozenset[str] | None = None,
+    owner: str | None = None,
 ) -> tuple[int, Any]:
     """Return the appropriate error when node selection fails.
 
     Distinguishes between:
-    - 503 no_nodes: no nodes registered at all
-    - 404 model_not_found: nodes exist but none (any status) serve the model
+    - 503 no_nodes: no nodes registered at all (or none within scope)
+    - 404 model_not_found: nodes exist but none serve the model
     - 503 model_unavailable: nodes serve the model but all are draining/unhealthy
     """
     all_nodes = node_selector._registry.get_all()
-    if not all_nodes:
+    scoped = [node for node in all_nodes if _in_scope(node, allowed_node_ids, owner)]
+    if not scoped:
         return no_nodes_error()
-    if model and not node_selector.has_model(model):
-        return model_not_found_error(model)
-    if model and node_selector.has_model(model):
+    if model:
+        if not any(node.model == model for node in scoped):
+            return model_not_found_error(model)
         return model_unavailable_error(model)
     return no_nodes_error()
 
@@ -335,6 +343,8 @@ async def _proxy_non_streaming(
     starlette_request: StarletteRequest | None = None,
     usage_store: AuthStore | None = None,
     usage_auth: TokenAuth | None = None,
+    allowed_node_ids: frozenset[str] | None = None,
+    owner: str | None = None,
 ) -> JSONResponse:
     """Forward a non-streaming request with retry-on-failover.
 
@@ -358,6 +368,8 @@ async def _proxy_non_streaming(
         reservation = node_selector.select_and_reserve(
             model=model,
             exclude_node_ids=excluded or None,
+            allowed_node_ids=allowed_node_ids,
+            owner=owner,
         )
         if reservation is None:
             if last_error is not None:
@@ -368,7 +380,9 @@ async def _proxy_non_streaming(
                     failover_exhausted=True,
                     attempts=attempts,
                 )
-            status, error_resp = _select_error(model, node_selector)
+            status, error_resp = _select_error(
+                model, node_selector, allowed_node_ids, owner
+            )
             return JSONResponse(content=error_resp.model_dump(), status_code=status)
         node = reservation.node
         attempts += 1
@@ -471,6 +485,7 @@ async def chat_completions(
     body["messages"] = [
         message.model_dump(exclude_unset=True) for message in request.messages
     ]
+    allowed, owner = auth_scope(usage_auth, settings)
     if request.stream:
         return await _stream_completion(
             endpoint_path="/v1/chat/completions",
@@ -484,6 +499,8 @@ async def chat_completions(
             handshake_timeout=settings.routing.timeout,
             usage_store=usage_store,
             usage_auth=usage_auth,
+            allowed_node_ids=allowed,
+            owner=owner,
         )
     return await _proxy_non_streaming(
         "/v1/chat/completions",
@@ -496,6 +513,8 @@ async def chat_completions(
         starlette_request=starlette_request,
         usage_store=usage_store,
         usage_auth=usage_auth,
+        allowed_node_ids=allowed,
+        owner=owner,
     )
 
 
@@ -522,6 +541,7 @@ async def text_completions(
     the request for usage tracking; enforcement is config-gated.
     """
     body = request.model_dump(exclude_none=True)
+    allowed, owner = auth_scope(usage_auth, settings)
     if request.stream:
         return await _stream_completion(
             endpoint_path="/v1/completions",
@@ -535,6 +555,8 @@ async def text_completions(
             handshake_timeout=settings.routing.timeout,
             usage_store=usage_store,
             usage_auth=usage_auth,
+            allowed_node_ids=allowed,
+            owner=owner,
         )
     return await _proxy_non_streaming(
         "/v1/completions",
@@ -547,6 +569,8 @@ async def text_completions(
         starlette_request=starlette_request,
         usage_store=usage_store,
         usage_auth=usage_auth,
+        allowed_node_ids=allowed,
+        owner=owner,
     )
 
 
@@ -558,13 +582,16 @@ async def list_models(
 
     Aggregates model names from all healthy registered nodes,
     deduplicating by model name.  DRAINING nodes are excluded so
-    clients only see models that can accept new requests.
+    clients only see models that can accept new requests.  Nodes owned
+    by a user are private (RFE #107) and their models are not listed.
     """
     nodes = node_selector._registry.get_all()
     models_seen: dict[str, dict[str, str | int]] = {}
 
     for node in nodes:
         if node.status != NodeStatus.HEALTHY:
+            continue
+        if node.owner:
             continue
         if node.model and node.model not in models_seen:
             models_seen[node.model] = {
@@ -594,6 +621,8 @@ async def _stream_completion(
     handshake_timeout: float = 30,
     usage_store: AuthStore | None = None,
     usage_auth: TokenAuth | None = None,
+    allowed_node_ids: frozenset[str] | None = None,
+    owner: str | None = None,
 ) -> JSONResponse | EventSourceResponse:
     """Establish a backend SSE stream, then expose it to the client.
 
@@ -619,6 +648,8 @@ async def _stream_completion(
         reservation = node_selector.select_and_reserve(
             model=model,
             exclude_node_ids=excluded or None,
+            allowed_node_ids=allowed_node_ids,
+            owner=owner,
         )
         if reservation is None:
             if last_error is not None:
@@ -629,7 +660,9 @@ async def _stream_completion(
                     failover_exhausted=True,
                     attempts=attempts,
                 )
-            status, error_resp = _select_error(model, node_selector)
+            status, error_resp = _select_error(
+                model, node_selector, allowed_node_ids, owner
+            )
             return JSONResponse(content=error_resp.model_dump(), status_code=status)
 
         node = reservation.node

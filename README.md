@@ -237,9 +237,10 @@ signed-in session):
 |--------|------|-------------|
 | `GET` | `/profile/me` | Public identity of the signed-in user |
 | `GET` | `/profile/tokens` | List the user's API tokens (prefix only) |
-| `POST` | `/profile/tokens` | Mint a token; returns the raw secret exactly once |
+| `POST` | `/profile/tokens` | Mint a token; accepts an optional `endpoints` pin (hostnames); returns the raw secret exactly once |
 | `DELETE` | `/profile/tokens/{id}` | Revoke a token |
 | `GET` | `/profile/usage` | Aggregated usage per token/model plus headline totals |
+| `GET` | `/profile/endpoints` | Registered nodes the user may pin (unowned nodes plus nodes they own) |
 
 HTTP Basic-protected administrative endpoints:
 
@@ -253,6 +254,7 @@ HTTP Basic-protected administrative endpoints:
 | `POST` | `/admin/nodes/setup` | Start background node provisioning |
 | `POST` | `/admin/nodes/{hostname}/llamacpp/relaunch` | Drain and relaunch a healthy managed llama.cpp node with a typed sizing policy |
 | `DELETE` | `/admin/nodes/{node_id}` | Drain and tear down a node; supports force and the scoped recovery procedure below |
+| `PATCH` | `/admin/nodes/{node_id}/owner` | Set or clear a node's owner email (`"owner": ""` clears it) |
 | `GET` | `/admin/provisioning/tasks` | List provisioning task states |
 | `GET` | `/admin/provisioning/{hostname}/logs` | Stream provisioning logs over SSE |
 | `GET` | `/admin/quads/status` | QUADS integration and cache status |
@@ -481,6 +483,7 @@ the signed user id and expiry.
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_CACHE_FILE` | unset | Optional flat-file cache of the last successful document (warm start + inspection, atomically replaced) |
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_EXTRA_USERS` | `[]` | Extra emails always allowed, merged over the fetched document |
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_EXTRA_DOMAINS` | `[]` | Extra domains where any username is allowed, merged over the fetched document |
+| `INFERENCE_PROXY_AUTH__ADMIN_ONLY_TOKENS_FULL_ACCESS` | `[]` | Emails whose tokens bypass endpoint scoping, owner isolation, and the SSO whitelist gate; they may pin tokens to any endpoint |
 
 Enablement and guardrails:
 
@@ -499,7 +502,9 @@ Enablement and guardrails:
   preserve fully public `/v1` deployments; set
   `INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS=true` once you want to require a
   token.
-- `/v1/models`, `/health`, and the chat playground stay public in both modes.
+- `/v1/models`, `/health`, and the chat playground stay public in both modes;
+  `/v1/models` lists only models served by unowned nodes (owner-private models
+  are never enumerated).
 - Anonymously reached `/v1` requests are proxied but not attributed; only
   token-authenticated calls record per-token usage (AUTH-04).
 
@@ -553,6 +558,36 @@ SSO whitelist (per-domain user filtering):
 - The whitelist governs the user identity, not anonymous traffic: while
   `enforce_api_tokens` is `false`, `/v1` still accepts requests without a
   token. Combine both flags to fully gate inference.
+
+Endpoint scoping (per-token pins and owner isolation):
+
+- A token may be pinned at creation to one or more endpoint hostnames
+  (`POST /profile/tokens` with `endpoints: ["host1.example.com"]`, selected
+  via the profile page). A pinned token routes only to those nodes — node
+  selection and retry/failover stay inside the pin — and requests whose
+  model exists only off-pin get the normal 404/503 error mapping.
+- Nodes may carry an `owner` (email) set at registration
+  (`POST /admin/nodes/pool`, `POST /admin/nodes/setup`) or later with
+  `PATCH /admin/nodes/{node_id}/owner` (empty string clears it). An owned
+  node is reachable only by that owner's tokens and admin full-access
+  tokens; unowned nodes stay shared. Node selection and `/v1` routing are
+  filtered accordingly for every caller, including anonymous requests, so
+  owned endpoints are never reached by other users' tokens or by
+  anonymous traffic.
+- `GET /profile/endpoints` lists the registered nodes the signed-in user may
+  pin (unowned nodes plus nodes they own); admins see everything. Minting
+  rejects unknown hostnames (400) and nodes owned by someone else (403), and
+  rejects an empty pin.
+- `/v1/models` never lists models served by owner-private nodes, so ownership
+  stays private even on the public catalog.
+- `admin_only_tokens_full_access` is a small static trust list of emails.
+  Those users' tokens bypass the endpoint pin, owner isolation, and the SSO
+  whitelist gate (login, mint, and use time), and may pin tokens to any
+  endpoint. Tokens are still required and OAuth sign-in still applies.
+- Scoping is enforced at the gateway. Node detail pages and dashboards are
+  admin-only (HTTP Basic), but backend origins are operator-visible
+  surface: keep backends of owned nodes off untrusted networks, because a
+  direct backend URL bypasses the gateway entirely.
 
 Upgrading an existing deployment: with user auth disabled (the default) nothing
 changes. To roll out tokens without waking an oversight surface, first deploy

@@ -47,6 +47,21 @@ def _validate_sha256(value: str, *, setting: str) -> str:
     return normalized
 
 
+def _clean_emails(value: list[str], setting: str) -> list[str]:
+    """Strip, lowercase, and validate a configured email list."""
+    cleaned: list[str] = []
+    for item in value:
+        normalized = item.strip().lower()
+        if not normalized or any(
+            ord(char) < 32 or char.isspace() for char in normalized
+        ):
+            raise ValueError(f"{setting} entries must be emails")
+        if normalized.count("@") != 1:
+            raise ValueError(f"{setting} entries must be emails")
+        cleaned.append(normalized)
+    return cleaned
+
+
 class EtcdSettings(BaseModel):
     """etcd service discovery configuration."""
 
@@ -558,24 +573,19 @@ class AuthSettings(BaseModel):
     sso_whitelist_cache_file: Path | None = None
     sso_whitelist_extra_users: list[str] = Field(default_factory=list)
     sso_whitelist_extra_domains: list[str] = Field(default_factory=list)
+    admin_only_tokens_full_access: list[str] = Field(default_factory=list)
+
+    @field_validator("admin_only_tokens_full_access")
+    @classmethod
+    def admin_only_tokens_full_access_are_emails(cls, value: list[str]) -> list[str]:
+        """Require valid email addresses for the full-access trust list."""
+        return _clean_emails(value, "auth.admin_only_tokens_full_access")
 
     @field_validator("sso_whitelist_extra_users")
     @classmethod
     def sso_whitelist_extra_users_are_emails(cls, value: list[str]) -> list[str]:
         """Require valid email addresses for local user grants."""
-        for item in value:
-            normalized = item.strip()
-            if not normalized or any(
-                ord(char) < 32 or char.isspace() for char in normalized
-            ):
-                raise ValueError(
-                    "auth.sso_whitelist_extra_users entries must be emails"
-                )
-            if normalized.count("@") != 1:
-                raise ValueError(
-                    "auth.sso_whitelist_extra_users entries must be emails"
-                )
-        return [item.strip() for item in value]
+        return _clean_emails(value, "auth.sso_whitelist_extra_users")
 
     @field_validator("sso_whitelist_default_domain")
     @classmethod

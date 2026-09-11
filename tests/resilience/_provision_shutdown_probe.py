@@ -62,6 +62,7 @@ async def _main(cache_dir: Path) -> None:
         engine: str = "vllm",
         artifact: object | None = None,
         vllm_params: object | None = None,
+        owner: str = "",
     ) -> None:
         del hostname, managed, model, engine, artifact, vllm_params
         started.set()

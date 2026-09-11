@@ -1027,7 +1027,7 @@ class TestAuthSettings:
         auth = AuthSettings(
             sso_whitelist_extra_users=[" Alice@example.com ", "bob@other.com"]
         )
-        assert auth.sso_whitelist_extra_users == ["Alice@example.com", "bob@other.com"]
+        assert auth.sso_whitelist_extra_users == ["alice@example.com", "bob@other.com"]
 
     def test_sso_whitelist_extra_domains_must_be_plain(self) -> None:
         with pytest.raises(ValidationError, match="domains"):
@@ -1145,6 +1145,27 @@ class TestAuthRootValidators:
         settings = Settings(_env_file=None)
 
         assert settings.auth.enforce_api_tokens is True
+
+
+class TestAdminFullAccessSetting:
+    """admin_only_tokens_full_access validation (RFE #107)."""
+
+    def test_valid_emails_accepted_and_stripped(self) -> None:
+        auth = AuthSettings(
+            admin_only_tokens_full_access=[" Ops@example.com ", "alice@example.com"]
+        )
+        assert auth.admin_only_tokens_full_access == [
+            "ops@example.com",
+            "alice@example.com",
+        ]
+
+    def test_invalid_entries_rejected(self) -> None:
+        for bad in ("not-an-email", "a @b.com", ""):
+            with pytest.raises(ValidationError, match="full_access"):
+                AuthSettings(admin_only_tokens_full_access=[bad])
+
+    def test_default_is_empty(self) -> None:
+        assert AuthSettings().admin_only_tokens_full_access == []
 
 
 class TestSSOWhitelistDefaultDomain:

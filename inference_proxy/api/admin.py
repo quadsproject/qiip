@@ -9,7 +9,6 @@ and circuit breaker state for the operations dashboard.
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -42,12 +41,14 @@ from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.llmfit.errors import LLMFitParseError, LLMFitTimeoutError
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.admin import (
+    _HOSTNAME_RE,
     AdminMetricsResponse,
     AdminNodeResponse,
     DownloadRequest,
     DownloadStatusResponse,
     LlamaCppRelaunchRequest,
     LlamaCppRelaunchResponse,
+    OwnerUpdateRequest,
     PowerActionRequest,
     PowerStateResponse,
     QUADSStatusResponse,
@@ -126,8 +127,6 @@ _SETUP_RETRYABLE_STATUSES = frozenset(
     }
 )
 
-# Regex from SetupRequest.validate_hostname — reused for path-parameter validation
-_HOSTNAME_RE = re.compile(r"[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?")
 _SETUP_SELECTION_FIELDS = frozenset({"engine", "model", "artifact_id"})
 
 
@@ -349,8 +348,15 @@ async def register_node(
                     hostname=hostname,
                     previous_model=node.model,
                 )
+            # Only override an already-registered owner when the request
+            # explicitly supplies one; a bare re-adoption must not wipe it.
+            owner = (
+                body.owner
+                if "owner" in body.model_fields_set
+                else (node.owner if node else "")
+            )
             try:
-                adopted = await provisioner.register_self_setup(hostname)
+                adopted = await provisioner.register_self_setup(hostname, owner=owner)
             except SelfSetupError as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             return JSONResponse(
@@ -362,7 +368,7 @@ async def register_node(
                     "self_setup": True,
                 },
             )
-        await provisioner.register_available(hostname)
+        await provisioner.register_available(hostname, owner=body.owner)
         return JSONResponse(
             status_code=201,
             content={"hostname": hostname, "state": "available"},
@@ -416,6 +422,25 @@ async def remove_from_pool(
         return JSONResponse(content={"hostname": hostname, "removed": True})
     finally:
         lease.release()
+
+
+@admin_router.patch("/nodes/{node_id}/owner")
+async def update_node_owner(
+    node_id: str,
+    body: OwnerUpdateRequest,
+    provisioner: NodeProvisioner = Depends(get_provisioner),
+) -> JSONResponse:
+    """Assign (or clear) the endpoint owner for a registered node."""
+    hostname = _validated_hostname(node_id)
+    try:
+        node = await provisioner.update_node_owner(hostname, body.owner)
+    except KeyError:
+        raise HTTPException(
+            status_code=404, detail=f"Node '{hostname}' not found"
+        ) from None
+    except ProvisioningError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return JSONResponse(content={"node_id": node.node_id, "owner": node.owner})
 
 
 @admin_router.post("/nodes/setup", status_code=202)
@@ -560,6 +585,21 @@ async def setup_node(
         # single-worker guard for clear duplicate-setup responses.
         pending_hosts.add(hostname)
 
+        # Retrying setup must not wipe an owner established by registration;
+        # only an explicit owner in the request overrides it. Prefer the
+        # post-lease node snapshot (a concurrent register/owner PATCH may have
+        # committed between the initial read and lease acquisition); fall back
+        # to the initial snapshot only if the node vanished under the lease.
+        setup_owner = (
+            body.owner
+            if "owner" in body.model_fields_set
+            else (
+                node.owner
+                if node is not None
+                else (initial_node.owner if initial_node is not None else "")
+            )
+        )
+
         async def _provision_and_cleanup() -> None:
             try:
                 if selection.llamacpp_request is None:
@@ -571,6 +611,7 @@ async def setup_node(
                         artifact_id=selection.artifact_id,
                         vllm_params=selection.vllm_params,
                         lifecycle_lease=lease,
+                        owner=setup_owner,
                     )
                 else:
                     await provisioner.provision(
@@ -581,6 +622,7 @@ async def setup_node(
                         artifact_id=selection.artifact_id,
                         llamacpp_request=selection.llamacpp_request,
                         lifecycle_lease=lease,
+                        owner=setup_owner,
                     )
             finally:
                 pending_hosts.discard(hostname)
