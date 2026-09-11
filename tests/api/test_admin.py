@@ -1174,8 +1174,63 @@ class TestNodePool:
 
         assert response.status_code == 201
         assert response.json() == {"hostname": "gpu01", "state": "available"}
-        mock_provisioner.register_available.assert_awaited_once_with("gpu01")
+        mock_provisioner.register_available.assert_awaited_once_with("gpu01", None)
         mock_provisioner.register_self_setup.assert_not_called()
+
+    def test_register_pool_rejects_custom_port(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """A plain pool node is provisioned on the default port, so a custom
+        port is rejected unless self_setup is true (it would be silently
+        replaced at launch)."""
+        mock_provisioner.register_available = AsyncMock()
+
+        response = client.post(
+            "/admin/nodes/pool", json={"hostname": "gpu01", "port": 9000}
+        )
+
+        assert response.status_code == 400
+        assert "only supported for self-setup adoption" in response.json()["detail"]
+        mock_provisioner.validate_endpoint.assert_not_called()
+        mock_provisioner.register_available.assert_not_called()
+
+    def test_register_self_setup_forwards_custom_port(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.register_self_setup = AsyncMock(
+            return_value=_make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+        )
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:9000"
+
+        response = client.post(
+            "/admin/nodes/pool",
+            json={"hostname": "gpu01", "self_setup": True, "port": 9000},
+        )
+
+        assert response.status_code == 201
+        mock_provisioner.validate_endpoint.assert_called_once_with("gpu01", 9000)
+        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01", 9000)
+
+    def test_register_pool_rejects_out_of_range_port(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        response = client.post(
+            "/admin/nodes/pool", json={"hostname": "gpu01", "port": 70000}
+        )
+
+        assert response.status_code == 422
+        mock_provisioner.register_available.assert_not_called()
 
     def test_register_self_setup_adopts_running_vllm(
         self,
@@ -1204,7 +1259,7 @@ class TestNodePool:
             "model": "org/model",
             "self_setup": True,
         }
-        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01")
+        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01", None)
         mock_provisioner.register_available.assert_not_called()
 
     def test_register_self_setup_unreachable_returns_502(
@@ -1336,7 +1391,7 @@ class TestNodePool:
         probes_started = threading.Event()
         release_probes = threading.Event()
 
-        async def paused_register(hostname: str) -> Node:
+        async def paused_register(hostname: str, port: int | None = None) -> Node:
             probes_started.set()
             while not release_probes.is_set():
                 await asyncio.sleep(0.01)
@@ -1385,7 +1440,7 @@ class TestNodePool:
             "model": "org/model",
             "self_setup": True,
         }
-        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01")
+        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01", None)
 
     def test_readoption_reconciles_reported_model(
         self,
@@ -1421,7 +1476,7 @@ class TestNodePool:
 
         assert response.status_code == 201
         assert response.json()["model"] == "org/new"
-        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01")
+        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01", None)
 
     def test_self_setup_flag_cannot_adopt_managed_node(
         self,

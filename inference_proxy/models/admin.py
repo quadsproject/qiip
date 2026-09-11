@@ -74,6 +74,7 @@ class RegisterRequest(BaseModel):
 
     hostname: str
     self_setup: bool = False
+    port: int | None = Field(default=None, ge=1, le=65535)
 
     @field_validator("hostname")
     @classmethod

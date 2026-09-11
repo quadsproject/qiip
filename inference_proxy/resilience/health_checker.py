@@ -12,6 +12,13 @@ endpoint using synchronous HTTP calls (per D-02) and updates the
 successful liveness probe when its circuit breaker is closed. An OPEN
 breaker requires a successful minimal inference probe before recovery.
 
+**Optional health for self-setup nodes**: A node adopted on the
+OpenAI-compatible ``/v1/models`` contract (``self_setup``) treats a
+missing ``/health`` endpoint (HTTP 404/405/501) as optional and falls
+back to a ``/v1/models`` probe. An authoritative unhealthy response
+(e.g. ``/health`` 503) is still a failure. Managed nodes require a
+healthy ``/health`` response.
+
 **Timeout** (per T-05-02): Health probes use a 5-second timeout. The
 inference recovery probe has its own 2-second timeout so a wedged engine
 cannot stall the serial probe cycle for the ordinary liveness budget.
@@ -53,6 +60,11 @@ _PROBE_TIMEOUT: float = 5.0
 _HALF_OPEN_PROBE_TIMEOUT: float = 2.0
 _RECOVERABLE_STATUSES = {NodeStatus.UNHEALTHY, NodeStatus.UNKNOWN}
 _DEMOTABLE_STATUSES = {NodeStatus.HEALTHY, NodeStatus.UNKNOWN}
+# /health responses that mean the endpoint is not implemented. For a self-setup
+# node (adopted on the OpenAI-compatible /v1/models contract) this is not a
+# liveness failure, so the probe falls back to /v1/models. Managed nodes still
+# require a healthy /health response.
+_OPTIONAL_HEALTH_STATUSES = frozenset({404, 405, 501})
 
 
 class _ConsecutiveFailures:
@@ -163,6 +175,38 @@ def _probe_all_nodes(
         )
 
 
+def _probe_liveness(
+    *,
+    endpoint: str,
+    client: httpx.Client,
+    self_setup: bool,
+) -> tuple[bool, str]:
+    """Probe a node's health endpoint and report whether it is alive.
+
+    Returns ``(alive, reason)``. For a self-setup node a missing ``/health``
+    endpoint (HTTP 404/405/501) is optional: the probe falls back to the
+    OpenAI-compatible ``/v1/models`` contract the node was adopted on. All other
+    non-200 responses, and managed nodes, are treated as failures.
+    """
+    health_url = build_backend_url(endpoint, "/health")
+    response = client.get(health_url)
+    if response.status_code == 200:
+        return True, "healthy"
+    if self_setup and response.status_code in _OPTIONAL_HEALTH_STATUSES:
+        models_url = build_backend_url(endpoint, "/v1/models")
+        models = client.get(models_url)
+        if models.status_code == 200:
+            return (
+                True,
+                f"missing /health ({response.status_code}); /v1/models ok",
+            )
+        return (
+            False,
+            f"missing /health; /v1/models returned {models.status_code}",
+        )
+    return False, f"non-200 status: {response.status_code}"
+
+
 def _probe_node(
     *,
     node_id: str,
@@ -176,6 +220,10 @@ def _probe_node(
 ) -> None:
     """Probe a single node and update its status if needed.
 
+    A ``self_setup`` node treats a missing ``/health`` endpoint as optional and
+    falls back to ``/v1/models``; managed nodes still require a healthy
+    ``/health`` response (per D-03/D-04).
+
     Args:
         node_id: The node's unique identifier.
         endpoint: The node's HTTP endpoint (host:port).
@@ -185,10 +233,15 @@ def _probe_node(
         consecutive_failures: Mutable dict tracking per-node failure counts.
         failure_threshold: Consecutive failures before marking UNHEALTHY.
     """
+    current = registry.get(node_id)
+    self_setup = current.self_setup if current is not None else False
     try:
-        url = build_backend_url(endpoint, "/health")
-        response = client.get(url)
-        if response.status_code == 200:
+        alive, reason = _probe_liveness(
+            endpoint=endpoint,
+            client=client,
+            self_setup=self_setup,
+        )
+        if alive:
             health_evidence = _handle_probe_success(
                 node_id=node_id,
                 registry=registry,
@@ -213,7 +266,7 @@ def _probe_node(
                 registry=registry,
                 consecutive_failures=consecutive_failures,
                 failure_threshold=failure_threshold,
-                reason=f"non-200 status: {response.status_code}",
+                reason=reason,
             )
     except Exception:
         _handle_probe_failure(

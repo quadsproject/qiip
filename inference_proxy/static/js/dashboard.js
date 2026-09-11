@@ -102,7 +102,7 @@ const ACTION_CONFIG = {
     confirm: true,
     confirmMsg: (nodeId, node) =>
       node && node.self_setup
-        ? `Remove ${nodeId} from the fleet? The existing vLLM instance will keep running.`
+        ? `Remove ${nodeId} from the fleet? The existing server will keep running.`
         : `Remove ${nodeId} from the available pool?`,
     danger: false,
     label: "Remove",
@@ -493,14 +493,19 @@ document.addEventListener("DOMContentLoaded", function () {
     }
   });
 
-  // Registration form handler — adds node to pool or adopts a running vLLM
+  // Registration form handler — adds node to pool or adopts a running server
   const form = document.getElementById("register-form");
   const selfSetup = document.getElementById("register-self-setup");
   const registerBtn = document.getElementById("register-btn");
+  const portInput = document.getElementById("register-port");
   function syncRegisterLabel() {
     registerBtn.textContent = selfSetup.checked ? "Add to Fleet" : "Add to Pool";
+    // A custom port is only supported for self-setup adoption; a plain pool
+    // node is provisioned on the configured default port.
+    portInput.style.display = selfSetup.checked ? "" : "none";
   }
   selfSetup.addEventListener("change", syncRegisterLabel);
+  syncRegisterLabel();
   form.addEventListener("submit", async function (e) {
     e.preventDefault();
     const input = document.getElementById("register-hostname");
@@ -508,12 +513,15 @@ document.addEventListener("DOMContentLoaded", function () {
     const hostname = input.value.trim();
     if (!hostname) return;
     const adoptExisting = selfSetup.checked;
+    const body = { hostname, self_setup: adoptExisting };
+    const port = portInput.value.trim();
+    if (adoptExisting && port) body.port = Number(port);
     btn.disabled = true;
     try {
       const resp = await fetch("/admin/nodes/pool", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ hostname, self_setup: adoptExisting }),
+        body: JSON.stringify(body),
       });
       if (resp.ok) {
         const data = await resp.json().catch(function () { return {}; });
@@ -528,6 +536,7 @@ document.addEventListener("DOMContentLoaded", function () {
           showToast(`${hostname} added to pool`, "success");
         }
         input.value = "";
+        portInput.value = "";
         selfSetup.checked = false;
         syncRegisterLabel();
         setTimeout(function () { btn.disabled = false; }, 2000);

@@ -251,7 +251,7 @@ class Node(BaseModel):
         managed: Whether the proxy owns the node lifecycle. Externally
             registered nodes must opt in explicitly.
         self_setup: Whether the node was adopted from an already-running
-            vLLM instance. These nodes are never torn down.
+            OpenAI-compatible server. These nodes are never torn down.
     """
 
     model_config = ConfigDict(frozen=True, extra="ignore")

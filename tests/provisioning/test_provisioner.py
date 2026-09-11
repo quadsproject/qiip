@@ -60,7 +60,7 @@ from inference_proxy.provisioning.provisioner import (
     ProvisioningIdentity,
     SelfSetupError,
     _parse_llamacpp_runtime_fit,
-    served_vllm_model_id,
+    served_model_id,
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -68,6 +68,10 @@ from inference_proxy.provisioning.ssh_client import (
 )
 from inference_proxy.redfish.errors import RedfishError
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
+from inference_proxy.resilience.health_checker import (
+    _ConsecutiveFailures,
+    _probe_all_nodes,
+)
 
 _TEST_ENDPOINT_POLICY = EndpointPolicy.from_values(
     allowed_hosts=["host1"],
@@ -1348,7 +1352,7 @@ class TestNodeRegistration:
 
 
 class TestSelfSetupRegistration:
-    """Adopt an already-running vLLM instance without owning its lifecycle."""
+    """Adopt an already-running OpenAI-compatible server without owning its lifecycle."""
 
     @pytest.mark.parametrize(
         ("payload", "expected"),
@@ -1361,8 +1365,8 @@ class TestSelfSetupRegistration:
             ("not-an-object", None),
         ],
     )
-    def test_served_vllm_model_id(self, payload: object, expected: str | None) -> None:
-        assert served_vllm_model_id(payload) == expected
+    def test_served_model_id(self, payload: object, expected: str | None) -> None:
+        assert served_model_id(payload) == expected
 
     @pytest.mark.asyncio
     async def test_registers_detected_model(self, httpx_mock: HTTPXMock) -> None:
@@ -1391,16 +1395,44 @@ class TestSelfSetupRegistration:
         assert stored.self_setup is True
 
     @pytest.mark.asyncio
-    async def test_health_failure_does_not_register(
+    async def test_missing_health_endpoint_is_best_effort(
         self, httpx_mock: HTTPXMock
     ) -> None:
+        """A missing /health (404/405/501) never blocks adoption with /v1/models.
+
+        Many OpenAI-compatible servers do not expose /health.
+        """
         etcd = MagicMock()
         etcd.prefix = "/nodes/"
         registry = NodeRegistry()
         provisioner = _make_provisioner(etcd_client=etcd, registry=registry)
+        httpx_mock.add_response(url="http://host1:8000/health", status_code=404)
+        httpx_mock.add_response(
+            url="http://host1:8000/v1/models",
+            json={"data": [{"id": "org/qwen"}]},
+        )
+
+        node = await provisioner.register_self_setup("host1")
+
+        assert node.model == "org/qwen"
+        etcd.put.assert_called_once()
+        assert registry.get("host1") is not None
+
+    @pytest.mark.asyncio
+    async def test_authoritative_unhealthy_health_refuses_adoption(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        """A 503 on /health is authoritative: the model list does not establish
+        inference readiness, so adoption is refused rather than routing traffic.
+        """
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        registry = NodeRegistry()
+        provisioner = _make_provisioner(etcd_client=etcd, registry=registry)
+        # Adoption is refused on the 503 before /v1/models is ever probed.
         httpx_mock.add_response(url="http://host1:8000/health", status_code=503)
 
-        with pytest.raises(SelfSetupError, match="health check failed"):
+        with pytest.raises(SelfSetupError, match="explicitly unhealthy"):
             await provisioner.register_self_setup("host1")
 
         etcd.put.assert_not_called()
@@ -1434,6 +1466,10 @@ class TestSelfSetupRegistration:
         httpx_mock.add_exception(
             httpx.ConnectError("refused"),
             url="http://host1:8000/health",
+        )
+        httpx_mock.add_exception(
+            httpx.ConnectError("refused"),
+            url="http://host1:8000/v1/models",
         )
 
         with pytest.raises(SelfSetupError, match="not reachable"):
@@ -1478,6 +1514,133 @@ class TestSelfSetupRegistration:
         assert stored is not None
         assert stored.model == "org/second"
         assert etcd.put.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_adopted_node_remains_routable_with_missing_health(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        """After adoption, the background checker keeps a self-setup node
+        HEALTHY (routable) when /health is missing but /v1/models works."""
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        registry = NodeRegistry()
+        provisioner = _make_provisioner(etcd_client=etcd, registry=registry)
+        httpx_mock.add_response(url="http://host1:8000/health", status_code=404)
+        httpx_mock.add_response(
+            url="http://host1:8000/v1/models",
+            json={"data": [{"id": "org/qwen"}]},
+        )
+        await provisioner.register_self_setup("host1")
+        node = registry.get("host1")
+        assert node is not None
+        assert node.status is NodeStatus.HEALTHY
+
+        client = MagicMock(spec=httpx.Client)
+        client.get.side_effect = [
+            MagicMock(status_code=404),  # /health missing
+            MagicMock(status_code=200),  # /v1/models fallback
+        ]
+        failures = _ConsecutiveFailures(registry)
+        try:
+            _probe_all_nodes(
+                registry,
+                CircuitBreakerRegistry(),
+                client,
+                failures,
+                failure_threshold=3,
+            )
+        finally:
+            failures.close()
+
+        stored = registry.get("host1")
+        assert stored is not None
+        assert stored.status is NodeStatus.HEALTHY
+
+    @pytest.mark.asyncio
+    async def test_adopted_node_marked_unhealthy_on_authoritative_health_failure(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        """A self-setup node with an authoritative /health failure (503) is
+        demoted after the failure threshold, so it stops receiving traffic."""
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        registry = NodeRegistry()
+        provisioner = _make_provisioner(etcd_client=etcd, registry=registry)
+        httpx_mock.add_response(url="http://host1:8000/health", status_code=404)
+        httpx_mock.add_response(
+            url="http://host1:8000/v1/models",
+            json={"data": [{"id": "org/qwen"}]},
+        )
+        await provisioner.register_self_setup("host1")
+
+        client = MagicMock(spec=httpx.Client)
+        client.get.return_value = MagicMock(status_code=503)
+        failures = _ConsecutiveFailures(registry)
+        try:
+            for _ in range(3):
+                _probe_all_nodes(
+                    registry,
+                    CircuitBreakerRegistry(),
+                    client,
+                    failures,
+                    failure_threshold=3,
+                )
+        finally:
+            failures.close()
+
+        stored = registry.get("host1")
+        assert stored is not None
+        assert stored.status is NodeStatus.UNHEALTHY
+
+    @pytest.mark.asyncio
+    async def test_adopted_node_recovers_after_health_restored(
+        self, httpx_mock: HTTPXMock
+    ) -> None:
+        """A self-setup node recovers to HEALTHY once its /health returns 200."""
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        registry = NodeRegistry()
+        provisioner = _make_provisioner(etcd_client=etcd, registry=registry)
+        httpx_mock.add_response(url="http://host1:8000/health", status_code=404)
+        httpx_mock.add_response(
+            url="http://host1:8000/v1/models",
+            json={"data": [{"id": "org/qwen"}]},
+        )
+        await provisioner.register_self_setup("host1")
+
+        # Demote to UNHEALTHY on authoritative /health failure.
+        failing = MagicMock(spec=httpx.Client)
+        failing.get.return_value = MagicMock(status_code=503)
+        failures = _ConsecutiveFailures(registry)
+        try:
+            for _ in range(3):
+                _probe_all_nodes(
+                    registry,
+                    CircuitBreakerRegistry(),
+                    failing,
+                    failures,
+                    failure_threshold=3,
+                )
+            node = registry.get("host1")
+            assert node is not None
+            assert node.status is NodeStatus.UNHEALTHY
+
+            # A 200 on /health recovers the node.
+            client = MagicMock(spec=httpx.Client)
+            client.get.return_value = MagicMock(status_code=200)
+            _probe_all_nodes(
+                registry,
+                CircuitBreakerRegistry(),
+                client,
+                failures,
+                failure_threshold=3,
+            )
+        finally:
+            failures.close()
+
+        stored = registry.get("host1")
+        assert stored is not None
+        assert stored.status is NodeStatus.HEALTHY
 
 
 class TestSetupFailure:
