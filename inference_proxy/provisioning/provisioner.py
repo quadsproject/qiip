@@ -1298,9 +1298,7 @@ class NodeProvisioner:
                     await keepalive
             self._log_buffer.mark_complete(hostname)
 
-    async def register_available(
-        self, hostname: str, port: int | None = None
-    ) -> None:
+    async def register_available(self, hostname: str, port: int | None = None) -> None:
         """Register a hostname as available in the node pool (no provisioning)."""
         endpoint = self.validate_endpoint(hostname, port)
         node = Node(
@@ -1314,9 +1312,7 @@ class NodeProvisioner:
         if self._registry is not None:
             self._registry.add(node)
 
-    async def register_self_setup(
-        self, hostname: str, port: int | None = None
-    ) -> Node:
+    async def register_self_setup(self, hostname: str, port: int | None = None) -> Node:
         """Adopt an already-running OpenAI-compatible server into the fleet.
 
         Adoption is based on the OpenAI-compatible contract (``GET
