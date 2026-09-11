@@ -497,21 +497,25 @@ document.addEventListener("DOMContentLoaded", function () {
   const form = document.getElementById("register-form");
   const selfSetup = document.getElementById("register-self-setup");
   const registerBtn = document.getElementById("register-btn");
+  const portInput = document.getElementById("register-port");
   function syncRegisterLabel() {
     registerBtn.textContent = selfSetup.checked ? "Add to Fleet" : "Add to Pool";
+    // A custom port is only supported for self-setup adoption; a plain pool
+    // node is provisioned on the configured default port.
+    portInput.style.display = selfSetup.checked ? "" : "none";
   }
   selfSetup.addEventListener("change", syncRegisterLabel);
+  syncRegisterLabel();
   form.addEventListener("submit", async function (e) {
     e.preventDefault();
     const input = document.getElementById("register-hostname");
-    const portInput = document.getElementById("register-port");
     const btn = document.getElementById("register-btn");
     const hostname = input.value.trim();
     if (!hostname) return;
     const adoptExisting = selfSetup.checked;
     const body = { hostname, self_setup: adoptExisting };
     const port = portInput.value.trim();
-    if (port) body.port = Number(port);
+    if (adoptExisting && port) body.port = Number(port);
     btn.disabled = true;
     try {
       const resp = await fetch("/admin/nodes/pool", {

@@ -36,7 +36,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Least-connections load balancing** -- routes to the node with the fewest in-flight requests
 - **Automatic failover** -- retries transport, timeout, and 5xx failures on alternate healthy nodes before a response begins (configurable, default 3 attempts)
 - **Circuit breakers** -- per-node circuit breakers trip after consecutive failures, preventing cascade
-- **Health checking** -- background thread probes each node's `/health` endpoint; marks nodes unhealthy after repeated failures and recovers them automatically
+- **Health checking** -- background thread probes each node's `/health` endpoint; marks nodes unhealthy after repeated failures and recovers them automatically. Self-setup nodes fall back to `/v1/models` when `/health` is missing (HTTP 404/405/501)
 - **Graceful shutdown** -- Uvicorn drains in-flight requests before application resources close; its server timeout remains configurable
 - **Structured logging** -- JSON or pretty console output via structlog
 - **Operations dashboard** -- interactive web UI at `/dashboard` with real-time node and engine identity, catalog-backed setup controls, detail pages, and provisioning status
@@ -251,6 +251,7 @@ HTTP Basic-protected administrative endpoints:
 | `POST` | `/admin/models/download` | Start or inspect a duplicate-safe model download |
 | `GET` | `/admin/models/downloads` | List tracked model-download states |
 | `POST` | `/admin/nodes/setup` | Start background node provisioning |
+| `POST` | `/admin/nodes/pool` | Add a node to the available pool, or adopt an already-running OpenAI-compatible server (`self_setup`) |
 | `POST` | `/admin/nodes/{hostname}/llamacpp/relaunch` | Drain and relaunch a healthy managed llama.cpp node with a typed sizing policy |
 | `DELETE` | `/admin/nodes/{node_id}` | Drain and tear down a node; supports force and the scoped recovery procedure below |
 | `GET` | `/admin/provisioning/tasks` | List provisioning task states |
@@ -307,6 +308,49 @@ Gateway-authorized custom records additionally contain exact
 A host present only in QUADS has not been provisioned and therefore reports
 both `engine: null` and `artifact_id: null`. Do not interpret a null engine as
 vLLM. It means QIIP has no registered serving identity for that host.
+
+### Adopt an existing OpenAI-compatible server
+
+`POST /admin/nodes/pool` with `"self_setup": true` adopts a server that is
+already running on the host and exposing the OpenAI-compatible API. QIIP
+registers it without provisioning it and never owns its lifecycle. The optional
+`port` selects a non-default listening port:
+
+```bash
+curl -X POST \
+  -u "$INFERENCE_PROXY_ADMIN__USERNAME:$INFERENCE_PROXY_ADMIN__PASSWORD" \
+  -H 'Content-Type: application/json' \
+  http://gateway.example.com/admin/nodes/pool \
+  -d '{"hostname": "gpu01", "self_setup": true, "port": 9000}'
+```
+
+Adoption is keyed on the OpenAI-compatible contract (`GET /v1/models`).
+`/health` is probed best-effort, but only a missing endpoint (HTTP 404/405/501)
+is treated as optional; an authoritative unhealthy response (such as `/health`
+503) refuses adoption because the model list does not establish inference
+readiness. QIIP registers the first model the server reports and never tears
+the node down.
+
+Requirements and limits:
+
+- **Plain HTTP only**: a backend that requires credentials on `/v1/models` is
+  not supported.
+- **Allowed port**: `port` must satisfy `routing.allowed_endpoint_ports`.
+  Omitting it uses the configured `provisioning.vllm_port`. Re-adopting a node
+  without a `port` currently selects that configured default rather than the
+  port recorded on the previous registration.
+- **Single model**: a self-setup node tracks exactly one model — the primary id
+  the server reports first on `/v1/models`. Aliases and LoRA entries are
+  ignored by design.
+- **Breaker recovery**: opening the breaker recovers by probing the registered
+  model on `/v1/completions`, so the server must expose an OpenAI-compatible
+  completions endpoint.
+
+A custom `port` is rejected for a plain pool registration (without
+`self_setup`), because that node is provisioned later on the configured default
+`provisioning.vllm_port` and a stored custom port would be silently replaced at
+launch. The dashboard's manual-setup form shows the port field only when the
+"Existing OpenAI-compatible server" option is enabled.
 
 ### Relaunch managed llama.cpp sizing
 
@@ -900,7 +944,7 @@ inference_proxy/
 ### Background threads
 
 - **etcd watcher** -- watches the configured key prefix for node PUT/DELETE events; updates the registry in real time
-- **Health checker** -- probes each registered node's `/health` endpoint, transitions liveness state, maintains managed-node leases after valid evidence, and removes idle draining ghosts
+- **Health checker** -- probes each registered node's `/health` endpoint, transitions liveness state, maintains managed-node leases after valid evidence, and removes idle draining ghosts. A self-setup node with a missing `/health` endpoint (HTTP 404/405/501) falls back to `/v1/models`; managed nodes always require a healthy `/health`
 - **QUADS poller and schedule enforcer** -- refresh QUADS inventory and tear down managed nodes before scheduling conflicts, with bounded retry backoff
 
 ## Development

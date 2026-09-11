@@ -73,6 +73,10 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 _SELF_SETUP_PROBE_TIMEOUT = 5.0
+# /health responses that mean the endpoint is not implemented, so a server is
+# still adoptable via the OpenAI-compatible /v1/models contract. An explicit
+# unhealthy response (e.g. 503) is authoritative and refuses adoption.
+_OPTIONAL_HEALTH_STATUSES = frozenset({404, 405, 501})
 
 STEP_PATTERN = re.compile(r"\[STEP:(\w+):(START|OK|FAIL|WARN)\]")
 MODEL_PATTERN = re.compile(r"#\s*Model:\s+(.+)")
@@ -1299,7 +1303,19 @@ class NodeProvisioner:
             self._log_buffer.mark_complete(hostname)
 
     async def register_available(self, hostname: str, port: int | None = None) -> None:
-        """Register a hostname as available in the node pool (no provisioning)."""
+        """Register a hostname as available in the node pool (no provisioning).
+
+        A custom port is rejected: a plain pool node is provisioned later on the
+        configured default (``provisioning.vllm_port``), so a stored custom port
+        would be silently replaced at launch time. Custom ports are supported
+        only for ``register_self_setup`` adoption.
+        """
+        if port is not None:
+            raise ValueError(
+                "a custom port is only supported for self-setup adoption; "
+                "plain pool registration provisions on the configured default "
+                "port"
+            )
         endpoint = self.validate_endpoint(hostname, port)
         node = Node(
             node_id=hostname,
@@ -1315,18 +1331,32 @@ class NodeProvisioner:
     async def register_self_setup(self, hostname: str, port: int | None = None) -> Node:
         """Adopt an already-running OpenAI-compatible server into the fleet.
 
-        Adoption is based on the OpenAI-compatible contract (``GET
-        /v1/models``); ``/health`` is probed best-effort only. This works for
-        any OpenAI-compatible backend (vLLM, llama.cpp, TGI, SGLang, Ollama's
-        shim, a remote gateway, ...), then registers the detected model in
-        etcd. QIIP never owns this node's lifecycle.
+        Adoption is keyed on the OpenAI-compatible contract (``GET
+        /v1/models``). ``/health`` is probed best-effort, but only a missing
+        health endpoint (HTTP 404/405/501) is treated as optional: an explicit
+        unhealthy response (e.g. ``/health`` 503) refuses adoption because the
+        model list does not establish inference readiness. On success QIIP
+        registers the detected model in etcd and never owns the node's
+        lifecycle.
 
-        Single-model contract: a self-setup node tracks exactly one model —
-        the primary id the server reports first on ``/v1/models``. Aliases and
-        LoRA entries are ignored by design. Re-adoption re-probes the live
-        server and reconciles the stored model, so drift from an external
-        restart with another primary model is refreshed on each re-adoption
-        instead of silently keeping the first reported model forever.
+        Requirements and limits:
+
+        - Plain HTTP only: a backend that requires credentials on
+          ``/v1/models`` is not supported.
+        - The hostname and port must satisfy the routing endpoint allowlist. If
+          *port* is omitted the configured ``provisioning.vllm_port`` is used;
+          re-adoption that omits *port* currently selects that configured
+          default rather than the port stored on the previous registration.
+        - Single-model contract: a self-setup node tracks exactly one model —
+          the primary id the server reports first on ``/v1/models``. Aliases
+          and LoRA entries are ignored by design. Re-adoption re-probes the
+          live server and reconciles the stored model, so drift from an
+          external restart with another primary model is refreshed on each
+          re-adoption instead of silently keeping the first reported model
+          forever.
+        - Circuit-breaker recovery probes ``/v1/completions``, so a self-setup
+          node must expose an OpenAI-compatible completions endpoint to recover
+          after its breaker opens.
         """
         endpoint = self.validate_endpoint(hostname, port)
         model = await self._discover_running_model(endpoint, hostname)
@@ -1364,24 +1394,36 @@ class NodeProvisioner:
         """Probe an OpenAI-compatible server and return its served model id.
 
         Adoption is based on the OpenAI-compatible contract (``GET
-        /v1/models``). ``/health`` is probed best-effort only — many
-        OpenAI-compatible servers do not expose it — so a missing or failing
-        health endpoint never blocks adoption.
+        /v1/models``). ``/health`` is probed best-effort, but only a missing
+        health endpoint (HTTP 404/405/501) is optional — many OpenAI-compatible
+        servers do not expose it. An authoritative unhealthy response (e.g.
+        ``/health`` 503) blocks adoption because the model list does not
+        establish inference readiness.
         """
         health_url = build_backend_url(endpoint, "/health")
         models_url = build_backend_url(endpoint, "/v1/models")
         timeout = httpx.Timeout(_SELF_SETUP_PROBE_TIMEOUT)
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                # Best-effort: /health is optional for OpenAI-compatible servers.
+                # /health is optional only when the endpoint is missing.
                 try:
                     health = await client.get(health_url)
-                    if health.status_code != 200:
+                    if health.status_code == 200:
+                        pass
+                    elif health.status_code in _OPTIONAL_HEALTH_STATUSES:
                         logger.debug(
-                            "self_setup_health_unavailable",
+                            "self_setup_health_missing",
                             hostname=hostname,
                             status_code=health.status_code,
                         )
+                    else:
+                        raise SelfSetupError(
+                            f"health check on {hostname} returned HTTP "
+                            f"{health.status_code}; refusing to adopt an "
+                            "explicitly unhealthy server"
+                        )
+                except SelfSetupError:
+                    raise
                 except httpx.HTTPError as exc:
                     logger.debug(
                         "self_setup_health_probe_failed",

@@ -1177,21 +1177,48 @@ class TestNodePool:
         mock_provisioner.register_available.assert_awaited_once_with("gpu01", None)
         mock_provisioner.register_self_setup.assert_not_called()
 
-    def test_register_pool_forwards_custom_port(
+    def test_register_pool_rejects_custom_port(
         self,
         client: TestClient,
         mock_provisioner: MagicMock,
     ) -> None:
+        """A plain pool node is provisioned on the default port, so a custom
+        port is rejected unless self_setup is true (it would be silently
+        replaced at launch)."""
         mock_provisioner.register_available = AsyncMock()
-        mock_provisioner.validate_endpoint.return_value = "http://gpu01:9000"
 
         response = client.post(
             "/admin/nodes/pool", json={"hostname": "gpu01", "port": 9000}
         )
 
+        assert response.status_code == 400
+        assert "only supported for self-setup adoption" in response.json()["detail"]
+        mock_provisioner.validate_endpoint.assert_not_called()
+        mock_provisioner.register_available.assert_not_called()
+
+    def test_register_self_setup_forwards_custom_port(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_provisioner.register_self_setup = AsyncMock(
+            return_value=_make_node(
+                node_id="gpu01",
+                managed=False,
+                self_setup=True,
+                model="org/model",
+            )
+        )
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:9000"
+
+        response = client.post(
+            "/admin/nodes/pool",
+            json={"hostname": "gpu01", "self_setup": True, "port": 9000},
+        )
+
         assert response.status_code == 201
         mock_provisioner.validate_endpoint.assert_called_once_with("gpu01", 9000)
-        mock_provisioner.register_available.assert_awaited_once_with("gpu01", 9000)
+        mock_provisioner.register_self_setup.assert_awaited_once_with("gpu01", 9000)
 
     def test_register_pool_rejects_out_of_range_port(
         self,

@@ -301,11 +301,25 @@ async def register_node(
     lease so adoption cannot race with setup, teardown, or another concurrent
     registration for the same hostname.
 
+    A custom port is accepted only for ``self_setup`` adoption. A plain pool
+    node is provisioned later on the configured default
+    (``provisioning.vllm_port``), so a stored custom port would be silently
+    replaced at launch time and is therefore rejected.
+
     Re-adoption of an existing self-setup instance is allowed: it re-probes
     the live server and reconciles the tracked model with what the server
     currently serves (see ``NodeProvisioner.register_self_setup``).
     """
     hostname = canonical_hostname(body.hostname)
+    if body.port is not None and not body.self_setup:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "a custom port is only supported for self-setup adoption; "
+                "plain pool registration provisions on the configured default "
+                "port"
+            ),
+        )
     node = registry.get(hostname)
     if node is not None and (not body.self_setup or not node.self_setup):
         raise HTTPException(
