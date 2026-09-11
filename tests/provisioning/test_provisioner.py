@@ -1531,7 +1531,9 @@ class TestSelfSetupRegistration:
             json={"data": [{"id": "org/qwen"}]},
         )
         await provisioner.register_self_setup("host1")
-        assert registry.get("host1").status is NodeStatus.HEALTHY
+        node = registry.get("host1")
+        assert node is not None
+        assert node.status is NodeStatus.HEALTHY
 
         client = MagicMock(spec=httpx.Client)
         client.get.side_effect = [
@@ -1619,7 +1621,9 @@ class TestSelfSetupRegistration:
                     failures,
                     failure_threshold=3,
                 )
-            assert registry.get("host1").status is NodeStatus.UNHEALTHY
+            node = registry.get("host1")
+            assert node is not None
+            assert node.status is NodeStatus.UNHEALTHY
 
             # A 200 on /health recovers the node.
             client = MagicMock(spec=httpx.Client)
