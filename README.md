@@ -476,6 +476,7 @@ the signed user id and expiry.
 | `INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS` | `false` | Require a valid bearer token for every `/v1` inference request |
 | `INFERENCE_PROXY_AUTH__REQUIRE_EMAIL_VERIFICATION` | `true` | Reject Google accounts whose email is not verified |
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_URL` | unset | HTTPS URL returning a per-domain JSON whitelist, e.g. `{"example.com": ["alice", "bob"]}` |
+| `INFERENCE_PROXY_AUTH__SSO_WHITELIST_DEFAULT_DOMAIN` | unset | Optional domain (e.g. `example.com`) that resolves bare usernames in a flat JSON whitelist list to `user@domain` |
 | `INFERENCE_PROXY_AUTH__ENFORCE_SSO_WHITELIST` | `false` | Gate SSO users on the per-domain username whitelist |
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_POLL_INTERVAL` | `hourly` | Refresh cadence: `hourly` (top of the hour) or `daily` |
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_POLL_TIME` | unset | `HH:MM` wall-clock refresh time; required with `daily` (server local time) |
@@ -515,8 +516,13 @@ SSO whitelist (per-domain user filtering):
   does not follow redirects, and is capped at 1 MiB. The document maps
   domains to username lists:
   `{"example.com": ["alice", "bob"], "lab.example.com": ["carol"]}`.
-  Matching is case-insensitive on both the domain and the username. The
-  payload can live anywhere reachable over HTTPS: a static file, an S3
+  Matching is case-insensitive on both the domain and the username.
+  Alternatively the document may be a flat list of usernames when
+  `sso_whitelist_default_domain` is set (a domain like `example.com`):
+  `["alice", "bob"]` is treated as `alice@example.com`, `bob@example.com`;
+  entries containing `@` are used as-is. A flat list without a configured
+  default domain fails closed. The payload can live anywhere reachable over
+  HTTPS: a static file, an S3
   object, a config repo, or output from an LDAP/group export; the guard
   rejects literal non-global IP addresses and `localhost` names, and DNS
   names are operator-trusted (TLS still verified). Local grants do not

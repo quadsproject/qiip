@@ -1166,3 +1166,19 @@ class TestAdminFullAccessSetting:
 
     def test_default_is_empty(self) -> None:
         assert AuthSettings().admin_only_tokens_full_access == []
+
+
+class TestSSOWhitelistDefaultDomain:
+    """sso_whitelist_default_domain validation (RFE)."""
+
+    def test_valid_domain_normalized(self) -> None:
+        auth = AuthSettings(sso_whitelist_default_domain=" Example.COM ")
+        assert auth.sso_whitelist_default_domain == "example.com"
+
+    def test_unset_by_default(self) -> None:
+        assert AuthSettings().sso_whitelist_default_domain is None
+
+    def test_rejects_email_and_url_and_blank(self) -> None:
+        for bad in ("a@b.com", "https://example.com", " ", ""):
+            with pytest.raises(ValidationError, match="default_domain"):
+                AuthSettings(sso_whitelist_default_domain=bad)

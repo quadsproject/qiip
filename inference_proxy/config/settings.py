@@ -566,6 +566,7 @@ class AuthSettings(BaseModel):
     enforce_api_tokens: bool = False
     require_email_verification: bool = True
     sso_whitelist_url: str | None = None
+    sso_whitelist_default_domain: str | None = None
     enforce_sso_whitelist: bool = False
     sso_whitelist_poll_interval: Literal["hourly", "daily"] = "hourly"
     sso_whitelist_poll_time: str | None = None
@@ -585,6 +586,24 @@ class AuthSettings(BaseModel):
     def sso_whitelist_extra_users_are_emails(cls, value: list[str]) -> list[str]:
         """Require valid email addresses for local user grants."""
         return _clean_emails(value, "auth.sso_whitelist_extra_users")
+
+    @field_validator("sso_whitelist_default_domain")
+    @classmethod
+    def sso_whitelist_default_domain_is_plain(cls, value: str | None) -> str | None:
+        """Require a plain domain for resolving bare usernames in the list."""
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if (
+            not normalized
+            or any(ord(char) < 32 or char.isspace() for char in normalized)
+            or "@" in value
+            or "/" in value
+        ):
+            raise ValueError(
+                "auth.sso_whitelist_default_domain must be a plain domain name"
+            )
+        return normalized
 
     @field_validator("sso_whitelist_extra_domains")
     @classmethod
