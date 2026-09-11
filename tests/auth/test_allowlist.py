@@ -32,6 +32,14 @@ async def allowlist() -> AsyncIterator[SSOAllowlist]:
     await client.aclose()
 
 
+@pytest.fixture
+async def allowlist_with_domain() -> AsyncIterator[SSOAllowlist]:
+    """Yield an allowlist with a default domain for flat username lists."""
+    client = httpx.AsyncClient(follow_redirects=False)
+    yield SSOAllowlist(_URL, "hourly", None, client, default_domain="example.com")
+    await client.aclose()
+
+
 class TestEmailDomain:
     def test_domain_is_lowercased(self) -> None:
         assert email_domain("Alice@Example.COM") == "example.com"
@@ -76,7 +84,6 @@ class TestSSOAllowlist:
         "payload",
         [
             "not json",
-            "[]",
             '["alice"]',
             '{"example.com": "alice"}',
             '{"example.com": [1, 2]}',
@@ -287,3 +294,69 @@ class TestSSOAllowlistExtras:
         assert await allowlist.is_allowed("anyone@lab.example.com") is True
         assert len(httpx_mock.get_requests()) == 0
         await client.aclose()
+
+
+class TestFlatUsernameList:
+    """Flat username JSON with sso_whitelist_default_domain (RFE)."""
+
+    async def test_empty_flat_list_denies_all(
+        self,
+        allowlist_with_domain: SSOAllowlist,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        httpx_mock.add_response(url=_URL, json=[])
+
+        assert await allowlist_with_domain.is_allowed("alice@example.com") is False
+
+    async def test_bare_usernames_resolve_to_default_domain(
+        self,
+        allowlist_with_domain: SSOAllowlist,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        httpx_mock.add_response(url=_URL, json=["alice", "  Bob  "])
+
+        assert await allowlist_with_domain.is_allowed("alice@example.com") is True
+        assert await allowlist_with_domain.is_allowed("BOB@example.com") is True
+        assert await allowlist_with_domain.is_allowed("carol@example.com") is False
+        assert await allowlist_with_domain.is_allowed("alice@other.com") is False
+
+    async def test_full_emails_in_flat_list_used_as_is(
+        self,
+        allowlist_with_domain: SSOAllowlist,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        httpx_mock.add_response(url=_URL, json=["alice", "bob@lab.example.com"])
+
+        assert await allowlist_with_domain.is_allowed("alice@example.com") is True
+        assert await allowlist_with_domain.is_allowed("bob@lab.example.com") is True
+        assert await allowlist_with_domain.is_allowed("bob@example.com") is False
+
+    async def test_flat_list_without_default_domain_fails_closed(
+        self,
+        allowlist: SSOAllowlist,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        httpx_mock.add_response(url=_URL, json=["alice"])
+
+        with pytest.raises(AllowlistUnavailableError):
+            await allowlist.is_allowed("alice@example.com")
+
+    async def test_malformed_entry_fails_closed(
+        self,
+        allowlist_with_domain: SSOAllowlist,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        httpx_mock.add_response(url=_URL, json=["@nope"])
+
+        with pytest.raises(AllowlistUnavailableError):
+            await allowlist_with_domain.is_allowed("alice@example.com")
+
+    async def test_per_domain_document_still_supported_with_domain_set(
+        self,
+        allowlist_with_domain: SSOAllowlist,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        httpx_mock.add_response(url=_URL, json={"other.com": ["carol"]})
+
+        assert await allowlist_with_domain.is_allowed("carol@other.com") is True
+        assert await allowlist_with_domain.is_allowed("alice@example.com") is False

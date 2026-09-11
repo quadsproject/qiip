@@ -5,6 +5,15 @@ filtered):
 
     {"example.com": ["alice", "bob"], "lab.example.com": ["carol"]}
 
+or, when ``sso_whitelist_default_domain`` is configured, a flat list of
+usernames:
+
+    ["alice", "bob", "carol"]
+
+Bare entries in a flat list resolve to ``<username>@<default_domain>``;
+full email entries are used as-is. A flat list without a default domain
+fails closed (unresolvable usernames are never silently ignored).
+
 The allowlist is a *filter*, not a revocation mechanism: tokens minted
 while a user was allowed are re-checked against the cache at use time by
 ``get_api_auth`` (fail closed).
@@ -46,7 +55,9 @@ _RETRY_COOLDOWN_SECONDS = 30
 _FETCH_DEADLINE_SECONDS = 30
 _POLL_TIME_PATTERN = re.compile(r"([01]\d|2[0-3]):([0-5]\d)")
 
-_WhitelistDocument = TypeAdapter(dict[str, list[str]])
+_WhitelistDocument: TypeAdapter[dict[str, list[str]] | list[str]] = TypeAdapter(
+    dict[str, list[str]] | list[str]
+)
 
 
 class AllowlistUnavailableError(Exception):
@@ -77,9 +88,42 @@ def email_domain(email: str) -> str:
     return email.rsplit("@", 1)[-1].strip().lower()
 
 
-def _normalize_document(raw: object) -> dict[str, frozenset[str]]:
+def _normalize_flat_entries(
+    entries: list[str], default_domain: str | None
+) -> dict[str, frozenset[str]]:
+    """Resolve a flat username/email list into the per-domain map.
+
+    Bare usernames require *default_domain*; without one the document is
+    commented out as unresolvable and the allowlist fails closed.
+    """
+    domains: dict[str, set[str]] = {}
+    for entry in entries:
+        name = entry.strip().lower()
+        if not name:
+            continue
+        if "@" in name:
+            username, domain = name.rsplit("@", 1)
+            if not domain or not username:
+                raise AllowlistUnavailableError(
+                    "flat list contains malformed email entries"
+                )
+            domains.setdefault(domain, set()).add(username)
+        elif default_domain:
+            domains.setdefault(default_domain, set()).add(name)
+        else:
+            raise AllowlistUnavailableError(
+                "flat username list requires sso_whitelist_default_domain"
+            )
+    return {domain: frozenset(users) for domain, users in domains.items()}
+
+
+def _normalize_document(
+    raw: object, default_domain: str | None = None
+) -> dict[str, frozenset[str]]:
     """Validate a raw JSON document and normalize domain/usernames."""
     document = _WhitelistDocument.validate_python(raw)
+    if isinstance(document, list):
+        return _normalize_flat_entries(document, default_domain)
     return {
         domain.strip().lower(): frozenset(
             username.strip().lower() for username in users if username.strip()
@@ -110,12 +154,14 @@ class SSOAllowlist:
         cache_file: Path | None = None,
         extra_users: tuple[str, ...] = (),
         extra_domains: tuple[str, ...] = (),
+        default_domain: str | None = None,
     ) -> None:
         self._url = url
         self._poll_interval = poll_interval
         self._poll_time = poll_time
         self._client = client
         self._cache_file = cache_file
+        self._default_domain = (default_domain or "").strip().lower() or None
         self._lock = asyncio.Lock()
         self._domains: dict[str, frozenset[str]] = {}
         self._extra_users = frozenset(
@@ -215,7 +261,7 @@ class SSOAllowlist:
                 "allowlist document is invalid JSON"
             ) from exc
         try:
-            return _normalize_document(raw)
+            return _normalize_document(raw, self._default_domain)
         except (ValidationError, TypeError) as exc:
             raise AllowlistUnavailableError(
                 "allowlist document is invalid JSON"
