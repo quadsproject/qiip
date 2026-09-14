@@ -884,12 +884,12 @@ tbody tr:last-child td { border-bottom: none; }
 .badge-standalone::before,
 .badge-self-setup::before { display: none; }
 
-.badge-hidden {
+.badge-admin-only {
   background: var(--warning-bg);
   color: var(--warning);
 }
 
-.node-id-hidden {
+.node-id-admin-only {
   font-weight: 700;
 }
 

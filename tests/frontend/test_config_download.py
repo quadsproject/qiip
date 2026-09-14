@@ -232,12 +232,12 @@ def _harness_opts(base_url: str, model_id: str, func: str, opts_json: str) -> st
     )
 
 
-class TestHiddenServerConfigs:
-    """Hidden server configs declare token auth with a placeholder."""
+class TestAdminOnlyServerConfigs:
+    """Admin-only server configs declare token auth with a placeholder."""
 
     _BASE = "https://inference-proxy-dev.rdu2.scalelab.redhat.com"
     _MODEL = "DeepSeek-V4-Flash-Vision-Exp"
-    _OPTS = '{"name": "DeepSeek-V4-Flash-Vision-Exp (qiip)", "hidden": true}'
+    _OPTS = '{"name": "DeepSeek-V4-Flash-Vision-Exp (qiip)", "admin_only": true}'
 
     def test_omp_config_requires_api_key(self) -> None:
         result = _run_node_yaml(
@@ -264,7 +264,7 @@ class TestHiddenServerConfigs:
 
     def test_configs_use_minted_token_when_available(self) -> None:
         token_opts = (
-            '{"name": "DeepSeek-V4-Flash-Vision-Exp (qiip)", "hidden": true, '
+            '{"name": "DeepSeek-V4-Flash-Vision-Exp (qiip)", "admin_only": true, '
             '"token": "qiip_abcdef123"}'
         )
         omp = _run_node_yaml(
@@ -338,9 +338,9 @@ class TestBaseUrlUsage:
 
 
 class TestMintTokenOnDownload:
-    """Downloading a hidden-server config mints the shared config token."""
+    """Downloading an admin_only-server config mints the shared config token."""
 
-    def test_hidden_download_mints_stable_config_token(self) -> None:
+    def test_admin_only_download_mints_stable_config_token(self) -> None:
         harness = r"""
 const fs = require("fs");
 const vm = require("vm");
@@ -381,7 +381,7 @@ vm.runInContext(source, sandbox);
 (async function () {
   sandbox.createConfigDropdown(
     "http://proxy:5000", "deepseek-model", function () {}, function () {},
-    { hidden: true, name: "DeepSeek (qiip)" }
+    { admin_only: true, name: "DeepSeek (qiip)" }
   );
   const formatButtons = created.filter(function (el) { return el._handlers.click && el.textContent; });
   const omp = formatButtons.find(function (el) { return el.textContent === "OMP Agent"; });

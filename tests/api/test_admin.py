@@ -93,7 +93,7 @@ def _make_node(
     artifact_id: str | None = None,
     llamacpp_runtime: LlamaCppRuntimeState | None = None,
     self_setup: bool = False,
-    hidden: bool = False,
+    admin_only: bool = False,
     owner: str = "",
 ) -> Node:
     """Create a test node with sensible defaults."""
@@ -107,7 +107,7 @@ def _make_node(
         artifact_id=artifact_id,
         llamacpp_runtime=llamacpp_runtime,
         self_setup=self_setup,
-        hidden=hidden,
+        admin_only=admin_only,
         owner=owner,
     )
 
@@ -209,7 +209,7 @@ class TestAdminNodesPopulated:
             "gpu_count",
             "managed",
             "self_setup",
-            "hidden",
+            "admin_only",
             "failed_step",
             "error",
             "owner",
@@ -327,7 +327,7 @@ class TestAdminNodesPopulated:
                 "gpu_count": None,
                 "managed": True,
                 "self_setup": False,
-                "hidden": False,
+                "admin_only": False,
                 "name": "",
                 "failed_step": None,
                 "error": None,
@@ -1242,7 +1242,7 @@ class TestNodePool:
         assert response.status_code == 201
         mock_provisioner.validate_endpoint.assert_called_once_with("gpu01", 9000)
         mock_provisioner.register_self_setup.assert_awaited_once_with(
-            "gpu01", 9000, owner=owner.lower(), hidden=False, name=""
+            "gpu01", 9000, owner=owner.lower(), admin_only=False, name=""
         )
 
     def test_register_pool_rejects_out_of_range_port(
@@ -1283,11 +1283,11 @@ class TestNodePool:
             "state": "healthy",
             "model": "org/model",
             "self_setup": True,
-            "hidden": False,
+            "admin_only": False,
             "name": "",
         }
         mock_provisioner.register_self_setup.assert_awaited_once_with(
-            "gpu01", None, owner="", hidden=False, name=""
+            "gpu01", None, owner="", admin_only=False, name=""
         )
         mock_provisioner.register_available.assert_not_called()
 
@@ -1424,10 +1424,10 @@ class TestNodePool:
             hostname: str,
             port: int | None = None,
             owner: str = "",
-            hidden: bool = False,
+            admin_only: bool = False,
             name: str = "",
         ) -> Node:
-            del owner, hidden, name
+            del owner, admin_only, name
             probes_started.set()
             while not release_probes.is_set():
                 await asyncio.sleep(0.01)
@@ -1475,11 +1475,11 @@ class TestNodePool:
             "state": "healthy",
             "model": "org/model",
             "self_setup": True,
-            "hidden": False,
+            "admin_only": False,
             "name": "",
         }
         mock_provisioner.register_self_setup.assert_awaited_once_with(
-            "gpu01", None, owner="", hidden=False, name=""
+            "gpu01", None, owner="", admin_only=False, name=""
         )
 
     def test_readoption_reconciles_reported_model(
@@ -1517,7 +1517,7 @@ class TestNodePool:
         assert response.status_code == 201
         assert response.json()["model"] == "org/new"
         mock_provisioner.register_self_setup.assert_awaited_once_with(
-            "gpu01", None, owner="", hidden=False, name=""
+            "gpu01", None, owner="", admin_only=False, name=""
         )
 
     def test_self_setup_flag_cannot_adopt_managed_node(
@@ -3273,7 +3273,7 @@ class TestOwnerPreservation:
 
         assert response.status_code == 201
         mock_provisioner.register_self_setup.assert_awaited_once_with(
-            "gpu01", port, owner="alice@example.com", hidden=False, name=""
+            "gpu01", port, owner="alice@example.com", admin_only=False, name=""
         )
 
     def test_setup_retry_preserves_existing_owner(

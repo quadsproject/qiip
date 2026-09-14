@@ -1,11 +1,11 @@
-"""Hidden inference servers and admin-role access gates.
+"""Admin-only inference servers and admin-role access gates.
 
 Regression coverage for:
 
-- ``hidden`` registration through the pool adoption path
-- hidden-node scope rules in the node selector (admin-only routing)
-- hidden nodes excluded from the public ``/v1/models`` catalog
-- the trimmed ``/fleet/nodes`` surface (hidden servers and actions stripped)
+- ``admin_only`` registration through the pool adoption path
+- admin-only node scope rules in the node selector (admin-only routing)
+- admin-only nodes excluded from the public ``/v1/models`` catalog
+- the trimmed ``/fleet/nodes`` surface (admin-only servers and actions stripped)
 - admin-role grant/revoke API and session-based admin access
 - per-role dashboard page gating
 """
@@ -31,7 +31,7 @@ from tests.auth.conftest import FakeAuthPlugin
 def _make_node(
     node_id: str,
     *,
-    hidden: bool = False,
+    admin_only: bool = False,
     owner: str = "",
     model: str = "llama-3",
 ) -> Node:
@@ -43,7 +43,7 @@ def _make_node(
         model=model,
         managed=False,
         self_setup=True,
-        hidden=hidden,
+        admin_only=admin_only,
         owner=owner,
     )
 
@@ -61,24 +61,24 @@ def _signed_in_client(app: FastAPI, store: AuthStore) -> tuple[TestClient, User]
     return client, users[0]
 
 
-class TestHiddenRegistration:
-    def test_hidden_implies_self_setup(self) -> None:
-        request = RegisterRequest(hostname="gpu01", hidden=True)
+class TestAdminOnlyRegistration:
+    def test_admin_only_implies_self_setup(self) -> None:
+        request = RegisterRequest(hostname="gpu01", admin_only=True)
 
         assert request.self_setup is True
 
-    def test_hidden_pool_registration_sets_flags(
+    def test_admin_only_pool_registration_sets_flags(
         self,
         client: TestClient,
         mock_provisioner: MagicMock,
     ) -> None:
         mock_provisioner.register_self_setup = AsyncMock(
-            return_value=_make_node("gpu01", hidden=True, model="org/model")
+            return_value=_make_node("gpu01", admin_only=True, model="org/model")
         )
         mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
 
         response = client.post(
-            "/admin/nodes/pool", json={"hostname": "gpu01", "hidden": True}
+            "/admin/nodes/pool", json={"hostname": "gpu01", "admin_only": True}
         )
 
         assert response.status_code == 201
@@ -87,37 +87,37 @@ class TestHiddenRegistration:
             "state": "healthy",
             "model": "org/model",
             "self_setup": True,
-            "hidden": True,
+            "admin_only": True,
             "name": "",
         }
         mock_provisioner.register_self_setup.assert_awaited_once_with(
-            "gpu01", None, owner="", hidden=True, name=""
+            "gpu01", None, owner="", admin_only=True, name=""
         )
 
 
-class TestHiddenRoutingScope:
-    def test_hidden_nodes_require_admin_scope(
+class TestAdminOnlyRoutingScope:
+    def test_admin_only_nodes_require_admin_scope(
         self,
         test_registry: NodeRegistry,
         node_selector: NodeSelector,
     ) -> None:
-        test_registry.add(_make_node("hidden1", hidden=True, model="secret"))
+        test_registry.add(_make_node("admin_only1", admin_only=True, model="secret"))
         test_registry.add(_make_node("pub1", model="public"))
 
-        # Admin scope (owner=None) reaches hidden nodes.
+        # Admin scope (owner=None) reaches admin-only nodes.
         assert node_selector.select("secret", owner=None) is not None
         # Anonymous (owner="") and user (email) scopes never do.
         assert node_selector.select("secret", owner="") is None
         assert node_selector.select("secret", owner="alice@example.com") is None
-        # A non-hidden node stays reachable for anonymous scope.
+        # A non-admin-only node stays reachable for anonymous scope.
         assert node_selector.select("public", owner="") is not None
 
-    def test_hidden_nodes_absent_from_public_model_catalog(
+    def test_admin_only_nodes_absent_from_public_model_catalog(
         self,
         client: TestClient,
         test_registry: NodeRegistry,
     ) -> None:
-        test_registry.add(_make_node("hidden1", hidden=True, model="secret"))
+        test_registry.add(_make_node("admin_only1", admin_only=True, model="secret"))
         test_registry.add(_make_node("pub1", model="public"))
 
         response = client.get("/v1/models")
@@ -137,13 +137,13 @@ class TestFleetEndpoint:
     def test_fleet_node_endpoint_requires_session(self, app: FastAPI) -> None:
         assert TestClient(app).get("/fleet/nodes").status_code == 401
 
-    def test_fleet_node_endpoint_hides_hidden_nodes_and_actions(
+    def test_fleet_node_endpoint_hides_admin_only_nodes_and_actions(
         self,
         app: FastAPI,
         auth_store: AuthStore,
         test_registry: NodeRegistry,
     ) -> None:
-        test_registry.add(_make_node("hidden1", hidden=True, model="secret"))
+        test_registry.add(_make_node("admin_only1", admin_only=True, model="secret"))
         test_registry.add(_make_node("pub1", model="public"))
         client, _user = _signed_in_client(app, auth_store)
 
@@ -165,20 +165,20 @@ class TestFleetEndpoint:
 
         assert client.get("/admin/nodes").status_code == 401
 
-    def test_admin_nodes_includes_hidden_flag(
+    def test_admin_nodes_includes_admin_only_flag(
         self,
         client: TestClient,
         test_registry: NodeRegistry,
     ) -> None:
-        test_registry.add(_make_node("hidden1", hidden=True, model="secret"))
+        test_registry.add(_make_node("admin_only1", admin_only=True, model="secret"))
         test_registry.add(_make_node("pub1", model="public"))
 
         response = client.get("/admin/nodes")
 
         assert response.status_code == 200
         nodes = {node["node_id"]: node for node in response.json()}
-        assert nodes["hidden1"]["hidden"] is True
-        assert nodes["pub1"]["hidden"] is False
+        assert nodes["admin_only1"]["admin_only"] is True
+        assert nodes["pub1"]["admin_only"] is False
 
 
 class TestAdminRoles:
@@ -357,7 +357,7 @@ class TestDashboardRoles:
 
         admin_page = client.get("/dashboard/admin")
         assert admin_page.status_code == 200
-        assert "Hidden Inference Servers" in admin_page.text
+        assert "Admin_Only Inference Servers" in admin_page.text
         assert "Admin Users" in admin_page.text
 
     def test_logout_visible_for_local_admin_session(

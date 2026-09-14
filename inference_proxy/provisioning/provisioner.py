@@ -1336,7 +1336,7 @@ class NodeProvisioner:
         hostname: str,
         port: int | None = None,
         owner: str = "",
-        hidden: bool = False,
+        admin_only: bool = False,
         name: str = "",
     ) -> Node:
         """Adopt an already-running OpenAI-compatible server into the fleet.
@@ -1388,7 +1388,7 @@ class NodeProvisioner:
             last_heartbeat=datetime.now(UTC),
             managed=False,
             self_setup=True,
-            hidden=hidden,
+            admin_only=admin_only,
             owner=owner,
         )
         key, value = node_to_etcd(node, self._etcd_client.prefix)

@@ -1,11 +1,11 @@
-"""Fleet endpoint for signed-in viewers (hidden-node visibility contract).
+"""Fleet endpoint for signed-in viewers (admin-only node visibility contract).
 
 ``GET /fleet/nodes`` backs the fleet page for non-admin signed-in users
 (and local-admin sessions via Basic): it returns registered nodes with
-hidden servers removed and operational actions stripped. Admins keep the
-full operational view through ``GET /admin/nodes``, so the fleet endpoint
-never needs to return hidden identity — hidden servers stay hidden from
-every transport of this surface.
+admin-only servers removed and operational actions stripped. Admins keep
+the full operational view through ``GET /admin/nodes``, so the fleet
+endpoint never needs to return admin-only identity — admin-only servers
+stay off this surface.
 """
 
 from __future__ import annotations

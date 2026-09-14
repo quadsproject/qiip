@@ -4,7 +4,7 @@ Per D-01: Dashboard served at /dashboard, separate from /admin/* JSON API.
 Per D-02: Client-side fetch -- HTML shell rendered by Jinja2, JS fetches
 /admin/nodes (admins) or /fleet/nodes (signed-in non-admins).
 
-Viewer contract (RFE hidden servers + admin roles):
+Viewer contract (RFE admin-only servers + admin roles):
 
 - The fleet page (``/dashboard``) is available to every authenticated
   viewer: the HTTP Basic local admin, a signed-in Google user, or a Google
@@ -153,7 +153,7 @@ async def admin_page(
     request: Request,
     settings: Settings = Depends(get_settings),
 ) -> HTMLResponse:
-    """Render the admin page: hidden inference servers and admin users."""
+    """Render the admin page: admin-only inference servers and admin users."""
     _, denied = _admin_or_signin(request, settings)
     if denied is not None:
         return denied

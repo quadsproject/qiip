@@ -70,7 +70,7 @@ class AdminNodeResponse(BaseModel):
     gpu_count: int | None = None
     managed: bool = True
     self_setup: bool = False
-    hidden: bool = False
+    admin_only: bool = False
     failed_step: str | None = None
     error: str | None = None
     owner: str = ""
@@ -97,7 +97,7 @@ class RegisterRequest(BaseModel):
 
     hostname: str
     self_setup: bool = False
-    hidden: bool = False
+    admin_only: bool = False
     name: str = Field(default="", max_length=256)
     port: int | None = Field(default=None, ge=1, le=65535)
     owner: str = ""
@@ -119,9 +119,13 @@ class RegisterRequest(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def hidden_implies_self_setup(cls, data: object) -> object:
-        """A hidden server is always an adopted existing server."""
-        if isinstance(data, dict) and data.get("hidden") and not data.get("self_setup"):
+    def admin_only_implies_self_setup(cls, data: object) -> object:
+        """An admin-only server is always an adopted existing server."""
+        if (
+            isinstance(data, dict)
+            and data.get("admin_only")
+            and not data.get("self_setup")
+        ):
             return {**data, "self_setup": True}
         return data
 

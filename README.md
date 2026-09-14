@@ -52,8 +52,8 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
 - **Admin authentication** -- HTTP Basic required on all `/admin/*` endpoints and `/dashboard*` pages
 - **Fleet sign-in gate** -- anonymous visitors to the fleet dashboard get a sign-in page with two options: **Sign in with Local Admin** (in-page username/password form that establishes a signed session cookie — no browser Basic challenge popup; HTTP Basic still works for scripts and SSE) and **Sign in with Google Auth** (same flow as the profile page)
-- **Admin roles** -- the HTTP Basic admin user (bootstrap authority) can grant or revoke the admin role to Google-authenticated users on the admin page; role admins then reach the admin surface through their session and see hidden servers
-- **Hidden inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). They are routable only to admin callers (Basic, admin-role tokens, and the full-access trust list), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with a `hidden` badge in the admin fleet view. Token usage from hidden servers is tracked on the token summary pages exactly like any other node
+- **Admin roles** -- the HTTP Basic admin user (bootstrap authority) can grant or revoke the admin role to Google-authenticated users on the admin page; role admins then reach the admin surface through their session and see admin-only servers
+- **Admin-only inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). They are routable only to admin callers (Basic, admin-role tokens, and the full-access trust list), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with an `admin_only` badge in the admin fleet view. Token usage from admin-only servers is tracked on the token summary pages exactly like any other node
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
 - **User API tokens** -- each user can mint `qiip_...` bearer tokens on their profile page to call `/v1/chat/completions` and `/v1/completions`; tokens are stored as SHA-256 digests and can be revoked at any time
 - **Config-gated inference auth** -- a valid `qiip_...` bearer token is always accepted on `/v1`; requiring a token for every `/v1` request (`auth.enforce_api_tokens`) is optional and off by default, so existing public deployments keep serving anonymous requests unchanged
@@ -239,7 +239,7 @@ Fleet (any signed-in user, or HTTP Basic local admin):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/fleet/nodes` | Fleet view for non-admin viewers: registered nodes without hidden servers or operational actions |
+| `GET` | `/fleet/nodes` | Fleet view for non-admin viewers: registered nodes without admin-only servers or operational actions |
 
 User-session-protected profile endpoints (require `auth.session_secret` and a
 signed-in session):
@@ -263,7 +263,7 @@ HTTP Basic-protected administrative endpoints:
 | `POST` | `/admin/models/download` | Start or inspect a duplicate-safe model download |
 | `GET` | `/admin/models/downloads` | List tracked model-download states |
 | `POST` | `/admin/nodes/setup` | Start background node provisioning |
-| `POST` | `/admin/nodes/pool` | Add a node to the available pool, or adopt an already-running OpenAI-compatible server; `"hidden": true` registers a hidden server (implies `self_setup`) |
+| `POST` | `/admin/nodes/pool` | Add a node to the available pool, or adopt an already-running OpenAI-compatible server; `"admin_only": true` registers an admin-only server (implies `self_setup`) |
 | `POST` | `/admin/nodes/{hostname}/llamacpp/relaunch` | Drain and relaunch a healthy managed llama.cpp node with a typed sizing policy |
 | `DELETE` | `/admin/nodes/{node_id}` | Drain and tear down a node; supports force and the scoped recovery procedure below |
 | `PATCH` | `/admin/nodes/{node_id}/owner` | Set or clear a node's owner email (`"owner": ""` clears it) |
@@ -278,7 +278,7 @@ HTTP Basic-protected administrative endpoints:
 | `GET` | `/admin/nodes/{hostname}/recommendations` | Run hardware-aware model recommendations |
 | `GET` | `/dashboard` | Authenticated operations dashboard; anonymous visitors get the sign-in page |
 | `GET` | `/dashboard/nodes/{node_id}` | Authenticated node detail page |
-| `GET` | `/dashboard/admin` | Admin page: manage hidden inference servers and admin users |
+| `GET` | `/dashboard/admin` | Admin page: manage admin-only inference servers and admin users |
 
 ### Administrative access
 
@@ -301,7 +301,7 @@ anonymous visitors receive a sign-in page with **Sign in with Local Admin**
 browser native Basic prompt is no longer used, though HTTP Basic requests and
 SSE still pass through unchanged) and **Sign in with Google Auth** (the same
 flow as the profile page).
-Signed-in non-admin users see the fleet with hidden servers removed and no
+Signed-in non-admin users see the fleet with admin-only servers removed and no
 operational actions; node detail, model catalog, token dashboards, and the
 admin page remain admin-only.
 
@@ -318,19 +318,19 @@ preflight. Do not add form-encoded, multipart, or plain-text state-changing
 admin endpoints without adding explicit CSRF protection. Authentication also
 does not protect an already-authenticated browser from same-origin XSS.
 
-### Hidden inference servers
+### Admin-only inference servers
 
-`POST /admin/nodes/pool` with `"hidden": true` (which implies `"self_setup":
-true`) registers an already-running OpenAI-compatible server as a **hidden
-server**: no provisioning steps are performed, QIIP never owns its lifecycle,
-and its node id is the server hostname. Hidden servers:
+`POST /admin/nodes/pool` with `"admin_only": true` (which implies `"self_setup":
+true`) registers an already-running OpenAI-compatible server as an
+**admin-only server**: no provisioning steps are performed, QIIP never owns its
+lifecycle, and its node id is the server hostname. Admin-only servers:
 
 - are routable only to admin callers (HTTP Basic, admin-role tokens, and the
   `admin_only_tokens_full_access` trust list) — node selection, retries, and
   `/v1/models` all enforce this;
 - are never listed on the non-admin fleet page or in the public `/v1/models`
-  catalog; admins see them in `/admin/nodes` with `"hidden": true`, displayed
-  bold with a `hidden` badge;
+  catalog; admins see them in `/admin/nodes` with `"admin_only": true`,
+  displayed bold with an `admin_only` badge;
 - track per-token usage on the profile and admin token summary pages exactly
   like any other node;
 - may carry an operator-facing display `name` (e.g. `"DeepSeek-V4-Flash-Vision-Exp (qiip)"`)

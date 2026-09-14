@@ -122,7 +122,7 @@ let openConfigMenuNode = null;
 let dashboardPollInFlight = false;
 let dashboardRequestSequence = 0;
 let dashboardLastRenderedSequence = 0;
-// Non-admin viewers use the trimmed fleet endpoint; hidden nodes and
+// Non-admin viewers use the trimmed fleet endpoint; admin-only nodes and
 // operational actions never reach them. VIEWER_ROLE is always rendered by
 // the dashboard HTML as a top-level `const`, which does NOT create a
 // window property -- read the lexical binding, with a window fallback for
@@ -244,7 +244,7 @@ async function refreshDashboard() {
   const warningEl = document.getElementById("poll-warning");
   try {
     // Admin viewers get the full operational view; signed-in non-admins get
-    // the trimmed fleet view (hidden servers and actions already stripped
+    // the trimmed fleet view (admin-only servers and actions already stripped
     // server-side).
     const nodesResp = viewerAdmin
       ? await fetch("/admin/nodes")
@@ -343,11 +343,11 @@ async function refreshDashboard() {
           tdId.appendChild(document.createTextNode(" "));
           tdId.appendChild(tag);
         }
-        if (node.hidden) {
-          idLink.classList.add("node-id-hidden");
+        if (node.admin_only) {
+          idLink.classList.add("node-id-admin-only");
           const tag = document.createElement("span");
-          tag.className = "badge badge-hidden";
-          tag.textContent = "hidden";
+          tag.className = "badge badge-admin-only";
+          tag.textContent = "admin_only";
           tdId.appendChild(document.createTextNode(" "));
           tdId.appendChild(tag);
         }

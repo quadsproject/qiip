@@ -240,7 +240,7 @@ class Node(BaseModel):
     Attributes:
         node_id: Unique identifier for the node.
         name: Optional operator-facing display name (e.g. a friendly label for
-            a hidden server). Empty means the node id is used for display.
+            an admin-only server). Empty means the node id is used for display.
         endpoint: HTTP endpoint (host:port) for the inference server.
         status: Current health status of the node.
         model: Name of the model being served.
@@ -254,10 +254,11 @@ class Node(BaseModel):
             registered nodes must opt in explicitly.
         self_setup: Whether the node was adopted from an already-running
             OpenAI-compatible server. These nodes are never torn down.
-        hidden: Whether the node is a hidden inference server. Hidden nodes
-            are adopted running servers (``self_setup``) that are never
-            listed on the non-admin fleet page and are routable only to
-            admin callers (Basic admin or admin-role token/user).
+        admin_only: Whether the node is visible only to admin callers.
+            Admin-only nodes are adopted running servers (``self_setup``)
+            that are never listed on the non-admin fleet page and are
+            routable only to admin callers (admin-role bearer tokens or the
+            full-access trust list).
         owner: Email of the endpoint owner. Empty means shared (any user
             may route to it); an owner restricts routing to that user's
             tokens and admin full-access tokens.
@@ -278,7 +279,7 @@ class Node(BaseModel):
     active_connections: int = 0
     managed: bool = False
     self_setup: bool = False
-    hidden: bool = False
+    admin_only: bool = False
     owner: str = ""
 
     @model_validator(mode="after")

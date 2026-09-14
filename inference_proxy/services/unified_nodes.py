@@ -55,7 +55,7 @@ class UnifiedNodeService:
         """Return merged QUADS + etcd node list sorted by node_id.
 
         ``viewer_admin`` controls the fleet-visibility contract: a non-admin
-        viewer never sees hidden nodes, never sees QUADS-only available
+        viewer never sees admin-only nodes, never sees QUADS-only available
         hosts, and receives no operational actions.
         """
         etcd_map = {canonical_hostname(n.node_id): n for n in self._registry.get_all()}
@@ -97,10 +97,10 @@ class UnifiedNodeService:
         if viewer_admin:
             return sorted(result, key=lambda r: r.node_id)
         filtered = [
-            # Non-admin callers never see hidden nodes or operational actions.
+            # Non-admin callers never see admin-only nodes or operational actions.
             item.model_copy(update={"actions": []})
             for item in result
-            if not item.hidden
+            if not item.admin_only
         ]
         return sorted(filtered, key=lambda r: r.node_id)
 
@@ -137,7 +137,7 @@ class UnifiedNodeService:
             gpu_count=host.gpu_count if host else None,
             managed=node.managed,
             self_setup=node.self_setup,
-            hidden=node.hidden,
+            admin_only=node.admin_only,
             owner=node.owner,
             failed_step=task.failed_step if task else None,
             error=task.error if task else None,

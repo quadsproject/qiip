@@ -2,16 +2,16 @@
 // Generators are pure functions testable via Node.js.
 //
 // *opts* carries node display info: `name` (operator-facing name) and
-// `hidden` (hidden servers require a bearer token, so the generated config
-// declares apiKey auth with a placeholder instead of `auth: none` — a
-// hidden server is unreachable anonymously by design).
+// `admin_only` (admin-only servers require a bearer token, so the generated
+// config declares apiKey auth with a placeholder instead of `auth: none` —
+// an admin-only server is unreachable anonymously by design).
 
 var TOKEN_PLACEHOLDER = "<paste-qiip-token-here>";
 
 function configApiKey(opts) {
-  // Hidden servers: a real minted token when the download flow obtained one,
+  // Admin-only servers: a real minted token when the download flow obtained one,
   // otherwise an explicit placeholder (never silently `auth: none`).
-  if (opts && opts.hidden) {
+  if (opts && opts.admin_only) {
     return (opts && opts.token) || TOKEN_PLACEHOLDER;
   }
   return null;
@@ -47,7 +47,7 @@ function generateOpenCodeConfig(baseUrl, modelId, opts) {
 function generatePiConfig(baseUrl, modelId, opts) {
   var base = baseUrl.replace(/\/+$/, "");
   var apiKey = configApiKey(opts);
-  var apiKeyValue = apiKey ? apiKey : (opts && opts.hidden ? TOKEN_PLACEHOLDER : "none");
+  var apiKeyValue = apiKey ? apiKey : (opts && opts.admin_only ? TOKEN_PLACEHOLDER : "none");
   return {
     providers: {
       qiip: {
@@ -79,8 +79,8 @@ function generateOmpConfig(baseUrl, modelId, opts) {
     "  qiip:",
     "    baseUrl: " + yamlScalar(base + "/v1"),
   ];
-  if (opts && opts.hidden) {
-    // Hidden inference servers are reachable only with an admin-role apiKey.
+  if (opts && opts.admin_only) {
+    // Admin-only inference servers are reachable only with an admin-role apiKey.
     var apiKey = opts.token || TOKEN_PLACEHOLDER;
     lines.push("    auth: apiKey");
     lines.push("    apiKey: " + yamlScalar(apiKey));
@@ -134,11 +134,11 @@ function createConfigDropdown(baseUrl, modelId, positionFn, onToggle, opts) {
       btn.textContent = fmt.label;
       btn.addEventListener("click", async function () {
         var generatorOpts = opts || {};
-        if (generatorOpts.hidden) {
-          // Hidden servers need a bearer token: share the user's single
+        if (generatorOpts.admin_only) {
+          // Admin-only servers need a bearer token: share the user's single
           // agent-config key (minted on first use, then reused). It is
           // derived server-side and never stored, so every download of any
-          // hidden server -- any browser, any machine -- embeds the same
+          // admin-only server -- any browser, any machine -- embeds the same
           // key. A revoke rotates it; the next download gets the new one.
           try {
             var mintResp = await fetch("/profile/tokens", {

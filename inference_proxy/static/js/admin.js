@@ -1,4 +1,4 @@
-// Admin page: hidden inference servers and admin-role users.
+// Admin page: admin-only inference servers and admin-role users.
 // ponytail: vanilla fetch + DOM, no framework needed
 
 function showAdminToast(message, type) {
@@ -26,10 +26,10 @@ function parseServerUrl(rawUrl) {
   };
 }
 
-async function removeHiddenNode(nodeId) {
+async function removeAdminOnlyNode(nodeId) {
   const ok = await confirmDialog({
-    title: "Remove hidden server",
-    message: `Remove ${nodeId} from the hidden server list? The existing server will keep running.`,
+    title: "Remove admin_only server",
+    message: `Remove ${nodeId} from the admin_only server list? The existing server will keep running.`,
     confirmLabel: "Remove",
     danger: false,
   });
@@ -47,14 +47,14 @@ async function removeHiddenNode(nodeId) {
   }
 }
 
-function renderHiddenNodes(nodes) {
-  const tbody = document.getElementById("hidden-node-body");
+function renderAdminOnlyNodes(nodes) {
+  const tbody = document.getElementById("admin-only-node-body");
   tbody.textContent = "";
   if (nodes.length === 0) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
     td.colSpan = 5;
-    td.textContent = "No hidden inference servers configured";
+    td.textContent = "No admin_only inference servers configured";
     tr.appendChild(td);
     tbody.appendChild(tr);
     return;
@@ -63,7 +63,7 @@ function renderHiddenNodes(nodes) {
     const tr = document.createElement("tr");
     const tdId = document.createElement("td");
     const idSpan = document.createElement("span");
-    idSpan.className = "node-id-hidden";
+    idSpan.className = "node-id-admin-only";
     idSpan.textContent = node.name || node.node_id;
     idSpan.title = node.node_id;
     tdId.appendChild(idSpan);
@@ -89,7 +89,7 @@ function renderHiddenNodes(nodes) {
     btn.type = "button";
     btn.className = "btn btn-sm btn-secondary";
     btn.textContent = "Remove";
-    btn.addEventListener("click", () => removeHiddenNode(node.node_id));
+    btn.addEventListener("click", () => removeAdminOnlyNode(node.node_id));
     tdActions.appendChild(btn);
     tr.appendChild(tdActions);
 
@@ -178,9 +178,9 @@ async function refreshAdminPage() {
     }
     const nodes = await nodesResp.json();
     const users = await usersResp.json();
-    renderHiddenNodes(nodes.filter((node) => node.hidden));
+    renderAdminOnlyNodes(nodes.filter((node) => node.admin_only));
     renderAdminUsers(users);
-    statusEl.textContent = `Admin data loaded: ${nodes.filter((node) => node.hidden).length} hidden servers, ${users.length} users`;
+    statusEl.textContent = `Admin data loaded: ${nodes.filter((node) => node.admin_only).length} admin_only servers, ${users.length} users`;
     const lastUpdated = document.getElementById("last-updated");
     if (lastUpdated) {
       lastUpdated.textContent = "Updated " + new Date().toLocaleTimeString();
@@ -195,11 +195,11 @@ document.addEventListener("DOMContentLoaded", function () {
   setInterval(refreshAdminPage, POLL_INTERVAL_MS);
 
   document
-    .getElementById("hidden-server-form")
+    .getElementById("admin-only-server-form")
     .addEventListener("submit", async function (e) {
       e.preventDefault();
-      const input = document.getElementById("hidden-server-url");
-      const btn = document.getElementById("hidden-server-btn");
+      const input = document.getElementById("admin-only-server-url");
+      const btn = document.getElementById("admin-only-server-btn");
       const rawUrl = input.value.trim();
       if (!rawUrl) return;
       let parsed;
@@ -214,7 +214,7 @@ document.addEventListener("DOMContentLoaded", function () {
         const body = {
           hostname: parsed.hostname,
           self_setup: true,
-          hidden: true,
+          admin_only: true,
         };
         if (parsed.port !== null) body.port = parsed.port;
         const resp = await fetch("/admin/nodes/pool", {
@@ -224,7 +224,7 @@ document.addEventListener("DOMContentLoaded", function () {
         });
         const data = await resp.json().catch(() => ({}));
         if (resp.ok) {
-          showAdminToast(`Hidden server ${parsed.hostname} registered`, "success");
+          showAdminToast(`admin_only server ${parsed.hostname} registered`, "success");
           input.value = "";
           refreshAdminPage();
         } else {

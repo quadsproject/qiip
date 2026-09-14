@@ -374,7 +374,7 @@ async def register_node(
                     hostname,
                     body.port,
                     owner=owner,
-                    hidden=body.hidden,
+                    admin_only=body.admin_only,
                     name=body.name,
                 )
             except SelfSetupError as exc:
@@ -386,7 +386,7 @@ async def register_node(
                     "state": adopted.status.value,
                     "model": adopted.model,
                     "self_setup": True,
-                    "hidden": adopted.hidden,
+                    "admin_only": adopted.admin_only,
                     "name": adopted.name,
                 },
             )

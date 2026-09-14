@@ -85,14 +85,14 @@ def pickable_endpoints(
     """Return hostnames *user_email* may pin a token to, sorted.
 
     A user may pin unowned nodes and nodes they own; admins may pin
-    anything, including hidden servers. Hidden servers are never
+    anything, including admin-only servers. Admin-only servers are never
     pickable by non-admin callers.
     """
     admin = is_full_access(user_email, settings) or is_admin
     email = user_email.lower()
     pickable = []
     for node in nodes:
-        if not admin and node.hidden:
+        if not admin and node.admin_only:
             continue
         if admin or not node.owner or node.owner.lower() == email:
             pickable.append(node.node_id)
