@@ -1302,7 +1302,9 @@ class NodeProvisioner:
                     await keepalive
             self._log_buffer.mark_complete(hostname)
 
-    async def register_available(self, hostname: str, port: int | None = None, owner: str = "") -> None:
+    async def register_available(
+        self, hostname: str, port: int | None = None, owner: str = ""
+    ) -> None:
         """Register a hostname as available in the node pool (no provisioning).
 
         A custom port is rejected: a plain pool node is provisioned later on the
@@ -1329,7 +1331,9 @@ class NodeProvisioner:
         if self._registry is not None:
             self._registry.add(node)
 
-    async def register_self_setup(self, hostname: str, port: int | None = None, owner: str = "") -> Node:
+    async def register_self_setup(
+        self, hostname: str, port: int | None = None, owner: str = ""
+    ) -> Node:
         """Adopt an already-running OpenAI-compatible server into the fleet.
 
         Adoption is keyed on the OpenAI-compatible contract (``GET
@@ -1395,12 +1399,9 @@ class NodeProvisioner:
     async def update_node_owner(self, hostname: str, owner: str) -> Node:
         """Set the owner of a registered node, preserving its etcd lease.
 
-        Adoption is based on the OpenAI-compatible contract (``GET
-        /v1/models``). ``/health`` is probed best-effort, but only a missing
-        health endpoint (HTTP 404/405/501) is optional — many OpenAI-compatible
-        servers do not expose it. An authoritative unhealthy response (e.g.
-        ``/health`` 503) blocks adoption because the model list does not
-        establish inference readiness.
+        Uses a CAS on the record revision so a concurrent status/liveness
+        write is never clobbered; retries a bounded number of times, then
+        raises ``ProvisioningError``.
         """
         key = f"{self._etcd_client.prefix}{hostname}"
         record = await asyncio.to_thread(self._etcd_client.get_record, key)
@@ -1439,8 +1440,16 @@ class NodeProvisioner:
             record = fresh
         raise ProvisioningError(f"Node {hostname!r} kept changing during owner update")
 
-    async def _discover_running_vllm_model(self, endpoint: str, hostname: str) -> str:
-        """Health-check an existing vLLM server and return the served model id."""
+    async def _discover_running_model(self, endpoint: str, hostname: str) -> str:
+        """Probe an OpenAI-compatible server and return its served model id.
+
+        Adoption is based on the OpenAI-compatible contract (``GET
+        /v1/models``). ``/health`` is probed best-effort, but only a missing
+        health endpoint (HTTP 404/405/501) is optional — many OpenAI-compatible
+        servers do not expose it. An authoritative unhealthy response (e.g.
+        ``/health`` 503) blocks adoption because the model list does not
+        establish inference readiness.
+        """
         health_url = build_backend_url(endpoint, "/health")
         models_url = build_backend_url(endpoint, "/v1/models")
         timeout = httpx.Timeout(_SELF_SETUP_PROBE_TIMEOUT)

@@ -370,8 +370,9 @@ async def register_node(
                 else (node.owner if node else "")
             )
             try:
-                adopted = await provisioner.register_self_setup(hostname, body.port, owner=owner)
-
+                adopted = await provisioner.register_self_setup(
+                    hostname, body.port, owner=owner
+                )
             except SelfSetupError as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
             return JSONResponse(
@@ -384,7 +385,6 @@ async def register_node(
                 },
             )
         await provisioner.register_available(hostname, body.port, owner=body.owner)
-
         return JSONResponse(
             status_code=201,
             content={"hostname": hostname, "state": "available"},

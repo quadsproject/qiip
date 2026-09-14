@@ -98,7 +98,6 @@ class RegisterRequest(BaseModel):
     port: int | None = Field(default=None, ge=1, le=65535)
     owner: str = ""
 
-
     @field_validator("hostname")
     @classmethod
     def validate_hostname(cls, v: str) -> str:

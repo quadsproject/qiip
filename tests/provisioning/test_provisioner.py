@@ -1370,30 +1370,49 @@ class TestSelfSetupRegistration:
         assert served_model_id(payload) == expected
 
     @pytest.mark.asyncio
-    async def test_registers_detected_model(self, httpx_mock: HTTPXMock) -> None:
+    @pytest.mark.parametrize("port", [None, 9000])
+    @pytest.mark.parametrize("owner", ["", "alice@example.com"])
+    async def test_registers_detected_model(
+        self, httpx_mock: HTTPXMock, port: int | None, owner: str
+    ) -> None:
         etcd = MagicMock()
         etcd.prefix = "/nodes/"
         registry = NodeRegistry()
-        provisioner = _make_provisioner(etcd_client=etcd, registry=registry)
-        httpx_mock.add_response(url="http://host1:8000/health", status_code=200)
+        provisioner = _make_provisioner(
+            etcd_client=etcd,
+            registry=registry,
+            endpoint_policy=EndpointPolicy.from_values(
+                allowed_hosts=["host1"],
+                allowed_networks=[],
+                allowed_ports=[8000, 9000],
+            ),
+        )
+        endpoint = f"http://host1:{port or 8000}"
+        httpx_mock.add_response(url=f"{endpoint}/health", status_code=200)
         httpx_mock.add_response(
-            url="http://host1:8000/v1/models",
+            url=f"{endpoint}/v1/models",
             json={"data": [{"id": "org/qwen", "owned_by": "vllm"}]},
         )
 
-        node = await provisioner.register_self_setup("host1")
+        node = await provisioner.register_self_setup("host1", port, owner=owner)
 
         assert node.self_setup is True
         assert node.managed is False
         assert node.status is NodeStatus.HEALTHY
         assert node.model == "org/qwen"
         assert node.engine is InferenceEngine.VLLM
+        assert node.endpoint == endpoint
+        assert node.owner == owner
         etcd.grant_node_lease.assert_not_called()
         etcd.put.assert_called_once()
+        persisted = json.loads(etcd.put.call_args.args[1])
+        assert persisted["endpoint"] == endpoint
+        assert persisted["owner"] == owner
         stored = registry.get("host1")
         assert stored is not None
         assert stored.model == "org/qwen"
         assert stored.self_setup is True
+        assert stored.owner == owner
 
     @pytest.mark.asyncio
     async def test_missing_health_endpoint_is_best_effort(
