@@ -457,24 +457,32 @@ class AuthStore:
 
         Returns None for unknown, malformed, or revoked tokens. The raw
         value is never stored or logged (AUTH-02).
+
+        The token and user are fetched as two single-table rows rather than
+        a ``tokens.*, users.*`` join: both tables carry ``id``, ``name`` and
+        ``created_at``, so a joined ``row["id"]`` is ambiguous and resolves to
+        the token id, collapsing the user's id onto the token's id and
+        orphaning usage rows under a phantom user id (AUTH-04).
         """
         if not raw or not str(raw).startswith(TOKEN_PREFIX):
             return None
         with self._lock:
-            row = self._conn.execute(
+            token_row = self._conn.execute(
                 """
-                SELECT tokens.*, users.*
-                  FROM tokens
-                  JOIN users ON users.id = tokens.user_id
-                 WHERE tokens.token_hash = ? AND tokens.revoked = 0
+                SELECT * FROM tokens
+                 WHERE token_hash = ? AND revoked = 0
                 """,
                 (_hash_token(raw),),
             ).fetchone()
-        if row is None:
-            return None
-        user = self._user_from_row(row)
-        token = self._token_from_row(row)
-        if user is None or token is None:  # pragma: no cover - defensive
+            token = self._token_from_row(token_row)
+            if token is None:
+                return None
+            user_row = self._conn.execute(
+                "SELECT * FROM users WHERE id = ?",
+                (token.user_id,),
+            ).fetchone()
+            user = self._user_from_row(user_row)
+        if user is None:  # pragma: no cover - defensive
             return None
         return TokenAuth(user=user, token=token)
 

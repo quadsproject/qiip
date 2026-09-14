@@ -321,6 +321,35 @@ class TestTokens:
         assert resolved.user.email == _GOOGLE["email"]
         assert resolved.token.id == created.id
 
+    def test_resolve_token_keeps_user_id_distinct_from_token_id(
+        self,
+        auth_store: AuthStore,
+    ) -> None:
+        # A token shared, id, name and created_at column names with users, so
+        # a `tokens.*, users.*` join makes row["id"] ambiguous. Seed the store
+        # so the token id differs from the user id, then confirm the resolved
+        # user is the real account (not a phantom built from the token row).
+        user = self._user(auth_store)  # user id 1
+        auth_store.create_token(user.id, "decoy")  # consumes token id 1
+        created = auth_store.create_token(user.id, "ci-job")  # token id 2
+        resolved = auth_store.resolve_token(created.token)
+
+        assert resolved is not None
+        assert resolved.user.id == user.id
+        assert resolved.user.email == _GOOGLE["email"]
+        assert resolved.user.name == _GOOGLE["name"]
+        assert resolved.token.id == created.id
+
+        # Usage recorded through the resolved identity lands on the real user.
+        auth_store.record_usage(
+            user_id=resolved.user.id,
+            token_id=resolved.token.id,
+            model="llama-3",
+            endpoint="/v1/chat/completions",
+            total_tokens=7,
+        )
+        assert auth_store.get_usage_totals(user.id).request_count == 1
+
 
 class TestUsage:
     def _user(self, store: AuthStore) -> User:
