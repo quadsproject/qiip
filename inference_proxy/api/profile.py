@@ -65,6 +65,7 @@ async def profile_me(
         email=user.email,
         name=user.name,
         picture=user.picture,
+        is_admin=user.is_admin,
     )
 
 
@@ -88,6 +89,11 @@ async def create_token(
     allowlist: Annotated[SSOAllowlist | None, Depends(get_sso_allowlist)] = None,
 ) -> CreatedToken:
     """Mint an API token; returns the raw secret exactly once (AUTH-02).
+
+    The ``agent-config`` name is special: it returns the user's single
+    reusable config token (derived on demand, never stored) so config
+    downloads stay stable across servers and browsers. Ordinary names mint
+    a fresh random token whose raw value is returned exactly once.
 
     When ``auth.enforce_sso_whitelist`` is on, the signed-in user must be on
     the fetched per-domain allowlist; otherwise 403. An unavailable
@@ -125,9 +131,20 @@ async def create_token(
                     status_code=403,
                     detail=f"Endpoint '{hostname}' is owned by another user",
                 )
-    created = await asyncio.to_thread(
-        store.create_token, user.id, body.name, body.endpoints
-    )
+    if body.name == "agent-config":
+        # Agent-config downloads share one stable token per user. The raw
+        # value is derived (never stored) so any browser/machine gets the
+        # same key; see AuthStore.get_or_create_config_token.
+        secret = settings.auth.session_secret
+        if secret is None:  # pragma: no cover - require_profile_user already
+            raise HTTPException(status_code=503, detail="Sessions are not configured")
+        created = await asyncio.to_thread(
+            store.get_or_create_config_token, user.id, secret.get_secret_value()
+        )
+    else:
+        created = await asyncio.to_thread(
+            store.create_token, user.id, body.name, body.endpoints
+        )
     return created
 
 
@@ -139,7 +156,7 @@ async def list_pickable_endpoints(
 ) -> list[dict[str, str]]:
     """List endpoints the signed-in user may pin a token to."""
     nodes = registry.get_all()
-    pickable = pickable_endpoints(user.email, settings, nodes)
+    pickable = pickable_endpoints(user.email, settings, nodes, is_admin=user.is_admin)
     by_id = {node.node_id: node for node in nodes}
     return [{"node_id": node_id, "model": by_id[node_id].model} for node_id in pickable]
 

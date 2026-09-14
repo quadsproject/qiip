@@ -174,10 +174,19 @@ class TestAdminBilling:
 
 class TestAdminTokenPages:
     def test_tokens_page_requires_admin(self, app: FastAPI) -> None:
-        assert TestClient(app).get("/dashboard/tokens").status_code == 401
+        """Anonymous visitors get the sign-in page instead of the token view."""
+        response = TestClient(app).get("/dashboard/tokens")
+
+        assert response.status_code == 200
+        assert "Sign in with Local Admin" in response.text
+        assert "QIIP - Token Management" not in response.text
 
     def test_user_detail_page_requires_admin(self, app: FastAPI) -> None:
-        assert TestClient(app).get("/dashboard/users/1").status_code == 401
+        response = TestClient(app).get("/dashboard/users/1")
+
+        assert response.status_code == 200
+        assert "Sign in with Local Admin" in response.text
+        assert "QIIP - User Tokens" not in response.text
 
     def test_tokens_page_renders(self, client: TestClient) -> None:
         response = client.get("/dashboard/tokens")

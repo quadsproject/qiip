@@ -33,8 +33,9 @@ def allowed_node_ids(
     Anonymous requests and admin full-access tokens are unpinned; a
     token with an endpoint scope is pinned to its stored hostnames.
     An explicit empty list pins to nothing (no reachable endpoints).
+    Admin-role users are unpinned, like the full-access trust list.
     """
-    if auth is None or is_full_access(auth.user.email, settings):
+    if auth is None or is_full_access(auth.user.email, settings) or auth.user.is_admin:
         return None
     scope = auth.token.endpoint_scope
     if scope is None:
@@ -50,7 +51,7 @@ def scope_owner(auth: TokenAuth | None, settings: Settings) -> str | None:
     """
     if auth is None:
         return ""
-    if is_full_access(auth.user.email, settings):
+    if is_full_access(auth.user.email, settings) or auth.user.is_admin:
         return None
     return auth.user.email.lower()
 
@@ -62,11 +63,12 @@ def auth_scope(
     """Resolve both selection filters for *auth* in one admin check.
 
     Returns ``(allowed_node_ids, owner)``; callers use the pair
-    together for node selection.
+    together for node selection. Admin-role users and the full-access
+    trust list are both treated as admins.
     """
     if auth is None:
         return (None, "")
-    if is_full_access(auth.user.email, settings):
+    if is_full_access(auth.user.email, settings) or auth.user.is_admin:
         return (None, None)
     scope = auth.token.endpoint_scope
     allowed = frozenset(scope) if scope is not None else None
@@ -77,16 +79,21 @@ def pickable_endpoints(
     user_email: str,
     settings: Settings,
     nodes: Iterable[Node],
+    *,
+    is_admin: bool = False,
 ) -> list[str]:
     """Return hostnames *user_email* may pin a token to, sorted.
 
     A user may pin unowned nodes and nodes they own; admins may pin
-    anything.
+    anything, including hidden servers. Hidden servers are never
+    pickable by non-admin callers.
     """
-    admin = is_full_access(user_email, settings)
+    admin = is_full_access(user_email, settings) or is_admin
     email = user_email.lower()
     pickable = []
     for node in nodes:
+        if not admin and node.hidden:
+            continue
         if admin or not node.owner or node.owner.lower() == email:
             pickable.append(node.node_id)
     return sorted(pickable)

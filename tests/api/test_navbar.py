@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from inference_proxy.api.templating import templates
@@ -33,6 +34,8 @@ _ALL_PAGES = (
 class _TemplateRequest:
     def url_for(self, _name: str, **params: str) -> str:
         return f"/static/{params['path']}"
+
+    headers: dict[str, str] = {}
 
 
 class TestNavbarRenderedOnEveryPage:
@@ -155,6 +158,26 @@ class TestNavbarIsSingleSourceOfTruth:
         text = (_TEMPLATES_DIR / template).read_text()
         assert '<nav class="top-bar"' not in text
         assert 'class="nav-link' not in text
+
+
+class TestNavbarLogout:
+    """The Logout control appears for every signed-in viewer, next to the theme toggle."""
+
+    def test_logout_visible_for_basic_admin(self, client: TestClient) -> None:
+        response = client.get("/chat")
+
+        assert response.status_code == 200
+        assert ">Logout</button>" in response.text
+        # Placed just left of the theme toggle.
+        assert response.text.index(">Logout</button>") < response.text.index(
+            'class="theme-toggle"'
+        )
+
+    def test_logout_hidden_for_anonymous(self, app: FastAPI) -> None:
+        response = TestClient(app).get("/chat")
+
+        assert response.status_code == 200
+        assert ">Logout</button>" not in response.text
 
 
 class TestNavbarRendersDirectly:

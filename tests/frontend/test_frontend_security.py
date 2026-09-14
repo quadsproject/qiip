@@ -32,6 +32,8 @@ class _TemplateRequest:
     def url_for(self, _name: str, **params: str) -> str:
         return f"/static/{params['path']}"
 
+    headers: dict[str, str] = {}
+
 
 def _node() -> str:
     executable = shutil.which("node")

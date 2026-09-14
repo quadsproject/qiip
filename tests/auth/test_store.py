@@ -71,6 +71,88 @@ class TestUsers:
     def test_get_user_missing_returns_none(self, auth_store: AuthStore) -> None:
         assert auth_store.get_user(999) is None
 
+    def test_is_admin_defaults_false(self, auth_store: AuthStore) -> None:
+        user = auth_store.upsert_google_user(**_GOOGLE)
+
+        assert user.is_admin is False
+
+    def test_set_user_admin_roundtrip(self, auth_store: AuthStore) -> None:
+        user = auth_store.upsert_google_user(**_GOOGLE)
+
+        assert auth_store.set_user_admin(user.id, True) is True
+        promoted = auth_store.get_user(user.id)
+        assert promoted is not None
+        assert promoted.is_admin is True
+        assert auth_store.set_user_admin(user.id, False) is True
+        demoted = auth_store.get_user(user.id)
+        assert demoted is not None
+        assert demoted.is_admin is False
+
+    def test_set_user_admin_unknown_user_is_false(
+        self,
+        auth_store: AuthStore,
+    ) -> None:
+        assert auth_store.set_user_admin(999999, True) is False
+
+    def test_list_users_includes_all(self, auth_store: AuthStore) -> None:
+        auth_store.upsert_google_user(**_GOOGLE)
+        auth_store.upsert_google_user(
+            google_sub="sub-bob",
+            email="bob@example.com",
+            name="Bob",
+            picture="",
+        )
+
+        users = auth_store.list_users()
+
+        assert {user.email for user in users} == {
+            "alice@example.com",
+            "bob@example.com",
+        }
+
+    def test_pre_existing_db_migrates_is_admin(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "legacy.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE users (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                google_sub  TEXT    NOT NULL UNIQUE,
+                email       TEXT    NOT NULL UNIQUE,
+                name        TEXT    NOT NULL DEFAULT '',
+                picture     TEXT    NOT NULL DEFAULT '',
+                created_at  TEXT    NOT NULL,
+                updated_at  TEXT    NOT NULL
+            )
+            """
+        )
+        now = _utcnow().isoformat()
+        conn.execute(
+            "INSERT INTO users (google_sub, email, name, picture, created_at, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("sub-legacy", "legacy@example.com", "", "", now, now),
+        )
+        conn.commit()
+        conn.close()
+
+        store = AuthStore(db_path)
+        try:
+            user = store.get_user(1)
+
+            assert user is not None
+            assert user.is_admin is False
+            assert store.set_user_admin(user.id, True) is True
+            promoted = store.get_user(user.id)
+            assert promoted is not None
+            assert promoted.is_admin is True
+        finally:
+            store.close()
+
 
 class TestTokens:
     def _user(self, store: AuthStore) -> User:
@@ -114,6 +196,71 @@ class TestTokens:
     ) -> None:
         with pytest.raises(KeyError):
             auth_store.create_token(4242, "ghost")
+
+    def test_get_or_create_config_token_reuses_same_key(
+        self,
+        auth_store: AuthStore,
+    ) -> None:
+        user = self._user(auth_store)
+        first = auth_store.get_or_create_config_token(user.id, "s3cret")
+        second = auth_store.get_or_create_config_token(user.id, "s3cret")
+
+        assert first.token == second.token
+        assert first.id == second.id
+        assert first.name == "agent-config"
+        assert first.token.startswith("qiip_")
+        count = auth_store._conn.execute(
+            "SELECT COUNT(*) FROM tokens WHERE name = 'agent-config'"
+        ).fetchone()[0]
+        assert count == 1
+
+    def test_get_or_create_config_token_rotates_after_revoke(
+        self,
+        auth_store: AuthStore,
+    ) -> None:
+        user = self._user(auth_store)
+        first = auth_store.get_or_create_config_token(user.id, "s3cret")
+
+        assert auth_store.revoke_token(user.id, first.id) is True
+        second = auth_store.get_or_create_config_token(user.id, "s3cret")
+
+        assert second.token != first.token
+        assert second.id != first.id
+        assert second.revoked is False
+
+    def test_get_or_create_config_token_stable_across_store_instances(
+        self,
+        auth_store: AuthStore,
+        tmp_path: Path,
+    ) -> None:
+        user = self._user(auth_store)
+        first = auth_store.get_or_create_config_token(user.id, "s3cret")
+        second_store = AuthStore(tmp_path / "qiip-test-auth-store.db")
+        try:
+            second = second_store.get_or_create_config_token(user.id, "s3cret")
+        finally:
+            second_store.close()
+        assert second.token == first.token
+        assert second.id == first.id
+
+    def test_get_or_create_config_token_supersedes_legacy_random(
+        self,
+        auth_store: AuthStore,
+    ) -> None:
+        user = self._user(auth_store)
+        legacy = auth_store.create_token(user.id, "agent-config")
+
+        derived = auth_store.get_or_create_config_token(user.id, "s3cret")
+
+        assert derived.token != legacy.token
+        assert derived.name == "agent-config"
+        # The legacy row stays active/auditable; the derived key wins.
+        count = auth_store._conn.execute(
+            "SELECT COUNT(*) FROM tokens WHERE name = 'agent-config'"
+        ).fetchone()[0]
+        assert count == 2
+        again = auth_store.get_or_create_config_token(user.id, "s3cret")
+        assert again.token == derived.token
 
     def test_list_tokens_returns_newest_first(
         self,
@@ -530,3 +677,56 @@ class TestAdminSurfaces:
         )
 
         assert auth_store.get_user_usage_timeline(alice.id) == []
+
+
+class TestConfigToken:
+    """The reusable agent-config token: stable key, revoke rotates it."""
+
+    def _user(self, store: AuthStore) -> User:
+        return store.upsert_google_user(**_GOOGLE)
+
+    def test_reuses_same_raw_and_row(self, auth_store: AuthStore) -> None:
+        user = self._user(auth_store)
+        first = auth_store.get_or_create_config_token(user.id, "session-secret")
+        second = auth_store.get_or_create_config_token(user.id, "session-secret")
+
+        assert first.token == second.token
+        assert first.id == second.id
+
+    def test_same_raw_across_store_instances(self, auth_store: AuthStore) -> None:
+        user = self._user(auth_store)
+        created = auth_store.get_or_create_config_token(user.id, "session-secret")
+
+        reopened = AuthStore(auth_store._db_path)
+        try:
+            again = reopened.get_or_create_config_token(user.id, "session-secret")
+        finally:
+            reopened.close()
+        assert again.token == created.token
+        assert again.id == created.id
+
+    def test_revoke_rotates_the_key(self, auth_store: AuthStore) -> None:
+        user = self._user(auth_store)
+        first = auth_store.get_or_create_config_token(user.id, "session-secret")
+        assert auth_store.revoke_token(user.id, first.id) is True
+
+        second = auth_store.get_or_create_config_token(user.id, "session-secret")
+        assert second.token != first.token
+        assert second.id != first.id
+        assert auth_store.resolve_token(first.token) is None
+        assert auth_store.resolve_token(second.token) is not None
+
+    def test_supersedes_pre_reuse_random_row(
+        self,
+        auth_store: AuthStore,
+    ) -> None:
+        user = self._user(auth_store)
+        random_row = auth_store.create_token(user.id, "agent-config")
+
+        derived = auth_store.get_or_create_config_token(user.id, "session-secret")
+
+        assert derived.token != random_row.token
+        assert derived.id != random_row.id
+        # The old random row is untouched and still valid; the derived one
+        # is what the downloader gets from now on.
+        assert auth_store.resolve_token(random_row.token) is not None

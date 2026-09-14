@@ -668,7 +668,7 @@ async function refreshDetail() {
         cfgPanel.style.display = "";
         cfgHint.textContent = "Download agent configuration pointing at the inference proxy.";
         cfgButtons.textContent = "";
-        cfgButtons.appendChild(createConfigDropdown(window.location.origin, node.model));
+        cfgButtons.appendChild(createConfigDropdown(window.location.origin, node.model, null, null, node));
       } else {
         cfgPanel.style.display = "none";
       }

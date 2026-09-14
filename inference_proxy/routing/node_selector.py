@@ -53,9 +53,13 @@ def _in_scope(
 
     ``allowed_node_ids`` pins to specific node ids; ``owner`` restricts to
     unowned nodes and nodes owned by that email (compared caselessly).
-    ``None`` filters disable the corresponding check.
+    ``None`` filters disable the corresponding check. An ``owner`` value of
+    ``None`` is the admin scope: only admin-scoped callers may route to a
+    hidden node (``owner`` ``""`` and user emails are both rejected).
     """
     if allowed_node_ids is not None and node.node_id not in allowed_node_ids:
+        return False
+    if node.hidden and owner is not None:
         return False
     return not (
         owner is not None and node.owner and node.owner.lower() != owner.lower()

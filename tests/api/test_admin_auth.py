@@ -183,11 +183,12 @@ class TestAdminBasicAuthentication:
             "/dashboard/users/1",
         ],
     )
-    async def test_dashboard_routes_require_admin_auth(
+    async def test_dashboard_routes_require_signin(
         self,
         app: FastAPI,
         path: str,
     ) -> None:
+        """Anonymous visitors get the two-option sign-in page; Basic admins pass."""
         unauthenticated = await _request(app, "GET", path)
         authenticated = await _request(
             app,
@@ -196,7 +197,9 @@ class TestAdminBasicAuthentication:
             headers=_basic_header("test-admin", "test-password"),
         )
 
-        assert unauthenticated.status_code == 401
+        assert unauthenticated.status_code == 200
+        assert "Sign in with Local Admin" in unauthenticated.text
+        assert "Sign in with Google Auth" in unauthenticated.text
         assert authenticated.status_code == 200
 
     @pytest.mark.parametrize("path", ["/health", "/v1/models", "/chat"])

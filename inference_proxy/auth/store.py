@@ -16,7 +16,9 @@ below anything WAL-mode SQLite cannot absorb on one process.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import secrets
 import sqlite3
@@ -48,6 +50,7 @@ CREATE TABLE IF NOT EXISTS users (
     email       TEXT    NOT NULL UNIQUE,
     name        TEXT    NOT NULL DEFAULT '',
     picture     TEXT    NOT NULL DEFAULT '',
+    is_admin    INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT    NOT NULL,
     updated_at  TEXT    NOT NULL
 );
@@ -111,6 +114,26 @@ def _generate_token() -> str:
     return f"{TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
 
 
+# Reusable agent-config token (AUTH-02-compatible): the raw value is never
+# stored -- it is deterministically re-derived from the session secret, the
+# user id, and a generation counter tracked by the token-row history. The
+# same config key therefore works across browsers and machines, and a revoke
+# rotates it (the next download derives the next generation).
+_CONFIG_TOKEN_NAME = "agent-config"
+_CONFIG_TOKEN_INFO = b"qiip-agent-config-token-v1"
+
+
+def _derive_config_token(secret: str, user_id: int, generation: int) -> str:
+    """Derive the stable raw value for the user's agent-config token."""
+    material = f"{_CONFIG_TOKEN_INFO.decode()}:{user_id}:{generation}"
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        material.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return f"{TOKEN_PREFIX}{base64.urlsafe_b64encode(digest).decode().rstrip('=')}"
+
+
 def _dump_scopes(scopes: list[str] | None) -> str | None:
     """Serialize an endpoint scope to its TEXT column value.
 
@@ -168,12 +191,20 @@ class AuthStore:
         ``CREATE TABLE IF NOT EXISTS`` handles fresh databases; tables
         created before a column existed need a guarded ALTER here.
         """
-        columns = {
+        token_columns = {
             row["name"]
             for row in self._conn.execute("PRAGMA table_info(tokens)").fetchall()
         }
-        if "endpoint_scope" not in columns:
+        if "endpoint_scope" not in token_columns:
             self._conn.execute("ALTER TABLE tokens ADD COLUMN endpoint_scope TEXT")
+        user_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "is_admin" not in user_columns:
+            self._conn.execute(
+                "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"
+            )
 
     def close(self) -> None:
         """Close the underlying connection (idempotent)."""
@@ -248,6 +279,24 @@ class AuthStore:
             ).fetchone()
         return self._user_from_row(row)
 
+    def list_users(self) -> list[User]:
+        """Return every user row, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM users ORDER BY created_at DESC, id DESC"
+            ).fetchall()
+        return [user for row in rows if (user := self._user_from_row(row))]
+
+    def set_user_admin(self, user_id: int, is_admin: bool) -> bool:
+        """Grant or revoke the admin role; False when the user does not exist."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE users SET is_admin = ?, updated_at = ? WHERE id = ?",
+                (1 if is_admin else 0, _iso(_utcnow()), user_id),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
     # ------------------------------------------------------------------
     # API tokens
     # ------------------------------------------------------------------
@@ -291,6 +340,86 @@ class AuthStore:
             row = self._conn.execute(
                 "SELECT * FROM tokens WHERE id = ?", (cursor.lastrowid,)
             ).fetchone()
+        token = self._token_from_row(row)
+        if token is None:  # pragma: no cover - defensive
+            raise RuntimeError("token row vanished after insert")
+        return CreatedToken(**token.model_dump(), token=raw)
+
+    def get_or_create_config_token(self, user_id: int, secret: str) -> CreatedToken:
+        """Return the user's reusable agent-config token, minting on first use.
+
+        One stable raw value is shared by every agent-config download
+        (across servers, browsers, and machines). The value is derived
+        deterministically from *secret* + user id + a generation counter;
+        only its digest is stored. Generation equals the number of prior
+        ``agent-config`` rows, so revoking the token rotates the value: the
+        next download derives (and stores) a fresh one. A pre-existing row
+        minted with a random secret (pre-reuse deployments) is detected by
+        hash mismatch and superseded by a derived token.
+
+        Raises ``KeyError`` when *user_id* does not exist.
+        """
+        now = _iso(_utcnow())
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT id FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if exists is None:
+                raise KeyError(user_id)
+            rows = self._conn.execute(
+                "SELECT * FROM tokens WHERE user_id = ? AND name = ? ORDER BY id",
+                (user_id, _CONFIG_TOKEN_NAME),
+            ).fetchall()
+            active = next((r for r in reversed(rows) if not r["revoked"]), None)
+            if active is not None:
+                generation = next(
+                    i for i, r in enumerate(rows) if r["id"] == active["id"]
+                )
+                raw = _derive_config_token(secret, user_id, generation)
+                if _hash_token(raw) == active["token_hash"]:
+                    token = self._token_from_row(active)
+                    if token is not None:  # pragma: no cover - defensive
+                        return CreatedToken(**token.model_dump(), token=raw)
+
+            generation = len(rows)
+            raw = _derive_config_token(secret, user_id, generation)
+            try:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO tokens
+                        (user_id, name, token_hash, prefix, created_at, endpoint_scope)
+                    VALUES (?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        user_id,
+                        _CONFIG_TOKEN_NAME,
+                        _hash_token(raw),
+                        raw[: len(TOKEN_PREFIX) + 8],
+                        now,
+                    ),
+                )
+                self._conn.commit()
+                row = self._conn.execute(
+                    "SELECT * FROM tokens WHERE id = ?", (cursor.lastrowid,)
+                ).fetchone()
+            except sqlite3.IntegrityError:
+                # Lost a concurrent mint race: return the winner's row.
+                self._conn.rollback()
+                row = self._conn.execute(
+                    """
+                    SELECT * FROM tokens
+                     WHERE user_id = ? AND name = ? AND revoked = 0
+                     ORDER BY id DESC LIMIT 1
+                    """,
+                    (user_id, _CONFIG_TOKEN_NAME),
+                ).fetchone()
+                if row is None:  # pragma: no cover - defensive
+                    raise
+                raw = _derive_config_token(
+                    secret,
+                    user_id,
+                    next(i for i, r in enumerate(rows) if r["id"] == row["id"]),
+                )
         token = self._token_from_row(row)
         if token is None:  # pragma: no cover - defensive
             raise RuntimeError("token row vanished after insert")
@@ -460,7 +589,7 @@ class AuthStore:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT u.id, u.email, u.name, u.picture, u.created_at,
+                SELECT u.id, u.email, u.name, u.picture, u.is_admin, u.created_at,
                        (SELECT COUNT(*) FROM tokens t
                           WHERE t.user_id = u.id) AS token_count,
                        (SELECT COUNT(*) FROM tokens t
@@ -484,6 +613,7 @@ class AuthStore:
                 email=row["email"],
                 name=row["name"],
                 picture=row["picture"],
+                is_admin=bool(row["is_admin"]),
                 created_at=_parse_iso(row["created_at"]),
                 token_count=row["token_count"],
                 active_token_count=row["active_token_count"],
@@ -618,6 +748,7 @@ class AuthStore:
             email=row["email"],
             name=row["name"],
             picture=row["picture"],
+            is_admin=bool(row["is_admin"]),
             created_at=_parse_iso(row["created_at"]),
             updated_at=_parse_iso(row["updated_at"]),
         )

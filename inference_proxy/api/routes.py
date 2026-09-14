@@ -591,6 +591,8 @@ async def list_models(
     for node in nodes:
         if node.status != NodeStatus.HEALTHY:
             continue
+        if node.hidden:
+            continue
         if node.owner:
             continue
         if node.model and node.model not in models_seen:

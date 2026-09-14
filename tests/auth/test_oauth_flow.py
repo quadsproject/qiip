@@ -358,6 +358,24 @@ class TestAuthMe:
         payload: dict[str, Any] = me.json()
         assert payload["id"] >= 1
 
+    def test_me_reports_admin_role_after_grant(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+        auth_store: AuthStore,
+    ) -> None:
+        """/auth/me must surface the live admin role (regression)."""
+        client = _client_with_auth(app, make_fake_auth_plugin(), test_settings)
+        client.get("/auth/callback?code=code&state=state", follow_redirects=False)
+
+        me = client.get("/auth/me").json()
+        assert me["is_admin"] is False
+
+        assert auth_store.set_user_admin(me["id"], True)
+        me = client.get("/auth/me").json()
+        assert me["is_admin"] is True
+
 
 class TestOAuthLogout:
     def test_logout_without_sessions_redirects(self, test_settings: Settings) -> None:
@@ -374,7 +392,7 @@ class TestOAuthLogout:
         response = client.post("/auth/logout", follow_redirects=False)
 
         assert response.status_code == 302
-        assert response.headers["location"] == "/profile"
+        assert response.headers["location"] == "/dashboard"
 
     def test_logout_clears_session(
         self,

@@ -51,6 +51,9 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Hardware-aware model recommendations** -- runs llmfit via SSH on a target host to produce ranked, runtime-normalized recommendations with fit levels, throughput, memory estimates, and typed GGUF sources; auto-installs the binary on first use
 - **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
 - **Admin authentication** -- HTTP Basic required on all `/admin/*` endpoints and `/dashboard*` pages
+- **Fleet sign-in gate** -- anonymous visitors to the fleet dashboard get a sign-in page with two options: **Sign in with Local Admin** (in-page username/password form that establishes a signed session cookie — no browser Basic challenge popup; HTTP Basic still works for scripts and SSE) and **Sign in with Google Auth** (same flow as the profile page)
+- **Admin roles** -- the HTTP Basic admin user (bootstrap authority) can grant or revoke the admin role to Google-authenticated users on the admin page; role admins then reach the admin surface through their session and see hidden servers
+- **Hidden inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). They are routable only to admin callers (Basic, admin-role tokens, and the full-access trust list), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with a `hidden` badge in the admin fleet view. Token usage from hidden servers is tracked on the token summary pages exactly like any other node
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
 - **User API tokens** -- each user can mint `qiip_...` bearer tokens on their profile page to call `/v1/chat/completions` and `/v1/completions`; tokens are stored as SHA-256 digests and can be revoked at any time
 - **Config-gated inference auth** -- a valid `qiip_...` bearer token is always accepted on `/v1`; requiring a token for every `/v1` request (`auth.enforce_api_tokens`) is optional and off by default, so existing public deployments keep serving anonymous requests unchanged
@@ -227,8 +230,16 @@ Public endpoints:
 | `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage |
 | `GET` | `/auth/login` | Start Google OAuth sign-in (302 to Google) |
 | `GET` | `/auth/callback` | Google redirect target; signs the session cookie |
+| `GET` | `/auth/local-admin` | Local admin login page entry (302 to `/dashboard`; the sign-in form POSTs here) |
+| `POST` | `/auth/local-admin` | Sign in as the local admin via the form; sets the session cookie and 302s to `/dashboard` |
 | `POST` | `/auth/logout` | Clear the session cookie |
 | `GET` | `/auth/me` | JSON identity of the signed-in user (401 when anonymous) |
+
+Fleet (any signed-in user, or HTTP Basic local admin):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/fleet/nodes` | Fleet view for non-admin viewers: registered nodes without hidden servers or operational actions |
 
 User-session-protected profile endpoints (require `auth.session_secret` and a
 signed-in session):
@@ -252,23 +263,29 @@ HTTP Basic-protected administrative endpoints:
 | `POST` | `/admin/models/download` | Start or inspect a duplicate-safe model download |
 | `GET` | `/admin/models/downloads` | List tracked model-download states |
 | `POST` | `/admin/nodes/setup` | Start background node provisioning |
-| `POST` | `/admin/nodes/pool` | Add a node to the available pool, or adopt an already-running OpenAI-compatible server (`self_setup`) |
+| `POST` | `/admin/nodes/pool` | Add a node to the available pool, or adopt an already-running OpenAI-compatible server; `"hidden": true` registers a hidden server (implies `self_setup`) |
 | `POST` | `/admin/nodes/{hostname}/llamacpp/relaunch` | Drain and relaunch a healthy managed llama.cpp node with a typed sizing policy |
 | `DELETE` | `/admin/nodes/{node_id}` | Drain and tear down a node; supports force and the scoped recovery procedure below |
 | `PATCH` | `/admin/nodes/{node_id}/owner` | Set or clear a node's owner email (`"owner": ""` clears it) |
+| `GET` | `/admin/users` | List Google users with token usage and `is_admin` |
+| `POST` | `/admin/users/{user_id}/admin` | Grant the admin role (204) |
+| `DELETE` | `/admin/users/{user_id}/admin` | Revoke the admin role (204) |
 | `GET` | `/admin/provisioning/tasks` | List provisioning task states |
 | `GET` | `/admin/provisioning/{hostname}/logs` | Stream provisioning logs over SSE |
 | `GET` | `/admin/quads/status` | QUADS integration and cache status |
 | `GET` | `/admin/nodes/{hostname}/power` | Read Redfish power state |
 | `POST` | `/admin/nodes/{hostname}/power` | Execute an allowed Redfish power action |
 | `GET` | `/admin/nodes/{hostname}/recommendations` | Run hardware-aware model recommendations |
-| `GET` | `/dashboard` | Authenticated operations dashboard |
+| `GET` | `/dashboard` | Authenticated operations dashboard; anonymous visitors get the sign-in page |
 | `GET` | `/dashboard/nodes/{node_id}` | Authenticated node detail page |
+| `GET` | `/dashboard/admin` | Admin page: manage hidden inference servers and admin users |
 
 ### Administrative access
 
-All `/admin/*` API endpoints and `/dashboard*` pages require the shared HTTP
-Basic credentials configured below. The inference API, chat page, profile page,
+All `/admin/*` API endpoints and `/dashboard` admin pages accept either the
+shared HTTP Basic credentials configured below or a signed-in Google user
+carrying the **admin role** (granted by the HTTP Basic admin user on the
+admin page at `/dashboard/admin`). The inference API, chat page, profile page,
 and health endpoint are public; the inference API may additionally require a
 user API token (see [User authentication (Google OAuth)](#user-authentication-google-oauth)).
 For example:
@@ -277,6 +294,16 @@ For example:
 curl -u "$INFERENCE_PROXY_ADMIN__USERNAME:$INFERENCE_PROXY_ADMIN__PASSWORD" \
   http://gateway.example.com/admin/nodes
 ```
+
+The fleet page (`/dashboard`) is available to every authenticated viewer:
+anonymous visitors receive a sign-in page with **Sign in with Local Admin**
+(an in-page username/password form that creates a signed admin session; the
+browser native Basic prompt is no longer used, though HTTP Basic requests and
+SSE still pass through unchanged) and **Sign in with Google Auth** (the same
+flow as the profile page).
+Signed-in non-admin users see the fleet with hidden servers removed and no
+operational actions; node detail, model catalog, token dashboards, and the
+admin page remain admin-only.
 
 On a trusted work LAN, the administrative surface may run over HTTP. Anyone able
 to observe that traffic can recover the reusable credential, so deploy a
@@ -290,6 +317,29 @@ boundary: cross-origin JSON requests and all DELETE requests require a browser
 preflight. Do not add form-encoded, multipart, or plain-text state-changing
 admin endpoints without adding explicit CSRF protection. Authentication also
 does not protect an already-authenticated browser from same-origin XSS.
+
+### Hidden inference servers
+
+`POST /admin/nodes/pool` with `"hidden": true` (which implies `"self_setup":
+true`) registers an already-running OpenAI-compatible server as a **hidden
+server**: no provisioning steps are performed, QIIP never owns its lifecycle,
+and its node id is the server hostname. Hidden servers:
+
+- are routable only to admin callers (HTTP Basic, admin-role tokens, and the
+  `admin_only_tokens_full_access` trust list) — node selection, retries, and
+  `/v1/models` all enforce this;
+- are never listed on the non-admin fleet page or in the public `/v1/models`
+  catalog; admins see them in `/admin/nodes` with `"hidden": true`, displayed
+  bold with a `hidden` badge;
+- track per-token usage on the profile and admin token summary pages exactly
+  like any other node;
+- may carry an operator-facing display `name` (e.g. `"DeepSeek-V4-Flash-Vision-Exp (qiip)"`)
+  that is shown in place of the raw short hostname in the admin fleet view;
+- are removed with the normal pool removal endpoint
+  (`DELETE /admin/nodes/{node_id}/pool`) — the server itself keeps running.
+
+The server URL host and port must satisfy the configured endpoint allowlist
+before registration is accepted.
 
 ### Node inventory identity
 

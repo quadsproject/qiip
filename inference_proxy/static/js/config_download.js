@@ -1,17 +1,38 @@
 // Config generators for OpenCode CLI, Pi coding agent, and OMP agent.
 // Generators are pure functions testable via Node.js.
+//
+// *opts* carries node display info: `name` (operator-facing name) and
+// `hidden` (hidden servers require a bearer token, so the generated config
+// declares apiKey auth with a placeholder instead of `auth: none` — a
+// hidden server is unreachable anonymously by design).
 
-function generateOpenCodeConfig(baseUrl, modelId) {
+var TOKEN_PLACEHOLDER = "<paste-qiip-token-here>";
+
+function configApiKey(opts) {
+  // Hidden servers: a real minted token when the download flow obtained one,
+  // otherwise an explicit placeholder (never silently `auth: none`).
+  if (opts && opts.hidden) {
+    return (opts && opts.token) || TOKEN_PLACEHOLDER;
+  }
+  return null;
+}
+
+function generateOpenCodeConfig(baseUrl, modelId, opts) {
   var base = baseUrl.replace(/\/+$/, "");
+  var options = {
+    baseURL: base + "/v1",
+  };
+  var apiKey = configApiKey(opts);
+  if (apiKey) {
+    options.apiKey = apiKey;
+  }
   return {
     $schema: "https://opencode.ai/config.json",
     provider: {
       qiip: {
         npm: "@ai-sdk/openai-compatible",
         name: "QIIP Inference Proxy",
-        options: {
-          baseURL: base + "/v1",
-        },
+        options: options,
         models: {
           [modelId]: {
             name: modelId,
@@ -23,14 +44,16 @@ function generateOpenCodeConfig(baseUrl, modelId) {
   };
 }
 
-function generatePiConfig(baseUrl, modelId) {
+function generatePiConfig(baseUrl, modelId, opts) {
   var base = baseUrl.replace(/\/+$/, "");
+  var apiKey = configApiKey(opts);
+  var apiKeyValue = apiKey ? apiKey : (opts && opts.hidden ? TOKEN_PLACEHOLDER : "none");
   return {
     providers: {
       qiip: {
         baseUrl: base + "/v1",
         api: "openai-completions",
-        apiKey: "none",
+        apiKey: apiKeyValue,
         compat: {
           supportsDeveloperRole: false,
           supportsReasoningEffort: false,
@@ -48,18 +71,27 @@ function yamlScalar(v) {
   return v;
 }
 
-function generateOmpConfig(baseUrl, modelId) {
+function generateOmpConfig(baseUrl, modelId, opts) {
   var base = baseUrl.replace(/\/+$/, "");
-  return [
+  var displayName = opts && opts.name ? opts.name : modelId + " (qiip)";
+  var lines = [
     "providers:",
     "  qiip:",
     "    baseUrl: " + yamlScalar(base + "/v1"),
-    "    auth: none",
-    "    api: openai-completions",
-    "    models:",
-    "      - id: " + yamlScalar(modelId),
-    "        name: " + yamlScalar(modelId + " (qiip)"),
-  ].join("\n");
+  ];
+  if (opts && opts.hidden) {
+    // Hidden inference servers are reachable only with an admin-role apiKey.
+    var apiKey = opts.token || TOKEN_PLACEHOLDER;
+    lines.push("    auth: apiKey");
+    lines.push("    apiKey: " + yamlScalar(apiKey));
+  } else {
+    lines.push("    auth: none");
+  }
+  lines.push("    api: openai-completions");
+  lines.push("    models:");
+  lines.push("      - id: " + yamlScalar(modelId));
+  lines.push("        name: " + yamlScalar(displayName));
+  return lines.join("\n");
 }
 
 function downloadConfigFile(data, filename) {
@@ -82,7 +114,7 @@ var CONFIG_FORMATS = [
   { label: "OMP Agent", generator: generateOmpConfig, filename: "models.yaml" },
 ];
 
-function createConfigDropdown(baseUrl, modelId, positionFn, onToggle) {
+function createConfigDropdown(baseUrl, modelId, positionFn, onToggle, opts) {
   var group = document.createElement("div");
   group.className = "action-group";
 
@@ -100,8 +132,41 @@ function createConfigDropdown(baseUrl, modelId, positionFn, onToggle) {
       btn.type = "button";
       btn.className = "btn btn-sm btn-neutral";
       btn.textContent = fmt.label;
-      btn.addEventListener("click", function () {
-        downloadConfigFile(fmt.generator(baseUrl, modelId), fmt.filename);
+      btn.addEventListener("click", async function () {
+        var generatorOpts = opts || {};
+        if (generatorOpts.hidden) {
+          // Hidden servers need a bearer token: share the user's single
+          // agent-config key (minted on first use, then reused). It is
+          // derived server-side and never stored, so every download of any
+          // hidden server -- any browser, any machine -- embeds the same
+          // key. A revoke rotates it; the next download gets the new one.
+          try {
+            var mintResp = await fetch("/profile/tokens", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ name: "agent-config" }),
+            });
+            if (mintResp.ok) {
+              var created = await mintResp.json();
+              generatorOpts = Object.assign({}, generatorOpts, {
+                token: created.token,
+              });
+            } else if (typeof window.showToast === "function") {
+              var mintErr = await mintResp.json().catch(function () {
+                return { detail: "HTTP " + mintResp.status };
+              });
+              window.showToast(
+                "Could not mint a config token: " + (mintErr.detail || "HTTP error"),
+                "error"
+              );
+            }
+          } catch (err) {
+            if (typeof window.showToast === "function") {
+              window.showToast("Token fetch failed: " + err.message, "error");
+            }
+          }
+        }
+        downloadConfigFile(fmt.generator(baseUrl, modelId, generatorOpts), fmt.filename);
         menu.classList.remove("open");
         if (onToggle) onToggle(false);
       });

@@ -27,6 +27,14 @@ class TestProfilePage:
         assert "QIIP - Profile" in response.text
         assert "API Tokens" in response.text
 
+    def test_profile_page_has_token_required_note(self, app: FastAPI) -> None:
+        """The no-token guidance callout is present in the page shell."""
+        response = TestClient(app).get("/profile")
+
+        assert response.status_code == 200
+        assert 'id="token-required-note"' in response.text
+        assert "At least one API token is required" in response.text
+
 
 class TestProfileMe:
     def test_me_requires_sign_in(self, app: FastAPI) -> None:
@@ -77,6 +85,29 @@ class TestTokenManagement:
 
         revoked_list = profile_client.get("/profile/tokens")
         assert revoked_list.json()[0]["revoked"] is True
+
+    def test_agent_config_token_reused_until_revoked(
+        self,
+        profile_client: TestClient,
+    ) -> None:
+        first = profile_client.post("/profile/tokens", json={"name": "agent-config"})
+        assert first.status_code == 201
+        first_body = first.json()
+        assert first_body["name"] == "agent-config"
+
+        # A second download (any browser, any machine) gets the same key.
+        second = profile_client.post("/profile/tokens", json={"name": "agent-config"})
+        assert second.json()["token"] == first_body["token"]
+        assert second.json()["id"] == first_body["id"]
+
+        revoked = profile_client.delete(f"/profile/tokens/{first_body['id']}")
+        assert revoked.status_code == 200
+
+        # After a revoke, the next download receives a rotated key.
+        third = profile_client.post("/profile/tokens", json={"name": "agent-config"})
+        assert third.status_code == 201
+        assert third.json()["token"] != first_body["token"]
+        assert third.json()["id"] != first_body["id"]
 
     def test_revoke_unknown_token_returns_404(
         self,
@@ -420,3 +451,40 @@ class TestTokenEndpointScope:
         response = client.post("/profile/tokens", json={"name": "ci"})
 
         assert response.status_code == 201
+
+
+class TestConfigTokenReuse:
+    """POST /profile/tokens with name 'agent-config' reuses the stable key."""
+
+    def test_agent_config_reuses_same_token(
+        self,
+        profile_client: TestClient,
+    ) -> None:
+        first = profile_client.post(
+            "/profile/tokens", json={"name": "agent-config"}
+        ).json()
+        second = profile_client.post(
+            "/profile/tokens", json={"name": "agent-config"}
+        ).json()
+
+        assert first["token"] == second["token"]
+        assert first["id"] == second["id"]
+        assert first["name"] == "agent-config"
+
+    def test_agent_config_rotates_after_revoke(
+        self,
+        profile_client: TestClient,
+    ) -> None:
+        first = profile_client.post(
+            "/profile/tokens", json={"name": "agent-config"}
+        ).json()
+        assert (
+            profile_client.delete(f"/profile/tokens/{first['id']}").status_code == 200
+        )
+
+        second = profile_client.post(
+            "/profile/tokens", json={"name": "agent-config"}
+        ).json()
+
+        assert second["token"] != first["token"]
+        assert second["id"] != first["id"]

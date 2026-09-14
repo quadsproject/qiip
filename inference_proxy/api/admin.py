@@ -371,7 +371,11 @@ async def register_node(
             )
             try:
                 adopted = await provisioner.register_self_setup(
-                    hostname, body.port, owner=owner
+                    hostname,
+                    body.port,
+                    owner=owner,
+                    hidden=body.hidden,
+                    name=body.name,
                 )
             except SelfSetupError as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -382,6 +386,8 @@ async def register_node(
                     "state": adopted.status.value,
                     "model": adopted.model,
                     "self_setup": True,
+                    "hidden": adopted.hidden,
+                    "name": adopted.name,
                 },
             )
         await provisioner.register_available(hostname, body.port, owner=body.owner)

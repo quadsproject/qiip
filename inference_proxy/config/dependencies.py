@@ -12,6 +12,8 @@ In tests, use ``app.dependency_overrides[get_settings]``,
 instances.
 """
 
+import base64
+import binascii
 from functools import lru_cache
 from secrets import compare_digest
 from typing import Annotated
@@ -19,6 +21,7 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
+from inference_proxy.auth.session import get_local_admin_session, get_session_user_id
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.huggingface.catalog import ModelCatalogService
 from inference_proxy.huggingface.downloader import DownloadService
@@ -48,28 +51,142 @@ def get_settings() -> Settings:
     return Settings()
 
 
+def _credentials_match(
+    username: str,
+    password: str,
+    settings: Settings,
+) -> bool:
+    """Return True when the credentials match the configured local admin."""
+    username_matches = compare_digest(
+        username.encode("utf-8"),
+        settings.admin.username.encode("utf-8"),
+    )
+    password_matches = compare_digest(
+        password.encode("utf-8"),
+        settings.admin.password.get_secret_value().encode("utf-8"),
+    )
+    return username_matches and password_matches
+
+
+def _basic_credentials_match(request: Request, settings: Settings) -> bool:
+    """Return True when the request carries valid local-admin Basic credentials.
+
+    Parses the ``Authorization`` header directly (no FastAPI HTTPBasic
+    dependency) so page handlers and template helpers can check the local
+    admin identity without declaring a credentials parameter.
+    """
+    header = request.headers.get("authorization", "")
+    scheme, _, encoded = header.partition(" ")
+    if scheme.lower() != "basic" or not encoded.strip():
+        return False
+    try:
+        decoded = base64.b64decode(encoded.strip(), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return False
+    username, separator, password = decoded.partition(":")
+    if not separator:
+        return False
+    return _credentials_match(username, password, settings)
+
+
+def _viewer_from_session(request: Request) -> str | None:
+    """Resolve the signed-in viewer role from the session cookie.
+
+    ``"admin"`` when the signed-in user carries the admin role, ``"user"``
+    for any other signed-in user, ``None`` when no valid session exists.
+    The identity is re-read from the SQLite store so a stale cookie can
+    never resurrect a deleted user or a demoted admin.
+    """
+    user_id = get_session_user_id(request)
+    if user_id is None:
+        return None
+    store = getattr(request.app.state, "auth_store", None)
+    if store is None:
+        return None
+    user = store.get_user(user_id)
+    if user is None:
+        return None
+    return "admin" if user.is_admin else "user"
+
+
+def viewer_role(request: Request, settings: Settings) -> str | None:
+    """Return the viewer role: ``"admin"``, ``"user"``, or ``None``.
+
+    A signed-in Google user is authoritative: their role is governed by the
+    admin role only, never elevated by incidentally cached HTTP Basic admin
+    credentials in the same browser. Without a Google session, the local
+    admin is recognized by HTTP Basic credentials or a signed local-admin
+    session (from the sign-in page form).
+    """
+    user_id = get_session_user_id(request)
+    if user_id is not None:
+        _role = _viewer_from_session(request)
+    elif _basic_credentials_match(request, settings) or get_local_admin_session(
+        request
+    ):
+        _role = "admin"
+    else:
+        _role = None
+    return _role
+
+
+def require_fleet_viewer(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> str:
+    """Require an authenticated fleet viewer (local admin or signed-in user)."""
+    role = viewer_role(request, settings)
+    if role is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+            headers=_ADMIN_AUTH_HEADERS,
+        )
+    return role
+
+
 def require_admin_auth(
     request: Request,
     credentials: Annotated[HTTPBasicCredentials | None, Depends(_ADMIN_BASIC)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> None:
-    """Authenticate admin requests and enforce the JSON-only CSRF boundary."""
-    supplied_username = credentials.username if credentials is not None else ""
-    supplied_password = credentials.password if credentials is not None else ""
-    username_matches = compare_digest(
-        supplied_username.encode("utf-8"),
-        settings.admin.username.encode("utf-8"),
-    )
-    password_matches = compare_digest(
-        supplied_password.encode("utf-8"),
-        settings.admin.password.get_secret_value().encode("utf-8"),
-    )
-    if credentials is None or not (username_matches and password_matches):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid admin credentials",
-            headers=_ADMIN_AUTH_HEADERS,
+    """Authenticate admin requests and enforce the JSON-only CSRF boundary.
+
+    Accepted identities: the HTTP Basic local admin, a signed local-admin
+    session, or a signed-in Google user carrying the admin role.
+
+    A signed-in Google session is authoritative: same-origin browser
+    requests replay cached HTTP Basic credentials automatically, so a
+    non-admin session is never elevated by incidentally cached admin
+    credentials (mirrors ``viewer_role`` on the HTML surface). Basic still
+    works everywhere for scripts and anonymous browsers.
+    """
+    if get_session_user_id(request) is not None:
+        if _viewer_from_session(request) != "admin":
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid admin credentials",
+                headers=_ADMIN_AUTH_HEADERS,
+            )
+    else:
+        supplied_username = credentials.username if credentials is not None else ""
+        supplied_password = credentials.password if credentials is not None else ""
+        username_matches = compare_digest(
+            supplied_username.encode("utf-8"),
+            settings.admin.username.encode("utf-8"),
         )
+        password_matches = compare_digest(
+            supplied_password.encode("utf-8"),
+            settings.admin.password.get_secret_value().encode("utf-8"),
+        )
+        if not (username_matches and password_matches) and not get_local_admin_session(
+            request
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid admin credentials",
+                headers=_ADMIN_AUTH_HEADERS,
+            )
 
     if request.method in _JSON_ADMIN_METHODS:
         media_type = request.headers.get("content-type", "").partition(";")[0].lower()

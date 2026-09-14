@@ -15,6 +15,8 @@ _CONFIG_DOWNLOAD_JS = _ROOT / "inference_proxy/static/js/config_download.js"
 _DASHBOARD_JS = _ROOT / "inference_proxy/static/js/dashboard.js"
 _NODE_DETAIL_JS = _ROOT / "inference_proxy/static/js/node_detail.js"
 
+TOKEN_PLACEHOLDER = "<paste-qiip-token-here>"
+
 
 def _run_node_raw(harness: str) -> object:
     node = shutil.which("node")
@@ -213,6 +215,86 @@ class TestGenerateOmpConfig:
         assert '"model: evil #comment"' in result
 
 
+def _harness_opts(base_url: str, model_id: str, func: str, opts_json: str) -> str:
+    """Like _harness but passes an opts object (node info) to the generator."""
+    js_path = json.dumps(str(_CONFIG_DOWNLOAD_JS))
+    js_base = json.dumps(base_url)
+    js_model = json.dumps(model_id)
+    return (
+        "const fs = require('fs');\n"
+        "const vm = require('vm');\n"
+        f"const source = fs.readFileSync({js_path}, 'utf8');\n"
+        "const sandbox = { console };\n"
+        "vm.createContext(sandbox);\n"
+        "vm.runInContext(source, sandbox);\n"
+        f"const result = sandbox.{func}({js_base}, {js_model}, {opts_json});\n"
+        "console.log(JSON.stringify(result));\n"
+    )
+
+
+class TestHiddenServerConfigs:
+    """Hidden server configs declare token auth with a placeholder."""
+
+    _BASE = "https://inference-proxy-dev.rdu2.scalelab.redhat.com"
+    _MODEL = "DeepSeek-V4-Flash-Vision-Exp"
+    _OPTS = '{"name": "DeepSeek-V4-Flash-Vision-Exp (qiip)", "hidden": true}'
+
+    def test_omp_config_requires_api_key(self) -> None:
+        result = _run_node_yaml(
+            _harness_opts(self._BASE, self._MODEL, "generateOmpConfig", self._OPTS)
+        )
+        assert "    auth: apiKey" in result
+        assert "    apiKey: <paste-qiip-token-here>" in result
+        assert "    auth: none" not in result
+        assert "        name: DeepSeek-V4-Flash-Vision-Exp (qiip)" in result
+
+    def test_pi_config_uses_token_placeholder(self) -> None:
+        result = _run_node(
+            _harness_opts(self._BASE, self._MODEL, "generatePiConfig", self._OPTS)
+        )
+        provider = result["providers"]["qiip"]
+        assert provider["apiKey"] == "<paste-qiip-token-here>"
+
+    def test_opencode_config_uses_token_placeholder(self) -> None:
+        result = _run_node(
+            _harness_opts(self._BASE, self._MODEL, "generateOpenCodeConfig", self._OPTS)
+        )
+        options = result["provider"]["qiip"]["options"]
+        assert options["apiKey"] == "<paste-qiip-token-here>"
+
+    def test_configs_use_minted_token_when_available(self) -> None:
+        token_opts = (
+            '{"name": "DeepSeek-V4-Flash-Vision-Exp (qiip)", "hidden": true, '
+            '"token": "qiip_abcdef123"}'
+        )
+        omp = _run_node_yaml(
+            _harness_opts(self._BASE, self._MODEL, "generateOmpConfig", token_opts)
+        )
+        assert "    apiKey: qiip_abcdef123" in omp
+        assert TOKEN_PLACEHOLDER not in omp
+
+        pi = _run_node(
+            _harness_opts(self._BASE, self._MODEL, "generatePiConfig", token_opts)
+        )
+        assert pi["providers"]["qiip"]["apiKey"] == "qiip_abcdef123"
+
+        opencode = _run_node(
+            _harness_opts(self._BASE, self._MODEL, "generateOpenCodeConfig", token_opts)
+        )
+        assert opencode["provider"]["qiip"]["options"]["apiKey"] == "qiip_abcdef123"
+
+    def test_public_configs_stay_anonymous(self) -> None:
+        result = _run_node_yaml(
+            _harness(
+                self._BASE,
+                self._MODEL,
+                "generateOmpConfig",
+            )
+        )
+        assert "    auth: none" in result
+        assert "    apiKey:" not in result
+
+
 class TestConfigFileContents:
     """config_download.js is present and contains expected functions."""
 
@@ -253,3 +335,65 @@ class TestBaseUrlUsage:
     def test_node_detail_does_not_use_node_endpoint_for_config(self) -> None:
         source = _NODE_DETAIL_JS.read_text()
         assert "createConfigDropdown(node.endpoint" not in source
+
+
+class TestMintTokenOnDownload:
+    """Downloading a hidden-server config mints the shared config token."""
+
+    def test_hidden_download_mints_stable_config_token(self) -> None:
+        harness = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(SOURCE_PATH, "utf8");
+let captured = [];
+const created = [];
+function element() {
+  const el = {
+    children: [], _handlers: {}, textContent: "", className: "", type: "",
+    href: "", download: "",
+    addEventListener(name, fn) { this._handlers[name] = fn; },
+    appendChild(child) { this.children.push(child); return child; },
+    removeChild(child) { return child; },
+    remove() {}, setAttribute() {}, click() {},
+    classList: { add() {}, remove() {}, contains() { return false; } },
+  };
+  created.push(el);
+  return el;
+}
+const sandbox = {
+  console,
+  Blob: function () {},
+  URL: { createObjectURL: function () { return "blob:test"; }, revokeObjectURL: function () {} },
+  document: {
+    createElement: function () { return element(); },
+    body: element(),
+    addEventListener() {},
+    querySelectorAll() { return []; },
+  },
+  window: { showToast: null, location: { origin: "http://test" } },
+  fetch: async function (url, options) {
+    captured.push({ url, options });
+    return { ok: true, status: 201, json: async function () { return { token: "qiip_minted123" }; } };
+  },
+};
+vm.createContext(sandbox);
+vm.runInContext(source, sandbox);
+(async function () {
+  sandbox.createConfigDropdown(
+    "http://proxy:5000", "deepseek-model", function () {}, function () {},
+    { hidden: true, name: "DeepSeek (qiip)" }
+  );
+  const formatButtons = created.filter(function (el) { return el._handlers.click && el.textContent; });
+  const omp = formatButtons.find(function (el) { return el.textContent === "OMP Agent"; });
+  await omp._handlers.click();
+  const mint = captured.find(function (c) { return c.url === "/profile/tokens"; });
+  process.stdout.write(JSON.stringify(mint ? JSON.parse(mint.options.body) : null));
+})().catch(function (error) {
+  console.error(error);
+  process.exit(1);
+});
+"""
+        result = _run_node_raw(
+            harness.replace("SOURCE_PATH", json.dumps(str(_CONFIG_DOWNLOAD_JS)))
+        )
+        assert result == {"name": "agent-config"}

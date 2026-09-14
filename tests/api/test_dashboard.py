@@ -37,6 +37,17 @@ class TestDashboardRoute:
         response = client.get("/dashboard")
         assert "text/html" in response.headers["content-type"]
 
+    def test_dynamic_responses_are_not_cached(self, client: TestClient) -> None:
+        """Role-specific pages/JSON must not be browser-cached."""
+        page = client.get("/dashboard")
+        assert page.headers["cache-control"] == "no-store"
+
+        api = client.get("/admin/nodes")
+        assert api.headers["cache-control"] == "no-store"
+
+        asset = client.get("/static/js/dashboard.js")
+        assert "no-store" not in asset.headers.get("cache-control", "")
+
     def test_dashboard_served_by_same_app(self, client: TestClient) -> None:
         """TestClient (wrapping create_app()) serves /dashboard -- proves DASH-03."""
         # The client fixture uses the same FastAPI app that serves /admin/nodes.

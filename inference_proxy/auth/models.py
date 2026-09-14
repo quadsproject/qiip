@@ -18,6 +18,8 @@ class User(BaseModel):
 
     ``google_sub`` is the OIDC subject claim: the stable, per-account
     identifier that never changes even when the user's email does.
+    ``is_admin`` is the admin-role designation granted by an existing
+    admin (HTTP Basic holder) through the admin page.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -27,6 +29,7 @@ class User(BaseModel):
     email: str
     name: str
     picture: str
+    is_admin: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -40,6 +43,7 @@ class PublicUser(BaseModel):
     email: str
     name: str
     picture: str
+    is_admin: bool = False
 
 
 class ApiToken(BaseModel):
@@ -163,6 +167,7 @@ class AdminUserStats(BaseModel):
     email: str
     name: str
     picture: str
+    is_admin: bool = False
     created_at: datetime
     token_count: int
     active_token_count: int

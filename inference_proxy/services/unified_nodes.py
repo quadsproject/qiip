@@ -49,16 +49,23 @@ class UnifiedNodeService:
     def get_unified_nodes(
         self,
         task_map: dict[str, TaskStatusResponse] | None = None,
+        *,
+        viewer_admin: bool = True,
     ) -> list[AdminNodeResponse]:
-        """Return merged QUADS + etcd node list sorted by node_id."""
+        """Return merged QUADS + etcd node list sorted by node_id.
+
+        ``viewer_admin`` controls the fleet-visibility contract: a non-admin
+        viewer never sees hidden nodes, never sees QUADS-only available
+        hosts, and receives no operational actions.
+        """
         etcd_map = {canonical_hostname(n.node_id): n for n in self._registry.get_all()}
 
         # Graceful degradation: no QUADS -> etcd-only
         if self._poller is None:
-            return sorted(
-                (self._from_etcd(n, task_map=task_map) for n in etcd_map.values()),
-                key=lambda r: r.node_id,
-            )
+            etcd_only = [
+                self._from_etcd(n, task_map=task_map) for n in etcd_map.values()
+            ]
+            return self._finalize(etcd_only, viewer_admin)
 
         quads_map: dict[str, QUADSHost] = {h.hostname: h for h in self._poller.hosts}
         available_set = set(self._poller.available_hostnames)
@@ -69,7 +76,7 @@ class UnifiedNodeService:
             if etcd_node is not None:
                 # D-05: etcd status wins
                 result.append(self._from_etcd(etcd_node, host, task_map=task_map))
-            elif hostname in available_set:
+            elif hostname in available_set and viewer_admin:
                 result.append(self._from_available(host))
             # else: not available and not in etcd -> skip
 
@@ -79,7 +86,23 @@ class UnifiedNodeService:
         for node in etcd_map.values():
             result.append(self._from_etcd(node, task_map=task_map))
 
-        return sorted(result, key=lambda r: r.node_id)
+        return self._finalize(result, viewer_admin)
+
+    @staticmethod
+    def _finalize(
+        result: list[AdminNodeResponse],
+        viewer_admin: bool,
+    ) -> list[AdminNodeResponse]:
+        """Apply the fleet-visibility contract to a completed node list."""
+        if viewer_admin:
+            return sorted(result, key=lambda r: r.node_id)
+        filtered = [
+            # Non-admin callers never see hidden nodes or operational actions.
+            item.model_copy(update={"actions": []})
+            for item in result
+            if not item.hidden
+        ]
+        return sorted(filtered, key=lambda r: r.node_id)
 
     def _from_etcd(
         self,
@@ -98,6 +121,7 @@ class UnifiedNodeService:
             actions.append("remove")
         return AdminNodeResponse(
             node_id=node.node_id,
+            name=node.name,
             endpoint=node.endpoint,
             model=node.model,
             status=node.status.value,
@@ -113,6 +137,7 @@ class UnifiedNodeService:
             gpu_count=host.gpu_count if host else None,
             managed=node.managed,
             self_setup=node.self_setup,
+            hidden=node.hidden,
             owner=node.owner,
             failed_step=task.failed_step if task else None,
             error=task.error if task else None,

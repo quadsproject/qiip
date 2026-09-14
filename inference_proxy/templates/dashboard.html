@@ -76,7 +76,7 @@
         <p>QIIP Inference Proxy</p>
     </footer>
 
-    <script>const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};</script>
+    <script>const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};const VIEWER_ROLE = {{ viewer_role | tojson }};</script>
     <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/config_download.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/setup_selection.js') }}"></script>

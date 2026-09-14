@@ -21,7 +21,7 @@ from typing import Annotated
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 
 from inference_proxy.auth.allowlist import (
     AllowlistUnavailableError,
@@ -37,12 +37,14 @@ from inference_proxy.auth.dependencies import (
 from inference_proxy.auth.models import PublicUser, User
 from inference_proxy.auth.scopes import is_full_access
 from inference_proxy.auth.session import (
+    clear_local_admin_session,
     clear_session_user,
     get_session_user_id,
+    set_local_admin_session,
     set_session_user,
 )
 from inference_proxy.auth.store import AuthStore
-from inference_proxy.config.dependencies import get_settings
+from inference_proxy.config.dependencies import _credentials_match, get_settings
 from inference_proxy.config.settings import Settings
 from inference_proxy.plugins.interfaces.auth import AuthCallbackError, AuthPlugin
 
@@ -51,11 +53,53 @@ logger = structlog.get_logger()
 auth_router = APIRouter(prefix="/auth", tags=["auth"])
 
 _PROFILE_HOME = "/profile"
+_DASHBOARD_HOME = "/dashboard"
 
 
 def _error_redirect(error: str) -> RedirectResponse:
     """Redirect back to the profile page carrying a short error code."""
     return RedirectResponse(f"{_PROFILE_HOME}?error={error}", status_code=302)
+
+
+@auth_router.get("/local-admin")
+async def local_admin_login_page() -> RedirectResponse:
+    """Send direct visitors to the sign-in page (no Basic challenge popup)."""
+    return RedirectResponse(_DASHBOARD_HOME, status_code=302)
+
+
+@auth_router.post("/local-admin")
+async def local_admin_login(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Response:
+    """Sign in as the local admin through the sign-in page form.
+
+    Accepts a JSON body (``{"username": ..., "password": ...}``) — the same
+    JSON-only state-changing convention as the admin API, so the login cannot
+    be CSRF'd by a cross-origin form. On success a signed session cookie is
+    set and the browser is redirected to the fleet page; invalid credentials
+    return 401 with a visible error message.
+    """
+    if settings.auth.session_secret is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Session storage is not configured; cannot sign in via the form",
+        )
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=415,
+            detail="Login requires a JSON body",
+        ) from None
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    if not _credentials_match(username, password, settings):
+        logger.warning("local admin login rejected", username=username)
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    set_local_admin_session(request, settings.auth.session_ttl_seconds)
+    logger.info("local admin signed in")
+    return RedirectResponse(_DASHBOARD_HOME, status_code=302)
 
 
 @auth_router.get("/login")
@@ -156,7 +200,8 @@ async def oauth_logout(
     """
     if settings.auth.session_secret is not None:
         clear_session_user(request)
-    return RedirectResponse(_PROFILE_HOME, status_code=302)
+        clear_local_admin_session(request)
+    return RedirectResponse(_DASHBOARD_HOME, status_code=302)
 
 
 @auth_router.get("/me")
@@ -167,4 +212,5 @@ async def oauth_me(user: Annotated[User, Depends(require_profile_user)]) -> Publ
         email=user.email,
         name=user.name,
         picture=user.picture,
+        is_admin=user.is_admin,
     )

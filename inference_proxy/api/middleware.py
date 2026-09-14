@@ -21,6 +21,29 @@ from starlette.responses import Response
 logger = structlog.get_logger()
 
 
+class NoStoreMiddleware(BaseHTTPMiddleware):
+    """Forbid browser caching of dynamic, role-specific responses.
+
+    The dashboard HTML shell embeds the viewer's role (``VIEWER_ROLE``) and
+    JSON endpoints return user-specific data, so a stale cached copy can
+    render the wrong surface (e.g. a cached admin shell for a non-admin
+    session, causing admin fetches, Basic popups, and endless retries).
+    Static assets are content-versioned by ``static_asset_url`` and may be
+    cached, so they are excluded.
+    """
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        """Add ``Cache-Control: no-store`` to every non-static response."""
+        response = await call_next(request)
+        if not request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     """Log every request with method, path, status, duration, and target node."""
 

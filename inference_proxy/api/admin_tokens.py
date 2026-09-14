@@ -116,7 +116,11 @@ async def user_detail(
     ]
     return AdminUserDetail(
         user=PublicUser(
-            id=user.id, email=user.email, name=user.name, picture=user.picture
+            id=user.id,
+            email=user.email,
+            name=user.name,
+            picture=user.picture,
+            is_admin=user.is_admin,
         ),
         tokens=views,
         usage=usage,
@@ -155,3 +159,25 @@ async def billing_summary(
         ),
         model_label=settings.pricing.model_label,
     )
+
+
+@admin_tokens_router.post("/users/{user_id}/admin", status_code=204)
+async def grant_admin_role(
+    user_id: int,
+    store: Annotated[AuthStore, Depends(get_auth_store)],
+) -> None:
+    """Grant the admin role to a Google-authenticated user."""
+    updated = await asyncio.to_thread(store.set_user_admin, user_id, True)
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+
+
+@admin_tokens_router.delete("/users/{user_id}/admin", status_code=204)
+async def revoke_admin_role(
+    user_id: int,
+    store: Annotated[AuthStore, Depends(get_auth_store)],
+) -> None:
+    """Revoke the admin role from a Google-authenticated user."""
+    updated = await asyncio.to_thread(store.set_user_admin, user_id, False)
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")

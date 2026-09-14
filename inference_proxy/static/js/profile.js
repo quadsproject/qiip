@@ -108,7 +108,12 @@
     } catch (_err) {
       // fall through to the empty-state row below
     }
+    // Revoked tokens are hash-disabled. Keep the audit rows in the store
+    // but drop them from the user-facing list -- they only add noise.
+    tokens = tokens.filter((token) => !token.revoked);
     clearChildren(body);
+    const note = $("token-required-note");
+    if (note) note.hidden = tokens.length !== 0;
     if (tokens.length === 0) {
       const row = document.createElement("tr");
       const td = document.createElement("td");
@@ -165,33 +170,90 @@
     loadTokens();
   }
 
+  function updateEndpointSummary() {
+    const select = $("token-endpoints");
+    const count = Array.from(select.children).filter((option) => option.selected).length;
+    $("endpoint-summary").textContent =
+      count === 0 ? "All Endpoints (0 selected)" : count + " Endpoints Selected";
+  }
+
+  function renderEndpointList(endpoints) {
+    const list = $("endpoint-list");
+    const empty = $("endpoint-empty");
+    const select = $("token-endpoints");
+    // Remove previous rows but keep the empty-state paragraph.
+    while (list.firstChild && list.firstChild !== empty) {
+      list.removeChild(list.firstChild);
+    }
+    if (endpoints.length === 0) {
+      empty.hidden = false;
+      updateEndpointSummary();
+      return;
+    }
+    empty.hidden = true;
+    for (const endpoint of endpoints) {
+      const label = document.createElement("label");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.value = endpoint.node_id;
+      checkbox.addEventListener("change", () => {
+        const option = Array.from(select.children).find(
+          (item) => item.value === endpoint.node_id
+        );
+        if (option) option.selected = checkbox.checked;
+        updateEndpointSummary();
+      });
+      label.appendChild(checkbox);
+      label.appendChild(
+        document.createTextNode(
+          endpoint.model
+            ? endpoint.node_id + " (" + endpoint.model + ")"
+            : endpoint.node_id
+        )
+      );
+      list.appendChild(label);
+    }
+    updateEndpointSummary();
+  }
+
   async function loadEndpoints() {
     const select = $("token-endpoints");
     clearChildren(select);
+    let endpoints = [];
     try {
       const resp = await fetch("/profile/endpoints");
-      if (resp.ok) {
-        const endpoints = await resp.json();
-        if (endpoints.length === 0) {
-          const option = document.createElement("option");
-          option.value = "";
-          option.textContent = "No endpoints available to pin";
-          option.disabled = true;
-          select.appendChild(option);
-          return;
-        }
-        for (const endpoint of endpoints) {
-          const option = document.createElement("option");
-          option.value = endpoint.node_id;
-          option.textContent = endpoint.model
-            ? endpoint.node_id + " (" + endpoint.model + ")"
-            : endpoint.node_id;
-          select.appendChild(option);
-        }
-      }
+      if (resp.ok) endpoints = await resp.json();
     } catch (_err) {
-      // leave the empty option in place; scoping is optional
+      // Scoping is optional; the picker shows the empty state below.
     }
+    for (const endpoint of endpoints) {
+      const option = document.createElement("option");
+      option.value = endpoint.node_id;
+      option.textContent = endpoint.model
+        ? endpoint.node_id + " (" + endpoint.model + ")"
+        : endpoint.node_id;
+      select.appendChild(option);
+    }
+    renderEndpointList(endpoints);
+  }
+
+  function wireEndpointPicker() {
+    const toggle = $("endpoint-toggle");
+    const list = $("endpoint-list");
+    const picker = $("endpoint-picker");
+    toggle.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const expanded = toggle.getAttribute("aria-expanded") === "true";
+      toggle.setAttribute("aria-expanded", String(!expanded));
+      list.hidden = expanded;
+    });
+    // Close the popover when clicking anywhere outside the picker.
+    document.addEventListener("click", (event) => {
+      if (!picker.contains(event.target)) {
+        list.hidden = true;
+        toggle.setAttribute("aria-expanded", "false");
+      }
+    });
   }
 
   function wireTokenForm() {
@@ -354,6 +416,7 @@
   async function init() {
     parseErrorParam();
     wireTokenForm();
+    wireEndpointPicker();
     wireLogout();
 
     let resp;
