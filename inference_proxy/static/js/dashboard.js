@@ -250,6 +250,38 @@ async function refreshDashboard() {
       renderQuadsStatus(await quadsResp.json());
     }
 
+    // Grand-total token budget saved for all users (RFE #113). Non-fatal:
+    // the fleet table must render even if the billing endpoint errors, and a
+    // stale figure must not survive a failed refresh.
+    let billing = null;
+    try {
+      const billingResp = await fetch("/admin/billing");
+      if (billingResp.ok) billing = await billingResp.json();
+    } catch (_err) {
+      billing = null;
+    }
+    const budgetEl = document.getElementById("token-budget");
+    if (budgetEl) {
+      if (
+        billing &&
+        billing.totals &&
+        typeof billing.totals.request_count === "number" &&
+        typeof billing.totals.total_tokens === "number"
+      ) {
+        const total = billing.totals.total_tokens || 0;
+        budgetEl.textContent =
+          `Token budget saved for all token-attributed requests: ${total.toLocaleString()} tokens` +
+          ` (${billing.totals.request_count.toLocaleString()} requests), ` +
+          `equivalent to $${Number(billing.estimated_cost_usd).toLocaleString(
+            undefined,
+            { minimumFractionDigits: 2, maximumFractionDigits: 2 }
+          )} at ${billing.model_label} rates`;
+        budgetEl.hidden = false;
+      } else {
+        budgetEl.hidden = true;
+      }
+    }
+
     renderTaskDataWarning(nodesResp, warningEl);
 
     if (nodes.length === 0) {

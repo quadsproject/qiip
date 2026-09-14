@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
 from inference_proxy.api.admin import admin_router
+from inference_proxy.api.admin_tokens import admin_tokens_router
 from inference_proxy.api.auth import auth_router
 from inference_proxy.api.chat import chat_router
 from inference_proxy.api.dashboard import dashboard_router
@@ -592,6 +593,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     application.include_router(router)
     application.include_router(admin_router)
+    application.include_router(admin_tokens_router)
     application.include_router(dashboard_router)
     application.include_router(chat_router)
     application.include_router(auth_router)

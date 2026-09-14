@@ -23,6 +23,7 @@ from inference_proxy.config.settings import (
     LLMFitSettings,
     LoggingSettings,
     OAuthSettings,
+    PricingSettings,
     ProvisioningSettings,
     QUADSSettings,
     RedfishSettings,
@@ -1182,3 +1183,42 @@ class TestSSOWhitelistDefaultDomain:
         for bad in ("a@b.com", "https://example.com", " ", ""):
             with pytest.raises(ValidationError, match="default_domain"):
                 AuthSettings(sso_whitelist_default_domain=bad)
+
+
+class TestPricingSettings:
+    """Premium rate settings for token budget estimates (RFE #113)."""
+
+    def test_defaults_match_opus_class_rates(self) -> None:
+        pricing = PricingSettings()
+        assert pricing.input_rate_per_mtok == 5.0
+        assert pricing.output_rate_per_mtok == 25.0
+        assert pricing.model_label == "claude-opus-4.8"
+
+    def test_registered_on_root_settings(self) -> None:
+        settings = Settings(_env_file=None)
+        assert settings.pricing.input_rate_per_mtok == 5.0
+        assert settings.pricing.output_rate_per_mtok == 25.0
+
+    def test_env_var_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("INFERENCE_PROXY_PRICING__INPUT_RATE_PER_MTOK", "8.5")
+        monkeypatch.setenv("INFERENCE_PROXY_PRICING__OUTPUT_RATE_PER_MTOK", "42.0")
+        monkeypatch.setenv("INFERENCE_PROXY_PRICING__MODEL_LABEL", "gpt-neo-test")
+
+        settings = Settings(_env_file=None)
+
+        assert settings.pricing.input_rate_per_mtok == 8.5
+        assert settings.pricing.output_rate_per_mtok == 42.0
+        assert settings.pricing.model_label == "gpt-neo-test"
+
+    def test_non_positive_rates_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="input_rate_per_mtok"):
+            PricingSettings(input_rate_per_mtok=0)
+        with pytest.raises(ValidationError, match="output_rate_per_mtok"):
+            PricingSettings(output_rate_per_mtok=-1)
+
+    def test_blank_model_label_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="model_label"):
+            PricingSettings(model_label="  ")
+
+    def test_is_base_model_not_base_settings(self) -> None:
+        assert not issubclass(PricingSettings, BaseSettings)

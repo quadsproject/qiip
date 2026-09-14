@@ -540,6 +540,7 @@ until every gateway that may provision or display the node understands it.
 | **Correctness fix** | Recommendation targets must be registered or currently QUADS-available and must pass the endpoint allowlist. | Do not use the recommendation endpoint as an unrestricted SSH target. |
 | **Correctness fix** | `GracefulRestart` and `ForceRestart` always issue a Redfish reset even when the machine is already On. Only `On` and `ForceOff` are idempotent shortcuts. Malformed or unsupported BMC power states return a structured 502. | Do not use a restart action as a state probe; expect it to restart a running machine. |
 | **Security fix** | Chat Markdown is rendered through vendored Marked and DOMPurify assets. All HTML attributes are removed, so model output cannot create event handlers, remote-image loads, or navigable URLs. | Do not depend on model-generated raw HTML, image sources, or link targets surviving rendering. Update the vendored assets through their documented review process. |
+| **New surface** | Admin-only token management: `GET /admin/users`, `GET /admin/tokens`, `GET /admin/users/{id}`, `DELETE /admin/tokens/{id}`, `GET /admin/billing`, plus the `/dashboard/tokens` and `/dashboard/users/{id}` pages, all behind the existing HTTP Basic admin gate. `GET /profile/usage` gains `estimated_premium_cost_usd` and `model_label`. | No action required; optional `INFERENCE_PROXY_PRICING__*` variables tune the premium-equivalent rate used for the estimate (defaults: $5/$25 per MTok, `claude-opus-4.8`). |
 
 ## Operational Runbooks
 

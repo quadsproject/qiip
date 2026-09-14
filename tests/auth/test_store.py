@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 
 from inference_proxy.auth.models import User
-from inference_proxy.auth.store import AuthStore
+from inference_proxy.auth.store import AuthStore, _utcnow
 
 _GOOGLE = {
     "google_sub": "sub-123",
@@ -15,6 +16,13 @@ _GOOGLE = {
     "name": "Alice",
     "picture": "https://example.com/alice.png",
 }
+
+
+class _AdminSeed(TypedDict):
+    alice: User
+    bob: User
+    token_id: int
+    token_raw: str
 
 
 class TestUsers:
@@ -382,3 +390,143 @@ class TestScopeSerialization:
         assert _load_scopes('{"a": 1}') == []
         assert _load_scopes("42") == []
         assert _load_scopes("[1, 2]") == []
+
+
+class TestAdminSurfaces:
+    """Cross-user queries backing the admin token dashboard (RFE #113)."""
+
+    def _seed(self, store: AuthStore) -> _AdminSeed:
+        """Create two users, one token each, and usage for Alice."""
+        alice = store.upsert_google_user(
+            google_sub="sub-alice",
+            email="alice@example.com",
+            name="Alice",
+            picture="",
+        )
+        bob = store.upsert_google_user(
+            google_sub="sub-bob",
+            email="bob@example.com",
+            name="Bob",
+            picture="",
+        )
+        token = store.create_token(alice.id, "ci")
+        store.create_token(bob.id, "gh")
+        store.record_usage(
+            user_id=alice.id,
+            token_id=token.id,
+            model="llama-3",
+            endpoint="/v1/chat/completions",
+            prompt_tokens=4,
+            completion_tokens=6,
+            total_tokens=10,
+        )
+        return {
+            "alice": alice,
+            "bob": bob,
+            "token_id": token.id,
+            "token_raw": token.token,
+        }
+
+    def test_list_users_with_stats_counts(self, auth_store: AuthStore) -> None:
+        self._seed(auth_store)
+
+        stats = auth_store.list_users_with_stats()
+
+        by_email = {row.email: row for row in stats}
+        assert by_email["alice@example.com"].token_count == 1
+        assert by_email["alice@example.com"].active_token_count == 1
+        assert by_email["alice@example.com"].request_count == 1
+        assert by_email["alice@example.com"].prompt_tokens == 4
+        assert by_email["alice@example.com"].completion_tokens == 6
+        assert by_email["alice@example.com"].total_tokens == 10
+        assert by_email["bob@example.com"].token_count == 1
+        assert by_email["bob@example.com"].request_count == 0
+        assert by_email["bob@example.com"].total_tokens == 0
+
+    def test_list_users_empty_store(self, auth_store: AuthStore) -> None:
+        assert auth_store.list_users_with_stats() == []
+
+    def test_list_all_tokens_joins_user(self, auth_store: AuthStore) -> None:
+        seeded = self._seed(auth_store)
+        bob = seeded["bob"]
+
+        tokens = auth_store.list_all_tokens()
+
+        assert len(tokens) == 2
+        assert {token.user_email for token in tokens} == {
+            "alice@example.com",
+            "bob@example.com",
+        }
+        bob_token = next(token for token in tokens if token.user_id == bob.id)
+        assert bob_token.user_name == "Bob"
+        assert bob_token.prefix.startswith("qiip_")
+        assert bob_token.request_count == 0
+        assert bob_token.total_tokens == 0
+        alice_token = next(token for token in tokens if token.user_id != bob.id)
+        assert alice_token.request_count == 1
+        assert alice_token.prompt_tokens == 4
+        assert alice_token.completion_tokens == 6
+        assert alice_token.total_tokens == 10
+        # AUTH-02: no raw secret is ever exposed by the admin view either.
+        assert not hasattr(bob_token, "token")
+
+    def test_revoke_any_token_by_id(self, auth_store: AuthStore) -> None:
+        seeded = self._seed(auth_store)
+
+        assert auth_store.revoke_any_token(seeded["token_id"]) is True
+        assert auth_store.revoke_any_token(seeded["token_id"]) is False
+        assert auth_store.resolve_token(seeded["token_raw"]) is None
+        assert auth_store.revoke_any_token(4242) is False
+
+    def test_usage_totals_all_spans_users(self, auth_store: AuthStore) -> None:
+        self._seed(auth_store)
+
+        totals = auth_store.get_usage_totals_all()
+
+        assert totals.request_count == 1
+        assert totals.prompt_tokens == 4
+        assert totals.completion_tokens == 6
+        assert totals.total_tokens == 10
+
+    def test_usage_totals_all_empty(self, auth_store: AuthStore) -> None:
+        assert auth_store.get_usage_totals_all().total_tokens == 0
+
+    def test_user_usage_timeline_groups_by_day(self, auth_store: AuthStore) -> None:
+        seeded = self._seed(auth_store)
+        alice = seeded["alice"]
+        token = auth_store.list_tokens(alice.id)[0]
+        auth_store.record_usage(
+            user_id=alice.id,
+            token_id=token.id,
+            model="llama-3",
+            endpoint="/v1/completions",
+            prompt_tokens=1,
+            completion_tokens=2,
+            total_tokens=3,
+        )
+
+        timeline = auth_store.get_user_usage_timeline(alice.id)
+
+        assert len(timeline) == 1
+        row = timeline[0]
+        assert row.day == _utcnow().date().isoformat()
+        assert row.request_count == 2
+        assert row.prompt_tokens == 5
+        assert row.completion_tokens == 8
+        assert row.total_tokens == 13
+
+    def test_user_usage_timeline_honors_day_window(self, auth_store: AuthStore) -> None:
+        seeded = self._seed(auth_store)
+        alice = seeded["alice"]
+
+        assert auth_store.get_user_usage_timeline(alice.id, days=-1) == []
+
+    def test_user_usage_timeline_empty(self, auth_store: AuthStore) -> None:
+        alice = auth_store.upsert_google_user(
+            google_sub="sub-alice",
+            email="alice@example.com",
+            name="Alice",
+            picture="",
+        )
+
+        assert auth_store.get_user_usage_timeline(alice.id) == []

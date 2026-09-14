@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -148,6 +149,28 @@ class TestUsageSummary:
         client = TestClient(app)
 
         assert client.get("/profile/usage").status_code == 401
+
+    def test_usage_includes_premium_cost_estimate(
+        self,
+        profile_client: TestClient,
+        auth_store: AuthStore,
+    ) -> None:
+        me = profile_client.get("/profile/me").json()
+        created = profile_client.post("/profile/tokens", json={"name": "ci"}).json()
+        auth_store.record_usage(
+            user_id=me["id"],
+            token_id=created["id"],
+            model="llama-3",
+            endpoint="/v1/chat/completions",
+            prompt_tokens=1_000_000,
+            completion_tokens=500_000,
+            total_tokens=1_500_000,
+        )
+
+        data = profile_client.get("/profile/usage").json()
+
+        assert data["estimated_premium_cost_usd"] == pytest.approx(17.5)
+        assert data["model_label"] == "claude-opus-4.8"
 
 
 class TestTokenMintWhitelist:

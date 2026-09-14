@@ -67,3 +67,37 @@ async def models_page(
             "active_page": "models",
         },
     )
+
+
+@dashboard_router.get("/dashboard/tokens", response_class=HTMLResponse)
+async def tokens_page(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> HTMLResponse:
+    """Render the admin token-management dashboard shell."""
+    return templates.TemplateResponse(
+        request=request,
+        name="tokens.html",
+        context={
+            "poll_interval": settings.dashboard.poll_interval,
+            "active_page": "tokens",
+        },
+    )
+
+
+@dashboard_router.get("/dashboard/users/{user_id}", response_class=HTMLResponse)
+async def user_detail_page(
+    request: Request,
+    user_id: int,
+    settings: Settings = Depends(get_settings),
+) -> HTMLResponse:
+    """Render the admin per-user token and usage detail shell."""
+    return templates.TemplateResponse(
+        request=request,
+        name="user_detail.html",
+        context={
+            "user_id": user_id,
+            "poll_interval": settings.dashboard.poll_interval,
+            "active_page": "tokens",
+        },
+    )

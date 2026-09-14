@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>QIIP - User Tokens</title>
+    <meta name="description" content="Per-user token detail for QIIP: tokens, usage, timeline, and revocation.">
+    <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
+    <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
+</head>
+<body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    {% include "partials/navbar.html" %}
+
+    <div class="dashboard">
+        <header class="dashboard-header">
+            <div>
+                <h1 id="user-title">User</h1>
+                <p id="user-subtitle">Loading user data...</p>
+                <p><a class="btn btn-neutral btn-sm" href="/dashboard/tokens">← All tokens</a></p>
+            </div>
+            <div class="header-right">
+                <p id="last-updated"></p>
+                <p id="poll-warning"></p>
+            </div>
+        </header>
+
+        <main id="main-content">
+            <div id="error-banner" class="profile-error" hidden></div>
+
+            <section class="card">
+                <h2 class="card-title">Identity</h2>
+                <div class="profile-user-row">
+                    <img id="user-avatar" class="profile-avatar" alt="" width="48" height="48">
+                    <div>
+                        <p class="profile-name" id="user-name"></p>
+                        <p class="muted-status" id="user-email"></p>
+                    </div>
+                </div>
+                <p class="muted-status" id="user-savings"></p>
+            </section>
+
+            <section class="card">
+                <h2 class="card-title">Tokens</h2>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">Name</th>
+                                <th scope="col">Prefix</th>
+                                <th scope="col">Created</th>
+                                <th scope="col">Last used</th>
+                                <th scope="col">Status</th>
+                                <th scope="col">Scope</th>
+                                <th scope="col">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tokens-table-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="card">
+                <h2 class="card-title">Usage</h2>
+                <p class="muted-status" id="usage-totals"></p>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">Token</th>
+                                <th scope="col">Model</th>
+                                <th scope="col">Endpoint</th>
+                                <th scope="col">Requests</th>
+                                <th scope="col">Prompt tokens</th>
+                                <th scope="col">Completion tokens</th>
+                                <th scope="col">Total tokens</th>
+                            </tr>
+                        </thead>
+                        <tbody id="usage-table-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="card">
+                <h2 class="card-title">Daily timeline</h2>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">Day (UTC)</th>
+                                <th scope="col">Requests</th>
+                                <th scope="col">Prompt tokens</th>
+                                <th scope="col">Completion tokens</th>
+                                <th scope="col">Total tokens</th>
+                            </tr>
+                        </thead>
+                        <tbody id="timeline-table-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <footer>
+        <p>QIIP Inference Proxy</p>
+    </footer>
+
+    <script>const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};</script>
+    <script>const USER_ID = {{ user_id }};</script>
+    <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/admin_user_detail.js') }}"></script>
+</body>
+</html>

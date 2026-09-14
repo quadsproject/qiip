@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>QIIP - Token Management</title>
+    <meta name="description" content="Admin token management for QIIP: every generated token by user, last access, usage, and revocation.">
+    <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
+    <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
+</head>
+<body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    {% include "partials/navbar.html" %}
+
+    <div class="dashboard">
+        <header class="dashboard-header">
+            <div>
+                <h1>Tokens</h1>
+                <p id="token-count">Loading token data...</p>
+            </div>
+            <div class="header-right">
+                <p id="last-updated"></p>
+                <p id="poll-warning"></p>
+            </div>
+        </header>
+
+        <main id="main-content">
+            <div id="error-banner" class="profile-error" hidden></div>
+
+            <section class="card">
+                <h2 class="card-title">Users</h2>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">User</th>
+                                <th scope="col">Email</th>
+                                <th scope="col">Tokens</th>
+                                <th scope="col">Requests</th>
+                                <th scope="col">Prompt tokens</th>
+                                <th scope="col">Completion tokens</th>
+                                <th scope="col">Total tokens</th>
+                                <th scope="col">Est. premium cost</th>
+                                <th scope="col">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="users-table-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="card">
+                <h2 class="card-title">All tokens</h2>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">User</th>
+                                <th scope="col">Name</th>
+                                <th scope="col">Prefix</th>
+                                <th scope="col">Created</th>
+                                <th scope="col">Last used</th>
+                                <th scope="col">Status</th>
+                                <th scope="col">Scope</th>
+                                <th scope="col">Requests</th>
+                                <th scope="col">Prompt tokens</th>
+                                <th scope="col">Completion tokens</th>
+                                <th scope="col">Total tokens</th>
+                                <th scope="col">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tokens-table-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <footer>
+        <p>QIIP Inference Proxy</p>
+    </footer>
+
+    <script>const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};</script>
+    <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/admin_tokens.js') }}"></script>
+</body>
+</html>

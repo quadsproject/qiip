@@ -154,6 +154,82 @@ class UsageTotals(BaseModel):
     total_tokens: int
 
 
+class AdminUserStats(BaseModel):
+    """Per-user aggregate counts for the admin token dashboard (RFE #113)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    email: str
+    name: str
+    picture: str
+    created_at: datetime
+    token_count: int
+    active_token_count: int
+    request_count: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    estimated_cost_usd: float = 0.0
+
+
+class AdminTokenView(BaseModel):
+    """Token row plus owner identity and usage counts (RFE #113)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    user_id: int
+    user_email: str
+    user_name: str
+    name: str
+    prefix: str
+    created_at: datetime
+    last_used_at: datetime | None
+    revoked: bool
+    endpoint_scope: list[str] | None = None
+    request_count: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class AdminUserDetail(BaseModel):
+    """Full user view for the admin drill-down surface (RFE #113)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    user: PublicUser
+    tokens: list[AdminTokenView]
+    usage: list[TokenUsage]
+    totals: UsageTotals
+    timeline: list[UsageTimelineRow]
+    estimated_cost_usd: float = 0.0
+    model_label: str = ""
+
+
+class UsageTimelineRow(BaseModel):
+    """One day of aggregated usage for a user (AUTH-04 rows by created_at)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    day: str
+    request_count: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+class BillingSummary(BaseModel):
+    """Global usage totals plus premium-equivalent cost (RFE #113)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    totals: UsageTotals
+    estimated_cost_usd: float
+    model_label: str
+
+
 class TokenAuth(BaseModel):
     """Authenticated caller context for a proxied /v1 request (AUTH-03)."""
 

@@ -128,9 +128,11 @@
       row.appendChild(tdCell(token.revoked ? "revoked" : "active"));
       row.appendChild(
         tdCell(
-          token.endpoint_scope && token.endpoint_scope.length
-            ? token.endpoint_scope.join(", ")
-            : "Full access"
+          token.endpoint_scope === null
+            ? "Full access"
+            : token.endpoint_scope.length
+              ? token.endpoint_scope.join(", ")
+              : "None"
         )
       );
       const actions = document.createElement("td");
@@ -147,6 +149,13 @@
   }
 
   async function revokeToken(tokenId) {
+    const ok = await confirmDialog({
+      title: "Revoke token",
+      message: "Revoke this token? It can no longer authenticate /v1 requests.",
+      confirmLabel: "Revoke",
+      danger: true,
+    });
+    if (!ok) return;
     const resp = await fetch("/profile/tokens/" + tokenId, { method: "DELETE" });
     if (!resp.ok) {
       showToast("Failed to revoke token.", "error");
@@ -283,6 +292,19 @@
       " completion tokens \u00b7 " +
       data.totals.total_tokens +
       " total tokens";
+    const savings = $("usage-savings");
+    if (data.estimated_premium_cost_usd !== undefined) {
+      savings.textContent =
+        "Estimated premium-equivalent cost (token budget saved): $" +
+        Number(data.estimated_premium_cost_usd).toLocaleString(undefined, {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        }) +
+        " \u00b7 model: " + (data.model_label || "n/a");
+      savings.hidden = false;
+    } else {
+      savings.hidden = true;
+    }
     const body = $("usage-table-body");
     clearChildren(body);
     if (data.rows.length === 0) {

@@ -192,6 +192,29 @@ class DashboardSettings(BaseModel):
     poll_interval: int = Field(default=10, ge=1)
 
 
+class PricingSettings(BaseModel):
+    """Premium frontier-model rates for token budget estimates (RFE #113).
+
+    The estimates are equivalence figures: what the recorded prompt and
+    completion token mix would cost at this per-million-token rate. The
+    defaults track Anthropic Claude Opus-class 1M-context pricing
+    (input $5/MTok, output $25/MTok); deployments can override when the
+    reference model changes.
+    """
+
+    input_rate_per_mtok: float = Field(default=5.0, gt=0)
+    output_rate_per_mtok: float = Field(default=25.0, gt=0)
+    model_label: str = Field(default="claude-opus-4.8", min_length=1)
+
+    @field_validator("model_label")
+    @classmethod
+    def model_label_is_plain(cls, value: str) -> str:
+        """Reject blank or whitespace-padded reference-model labels."""
+        if value != value.strip():
+            raise ValueError("pricing.model_label must not have surrounding whitespace")
+        return value
+
+
 class SSHSettings(BaseModel):
     """SSH connection configuration (D-16).
 
@@ -806,6 +829,7 @@ class Settings(BaseSettings):
     logging: LoggingSettings = LoggingSettings()
     admin: AdminSettings
     dashboard: DashboardSettings = DashboardSettings()
+    pricing: PricingSettings = PricingSettings()
     ssh: SSHSettings = SSHSettings()
     provisioning: ProvisioningSettings = ProvisioningSettings()
     quads: QUADSSettings = QUADSSettings()

@@ -55,6 +55,22 @@ def _versioned_path(path: str) -> str:
                 "js/profile.js",
             ),
         ),
+        (
+            "/dashboard/tokens",
+            (
+                "css/dashboard.css",
+                "js/confirm_dialog.js",
+                "js/admin_tokens.js",
+            ),
+        ),
+        (
+            "/dashboard/users/1",
+            (
+                "css/dashboard.css",
+                "js/confirm_dialog.js",
+                "js/admin_user_detail.js",
+            ),
+        ),
     ],
 )
 def test_templates_bind_each_asset_url_to_its_contents(

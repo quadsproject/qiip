@@ -23,6 +23,7 @@ from inference_proxy.auth.allowlist import (
     SSOAllowlist,
     enforce_allowlist,
 )
+from inference_proxy.auth.billing import premium_equivalent_cost
 from inference_proxy.auth.dependencies import (
     get_auth_store,
     get_sso_allowlist,
@@ -160,6 +161,7 @@ async def revoke_token(
 async def usage_summary(
     user: Annotated[User, Depends(require_profile_user)],
     store: Annotated[AuthStore, Depends(get_auth_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, object]:
     """Return per-token/per-model usage plus headline totals (AUTH-04)."""
     summary, totals = await asyncio.gather(
@@ -169,4 +171,11 @@ async def usage_summary(
     return {
         "totals": totals,
         "rows": summary,
+        "estimated_premium_cost_usd": premium_equivalent_cost(
+            totals.prompt_tokens,
+            totals.completion_tokens,
+            input_rate_per_mtok=settings.pricing.input_rate_per_mtok,
+            output_rate_per_mtok=settings.pricing.output_rate_per_mtok,
+        ),
+        "model_label": settings.pricing.model_label,
     }

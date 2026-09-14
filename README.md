@@ -595,6 +595,37 @@ with OAuth enabled but `enforce_api_tokens` left `false`, then flip enforcement
 once users have minted tokens. Rotate `auth.session_secret` to log every session
 out at once.
 
+Token management dashboards (admin and per-user):
+
+- The admin token dashboard lives at `/dashboard/tokens` (same HTTP Basic
+  gate as the ops dashboard). It lists every generated token by user with
+  creation time, last-used time, revoked state, endpoint scope, request
+  count, prompt/completion/total tokens, and an estimated premium-equivalent
+  cost. A per-user view at `/dashboard/users/{id}` adds the usage breakdown
+  by token/model/endpoint, a daily timeline (last 30 days, UTC days), and
+  revoke buttons for each token.
+- The per-user profile page (`/profile`) keeps its existing token list and
+  revocation, and adds the same premium-equivalent cost estimate next to the
+  usage totals. The admin dashboard front page shows the grand total
+  "token budget saved" for all token-attributed requests.
+- The estimate is `prompt_tokens/1M * input_rate + completion_tokens/1M *
+  output_rate`: what the recorded mix would have cost at the configured
+  premium frontier-model rate. It is an equivalence figure for self-hosted
+  usage (near-zero marginal cost), not a cash ledger, and it ignores
+  prompt-cache discounts because the usage store does not record cache-token
+  splits. Only token-authenticated requests are recorded (AUTH-04), so the
+  global figure covers token-attributed traffic; anonymous requests in
+  enforcement-off deployments are not included.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `INFERENCE_PROXY_PRICING__INPUT_RATE_PER_MTOK` | `5.0` | USD per million input (prompt) tokens |
+| `INFERENCE_PROXY_PRICING__OUTPUT_RATE_PER_MTOK` | `25.0` | USD per million output (completion) tokens |
+| `INFERENCE_PROXY_PRICING__MODEL_LABEL` | `claude-opus-4.8` | Reference model shown next to the estimate |
+
+The defaults track published Claude Opus-class 1M-context pricing; override
+them when the reference model or your accounting changes.
+
 ### etcd
 
 | Variable | Default | Description |

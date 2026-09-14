@@ -21,17 +21,20 @@ import json
 import secrets
 import sqlite3
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import structlog
 
 from inference_proxy.auth._constants import TOKEN_PREFIX
 from inference_proxy.auth.models import (
+    AdminTokenView,
+    AdminUserStats,
     ApiToken,
     CreatedToken,
     TokenAuth,
     TokenUsage,
+    UsageTimelineRow,
     UsageTotals,
     User,
 )
@@ -77,6 +80,7 @@ CREATE TABLE IF NOT EXISTS usage (
 CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_usage_user ON usage(user_id);
 CREATE INDEX IF NOT EXISTS idx_usage_token ON usage(token_id);
+CREATE INDEX IF NOT EXISTS idx_usage_user_created ON usage(user_id, created_at);
 """
 
 
@@ -446,6 +450,158 @@ class AuthStore:
             completion_tokens=row["completion_tokens"],
             total_tokens=row["total_tokens"],
         )
+
+    # ------------------------------------------------------------------
+    # Admin surfaces (RFE #113)
+    # ------------------------------------------------------------------
+
+    def list_users_with_stats(self) -> list[AdminUserStats]:
+        """Return every user plus token and usage counts, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT u.id, u.email, u.name, u.picture, u.created_at,
+                       (SELECT COUNT(*) FROM tokens t
+                          WHERE t.user_id = u.id) AS token_count,
+                       (SELECT COUNT(*) FROM tokens t
+                          WHERE t.user_id = u.id AND t.revoked = 0)
+                           AS active_token_count,
+                       COALESCE((SELECT SUM(request_count) FROM usage w
+                                   WHERE w.user_id = u.id), 0) AS request_count,
+                       COALESCE((SELECT SUM(prompt_tokens) FROM usage w
+                                   WHERE w.user_id = u.id), 0) AS prompt_tokens,
+                       COALESCE((SELECT SUM(completion_tokens) FROM usage w
+                                   WHERE w.user_id = u.id), 0) AS completion_tokens,
+                       COALESCE((SELECT SUM(total_tokens) FROM usage w
+                                   WHERE w.user_id = u.id), 0) AS total_tokens
+                  FROM users u
+                 ORDER BY u.created_at DESC, u.id DESC
+                """
+            ).fetchall()
+        return [
+            AdminUserStats(
+                id=row["id"],
+                email=row["email"],
+                name=row["name"],
+                picture=row["picture"],
+                created_at=_parse_iso(row["created_at"]),
+                token_count=row["token_count"],
+                active_token_count=row["active_token_count"],
+                request_count=row["request_count"],
+                prompt_tokens=row["prompt_tokens"],
+                completion_tokens=row["completion_tokens"],
+                total_tokens=row["total_tokens"],
+            )
+            for row in rows
+        ]
+
+    def list_all_tokens(self) -> list[AdminTokenView]:
+        """Return every token with its owner identity and usage, newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT tokens.*, users.email AS user_email, users.name AS user_name,
+                       COALESCE(agg.request_count, 0)     AS request_count,
+                       COALESCE(agg.prompt_tokens, 0)     AS prompt_tokens,
+                       COALESCE(agg.completion_tokens, 0) AS completion_tokens,
+                       COALESCE(agg.total_tokens, 0)      AS total_tokens
+                  FROM tokens
+                  JOIN users ON users.id = tokens.user_id
+                  LEFT JOIN (
+                      SELECT token_id,
+                             SUM(request_count)     AS request_count,
+                             SUM(prompt_tokens)     AS prompt_tokens,
+                             SUM(completion_tokens) AS completion_tokens,
+                             SUM(total_tokens)      AS total_tokens
+                        FROM usage
+                       GROUP BY token_id
+                  ) agg ON agg.token_id = tokens.id
+                 ORDER BY tokens.created_at DESC, tokens.id DESC
+                """
+            ).fetchall()
+        return [
+            AdminTokenView(
+                id=row["id"],
+                user_id=row["user_id"],
+                user_email=row["user_email"],
+                user_name=row["user_name"],
+                name=row["name"],
+                prefix=row["prefix"],
+                created_at=_parse_iso(row["created_at"]),
+                last_used_at=_parse_iso(row["last_used_at"]),
+                revoked=bool(row["revoked"]),
+                endpoint_scope=_load_scopes(row["endpoint_scope"]),
+                request_count=row["request_count"],
+                prompt_tokens=row["prompt_tokens"],
+                completion_tokens=row["completion_tokens"],
+                total_tokens=row["total_tokens"],
+            )
+            for row in rows
+        ]
+
+    def get_user_usage_timeline(
+        self, user_id: int, days: int = 30
+    ) -> list[UsageTimelineRow]:
+        """Return per-day usage aggregates for a user, newest day first."""
+        cutoff = _iso(_utcnow() - timedelta(days=days))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT substr(created_at, 1, 10)                AS day,
+                       COALESCE(SUM(request_count), 0)          AS request_count,
+                       COALESCE(SUM(prompt_tokens), 0)          AS prompt_tokens,
+                       COALESCE(SUM(completion_tokens), 0)      AS completion_tokens,
+                       COALESCE(SUM(total_tokens), 0)           AS total_tokens
+                  FROM usage
+                 WHERE user_id = ? AND created_at >= ?
+                 GROUP BY day
+                 ORDER BY day DESC
+                """,
+                (user_id, cutoff),
+            ).fetchall()
+        return [
+            UsageTimelineRow(
+                day=row["day"],
+                request_count=row["request_count"],
+                prompt_tokens=row["prompt_tokens"],
+                completion_tokens=row["completion_tokens"],
+                total_tokens=row["total_tokens"],
+            )
+            for row in rows
+        ]
+
+    def get_usage_totals_all(self) -> UsageTotals:
+        """Return headline request/token sums across the whole store."""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COALESCE(SUM(request_count), 0)     AS request_count,
+                       COALESCE(SUM(prompt_tokens), 0)     AS prompt_tokens,
+                       COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                       COALESCE(SUM(total_tokens), 0)      AS total_tokens
+                  FROM usage
+                """
+            ).fetchone()
+        return UsageTotals(
+            request_count=row["request_count"],
+            prompt_tokens=row["prompt_tokens"],
+            completion_tokens=row["completion_tokens"],
+            total_tokens=row["total_tokens"],
+        )
+
+    def revoke_any_token(self, token_id: int) -> bool:
+        """Revoke any token by id (admin path), True when a live token was revoked."""
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE tokens
+                   SET revoked = 1
+                 WHERE id = ? AND revoked = 0
+                """,
+                (token_id,),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
 
     # ------------------------------------------------------------------
     # Row handling

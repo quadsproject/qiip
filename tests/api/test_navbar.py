@@ -22,6 +22,8 @@ _PARTIAL = _TEMPLATES_DIR / "partials" / "navbar.html"
 _ALL_PAGES = (
     "/dashboard",
     "/dashboard/nodes/test-node",
+    "/dashboard/tokens",
+    "/dashboard/users/1",
     "/models",
     "/chat",
     "/profile",
@@ -80,6 +82,20 @@ class TestNavbarActiveState:
             in response.text
         )
 
+    def test_tokens_marks_tokens_active(self, client: TestClient) -> None:
+        response = client.get("/dashboard/tokens")
+        assert (
+            '<a href="/dashboard/tokens" class="nav-link nav-link-active" aria-current="page">Tokens</a>'
+            in response.text
+        )
+
+    def test_user_detail_marks_tokens_active(self, client: TestClient) -> None:
+        response = client.get("/dashboard/users/1")
+        assert (
+            '<a href="/dashboard/tokens" class="nav-link nav-link-active" aria-current="page">Tokens</a>'
+            in response.text
+        )
+
     def test_chat_marks_chat_active(self, client: TestClient) -> None:
         response = client.get("/chat")
         assert (
@@ -114,6 +130,8 @@ class TestNavbarIsSingleSourceOfTruth:
             "models.html",
             "chat.html",
             "profile.html",
+            "tokens.html",
+            "user_detail.html",
         ],
     )
     def test_every_page_includes_the_shared_partial(self, template: str) -> None:
@@ -128,6 +146,8 @@ class TestNavbarIsSingleSourceOfTruth:
             "models.html",
             "chat.html",
             "profile.html",
+            "tokens.html",
+            "user_detail.html",
         ],
     )
     def test_no_page_embeds_its_own_nav_markup(self, template: str) -> None:

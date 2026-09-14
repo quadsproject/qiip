@@ -174,7 +174,15 @@ class TestAdminBasicAuthentication:
             for route in admin_routes
         )
 
-    @pytest.mark.parametrize("path", ["/dashboard", "/dashboard/nodes/gpu01"])
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/dashboard",
+            "/dashboard/nodes/gpu01",
+            "/dashboard/tokens",
+            "/dashboard/users/1",
+        ],
+    )
     async def test_dashboard_routes_require_admin_auth(
         self,
         app: FastAPI,

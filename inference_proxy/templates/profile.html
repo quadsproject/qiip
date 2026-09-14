@@ -95,6 +95,7 @@
                 <section class="card">
                     <h2 class="card-title">Usage</h2>
                     <p class="muted-status" id="usage-totals">Loading usage...</p>
+                    <p class="muted-status" id="usage-savings" hidden></p>
                     <div class="table-wrap">
                         <table>
                             <thead>
@@ -124,6 +125,7 @@
         <p>QIIP Inference Proxy</p>
     </footer>
 
+    <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/profile.js') }}"></script>
 </body>
 </html>
