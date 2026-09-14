@@ -115,7 +115,7 @@ var ACTION_CONFIG = {
     body: null, confirm: true, danger: false,
     confirmMsg: function (id, node) {
       return node && node.self_setup
-        ? "Remove " + id + " from the fleet? The existing vLLM instance will keep running."
+        ? "Remove " + id + " from the fleet? The existing server will keep running."
         : "Remove " + id + " from the available pool?";
     },
     label: "Remove", pendingLabel: "Removing…", css: "btn-secondary",

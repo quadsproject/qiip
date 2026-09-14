@@ -11,7 +11,7 @@ Tests cover:
 from __future__ import annotations
 
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import httpx
 import pytest
@@ -36,9 +36,16 @@ def _make_node(
     endpoint: str = "10.0.1.100:8000",
     status: NodeStatus = NodeStatus.HEALTHY,
     model: str = "llama-3",
+    self_setup: bool = False,
 ) -> Node:
     """Create a Node fixture with the given parameters."""
-    return Node(node_id=node_id, endpoint=endpoint, status=status, model=model)
+    return Node(
+        node_id=node_id,
+        endpoint=endpoint,
+        status=status,
+        model=model,
+        self_setup=self_setup,
+    )
 
 
 class _FailureCounts(_ConsecutiveFailures):
@@ -716,6 +723,133 @@ class TestRecoveryAfterOneSuccess:
         replacement = registry.get("node-1")
         assert replacement is not None
         assert replacement.status == NodeStatus.HEALTHY
+
+
+class TestSelfSetupOptionalHealth:
+    """A self-setup node treats a missing /health endpoint as optional."""
+
+    def test_missing_health_falls_back_to_models_stays_healthy(self) -> None:
+        """/health 404 with a working /v1/models keeps a self-setup node HEALTHY."""
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        cb_registry = CircuitBreakerRegistry()
+        failures = _FailureCounts()
+        client = MagicMock(spec=httpx.Client)
+
+        def probe(url: str) -> MagicMock:
+            if url.endswith("/health"):
+                return MagicMock(status_code=404)
+            return MagicMock(status_code=200)
+
+        client.get.side_effect = probe
+        try:
+            _probe_all_nodes(
+                registry,
+                cb_registry,
+                client,
+                failures,
+                failure_threshold=3,
+            )
+        finally:
+            failures.close()
+
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.status == NodeStatus.HEALTHY
+        client.get.assert_has_calls(
+            [
+                call("http://10.0.1.100:8000/health"),
+                call("http://10.0.1.100:8000/v1/models"),
+            ]
+        )
+
+    def test_missing_health_models_down_marks_unhealthy(self) -> None:
+        """The /v1/models fallback is a real liveness signal: when it fails the
+        self-setup node is demoted after the threshold."""
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        cb_registry = CircuitBreakerRegistry()
+        failures = _FailureCounts()
+        client = MagicMock(spec=httpx.Client)
+
+        def probe(url: str) -> MagicMock:
+            if url.endswith("/health"):
+                return MagicMock(status_code=404)
+            return MagicMock(status_code=500)
+
+        client.get.side_effect = probe
+        try:
+            for _ in range(3):
+                _probe_all_nodes(
+                    registry,
+                    cb_registry,
+                    client,
+                    failures,
+                    failure_threshold=3,
+                )
+        finally:
+            failures.close()
+
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.status == NodeStatus.UNHEALTHY
+
+    def test_authoritative_health_failure_does_not_fall_back(self) -> None:
+        """An explicit /health 503 is authoritative; no /v1/models fallback."""
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        cb_registry = CircuitBreakerRegistry()
+        failures = _FailureCounts()
+        client = MagicMock(spec=httpx.Client)
+        client.get.return_value = MagicMock(status_code=503)
+        try:
+            for _ in range(3):
+                _probe_all_nodes(
+                    registry,
+                    cb_registry,
+                    client,
+                    failures,
+                    failure_threshold=3,
+                )
+        finally:
+            failures.close()
+
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.status == NodeStatus.UNHEALTHY
+        # Never probed /v1/models for an authoritative unhealthy response.
+        assert all(
+            c == call("http://10.0.1.100:8000/health")
+            for c in client.get.call_args_list
+        )
+
+    def test_managed_node_missing_health_no_fallback(self) -> None:
+        """Managed nodes still require a healthy /health (no models fallback)."""
+        registry = NodeRegistry()
+        registry.add(_make_node())  # self_setup=False
+        cb_registry = CircuitBreakerRegistry()
+        failures = _FailureCounts()
+        client = MagicMock(spec=httpx.Client)
+        client.get.return_value = MagicMock(status_code=404)
+        try:
+            for _ in range(3):
+                _probe_all_nodes(
+                    registry,
+                    cb_registry,
+                    client,
+                    failures,
+                    failure_threshold=3,
+                )
+        finally:
+            failures.close()
+
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.status == NodeStatus.UNHEALTHY
+        assert all(
+            c == call("http://10.0.1.100:8000/health")
+            for c in client.get.call_args_list
+        )
 
 
 class TestStopEventExitsImmediately:
