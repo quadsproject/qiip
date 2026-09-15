@@ -175,16 +175,14 @@ def test_user_role_fetches_fleet_endpoint() -> None:
     assert result["nodeCount"] == "0 nodes"
 
 
-def test_non_admin_node_id_is_plain_text_not_link() -> None:
-    """Regression (grafuls review): a non-admin clicking a node must not land
-    on the 'Administrator access required' sign-in page -- the node id is
-    plain text for non-admin viewers."""
+def test_non_admin_node_id_links_to_read_only_detail() -> None:
+    """A non-admin clicking a node id lands on the read-only node detail page
+    (node info, provisioning tasks, installation log) -- never the admin
+    sign-in page, never a native Basic pop-up."""
     result = _run_harness(lexical_role="user", fleet_nodes=[_node_payload()])
-    assert result["nodeIdLink"] == {
-        "tag": "span",
-        "href": None,
-        "text": "gpu01",
-    }
+    assert result["nodeIdLink"]["tag"] == "a"
+    assert result["nodeIdLink"]["href"].endswith("/dashboard/nodes/gpu01")
+    assert result["nodeIdLink"]["text"] == "gpu01"
 
 
 def test_admin_node_id_links_to_node_detail() -> None:

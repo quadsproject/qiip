@@ -12,6 +12,7 @@ Regression coverage for:
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 from fastapi import FastAPI
@@ -27,6 +28,7 @@ from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.admin import RegisterRequest
 from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
 from inference_proxy.routing.node_selector import NodeSelector
 from tests.auth.conftest import FakeAuthPlugin
 
@@ -651,3 +653,162 @@ class TestDashboardRoles:
         )
 
         assert client.get("/admin/metrics").status_code == 200
+
+
+class TestFleetReadOnlySurface:
+    """Read-only per-node detail surface for signed-in non-admins."""
+
+    def test_fleet_node_detail_returns_visible_node(
+        self,
+        app: FastAPI,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+    ) -> None:
+        test_registry.add(_make_node("pub1", model="public"))
+        test_registry.add(_make_node("mine1", model="mine", owner="alice@example.com"))
+        client, _user = _signed_in_client(app, auth_store)
+
+        for node_id in ("pub1", "mine1"):
+            response = client.get(f"/fleet/nodes/{node_id}")
+            assert response.status_code == 200
+            assert response.json()["node_id"] == node_id
+            assert response.json()["actions"] == []
+
+    def test_fleet_node_detail_hides_invisible_nodes(
+        self,
+        app: FastAPI,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+    ) -> None:
+        """The read-only detail obeys the same visibility contract as the
+        fleet list: admin-only, other users' owned, and absent nodes 404."""
+        test_registry.add(_make_node("admin_only1", admin_only=True, model="secret"))
+        test_registry.add(_make_node("private1", model="gpt", owner="bob@example.com"))
+        client, _user = _signed_in_client(app, auth_store)
+
+        assert client.get("/fleet/nodes/admin_only1").status_code == 404
+        assert client.get("/fleet/nodes/private1").status_code == 404
+        assert client.get("/fleet/nodes/ghost").status_code == 404
+
+    def test_fleet_node_tasks_and_logs_are_scoped_to_visible_nodes(
+        self,
+        app: FastAPI,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        test_registry.add(_make_node("pub1", model="public"))
+        test_registry.add(_make_node("private1", model="gpt", owner="bob@example.com"))
+        mock_provisioner.list_tasks_raw.return_value = [
+            (
+                json.dumps(
+                    {
+                        "hostname": "pub1",
+                        "current_step": "installing",
+                        "started_at": "2026-09-15T12:00:00Z",
+                        "updated_at": "2026-09-15T12:00:01Z",
+                    }
+                ).encode(),
+                None,
+            ),
+        ]
+        buffer = ProvisioningLogBuffer()
+        buffer.create("pub1")
+        buffer.append("pub1", "info", "driver installed")
+        buffer.mark_complete("pub1")
+        mock_provisioner.log_buffer = buffer
+        client, _user = _signed_in_client(app, auth_store)
+
+        tasks = client.get("/fleet/nodes/pub1/tasks")
+        assert tasks.status_code == 200
+        assert [task["hostname"] for task in tasks.json()] == ["pub1"]
+        logs = client.get("/fleet/nodes/pub1/logs")
+        assert logs.status_code == 200
+        assert logs.headers["content-type"].startswith("text/event-stream")
+
+        # Invisible nodes get nothing at all on the read-only surface.
+        assert client.get("/fleet/nodes/private1/tasks").status_code == 404
+        assert client.get("/fleet/nodes/private1/logs").status_code == 404
+        assert client.get("/fleet/nodes/private1").status_code == 404
+
+
+class TestNodeDetailReadOnly:
+    def test_non_admin_gets_read_only_detail_page(
+        self,
+        app: FastAPI,
+        auth_store: AuthStore,
+    ) -> None:
+        client, _user = _signed_in_client(app, auth_store)
+
+        response = client.get("/dashboard/nodes/gpu01")
+
+        assert response.status_code == 200
+        assert "READ_ONLY = true" in response.text
+        # In-page sign-in must never be shown for a still-signed-in user.
+        assert "Sign in with Local Admin" not in response.text
+
+    def test_admin_gets_operational_detail_page(
+        self,
+        app: FastAPI,
+        auth_store: AuthStore,
+    ) -> None:
+        client, user = _signed_in_client(app, auth_store)
+        auth_store.set_user_admin(user.id, True)
+
+        response = client.get("/dashboard/nodes/gpu01")
+
+        assert response.status_code == 200
+        assert "READ_ONLY = false" in response.text
+
+    def test_anonymous_gets_signin_page(
+        self,
+        app: FastAPI,
+    ) -> None:
+        response = TestClient(app).get("/dashboard/nodes/gpu01")
+
+        assert response.status_code == 200
+        assert "Sign in with Local Admin" in response.text
+
+
+class TestSelfRevocation:
+    def test_self_revoke_marks_response_and_keeps_session(
+        self,
+        app: FastAPI,
+        auth_store: AuthStore,
+    ) -> None:
+        """Revoking your own admin role must never pop the native Basic
+        dialog: the session stays valid, the dashboard keeps serving the
+        trimmed fleet view, and admin pages fall back to the in-page sign-in.
+        """
+        client, user = _signed_in_client(app, auth_store)
+        auth_store.set_user_admin(user.id, True)
+        assert client.get("/dashboard/tokens").status_code == 200
+
+        response = client.delete(f"/admin/users/{user.id}/admin")
+
+        assert response.status_code == 204
+        assert response.headers["x-qiip-self-revoked"] == "true"
+        assert "www-authenticate" not in response.headers
+        # Session survives; admin pages now render the in-page sign-in.
+        assert client.get("/dashboard").status_code == 200
+        tokens_page = client.get("/dashboard/tokens")
+        assert tokens_page.status_code == 200
+        assert "Sign in with Local Admin" in tokens_page.text
+        assert "www-authenticate" not in tokens_page.headers
+
+    def test_revoking_other_user_does_not_mark_self(
+        self,
+        client: TestClient,
+        auth_store: AuthStore,
+    ) -> None:
+        user = auth_store.upsert_google_user(
+            google_sub="sub-bob",
+            email="bob@example.com",
+            name="Bob",
+            picture="",
+        )
+
+        response = client.delete(f"/admin/users/{user.id}/admin")
+
+        assert response.status_code == 204
+        assert "x-qiip-self-revoked" not in response.headers

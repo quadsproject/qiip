@@ -294,14 +294,11 @@ async function refreshDashboard() {
         const tr = document.createElement("tr");
 
         const tdId = document.createElement("td");
-        // Only admins may open the node detail page (provisioning tasks,
-        // power controls, runtime editor are admin-only); for non-admin
-        // viewers the node id is plain text so a click never lands on the
-        // "Administrator access required" sign-in page.
-        const idLink = document.createElement(viewerAdmin ? "a" : "span");
-        if (viewerAdmin) {
-          idLink.href = "/dashboard/nodes/" + encodeURIComponent(node.node_id);
-        }
+        // Every viewer may open the node detail page: non-admins get the
+        // read-only view (node info, provisioning tasks, installation log —
+        // no setup/teardown/remove/power), admins the operational page.
+        const idLink = document.createElement("a");
+        idLink.href = "/dashboard/nodes/" + encodeURIComponent(node.node_id);
         idLink.textContent = node.name || node.node_id.split(".")[0];
         idLink.title = node.node_id;
         tdId.appendChild(idLink);

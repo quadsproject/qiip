@@ -40,9 +40,6 @@ from inference_proxy.services.unified_nodes import UnifiedNodeService
 from .settings import Settings
 
 _JSON_ADMIN_METHODS = frozenset({"POST", "PUT", "PATCH"})
-_ADMIN_AUTH_HEADERS = {
-    "WWW-Authenticate": 'Basic realm="inference-proxy-admin", charset="UTF-8"'
-}
 
 
 @lru_cache
@@ -137,11 +134,8 @@ def require_fleet_viewer(
     """Require an authenticated fleet viewer (local admin or signed-in user)."""
     role = viewer_role(request, settings)
     if role is None:
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication required",
-            headers=_ADMIN_AUTH_HEADERS,
-        )
+        # No Basic challenge: browsers must never pop the native dialog.
+        raise HTTPException(status_code=401, detail="Authentication required")
     return role
 
 
@@ -171,11 +165,7 @@ async def require_fleet_viewer_email(
         # The session user was deleted between the role read in this request
         # and this lookup: fail closed rather than silently dropping the
         # ownership filter (which would disclose other users' nodes).
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid admin credentials",
-            headers=_ADMIN_AUTH_HEADERS,
-        )
+        raise HTTPException(status_code=401, detail="Invalid admin credentials")
     return user.email.lower()
 
 
@@ -196,11 +186,10 @@ def require_admin_auth(
     credentials.
     """
     if viewer_role(request, settings) != "admin":
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid admin credentials",
-            headers=_ADMIN_AUTH_HEADERS,
-        )
+        # No WWW-Authenticate challenge: browsers must never pop the native
+        # Basic dialog (they get the in-page sign-in page instead), and curl
+        # -u sends Basic preemptively, so API scripting keeps working.
+        raise HTTPException(status_code=401, detail="Invalid admin credentials")
 
     if request.method in _JSON_ADMIN_METHODS:
         media_type = request.headers.get("content-type", "").partition(";")[0].lower()

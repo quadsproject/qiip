@@ -87,15 +87,27 @@ async def node_detail(
     node_id: str,
     settings: Settings = Depends(get_settings),
 ) -> HTMLResponse:
-    """Render per-node detail page with provisioning tasks."""
-    _, denied = _admin_or_signin(request, settings)
-    if denied is not None:
-        return denied
+    """Render per-node detail page with provisioning tasks.
+
+    Admins get the full operational page; signed-in non-admins get the
+    read-only equivalent (node info, provisioning tasks, installation log)
+    for nodes their fleet view is allowed to see — the interactive panels
+    (setup, power, relaunch, recommendations, config download) are rendered
+    but hidden client-side, and their backing /admin APIs never load.
+    """
+    role = viewer_role(request, settings)
+    if role is None:
+        return signin_response(
+            request,
+            oauth_enabled=settings.oauth.enabled,
+            sessions_available=settings.auth.session_secret is not None,
+        )
     return templates.TemplateResponse(
         request=request,
         name="node_detail.html",
         context={
             "node_id": node_id,
+            "read_only": role != "admin",
             "poll_interval": settings.dashboard.poll_interval,
             "active_page": "dashboard",
         },

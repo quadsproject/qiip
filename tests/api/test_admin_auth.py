@@ -172,7 +172,9 @@ class TestAdminBasicAuthentication:
 
         assert response.status_code == expected_status
         if expected_status == 401:
-            assert response.headers["www-authenticate"].startswith("Basic ")
+            # Browsers must never see a Basic challenge (native auth pop-up):
+            # API clients send the Authorization header themselves.
+            assert "www-authenticate" not in response.headers
 
     async def test_both_credentials_are_compared_for_wrong_username(
         self,
