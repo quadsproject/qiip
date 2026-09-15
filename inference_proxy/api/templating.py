@@ -9,6 +9,8 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
+from inference_proxy.config.settings import Settings
+
 _BASE_DIR = Path(__file__).resolve().parent.parent
 _STATIC_DIR = (_BASE_DIR / "static").resolve()
 
@@ -55,15 +57,34 @@ def signin_response(
     )
 
 
+def _request_settings(request: Request) -> Settings:
+    """Return the settings the page handlers resolve for this app.
+
+    ``create_app(settings=...)`` stores the resolved instance on
+    ``app.state`` (and overrides the ``get_settings`` dependency with it),
+    so the Jinja navbar globals resolve the *same* settings as the routes —
+    an injected instance must never be shadowed by environment credentials
+    read through the cache, and missing environment settings must not make
+    template rendering fail.
+    """
+    from inference_proxy.config.dependencies import get_settings
+
+    state = getattr(request.app, "state", None) if hasattr(request, "app") else None
+    resolved = getattr(state, "settings", None) if state is not None else None
+    if isinstance(resolved, Settings):
+        return resolved
+    return get_settings()
+
+
 def viewer_is_admin(request: Request) -> bool:
     """Jinja global: whether the current request viewer is an admin.
 
     Resolves the same identity chain as the page gates: HTTP Basic local
     admin, or a signed-in Google user carrying the admin role.
     """
-    from inference_proxy.config.dependencies import get_settings, viewer_role
+    from inference_proxy.config.dependencies import viewer_role
 
-    return viewer_role(request, get_settings()) == "admin"
+    return viewer_role(request, _request_settings(request)) == "admin"
 
 
 def viewer_signed_in(request: Request) -> bool:
@@ -72,9 +93,9 @@ def viewer_signed_in(request: Request) -> bool:
     True for the HTTP Basic local admin, a local-admin session, or any
     signed-in Google user — regardless of admin role.
     """
-    from inference_proxy.config.dependencies import get_settings, viewer_role
+    from inference_proxy.config.dependencies import viewer_role
 
-    return viewer_role(request, get_settings()) is not None
+    return viewer_role(request, _request_settings(request)) is not None
 
 
 def viewer_identity(request: Request) -> str | None:
@@ -85,7 +106,7 @@ def viewer_identity(request: Request) -> str | None:
     """
     from inference_proxy.auth.session import get_session_user_id
     from inference_proxy.auth.store import AuthStore
-    from inference_proxy.config.dependencies import get_settings, viewer_role
+    from inference_proxy.config.dependencies import viewer_role
 
     user_id = get_session_user_id(request)
     if user_id is not None:
@@ -95,7 +116,7 @@ def viewer_identity(request: Request) -> str | None:
             if user is not None:
                 return user.email
         return None
-    if viewer_role(request, get_settings()) == "admin":
+    if viewer_role(request, _request_settings(request)) == "admin":
         return "Local Admin"
     return None
 

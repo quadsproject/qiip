@@ -589,6 +589,7 @@ the signed user id and expiry.
 | `INFERENCE_PROXY_OAUTH__CLIENT_SECRET` | required (to enable) | Google OAuth 2.0 client secret, stored as a masked secret |
 | `INFERENCE_PROXY_OAUTH__REDIRECT_URI` | required (to enable) | Absolute `http(s)://` callback URI, e.g. `https://gateway.example.com/auth/callback` |
 | `INFERENCE_PROXY_OAUTH__ALLOWED_DOMAINS` | `[]` | JSON array of hosted domains allowed to sign in; empty allows any Google account |
+| `INFERENCE_PROXY_OAUTH__ALLOWED_REDIRECT_HOSTS` | `[]` | JSON array of extra hostnames that may start an OAuth flow (multi-name deployments behind one wildcard cert, e.g. `["inference-proxy.scalelab.redhat.com"]`); the callback returns to the hostname used to sign in. Hosts outside the list fall back to `REDIRECT_URI`, so single-name deployments are unchanged |
 | `INFERENCE_PROXY_AUTH__DB_PATH` | `data/qiip.db` | SQLite file holding users, token digests, and usage |
 | `INFERENCE_PROXY_AUTH__SESSION_SECRET` | required for browser sign-in | Long random secret signing the session cookie (local-admin form and Google OAuth) |
 | `INFERENCE_PROXY_AUTH__SESSION_COOKIE` | `qiip_session` | Session cookie name (alphanumeric plus `_` and `-`) |

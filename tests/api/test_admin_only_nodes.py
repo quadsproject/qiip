@@ -733,6 +733,78 @@ class TestFleetReadOnlySurface:
         assert client.get("/fleet/nodes/private1/logs").status_code == 404
         assert client.get("/fleet/nodes/private1").status_code == 404
 
+    def test_fleet_tasks_and_logs_redact_credentials(
+        self,
+        app: FastAPI,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """Regression (sjug review): failed engine-start commands embed
+        HF_TOKEN in error/log text; the read-only surface must redact it for
+        non-admin viewers, including retained buffered entries."""
+        test_registry.add(_make_node("pub1", model="public"))
+        secret = "hf_0123456789abcdef"
+        mock_provisioner.list_tasks_raw.return_value = [
+            (
+                json.dumps(
+                    {
+                        "hostname": "pub1",
+                        "current_step": "engine-start",
+                        "failed_step": "engine-start",
+                        "error": f"command failed: export HF_TOKEN={secret}",
+                        "started_at": "2026-09-15T12:00:00Z",
+                        "updated_at": "2026-09-15T12:00:01Z",
+                    }
+                ).encode(),
+                None,
+            ),
+        ]
+        buffer = ProvisioningLogBuffer()
+        buffer.create("pub1")
+        buffer.append("pub1", "error", f"HF_TOKEN={secret} launch failed")
+        buffer.mark_complete("pub1")
+        mock_provisioner.log_buffer = buffer
+        client, _user = _signed_in_client(app, auth_store)
+
+        tasks = client.get("/fleet/nodes/pub1/tasks")
+        assert tasks.status_code == 200
+        assert secret not in tasks.text
+        assert "HF_TOKEN=[REDACTED]" in tasks.text
+
+        logs = client.get("/fleet/nodes/pub1/logs")
+        assert logs.status_code == 200
+        log_text = logs.text
+        assert secret not in log_text
+        assert "HF_TOKEN=[REDACTED]" in log_text
+
+
+class TestLocalAdminLoginJSONOnly:
+    """The JSON-only CSRF boundary and body validation on /auth/local-admin."""
+
+    def test_text_plain_body_rejected(self, app: FastAPI) -> None:
+        client = TestClient(app)
+        response = client.post(
+            "/auth/local-admin",
+            content='{"username": "test-admin", "password": "test-password"}',
+            headers={"Content-Type": "text/plain"},
+        )
+
+        assert response.status_code == 415
+        assert response.json()["detail"] == (
+            "Login requires Content-Type: application/json"
+        )
+
+    def test_non_object_json_rejected(self, app: FastAPI) -> None:
+        client = TestClient(app)
+        for body in ("[]", "null", '"x"'):
+            response = client.post(
+                "/auth/local-admin",
+                content=body,
+                headers={"Content-Type": "application/json"},
+            )
+            assert response.status_code == 422
+
 
 class TestNodeDetailReadOnly:
     def test_non_admin_gets_read_only_detail_page(

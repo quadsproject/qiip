@@ -549,6 +549,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    application.state.settings = resolved_settings
     application.dependency_overrides[get_settings] = lambda: resolved_settings
 
     application.add_middleware(RequestLoggingMiddleware)

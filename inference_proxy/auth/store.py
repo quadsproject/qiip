@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS tokens (
     created_at      TEXT    NOT NULL,
     last_used_at    TEXT,
     revoked         INTEGER NOT NULL DEFAULT 0,
-    endpoint_scope  TEXT
+    endpoint_scope  TEXT,
+    purpose         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS usage (
@@ -123,6 +124,26 @@ def _generate_token() -> str:
 # same config key therefore works across browsers and machines, and a revoke
 # rotates it (the next download derives the next generation).
 _CONFIG_TOKEN_NAME = "agent-config"
+_CONFIG_TOKEN_PURPOSE = "agent-config"
+
+# Generated agent-config keys are matched by purpose; pre-marker legacy rows
+# are matched by name (their purpose column is NULL). The two variants are
+# disambiguated by token hash: only a row whose hash equals the derived value
+# for its generation is a generated key — a user-created token named
+# 'agent-config' (minted from a random value) never matches.
+_CONFIG_ROWS_SQL = """
+SELECT * FROM tokens
+ WHERE user_id = ?
+   AND (purpose = ? OR (purpose IS NULL AND name = ?))
+ ORDER BY id
+"""
+_CONFIG_ACTIVE_SQL = """
+SELECT * FROM tokens
+ WHERE user_id = ?
+   AND (purpose = ? OR (purpose IS NULL AND name = ?))
+   AND revoked = 0
+ ORDER BY id DESC LIMIT 1
+"""
 _CONFIG_TOKEN_INFO = b"qiip-agent-config-token-v1"
 
 
@@ -184,6 +205,10 @@ class AuthStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
+            # Multi-worker deployments share one db file: concurrent writers
+            # wait (bounded) for the writer lock instead of failing with
+            # "database is locked" mid-recovery.
+            self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(_SCHEMA)
             self._migrate()
         logger.info("auth store opened", db_path=str(db_path))
@@ -208,33 +233,18 @@ class AuthStore:
             self._conn.execute(
                 "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"
             )
-        # One active agent-config key per user (rolling rotation / multi-worker
-        # safety). Pre-index databases may hold duplicates: keep the newest
-        # active row per user, then create the partial unique index.
-        duplicates = self._conn.execute(
-            """
-            SELECT user_id FROM tokens
-             WHERE name = 'agent-config' AND revoked = 0
-             GROUP BY user_id
-            HAVING COUNT(*) > 1
-            """
-        ).fetchall()
-        if duplicates:
-            self._conn.execute(
-                """
-                UPDATE tokens SET revoked = 1
-                 WHERE name = 'agent-config' AND revoked = 0
-                   AND id NOT IN (
-                       SELECT MAX(id) FROM tokens
-                        WHERE name = 'agent-config' AND revoked = 0
-                        GROUP BY user_id
-                   )
-                """
-            )
-            self._conn.commit()
+        if "purpose" not in token_columns:
+            self._conn.execute("ALTER TABLE tokens ADD COLUMN purpose TEXT")
+        # Generated agent-config keys are distinguished by the purpose marker,
+        # never by their display name: earlier versions let users create their
+        # own tokens named "agent-config" (possibly pinned), and those must
+        # survive the migration untouched — with their scopes. Legacy rows
+        # keep working exactly as before; only purpose-marked rows are
+        # governed by the one-active-per-user invariant below.
+        self._conn.execute("DROP INDEX IF EXISTS idx_tokens_user_name_active_config")
         self._conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_user_name_active_config "
-            "ON tokens(user_id, name) WHERE revoked = 0 AND name = 'agent-config'"
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_user_purpose_active_config "
+            "ON tokens(user_id) WHERE revoked = 0 AND purpose = 'agent-config'"
         )
 
     def close(self) -> None:
@@ -390,8 +400,8 @@ class AuthStore:
             if exists is None:
                 raise KeyError(user_id)
             rows = self._conn.execute(
-                "SELECT * FROM tokens WHERE user_id = ? AND name = ? ORDER BY id",
-                (user_id, _CONFIG_TOKEN_NAME),
+                _CONFIG_ROWS_SQL,
+                (user_id, _CONFIG_TOKEN_PURPOSE, _CONFIG_TOKEN_NAME),
             ).fetchall()
             active = next((r for r in reversed(rows) if not r["revoked"]), None)
             if active is not None:
@@ -400,6 +410,14 @@ class AuthStore:
                 )
                 raw = _derive_config_token(secret, user_id, generation)
                 if _hash_token(raw) == active["token_hash"]:
+                    # Reusing a pre-marker generated row: hash match proves it
+                    # is generated, so backfill the missing marker.
+                    if active["purpose"] is None:
+                        self._conn.execute(
+                            "UPDATE tokens SET purpose = ? WHERE id = ?",
+                            (_CONFIG_TOKEN_PURPOSE, active["id"]),
+                        )
+                        self._conn.commit()
                     token = self._token_from_row(active)
                     if token is not None:  # pragma: no cover - defensive
                         return CreatedToken(**token.model_dump(), token=raw)
@@ -413,19 +431,42 @@ class AuthStore:
                     """
                     UPDATE tokens
                        SET revoked = 1
-                     WHERE user_id = ? AND name = ? AND revoked = 0
+                     WHERE user_id = ? AND purpose = ? AND revoked = 0
                     """,
-                    (user_id, _CONFIG_TOKEN_NAME),
+                    (user_id, _CONFIG_TOKEN_PURPOSE),
                 )
 
+            # Pre-marker databases store the generated key without a purpose
+            # marker. If the derived value for a stored generation matches a
+            # row, the downloader keeps the key it already has (never mint
+            # into a token_hash collision); a revoked legacy generation is
+            # skipped by minting one past it.
+            for index, row in enumerate(rows):
+                candidate = _derive_config_token(secret, user_id, index)
+                if _hash_token(candidate) == row["token_hash"]:
+                    if row["revoked"] == 0:
+                        # A hash match proves this is a generated key (only
+                        # the secret holder can derive the value), so it is
+                        # safe to backfill the marker that was missing from
+                        # pre-marker databases.
+                        self._conn.execute(
+                            "UPDATE tokens SET purpose = ? WHERE id = ?",
+                            (_CONFIG_TOKEN_PURPOSE, row["id"]),
+                        )
+                        self._conn.commit()
+                        token = self._token_from_row(row)
+                        if token is not None:
+                            return CreatedToken(**token.model_dump(), token=candidate)
+                    break
             generation = len(rows)
             raw = _derive_config_token(secret, user_id, generation)
             try:
                 cursor = self._conn.execute(
                     """
                     INSERT INTO tokens
-                        (user_id, name, token_hash, prefix, created_at, endpoint_scope)
-                    VALUES (?, ?, ?, ?, ?, NULL)
+                        (user_id, name, token_hash, prefix, created_at, endpoint_scope,
+                         purpose)
+                    VALUES (?, ?, ?, ?, ?, NULL, ?)
                     """,
                     (
                         user_id,
@@ -433,6 +474,7 @@ class AuthStore:
                         _hash_token(raw),
                         raw[: len(TOKEN_PREFIX) + 8],
                         now,
+                        _CONFIG_TOKEN_PURPOSE,
                     ),
                 )
                 self._conn.commit()
@@ -450,48 +492,48 @@ class AuthStore:
                 # competing insert always conflict, so this never 500s.
                 self._conn.rollback()
                 while True:
-                    active = self._conn.execute(
-                        """
-                        SELECT * FROM tokens
-                         WHERE user_id = ? AND name = ? AND revoked = 0
-                         ORDER BY id DESC LIMIT 1
-                        """,
-                        (user_id, _CONFIG_TOKEN_NAME),
-                    ).fetchone()
+                    fresh_rows = self._conn.execute(
+                        _CONFIG_ROWS_SQL,
+                        (user_id, _CONFIG_TOKEN_PURPOSE, _CONFIG_TOKEN_NAME),
+                    ).fetchall()
                     # Re-read the full history: the snapshot taken before our
                     # insert predates the winner's row, so indexing it would
                     # raise StopIteration (a 500) instead of recovering.
-                    fresh_rows = self._conn.execute(
-                        "SELECT * FROM tokens WHERE user_id = ? AND name = ? ORDER BY id",
-                        (user_id, _CONFIG_TOKEN_NAME),
-                    ).fetchall()
-                    if active is not None:
+                    reused = None
+                    for index, row in enumerate(fresh_rows):
+                        candidate = _derive_config_token(secret, user_id, index)
+                        if _hash_token(candidate) == row["token_hash"]:
+                            if row["revoked"] == 0:
+                                reused = row
+                            break
+                    if reused is not None:
                         generation = next(
                             i
                             for i, r in enumerate(fresh_rows)
-                            if r["id"] == active["id"]
+                            if r["id"] == reused["id"]
                         )
-                        candidate = _derive_config_token(secret, user_id, generation)
-                        if (
-                            active["revoked"] == 0
-                            and _hash_token(candidate) == active["token_hash"]
-                        ):
-                            # Current key (same secret, still active): hand
-                            # the winner's key back.
-                            raw = candidate
-                            row = active
-                            break
-                        # Stale secret or revoked-between-our-snapshot-and-
-                        # this-insert: drop the stale active row(s) so exactly
-                        # one key stays active, then mint the next generation.
+                        raw = _derive_config_token(secret, user_id, generation)
                         self._conn.execute(
-                            """
-                            UPDATE tokens
-                               SET revoked = 1
-                             WHERE user_id = ? AND name = ? AND revoked = 0
-                            """,
-                            (user_id, _CONFIG_TOKEN_NAME),
+                            "UPDATE tokens SET purpose = ? WHERE id = ?",
+                            (_CONFIG_TOKEN_PURPOSE, reused["id"]),
                         )
+                        self._conn.commit()
+                        row = reused
+                        break
+                    # Stale secret or revoked-between-our-snapshot-and-this-
+                    # insert: drop the stale purpose-marked active row(s) so
+                    # exactly one generated key stays active, then mint the
+                    # next generation. Legacy (pre-purpose) rows are left
+                    # untouched: a same-named user token is indistinguishable
+                    # from a generated key without the old secret.
+                    self._conn.execute(
+                        """
+                        UPDATE tokens
+                           SET revoked = 1
+                         WHERE user_id = ? AND purpose = ? AND revoked = 0
+                        """,
+                        (user_id, _CONFIG_TOKEN_PURPOSE),
+                    )
                     generation = len(fresh_rows)
                     raw = _derive_config_token(secret, user_id, generation)
                     try:
@@ -499,8 +541,8 @@ class AuthStore:
                             """
                             INSERT INTO tokens
                                 (user_id, name, token_hash, prefix,
-                                 created_at, endpoint_scope)
-                            VALUES (?, ?, ?, ?, ?, NULL)
+                                 created_at, endpoint_scope, purpose)
+                            VALUES (?, ?, ?, ?, ?, NULL, ?)
                             """,
                             (
                                 user_id,
@@ -508,6 +550,7 @@ class AuthStore:
                                 _hash_token(raw),
                                 raw[: len(TOKEN_PREFIX) + 8],
                                 now,
+                                _CONFIG_TOKEN_PURPOSE,
                             ),
                         )
                         self._conn.commit()

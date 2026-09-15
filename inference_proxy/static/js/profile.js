@@ -170,9 +170,12 @@
     const list = $("endpoint-list");
     const empty = $("endpoint-empty");
     const select = $("token-endpoints");
-    // Remove previous rows but keep the empty-state paragraph.
-    while (list.firstChild && list.firstChild !== empty) {
-      list.removeChild(list.firstChild);
+    // Remove previous generated rows but keep the empty-state paragraph
+    // (it is the first child of #endpoint-list). The old loop stopped when
+    // the first child was the paragraph, so stale checked boxes survived a
+    // reopen and could mint an unpinned token while a selection was shown.
+    for (const child of Array.from(list.children)) {
+      if (child !== empty) list.removeChild(child);
     }
     if (endpoints.length === 0) {
       empty.hidden = false;

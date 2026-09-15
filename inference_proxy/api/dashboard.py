@@ -10,8 +10,10 @@ Viewer contract (RFE admin-only servers + admin roles):
   viewer: the HTTP Basic local admin, a signed-in Google user, or a Google
   user granted the admin role. Anonymous visitors get the sign-in page with
   the "Local Admin" and "Google Auth" options.
-- Node detail, model catalog, token dashboards, and the admin page are
-  admin-only (local admin or admin-role user); other viewers get the
+- Node detail (``/dashboard/nodes/{id}``) is read-only for signed-in
+  non-admins (node info, provisioning tasks, installation log — no
+  operations); the model catalog, token dashboards, and the admin page
+  are admin-only (local admin or admin-role user); other viewers get the
   sign-in page with an access notice.
 """
 

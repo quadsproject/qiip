@@ -247,10 +247,14 @@ class TestTokens:
         assert second.token == first.token
         assert second.id == first.id
 
-    def test_get_or_create_config_token_supersedes_legacy_random(
+    def test_get_or_create_config_token_preserves_legacy_random(
         self,
         auth_store: AuthStore,
     ) -> None:
+        """Regression (sjug review): a pre-reuse database holds a user-created
+        token named 'agent-config' with a random value. The generated-key
+        path must keep it active (it is indistinguishable from a user pin)
+        and mint a purpose-marked derived key beside it."""
         user = self._user(auth_store)
         legacy = auth_store.create_token(user.id, "agent-config")
 
@@ -258,13 +262,15 @@ class TestTokens:
 
         assert derived.token != legacy.token
         assert derived.name == "agent-config"
-        # The mismatched pre-reuse row is revoked so exactly one agent-config
-        # key stays active (the derived one).
-        assert auth_store.resolve_token(legacy.token) is None
-        count = auth_store._conn.execute(
-            "SELECT COUNT(*) FROM tokens WHERE name = 'agent-config'"
+        # The pre-reuse row is preserved and still resolvable.
+        assert auth_store.resolve_token(legacy.token) is not None
+        # Exactly one purpose-marked active key exists (the derived one).
+        active = auth_store._conn.execute(
+            "SELECT COUNT(*) FROM tokens "
+            "WHERE user_id = ? AND purpose = 'agent-config' AND revoked = 0",
+            (user.id,),
         ).fetchone()[0]
-        assert count == 2
+        assert active == 1
         again = auth_store.get_or_create_config_token(user.id, "s3cret")
         assert again.token == derived.token
 
@@ -773,20 +779,35 @@ class TestConfigToken:
         ).fetchone()[0]
         assert active == 1
 
-    def test_supersedes_pre_reuse_random_row(
+    def test_preserves_pre_reuse_same_named_user_token(
         self,
         auth_store: AuthStore,
     ) -> None:
+        """Regression (sjug review): a user-created token named
+        'agent-config' (random value, pre-reuse deployments) is not a
+        generated key. The downloader mints a purpose-marked derived key
+        alongside it and the user token keeps working — it must never be
+        revoked or replaced by the generated-key path."""
         user = self._user(auth_store)
-        random_row = auth_store.create_token(user.id, "agent-config")
+        user_token = auth_store.create_token(
+            user.id, "agent-config", endpoint_scope=["pub1"]
+        )
 
         derived = auth_store.get_or_create_config_token(user.id, "session-secret")
 
-        assert derived.token != random_row.token
-        assert derived.id != random_row.id
-        # The old random row is revoked so exactly one agent-config key stays
-        # active; the derived one is what the downloader gets from now on.
-        assert auth_store.resolve_token(random_row.token) is None
+        assert derived.token != user_token.token
+        assert derived.id != user_token.id
+        # The user's same-named token stays active and keeps its scope.
+        resolved = auth_store.resolve_token(user_token.token)
+        assert resolved is not None
+        assert resolved.token.endpoint_scope == ["pub1"]
+        # Exactly one purpose-marked active key exists.
+        active = auth_store._conn.execute(
+            "SELECT COUNT(*) FROM tokens "
+            "WHERE user_id = ? AND purpose = 'agent-config' AND revoked = 0",
+            (user.id,),
+        ).fetchone()[0]
+        assert active == 1
 
 
 class _StaleRows:
@@ -810,7 +831,12 @@ class _StaleSnapshotConn:
     ``INSERT`` (the exact timing the multi-process race produces).
     """
 
-    _SNAPSHOT_SQL = "SELECT * FROM tokens WHERE user_id = ? AND name = ? ORDER BY id"
+    _SNAPSHOT_SQL = """
+SELECT * FROM tokens
+ WHERE user_id = ?
+   AND (purpose = ? OR (purpose IS NULL AND name = ?))
+ ORDER BY id
+"""
 
     def __init__(self, real: sqlite3.Connection, snapshot: tuple[object, ...]) -> None:
         self._real = real
@@ -1007,33 +1033,70 @@ class TestConfigTokenRaceRecovery:
         ).fetchone()[0]
         assert active == 1
 
-    def test_migrate_dedupes_pre_index_active_config_rows(
+    def test_migrate_preserves_legacy_agent_config_named_tokens(
         self,
         tmp_path: Path,
     ) -> None:
-        """Pre-index databases with duplicate active agent-config rows keep
-        only the newest on reopen, and the partial unique index is created."""
-        db = tmp_path / "dedupe.db"
+        """Regression (sjug review): users could create their own tokens named
+        'agent-config' in earlier builds. The migration must preserve those
+        rows untouched — including their endpoint pins — and only generated
+        (purpose-marked) keys are governed by the one-active invariant."""
+        db = tmp_path / "legacy-name.db"
         store = AuthStore(db)
         user = store.upsert_google_user(**_GOOGLE)
-        store.get_or_create_config_token(user.id, "s3cret")
-        # Simulate a pre-index database: drop the index, add a second active
-        # agent-config row.
-        store._conn.execute("DROP INDEX IF EXISTS idx_tokens_user_name_active_config")
-        store._conn.execute(
-            """
-            INSERT INTO tokens
-                (user_id, name, token_hash, prefix, created_at, revoked, endpoint_scope)
-            VALUES (?, 'agent-config', ?, ?, ?, 0, NULL)
-            """,
-            (user.id, "dup-hash", "qiip_dup", _utcnow().isoformat()),
-        )
+        # A user-created token that happens to be named 'agent-config' (pinned).
+        legacy = store.create_token(user.id, "agent-config", endpoint_scope=["pub1"])
+        # A generated key from an earlier build (no purpose marker yet).
+        generated = store.get_or_create_config_token(user.id, "s3cret")
+        # Simulate a pre-marker database: clear any purpose markers so both
+        # rows look like legacy rows, then reopen (migration runs).
+        store._conn.execute("UPDATE tokens SET purpose = NULL")
         store._conn.commit()
 
         reopened = AuthStore(db)
 
+        # The pinned user token is untouched and still resolves with its scope.
+        auth = reopened.resolve_token(legacy.token)
+        assert auth is not None
+        assert auth.token.endpoint_scope == ["pub1"]
+        # The generated row is also preserved as a plain legacy token.
+        assert reopened.resolve_token(generated.token) is not None
+        # New downloads reuse the legacy generated key (hash match proves it
+        # is generated) and backfill its purpose marker; legacy rows stay
+        # valid. The user-created token is untouched.
+        fresh = reopened.get_or_create_config_token(user.id, "s3cret")
+        assert fresh.token == generated.token
+        assert reopened.resolve_token(generated.token) is not None
         active = reopened._conn.execute(
-            "SELECT id, token_hash FROM tokens WHERE name = 'agent-config' AND revoked = 0"
-        ).fetchall()
-        assert len(active) == 1
-        assert active[0]["token_hash"] == "dup-hash"  # newest row kept
+            "SELECT COUNT(*) FROM tokens "
+            "WHERE user_id = ? AND purpose = 'agent-config' AND revoked = 0",
+            (user.id,),
+        ).fetchone()[0]
+        assert active == 1
+
+    def test_generated_config_keys_carry_purpose_marker(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Minted keys are marked with purpose='agent-config' and never touch
+        same-named user tokens."""
+        db = tmp_path / "purpose.db"
+        store = AuthStore(db)
+        user = store.upsert_google_user(**_GOOGLE)
+        store.create_token(user.id, "agent-config", endpoint_scope=["pub1"])
+
+        token = store.get_or_create_config_token(user.id, "s3cret")
+        row = store._conn.execute(
+            "SELECT purpose, name, endpoint_scope FROM tokens WHERE id = ?",
+            (token.id,),
+        ).fetchone()
+        assert row is not None
+        assert row["purpose"] == "agent-config"
+        assert row["name"] == "agent-config"
+        # The user-created same-named token is untouched (still active).
+        legacy = store._conn.execute(
+            "SELECT COUNT(*) FROM tokens "
+            "WHERE user_id = ? AND name = 'agent-config' AND purpose IS NULL AND revoked = 0",
+            (user.id,),
+        ).fetchone()[0]
+        assert legacy == 1

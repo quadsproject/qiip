@@ -66,10 +66,20 @@ function generatePiConfig(baseUrl, modelId, opts) {
 }
 
 function yamlScalar(v) {
-  if (/: | #|[{}\[\]]/.test(v)) {
-    return '"' + v.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
-  }
-  return v;
+  // Always emit a double-quoted YAML scalar with explicit escaping. Free-form
+  // display names can contain YAML metacharacters (* # [ ] { } : - ? etc.)
+  // that would otherwise change the document (aliases, comments, flow
+  // collections) or silently null out the value.
+  return (
+    '"' +
+    String(v)
+      .replace(/\\/g, "\\\\")
+      .replace(/"/g, '\\"')
+      .replace(/\n/g, "\\n")
+      .replace(/\r/g, "\\r")
+      .replace(/\t/g, "\\t") +
+    '"'
+  );
 }
 
 function generateOmpConfig(baseUrl, modelId, opts) {

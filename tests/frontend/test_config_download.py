@@ -178,11 +178,11 @@ class TestGenerateOmpConfig:
         )
         assert "providers:" in result
         assert "  qiip:" in result
-        assert "    baseUrl: http://proxy.example.com:8080/v1" in result
+        assert '    baseUrl: "http://proxy.example.com:8080/v1"' in result
         assert "    auth: none" in result
         assert "    api: openai-completions" in result
-        assert "      - id: meta-llama/Llama-3-8B" in result
-        assert "        name: meta-llama/Llama-3-8B (qiip)" in result
+        assert '      - id: "meta-llama/Llama-3-8B"' in result
+        assert '        name: "meta-llama/Llama-3-8B (qiip)"' in result
 
     def test_base_url_includes_v1(self) -> None:
         result = _run_node_yaml(
@@ -202,7 +202,7 @@ class TestGenerateOmpConfig:
                 "generateOmpConfig",
             )
         )
-        assert "baseUrl: http://proxy.example.com:8080/v1" in result
+        assert 'baseUrl: "http://proxy.example.com:8080/v1"' in result
 
     def test_special_chars_quoted(self) -> None:
         result = _run_node_yaml(
@@ -244,9 +244,9 @@ class TestAdminOnlyServerConfigs:
             _harness_opts(self._BASE, self._MODEL, "generateOmpConfig", self._OPTS)
         )
         assert "    auth: apiKey" in result
-        assert "    apiKey: <paste-qiip-token-here>" in result
+        assert '    apiKey: "<paste-qiip-token-here>"' in result
         assert "    auth: none" not in result
-        assert "        name: DeepSeek-V4-Flash-Vision-Exp (qiip)" in result
+        assert '        name: "DeepSeek-V4-Flash-Vision-Exp (qiip)"' in result
 
     def test_pi_config_uses_token_placeholder(self) -> None:
         result = _run_node(
@@ -270,7 +270,7 @@ class TestAdminOnlyServerConfigs:
         omp = _run_node_yaml(
             _harness_opts(self._BASE, self._MODEL, "generateOmpConfig", token_opts)
         )
-        assert "    apiKey: qiip_abcdef123" in omp
+        assert '    apiKey: "qiip_abcdef123"' in omp
         assert TOKEN_PLACEHOLDER not in omp
 
         pi = _run_node(
@@ -466,3 +466,30 @@ vm.runInContext(source, sandbox);
             harness.replace("SOURCE_PATH", json.dumps(str(_CONFIG_DOWNLOAD_JS)))
         )
         assert result == {"toasts": 1, "downloadCount": 0, "mintAttempts": 1}
+
+
+def _name_yaml_harness(name: str) -> str:
+    """Harness that generates the OMP YAML with a free-form display name."""
+    js_path = json.dumps(str(_CONFIG_DOWNLOAD_JS))
+    js_name = json.dumps(name)
+    return (
+        "const fs=require('fs');const vm=require('vm');\n"
+        f"const source=fs.readFileSync({js_path},'utf8');\n"
+        "const sandbox={console};\n"
+        "vm.createContext(sandbox);\n"
+        "vm.runInContext(source,sandbox);\n"
+        f"process.stdout.write(JSON.stringify(sandbox.generateOmpConfig('https://gw.example.com','model-id',{{name:{js_name}}})));\n"
+    )
+
+
+def test_omp_display_name_is_always_yaml_quoted() -> None:
+    """Regression (sjug review): free-form display names such as
+    '*Production' (YAML alias) or '#1 GPU' (comment -> null) must be fully
+    quoted when emitted into the generated YAML."""
+    output = _run_node_yaml(_name_yaml_harness("*Production #1 GPU"))
+    assert 'name: "*Production #1 GPU"' in output
+
+
+def test_omp_model_id_is_always_yaml_quoted() -> None:
+    output = _run_node_yaml(_name_yaml_harness("plain"))
+    assert 'name: "plain"' in output

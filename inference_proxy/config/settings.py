@@ -500,12 +500,19 @@ class OAuthSettings(BaseModel):
     ``allowed_domains`` optionally restricts sign-in to Google Workspace
     hosted domains (the OIDC ``hd`` claim); when empty, any Google
     account is accepted.
+
+    ``allowed_redirect_hosts`` lists additional hostnames (multi-name
+    deployments) that may start an OAuth flow; the callback then returns
+    to the same hostname the user started from. Hosts outside the list
+    fall back to ``redirect_uri``. When empty, only the ``redirect_uri``
+    host is accepted, so single-name deployments are unchanged.
     """
 
     client_id: str | None = None
     client_secret: SecretStr | None = None
     redirect_uri: str | None = None
     allowed_domains: list[str] = Field(default_factory=list)
+    allowed_redirect_hosts: list[str] = Field(default_factory=list)
 
     @property
     def enabled(self) -> bool:

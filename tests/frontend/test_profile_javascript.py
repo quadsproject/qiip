@@ -119,6 +119,14 @@ vm.runInContext(source, sandbox);
     }
   }
 
+  if (REOPEN) {
+    // Close and reopen the form: loadEndpoints re-renders the endpoint list.
+    toggle._handlers.click();
+    await new Promise(function (r) { setTimeout(r, 20); });
+    toggle._handlers.click();
+    await new Promise(function (r) { setTimeout(r, 20); });
+  }
+
   const body = byId("tokens-table-body");
   const list = byId("endpoint-list");
   const select = byId("token-endpoints");
@@ -133,6 +141,9 @@ vm.runInContext(source, sandbox);
     }),
     listValues: list.children.map(function (label) {
       return label.children[0] ? label.children[0].value : "";
+    }),
+    checkedValues: list.children.map(function (label) {
+      return label.children[0] ? !!label.children[0].checked : false;
     }),
     selectValues: select.children.map(function (option) {
       return { value: option.value, selected: !!option.selected };
@@ -149,6 +160,7 @@ def _run(
     tokens: list[dict[str, Any]],
     endpoints: list[dict[str, Any]],
     check_index: int = -1,
+    reopen: bool = False,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -157,6 +169,7 @@ def _run(
         _HARNESS.replace("TOKENS", json.dumps(tokens))
         .replace("ENDPOINTS", json.dumps(endpoints))
         .replace("CHECK_INDEX", str(check_index))
+        .replace("REOPEN", "true" if reopen else "false")
         .replace(
             "USER",
             json.dumps(
@@ -221,6 +234,22 @@ def test_picker_lists_endpoints_with_zero_selected() -> None:
     assert result["emptyHidden"] is True
     assert result["listValues"] == ["gpu01", "gpu02"]
     assert all(not item["selected"] for item in result["selectValues"])
+
+
+def test_picker_reopen_removes_stale_rows() -> None:
+    """Regression (sjug review): reopening the form kept the previous
+    checkbox rows (the clear loop stopped at the first-child paragraph), so
+    a visible selection could disagree with the hidden select and mint an
+    unpinned token. After reopen only fresh, unchecked rows remain."""
+    result = _run(
+        [_token(1, False)],
+        [{"node_id": "gpu01", "model": "llama"}, {"node_id": "gpu02", "model": "qwen"}],
+        check_index=0,
+        reopen=True,
+    )
+    assert result["listValues"] == ["gpu01", "gpu02"]
+    assert result["checkedValues"] == [False, False]
+    assert "1 Endpoints Selected" not in result["summary"]
 
 
 def test_picker_selection_updates_summary_and_select() -> None:

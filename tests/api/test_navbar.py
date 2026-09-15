@@ -9,6 +9,7 @@ others -- which is the exact failure the shared partial prevents.
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from inference_proxy.api.templating import templates
+from inference_proxy.config.dependencies import get_settings
+from inference_proxy.config.settings import Settings
 
 _TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "inference_proxy" / "templates"
 _PARTIAL = _TEMPLATES_DIR / "partials" / "navbar.html"
@@ -190,3 +193,27 @@ class TestNavbarRendersDirectly:
         )
         assert '<nav class="top-bar" aria-label="Primary">' in rendered
         assert '<a href="/profile"' in rendered
+
+
+def test_navbar_resolves_app_settings_not_env(
+    app: FastAPI,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (sjug review): the navbar helpers called get_settings()
+    directly, bypassing create_app(settings=...). An injected app therefore
+    showed the wrong admin links (or failed to render) when the environment
+    held different or missing credentials.
+    """
+    monkeypatch.setenv("INFERENCE_PROXY_ADMIN__USERNAME", "other-admin")
+    monkeypatch.setenv("INFERENCE_PROXY_ADMIN__PASSWORD", "other-pass")
+    get_settings.cache_clear()
+
+    token = base64.b64encode(b"test-admin:test-password").decode()
+    client = TestClient(app, headers={"Authorization": "Basic " + token})
+    response = client.get("/dashboard")
+
+    assert response.status_code == 200
+    # Admin-only navigation is visible because the navbar resolves the same
+    # settings the app was created with (test_settings), not the env cache.
+    assert '<a href="/dashboard/tokens"' in response.text
