@@ -470,7 +470,7 @@ class TestDashboardRoles:
 
         admin_page = client.get("/dashboard/admin")
         assert admin_page.status_code == 200
-        assert "Admin_Only Inference Servers" in admin_page.text
+        assert "Admin-only Inference Servers" in admin_page.text
         # Role management moved to the token dashboard (single users table).
         assert "Admin Users" not in admin_page.text
         assert '<th scope="col">Admin</th>' in tokens.text

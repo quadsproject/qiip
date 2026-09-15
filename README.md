@@ -52,10 +52,11 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
 - **Admin authentication** -- HTTP Basic credentials or a signed-in admin-role session (local-admin form or Google OAuth) on all `/admin/*` endpoints; browser pages gate with a sign-in page instead of 401ing
 - **Fleet sign-in gate** -- anonymous visitors to the fleet dashboard get a sign-in page with two options: **Sign in with Local Admin** (in-page username/password form that establishes a signed session cookie — no browser Basic challenge popup; HTTP Basic still works for scripts and SSE) and **Sign in with Google Auth** (same flow as the profile page)
-- **Admin roles** -- the HTTP Basic admin user (bootstrap authority) can grant or revoke the admin role to Google-authenticated users on the admin page; role admins then reach the admin surface through their session and see admin-only servers
+- **Admin roles** -- the HTTP Basic admin user (bootstrap authority) can grant or revoke the admin role to Google-authenticated users on the token dashboard (`/dashboard/tokens`); role admins then reach the admin surface through their session and see admin-only servers
 - **Admin-only inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). At `/v1` they are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with an `admin_only` badge in the admin fleet view. Token usage from admin-only servers is tracked on the token summary pages exactly like any other node
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
 - **User API tokens** -- each user can mint `qiip_...` bearer tokens on their profile page to call `/v1/chat/completions` and `/v1/completions`; tokens are stored as SHA-256 digests and can be revoked at any time
+- **Stable agent-config token** -- one derived per-user key (`agent-config`) is shared by every config download across servers and browsers; its raw value is derived from `auth.session_secret` + user + generation and never stored, so revoking it rotates the key embedded in already-downloaded configs (configuration downloads for admin-only servers require the Google session that can mint it)
 - **Config-gated inference auth** -- a valid `qiip_...` bearer token is always accepted on `/v1`; requiring a token for every `/v1` request (`auth.enforce_api_tokens`) is optional and off by default, so existing public deployments keep serving anonymous requests unchanged
 - **Token usage tracking** -- token-authenticated requests record OpenAI token usage per token/model for reporting on the profile page
 - **Backend endpoint allowlist** -- configurable hostname wildcard, CIDR network, and port allowlists; rejects non-matching registrations with loopback-only defaults
@@ -251,7 +252,7 @@ signed-in session):
 |--------|------|-------------|
 | `GET` | `/profile/me` | Public identity of the signed-in user |
 | `GET` | `/profile/tokens` | List the user's API tokens (prefix only) |
-| `POST` | `/profile/tokens` | Mint a token; accepts an optional `endpoints` pin (hostnames); returns the raw secret exactly once |
+| `POST` | `/profile/tokens` | Mint a token; accepts an optional `endpoints` pin (hostnames); returns the raw secret exactly once (except `name: agent-config`, the reusable derived config key) |
 | `DELETE` | `/profile/tokens/{id}` | Revoke a token |
 | `GET` | `/profile/usage` | Aggregated usage per token/model plus headline totals |
 | `GET` | `/profile/endpoints` | Registered nodes the user may pin (unowned nodes plus nodes they own) |
@@ -288,7 +289,7 @@ Admin-authenticated endpoints (HTTP Basic or admin-role session):
 All `/admin/*` API endpoints and `/dashboard` admin pages accept either the
 shared HTTP Basic credentials configured below or a signed-in Google user
 carrying the **admin role** (granted by the HTTP Basic admin user on the
-admin page at `/dashboard/admin`). The inference API, chat page, profile page,
+token dashboard at `/dashboard/tokens`). The inference API, chat page, profile page,
 and health endpoint are public; the inference API may additionally require a
 user API token (see [User authentication (Google OAuth)](#user-authentication-google-oauth)).
 For example:
@@ -304,9 +305,10 @@ anonymous visitors receive a sign-in page with **Sign in with Local Admin**
 browser native Basic prompt is no longer used, though HTTP Basic requests and
 SSE still pass through unchanged) and **Sign in with Google Auth** (the same
 flow as the profile page).
-Signed-in non-admin users see the fleet with admin-only servers removed and no
-operational actions; node detail, model catalog, token dashboards, and the
-admin page remain admin-only.
+Signed-in non-admin users see the fleet with admin-only servers removed, no
+operational actions, and nodes owned by another user excluded (ownership is
+private: `/v1/models` and the endpoint picker treat it the same way); node
+detail, model catalog, token dashboards, and the admin page remain admin-only.
 
 On a trusted work LAN, the administrative surface may run over HTTP. Anyone able
 to observe that traffic can recover the reusable credential, so deploy a

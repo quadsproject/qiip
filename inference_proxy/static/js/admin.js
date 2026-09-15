@@ -16,8 +16,8 @@ function parseServerUrl(rawUrl) {
 
 async function removeAdminOnlyNode(nodeId) {
   const ok = await confirmDialog({
-    title: "Remove admin_only server",
-    message: `Remove ${nodeId} from the admin_only server list? The existing server will keep running.`,
+    title: "Remove admin-only server",
+    message: `Remove ${nodeId} from the admin-only server list? The existing server will keep running.`,
     confirmLabel: "Remove",
     danger: false,
   });
@@ -42,7 +42,7 @@ function renderAdminOnlyNodes(nodes) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
     td.colSpan = 5;
-    td.textContent = "No admin_only inference servers configured";
+    td.textContent = "No admin-only inference servers configured";
     tr.appendChild(td);
     tbody.appendChild(tr);
     return;
@@ -95,7 +95,7 @@ async function refreshAdminPage() {
     const nodes = await nodesResp.json();
     const adminOnly = nodes.filter((node) => node.admin_only);
     renderAdminOnlyNodes(adminOnly);
-    statusEl.textContent = `Admin data loaded: ${adminOnly.length} admin_only servers`;
+    statusEl.textContent = `Admin data loaded: ${adminOnly.length} admin-only servers`;
     const lastUpdated = document.getElementById("last-updated");
     if (lastUpdated) {
       lastUpdated.textContent = "Updated " + new Date().toLocaleTimeString();
@@ -142,7 +142,7 @@ document.addEventListener("DOMContentLoaded", function () {
         });
         const data = await resp.json().catch(() => ({}));
         if (resp.ok) {
-          showToast(`admin_only server ${parsed.hostname} registered`, "success");
+          showToast(`admin-only server ${parsed.hostname} registered`, "success");
           input.value = "";
           nameInput.value = "";
           refreshAdminPage();

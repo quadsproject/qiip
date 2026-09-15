@@ -409,7 +409,11 @@ class AuthStore:
                     "SELECT * FROM tokens WHERE id = ?", (cursor.lastrowid,)
                 ).fetchone()
             except sqlite3.IntegrityError:
-                # Lost a concurrent mint race: return the winner's row.
+                # Lost a concurrent mint race: return the winner's row, or
+                # mint the next generation if the winner was revoked between
+                # our snapshot and this insert (user revoke, or another
+                # worker's rotation revoke -- the exact multi-process case
+                # this branch exists for). Re-raising would 500 the caller.
                 self._conn.rollback()
                 row = self._conn.execute(
                     """
@@ -419,8 +423,6 @@ class AuthStore:
                     """,
                     (user_id, _CONFIG_TOKEN_NAME),
                 ).fetchone()
-                if row is None:  # pragma: no cover - defensive
-                    raise
                 # Re-read the rows: the snapshot taken before our insert
                 # predates the winner's row, so indexing the stale snapshot
                 # would raise StopIteration (a 500) instead of returning the
@@ -429,13 +431,49 @@ class AuthStore:
                     "SELECT * FROM tokens WHERE user_id = ? AND name = ? ORDER BY id",
                     (user_id, _CONFIG_TOKEN_NAME),
                 ).fetchall()
-                raw = _derive_config_token(
-                    secret,
-                    user_id,
-                    next(
-                        i for i, r in enumerate(fresh_rows) if r["id"] == row["id"]
-                    ),
-                )
+                if row is not None:
+                    raw = _derive_config_token(
+                        secret,
+                        user_id,
+                        next(
+                            i for i, r in enumerate(fresh_rows) if r["id"] == row["id"]
+                        ),
+                    )
+                else:
+                    # No active row (the colliding one was revoked). Mint the
+                    # next generation; if another worker inserts the same
+                    # generation before us, re-read and retry.
+                    while True:
+                        generation = len(fresh_rows)
+                        raw = _derive_config_token(secret, user_id, generation)
+                        try:
+                            cursor = self._conn.execute(
+                                """
+                                INSERT INTO tokens
+                                    (user_id, name, token_hash, prefix,
+                                     created_at, endpoint_scope)
+                                VALUES (?, ?, ?, ?, ?, NULL)
+                                """,
+                                (
+                                    user_id,
+                                    _CONFIG_TOKEN_NAME,
+                                    _hash_token(raw),
+                                    raw[: len(TOKEN_PREFIX) + 8],
+                                    now,
+                                ),
+                            )
+                            self._conn.commit()
+                        except sqlite3.IntegrityError:
+                            self._conn.rollback()
+                            fresh_rows = self._conn.execute(
+                                "SELECT * FROM tokens WHERE user_id = ? AND name = ? ORDER BY id",
+                                (user_id, _CONFIG_TOKEN_NAME),
+                            ).fetchall()
+                            continue
+                        row = self._conn.execute(
+                            "SELECT * FROM tokens WHERE id = ?", (cursor.lastrowid,)
+                        ).fetchone()
+                        break
         token = self._token_from_row(row)
         if token is None:  # pragma: no cover - defensive
             raise RuntimeError("token row vanished after insert")

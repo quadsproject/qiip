@@ -82,7 +82,7 @@
     if (users.length === 0) {
       const row = document.createElement("tr");
       const td = document.createElement("td");
-      td.colSpan = 9;
+      td.colSpan = 10;
       td.textContent = "No users yet.";
       td.className = "muted-status";
       row.appendChild(td);

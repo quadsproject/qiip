@@ -143,6 +143,30 @@ def require_fleet_viewer(
     return role
 
 
+def require_fleet_viewer_email(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> str | None:
+    """Return the signed-in Google user's lowercase email for fleet filtering.
+
+    Fleet privacy (RFE-107): nodes owned by someone else are excluded from
+    the non-admin fleet view, so the endpoint/model/GPU identity of another
+    user's node is never disclosed. Local-admin/HTTP Basic viewers have no
+    Google identity and get None (the node filter then keeps the current
+    non-admin_only set). Raises 401 for anonymous callers, same gate as
+    ``require_fleet_viewer``.
+    """
+    require_fleet_viewer(request, settings)
+    user_id = get_session_user_id(request)
+    if user_id is None:
+        return None
+    store = getattr(request.app.state, "auth_store", None)
+    if store is None:
+        return None
+    user = store.get_user(user_id)
+    return user.email.lower() if user is not None else None
+
+
 def require_admin_auth(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],

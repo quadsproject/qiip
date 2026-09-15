@@ -358,6 +358,63 @@ class TestTokenEndpointScope:
 
         assert response.status_code == 403
 
+    def test_non_admin_cannot_pin_admin_only_endpoint(
+        self, profile_client: TestClient, test_registry: NodeRegistry
+    ) -> None:
+        """Regression (second review): pinning an admin-only server must not
+        mint a dead token that ``_in_scope`` rejects on every use."""
+        from inference_proxy.models.node import Node
+
+        test_registry.add(
+            Node(
+                node_id="private-1",
+                endpoint="10.0.0.4:8000",
+                model="llama-4",
+                admin_only=True,
+            )
+        )
+        response = profile_client.post(
+            "/profile/tokens", json={"name": "x", "endpoints": ["private-1"]}
+        )
+
+        assert response.status_code == 403
+
+    def test_admin_role_user_can_pin_admin_only_endpoint(
+        self,
+        app: FastAPI,
+        test_registry: NodeRegistry,
+        auth_store: AuthStore,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        from inference_proxy.models.node import Node
+
+        test_registry.add(
+            Node(
+                node_id="private-1",
+                endpoint="10.0.0.4:8000",
+                model="llama-4",
+                admin_only=True,
+            )
+        )
+        app.dependency_overrides[get_auth_plugin] = lambda: make_fake_auth_plugin()
+        client = TestClient(app)
+        assert (
+            client.get(
+                "/auth/callback?code=code&state=state", follow_redirects=False
+            ).status_code
+            == 302
+        )
+        users = auth_store.list_users_with_stats()
+        assert len(users) == 1
+        auth_store.set_user_admin(users[0].id, True)
+
+        response = client.post(
+            "/profile/tokens", json={"name": "admin", "endpoints": ["private-1"]}
+        )
+
+        assert response.status_code == 201
+        assert response.json()["endpoint_scope"] == ["private-1"]
+
     def test_endpoints_lists_pickable(
         self, profile_client: TestClient, test_registry: NodeRegistry
     ) -> None:
@@ -495,9 +552,68 @@ class TestTokenEndpointScope:
 
         assert response.status_code == 201
 
+    def test_admin_role_user_does_not_bypass_mint_whitelist(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        auth_store: AuthStore,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        """Regression (second review): the mint whitelist gate must match the
+        login and use-time gates -- only the full-access trust list bypasses.
+        Granting the admin role cannot sidestep the allowlist at mint (the
+        resulting token would 401 at every /v1 use anyway)."""
+        enforced = test_settings.model_copy(
+            deep=True,
+            update={
+                "auth": test_settings.auth.model_copy(
+                    update={
+                        "sso_whitelist_url": "https://allowlist.example.com/list.json",
+                        "enforce_sso_whitelist": True,
+                    }
+                )
+            },
+        )
+        app.dependency_overrides[get_auth_plugin] = lambda: make_fake_auth_plugin()
+        app.dependency_overrides[get_settings] = lambda: enforced
+        # Allow at the login gate, deny at mint.
+        app.dependency_overrides[get_sso_allowlist] = lambda: FakeAllowlist(
+            allowed=True
+        )
+        client = TestClient(app)
+        assert (
+            client.get(
+                "/auth/callback?code=code&state=state", follow_redirects=False
+            ).status_code
+            == 302
+        )
+        users = auth_store.list_users_with_stats()
+        assert len(users) == 1
+        auth_store.set_user_admin(users[0].id, True)
+        app.dependency_overrides[get_sso_allowlist] = lambda: FakeAllowlist(
+            allowed=False
+        )
+
+        response = client.post("/profile/tokens", json={"name": "ci"})
+
+        assert response.status_code == 403
+
 
 class TestConfigTokenReuse:
     """POST /profile/tokens with name 'agent-config' reuses the stable key."""
+
+    def test_agent_config_with_endpoints_rejected(
+        self,
+        profile_client: TestClient,
+    ) -> None:
+        """Regression (second review): the agent-config key is intentionally
+        full-access; accepting a pin would silently discard it."""
+        response = profile_client.post(
+            "/profile/tokens",
+            json={"name": "agent-config", "endpoints": ["shared-1"]},
+        )
+
+        assert response.status_code == 400
 
     def test_agent_config_reuses_same_token(
         self,

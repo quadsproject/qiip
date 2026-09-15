@@ -64,7 +64,7 @@ const sandbox = {
   fetch: async function (url, options) {
     captured.push({ url, options });
     const body = {
-      "/admin/nodes": { nodes: [] },
+      "/admin/nodes": [],
       "/fleet/nodes": [],
       "/admin/metrics": { per_node: {} },
       "/admin/quads/status": { status: "connected", last_sync: new Date().toISOString() },
@@ -143,6 +143,11 @@ def test_admin_role_fetches_admin_endpoints() -> None:
         "/admin/quads/status",
         "/admin/billing",
     ]
+    # The render path must actually run: with the real array-shaped response
+    # the admin branch iterates nodes (the old {nodes: []} mock threw
+    # 'not iterable' and landed in the retry catch without failing these
+    # assertions).
+    assert result["nodeCount"] == "0 nodes"
 
 
 def test_window_role_fallback_keeps_legacy_shells_working() -> None:
@@ -153,3 +158,4 @@ def test_window_role_fallback_keeps_legacy_shells_working() -> None:
 def test_missing_role_defaults_to_admin_legacy() -> None:
     result = _run_harness()
     assert result["captured"][0] == "/admin/nodes"
+    assert result["nodeCount"] == "0 nodes"

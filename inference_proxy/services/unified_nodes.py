@@ -51,12 +51,16 @@ class UnifiedNodeService:
         task_map: dict[str, TaskStatusResponse] | None = None,
         *,
         viewer_admin: bool = True,
+        viewer_email: str | None = None,
     ) -> list[AdminNodeResponse]:
         """Return merged QUADS + etcd node list sorted by node_id.
 
         ``viewer_admin`` controls the fleet-visibility contract: a non-admin
         viewer never sees admin-only nodes, never sees QUADS-only available
-        hosts, and receives no operational actions.
+        hosts, and receives no operational actions. ``viewer_email`` is the
+        signed-in Google user's email (lowercase): nodes owned by someone
+        else are excluded from the non-admin view, matching ``/v1/models``
+        and the endpoint picker (RFE-107 ownership privacy).
         """
         etcd_map = {canonical_hostname(n.node_id): n for n in self._registry.get_all()}
 
@@ -65,7 +69,7 @@ class UnifiedNodeService:
             etcd_only = [
                 self._from_etcd(n, task_map=task_map) for n in etcd_map.values()
             ]
-            return self._finalize(etcd_only, viewer_admin)
+            return self._finalize(etcd_only, viewer_admin, viewer_email)
 
         quads_map: dict[str, QUADSHost] = {h.hostname: h for h in self._poller.hosts}
         available_set = set(self._poller.available_hostnames)
@@ -86,12 +90,13 @@ class UnifiedNodeService:
         for node in etcd_map.values():
             result.append(self._from_etcd(node, task_map=task_map))
 
-        return self._finalize(result, viewer_admin)
+        return self._finalize(result, viewer_admin, viewer_email)
 
     @staticmethod
     def _finalize(
         result: list[AdminNodeResponse],
         viewer_admin: bool,
+        viewer_email: str | None = None,
     ) -> list[AdminNodeResponse]:
         """Apply the fleet-visibility contract to a completed node list."""
         if viewer_admin:
@@ -101,9 +106,16 @@ class UnifiedNodeService:
             # actions, or any node's owner email (ownership is private per
             # RFE-107: owned nodes are already hidden from /v1/models and the
             # endpoint picker, so the fleet must not disclose who owns them).
+            # Nodes owned by another user are excluded entirely so their
+            # endpoint/model/engine/artifact/GPU identity is not disclosed.
             item.model_copy(update={"actions": [], "owner": ""})
             for item in result
             if not item.admin_only
+            and not (
+                viewer_email
+                and item.owner
+                and item.owner.lower() != viewer_email
+            )
         ]
         return sorted(filtered, key=lambda r: r.node_id)
 

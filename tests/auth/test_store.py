@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import threading
+from contextlib import suppress
 from pathlib import Path
 from typing import TypedDict
 
 import pytest
 
+import inference_proxy.auth.store as store_module
 from inference_proxy.auth.models import User
 from inference_proxy.auth.store import AuthStore, _utcnow
 
@@ -783,3 +786,179 @@ class TestConfigToken:
         # The old random row is revoked so exactly one agent-config key stays
         # active; the derived one is what the downloader gets from now on.
         assert auth_store.resolve_token(random_row.token) is None
+
+
+class _StaleRows:
+    """Result stand-in with a sqlite3.Row-compatible fetchall/fetchone."""
+
+    def __init__(self, rows: tuple[object, ...]) -> None:
+        self._rows = rows
+
+    def fetchall(self) -> tuple[object, ...]:
+        return self._rows
+
+    def fetchone(self) -> object | None:
+        return self._rows[0] if self._rows else None
+
+
+class _StaleSnapshotConn:
+    """Serve a pre-race (stale) rows snapshot for the first agent-config
+    read, then delegate everything else to the real connection.
+
+    Simulates a second process whose ``SELECT`` happened before the winner's
+    ``INSERT`` (the exact timing the multi-process race produces).
+    """
+
+    _SNAPSHOT_SQL = (
+        "SELECT * FROM tokens WHERE user_id = ? AND name = ? ORDER BY id"
+    )
+
+    def __init__(self, real: object, snapshot: tuple[object, ...]) -> None:
+        self._real = real
+        self._snapshot = snapshot
+        self._served = False
+
+    def execute(self, sql: str, params: tuple[object, ...] = ()) -> object:
+        if not self._served and sql == self._SNAPSHOT_SQL:
+            self._served = True
+            return _StaleRows(self._snapshot)
+        return self._real.execute(sql, params)  # type: ignore[no-any-return]
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._real, name)
+
+
+class TestConfigTokenRaceRecovery:
+    """Concurrent mint recovery: the IntegrityError path must return a usable
+    key (the winner's, or the next generation), never 500. Reachable only
+    with multiple AuthStore instances on one DB (the in-process lock
+    serializes a single store)."""
+
+    def test_concurrent_mint_returns_winner_key(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db = tmp_path / "race.db"
+        store_a = AuthStore(db)
+        store_b = AuthStore(db)
+        user = store_a.upsert_google_user(**_GOOGLE)
+
+        barrier = threading.Barrier(2)
+        original = store_module._derive_config_token
+        counter = 0
+        counter_lock = threading.Lock()
+
+        def synchronized(secret: str, user_id: int, generation: int) -> str:
+            nonlocal counter
+            with counter_lock:
+                counter += 1
+                call_no = counter
+            if call_no <= 2:
+                # The two pre-insert derivations (one per process) coincide;
+                # recovery derivations pass straight through.
+                with suppress(threading.BrokenBarrierError):
+                    barrier.wait(timeout=5)
+            return original(secret, user_id, generation)
+
+        monkeypatch.setattr(store_module, "_derive_config_token", synchronized)
+
+        results: dict[str, object] = {}
+
+        def mint(label: str, store: AuthStore) -> None:
+            results[label] = store.get_or_create_config_token(user.id, "s3cret")
+
+        threads = [
+            threading.Thread(target=mint, args=("a", store_a)),
+            threading.Thread(target=mint, args=("b", store_b)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        first = results["a"]
+        second = results["b"]
+        # Both callers end up with the same stable agent-config key.
+        assert first.token == second.token  # type: ignore[attr-defined]
+        assert store_a.resolve_token(first.token) is not None  # type: ignore[attr-defined]
+        active = store_a._conn.execute(
+            "SELECT COUNT(*) FROM tokens WHERE name = 'agent-config' AND revoked = 0"
+        ).fetchone()[0]
+        assert active == 1
+
+    def test_concurrent_mint_with_revoked_winner_mints_next_generation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db = tmp_path / "race-revoked.db"
+        store = AuthStore(db)
+        user = store.upsert_google_user(**_GOOGLE)
+        # Generator-0 key created and then revoked -- the "winner" row is gone
+        # by the time the loser re-queries after its failed insert.
+        first = store.get_or_create_config_token(user.id, "s3cret")
+        assert store.revoke_token(user.id, first.id) is True
+
+        # Second process: its rows snapshot predates the winner's insert, so
+        # it derives generation 0 -> collides with the (now revoked) row.
+        stale = AuthStore(db)
+        stale._conn = _StaleSnapshotConn(stale._conn, ())
+        recovered = stale.get_or_create_config_token(user.id, "s3cret")
+
+        assert recovered.token != first.token
+        assert stale.resolve_token(recovered.token) is not None
+        active = stale._conn.execute(
+            "SELECT COUNT(*) FROM tokens WHERE name = 'agent-config' AND revoked = 0"
+        ).fetchone()[0]
+        assert active == 1
+
+    def test_concurrent_mint_never_raises_on_repeated_collisions(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The retry loop keeps a third process from 500ing when the recovery
+        mint itself collides with another worker's next-generation insert."""
+        db = tmp_path / "race-triple.db"
+        stores = [AuthStore(db) for _ in range(3)]
+        user = stores[0].upsert_google_user(**_GOOGLE)
+
+        barrier = threading.Barrier(3)
+        original = store_module._derive_config_token
+        counter = 0
+        counter_lock = threading.Lock()
+
+        def synchronized(secret: str, user_id: int, generation: int) -> str:
+            nonlocal counter
+            with counter_lock:
+                counter += 1
+                call_no = counter
+            if call_no <= 3:
+                with suppress(threading.BrokenBarrierError):
+                    barrier.wait(timeout=5)
+            return original(secret, user_id, generation)
+
+        monkeypatch.setattr(store_module, "_derive_config_token", synchronized)
+
+        results: dict[str, object] = {}
+
+        def mint(label: str, store: AuthStore) -> None:
+            results[label] = store.get_or_create_config_token(user.id, "s3cret")
+
+        threads = [
+            threading.Thread(target=mint, args=(f"s{i}", store))
+            for i, store in enumerate(stores)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        active = stores[0]._conn.execute(
+            "SELECT COUNT(*) FROM tokens WHERE name = 'agent-config' AND revoked = 0"
+        ).fetchone()[0]
+        assert active == 1
+        # Every caller resolved to the same active key.
+        tokens = [results[f"s{i}"] for i in range(len(stores))]
+        resolved = {s.resolve_token(t.token).user.id for s, t in zip(stores, tokens, strict=True)}  # type: ignore[attr-defined]
+        assert resolved == {user.id}

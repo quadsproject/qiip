@@ -64,7 +64,9 @@ class ApiToken(BaseModel):
 class CreatedToken(ApiToken):
     """The token row plus the one-time raw secret (AUTH-02).
 
-    The full ``token`` value is returned exactly once, at creation.
+    The full ``token`` value is returned exactly once, at creation -- except
+    for the derived ``agent-config`` key, which is returned by every
+    ``get_or_create_config_token`` call (see :mod:`inference_proxy.auth.store`).
     """
 
     token: str

@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>QIIP - Admin</title>
-    <meta name="description" content="Manage admin_only inference servers.">
+    <meta name="description" content="Manage admin-only inference servers.">
     <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -29,12 +29,12 @@
 
         <main id="main-content">
             <section class="card">
-                <h2 class="card-title">Admin_Only Inference Servers</h2>
+                <h2 class="card-title">Admin-only Inference Servers</h2>
                 <div class="admin-add-row">
                     <form id="admin-only-server-form" class="setup-form">
                         <input type="url" id="admin-only-server-url" placeholder="http://hostname:port" required>
                         <input type="text" id="admin-only-server-name" placeholder="Name (optional, shown in fleet)" maxlength="100" aria-label="Operator-facing name (optional)">
-                        <button type="submit" id="admin-only-server-btn" class="btn btn-primary">Add Admin_Only Server</button>
+                        <button type="submit" id="admin-only-server-btn" class="btn btn-primary">Add Admin-only Server</button>
                     </form>
                 </div>
                 <div class="table-wrap">

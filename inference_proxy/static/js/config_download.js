@@ -162,7 +162,7 @@ function createConfigDropdown(baseUrl, modelId, positionFn, onToggle, opts) {
               });
               if (typeof window.showToast === "function") {
                 window.showToast(
-                  "Cannot download admin_only server config: " +
+                  "Cannot download admin-only server config: " +
                     (mintErr.detail || "HTTP error") +
                     ". Sign in with Google to mint an agent-config token.",
                   "error"

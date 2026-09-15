@@ -61,10 +61,16 @@ def clear_local_admin_session(request: Request) -> None:
 
 def _session_state(request: Request, key: str) -> tuple[object, object] | None:
     """Return ``(marker, expiry)`` for *key*, or None when session middleware
-    is not installed (no ``SessionMiddleware`` on the app; AUTH-02)."""
+    is not installed (no ``SessionMiddleware`` on the app; AUTH-02).
+
+    Starlette's ``Request.session`` raises ``AssertionError`` (not
+    ``AttributeError``) when middleware is absent, so both are treated as
+    "no session" -- a Basic-only deployment must not 500 while rendering
+    the navbar or answering /admin calls.
+    """
     try:
         return (request.session.get(key), request.session.get(_SESSION_EXPIRY_KEY))
-    except AttributeError:
+    except (AttributeError, AssertionError):
         return None
 
 

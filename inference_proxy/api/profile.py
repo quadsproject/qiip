@@ -5,8 +5,12 @@ call-to-action when the visitor is anonymous and the full manager once
 signed in (the client decides from ``/auth/me``). The JSON endpoints under
 ``/profile/*`` are guarded by ``require_profile_user`` (AUTH-03).
 
-Per AUTH-02 the raw token secret is returned exactly once, at creation; the
-list endpoints return only the token prefix for display.
+Per AUTH-02 a minted token's raw secret is returned exactly once, at
+creation; the list endpoints return only the token prefix for display. The
+one exception is ``name: agent-config``: that request returns the user's
+reusable derived config key (same value on every download, see
+``AuthStore.get_or_create_config_token``), which is intentionally not
+one-time.
 """
 
 from __future__ import annotations
@@ -36,7 +40,11 @@ from inference_proxy.auth.models import (
     PublicUser,
     User,
 )
-from inference_proxy.auth.scopes import has_admin_access, pickable_endpoints
+from inference_proxy.auth.scopes import (
+    has_admin_access,
+    is_full_access,
+    pickable_endpoints,
+)
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import get_registry, get_settings
 from inference_proxy.config.settings import Settings
@@ -106,7 +114,14 @@ async def create_token(
     someone else is rejected (403). Admins may pin any registered node.
     """
     admin = has_admin_access(user.email, settings, is_admin=user.is_admin)
-    if settings.auth.enforce_sso_whitelist and not admin:
+    # The SSO whitelist gate matches the login and use-time gates exactly:
+    # only the full-access trust list bypasses it. Admin-role users must
+    # still mint through the whitelist at /v1 use time (auth/dependencies.py)
+    # would reject them, so letting them bypass at mint would create tokens
+    # that 401 on every call.
+    if settings.auth.enforce_sso_whitelist and not is_full_access(
+        user.email, settings
+    ):
         try:
             allowed = await enforce_allowlist(user.email, allowlist)
         except AllowlistUnavailableError:
@@ -117,6 +132,14 @@ async def create_token(
             raise HTTPException(
                 status_code=403, detail="User is not in the SSO whitelist"
             )
+    if body.name == "agent-config" and body.endpoints is not None:
+        # The agent-config key is a single stable full-access credential
+        # (get_or_create_config_token always stores a NULL scope), so a pin
+        # cannot be honored. Reject instead of silently discarding it.
+        raise HTTPException(
+            status_code=400,
+            detail="The agent-config token cannot be pinned to endpoints",
+        )
     if body.endpoints is not None:
         email = user.email.lower()
         for hostname in body.endpoints:
@@ -126,11 +149,19 @@ async def create_token(
                     status_code=400,
                     detail=f"Endpoint '{hostname}' is not a registered node",
                 )
-            if not admin and node.owner and node.owner.lower() != email:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Endpoint '{hostname}' is owned by another user",
-                )
+            if not admin:
+                if node.admin_only:
+                    # Non-admins cannot route to admin-only servers; accepting
+                    # the pin would mint a token _in_scope rejects on every use.
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Endpoint '{hostname}' is admin-only",
+                    )
+                if node.owner and node.owner.lower() != email:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Endpoint '{hostname}' is owned by another user",
+                    )
     if body.name == "agent-config":
         # Agent-config downloads share one stable token per user. The raw
         # value is derived (never stored) so any browser/machine gets the
