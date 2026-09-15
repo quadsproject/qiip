@@ -1,6 +1,85 @@
-// Admin page: admin-only inference servers (user role management lives on
-// the token dashboard).
+// Admin page: admin-only inference servers and admin-user role management.
 // ponytail: vanilla fetch + DOM, no framework needed
+
+function clearChildren(el) {
+  while (el.firstChild) el.removeChild(el.firstChild);
+}
+
+async function setUserAdmin(user, grant, btn) {
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/admin/users/" + user.id + "/admin", {
+      method: grant ? "POST" : "DELETE",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (resp.ok) {
+      if (!grant && resp.headers.get("x-qiip-self-revoked") === "true") {
+        // Self-revocation: the OAuth session stays valid, so land on the
+        // dashboard's trimmed fleet view directly — never the sign-in page,
+        // never a native Basic pop-up.
+        window.location.assign("/dashboard");
+        return;
+      }
+      showToast(
+        grant ? `Admin granted to ${user.email}` : `Admin revoked for ${user.email}`,
+        "success",
+      );
+      refreshAdminPage();
+    } else {
+      const data = await resp.json().catch(() => ({}));
+      showToast(data.detail || `HTTP ${resp.status}`, "error");
+      btn.disabled = false;
+    }
+  } catch (err) {
+    showToast(`Role change failed: ${err.message}`, "error");
+    btn.disabled = false;
+  }
+}
+
+function renderAdminUsers(users) {
+  const tbody = document.getElementById("admin-user-body");
+  if (!tbody || !Array.isArray(users)) return;
+  clearChildren(tbody);
+  if (users.length === 0) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 4;
+    td.textContent = "No users yet.";
+    td.className = "muted-status";
+    tr.appendChild(td);
+    tbody.appendChild(tr);
+    return;
+  }
+  for (const user of users) {
+    const tr = document.createElement("tr");
+
+    const tdUser = document.createElement("td");
+    const link = document.createElement("a");
+    link.href = "/dashboard/users/" + encodeURIComponent(user.id);
+    link.textContent = user.name || user.email;
+    tdUser.appendChild(link);
+    tr.appendChild(tdUser);
+
+    const tdEmail = document.createElement("td");
+    tdEmail.textContent = user.email;
+    tr.appendChild(tdEmail);
+
+    const tdAdmin = document.createElement("td");
+    tdAdmin.textContent = user.is_admin ? "yes" : "no";
+    tr.appendChild(tdAdmin);
+
+    const tdActions = document.createElement("td");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-sm " + (user.is_admin ? "btn-danger" : "btn-primary");
+    btn.textContent = user.is_admin ? "Revoke Admin" : "Grant Admin";
+    btn.addEventListener("click", () => setUserAdmin(user, !user.is_admin, btn));
+    tdActions.appendChild(btn);
+    tr.appendChild(tdActions);
+
+    tbody.appendChild(tr);
+  }
+}
 
 async function removeAdminOnlyNode(nodeId) {
   const ok = await confirmDialog({
@@ -90,6 +169,16 @@ async function refreshAdminPage() {
     }
   } catch (err) {
     statusEl.textContent = `Failed to load admin data: ${err.message}`;
+  }
+  // Users table is a separate concern: a failure to list users must not
+  // blank out the servers table (or vice versa).
+  try {
+    const usersResp = await fetch("/admin/users");
+    if (usersResp.ok) {
+      renderAdminUsers(await usersResp.json());
+    }
+  } catch (_err) {
+    // Keep whatever was rendered last; the next poll retries.
   }
 }
 

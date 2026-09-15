@@ -178,8 +178,8 @@ async def admin_page(
     request: Request,
     settings: Settings = Depends(get_settings),
 ) -> HTMLResponse:
-    """Render the admin page: manage admin-only inference servers (admin-role
-    management lives on /dashboard/tokens)."""
+    """Render the admin page: admin-only inference servers and admin-role
+    management (users table with grant/revoke actions)."""
     _, denied = _admin_or_signin(request, settings)
     if denied is not None:
         return denied

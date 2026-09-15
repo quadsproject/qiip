@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>QIIP - Admin</title>
-    <meta name="description" content="Manage admin-only inference servers.">
+    <meta name="description" content="Manage admin-only inference servers and admin users.">
     <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -43,7 +43,7 @@
                     <table>
                         <thead>
                             <tr>
-                                <th scope="col">Node ID</th>
+                                <th scope="col">Hostname</th>
                                 <th scope="col">Endpoint</th>
                                 <th scope="col">Model</th>
                                 <th scope="col">State</th>
@@ -52,6 +52,26 @@
                         </thead>
                         <tbody id="admin-only-node-body">
                             <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="card">
+                <h2 class="card-title">Users</h2>
+                <p class="muted-status">Signed-in OAuth users; grant or revoke the admin role per user.</p>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">User</th>
+                                <th scope="col">Email</th>
+                                <th scope="col">Admin</th>
+                                <th scope="col">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="admin-user-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
                         </tbody>
                     </table>
                 </div>
