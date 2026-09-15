@@ -8,6 +8,7 @@ from inference_proxy.auth.models import ApiToken, TokenAuth, User
 from inference_proxy.auth.scopes import (
     allowed_node_ids,
     auth_scope,
+    has_admin_access,
     is_full_access,
     pickable_endpoints,
     scope_owner,
@@ -59,6 +60,24 @@ class TestIsFullAccess:
 
     def test_empty_list(self) -> None:
         assert not is_full_access("ops@example.com", _settings())
+
+
+class TestHasAdminAccess:
+    def test_full_access_trust_list(self) -> None:
+        assert has_admin_access("ops@example.com", _settings(["ops@example.com"]))
+
+    def test_admin_role_only(self) -> None:
+        # An admin-role user who is NOT on the trust list still holds admin
+        # scope — the token-mint surface and picker must agree (RFE #107).
+        assert has_admin_access(
+            "alice@example.com", _settings(), is_admin=True
+        )
+
+    def test_neither_is_not_admin(self) -> None:
+        assert not has_admin_access("alice@example.com", _settings())
+        assert not has_admin_access(
+            "alice@example.com", _settings(["ops@example.com"]), is_admin=False
+        )
 
 
 class TestAllowedNodeIds:

@@ -409,6 +409,49 @@ class TestTokenEndpointScope:
         assert response.status_code == 201
         assert response.json()["endpoint_scope"] == ["theirs-1"]
 
+    def test_admin_role_user_pins_any_endpoint(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        test_registry: NodeRegistry,
+        auth_store: AuthStore,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+    ) -> None:
+        """An admin-role (not trust-list) user may pin another user's node.
+
+        Regression for the predicate mismatch between the endpoint picker
+        (list_pickable_endpoints uses is_admin) and create_token (which only
+        checked the trust list): an admin-role user was offered ``theirs-1``
+        in the picker but 403'd when pinning it.
+        """
+        self._seed_nodes(test_registry)
+        app.dependency_overrides[get_auth_plugin] = lambda: make_fake_auth_plugin(
+            userinfo={
+                "sub": "sub-admin-role",
+                "email": "alice@example.com",
+                "email_verified": True,
+                "name": "Alice",
+                "picture": "",
+            }
+        )
+        client = TestClient(app)
+        assert (
+            client.get(
+                "/auth/callback?code=code&state=state", follow_redirects=False
+            ).status_code
+            == 302
+        )
+        users = auth_store.list_users()
+        assert len(users) == 1
+        auth_store.set_user_admin(users[0].id, True)
+
+        response = client.post(
+            "/profile/tokens", json={"name": "admin-role", "endpoints": ["theirs-1"]}
+        )
+
+        assert response.status_code == 201
+        assert response.json()["endpoint_scope"] == ["theirs-1"]
+
     def test_admin_bypasses_mint_whitelist(
         self,
         app: FastAPI,

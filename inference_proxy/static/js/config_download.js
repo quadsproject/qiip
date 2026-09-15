@@ -140,6 +140,9 @@ function createConfigDropdown(baseUrl, modelId, positionFn, onToggle, opts) {
           // derived server-side and never stored, so every download of any
           // admin-only server -- any browser, any machine -- embeds the same
           // key. A revoke rotates it; the next download gets the new one.
+          // Minting requires a Google-user session (/profile/tokens); a
+          // local-admin/Basic identity cannot mint, so abort the download
+          // rather than shipping a knowingly unusable placeholder config.
           try {
             var mintResp = await fetch("/profile/tokens", {
               method: "POST",
@@ -151,19 +154,29 @@ function createConfigDropdown(baseUrl, modelId, positionFn, onToggle, opts) {
               generatorOpts = Object.assign({}, generatorOpts, {
                 token: created.token,
               });
-            } else if (typeof window.showToast === "function") {
+            } else {
               var mintErr = await mintResp.json().catch(function () {
                 return { detail: "HTTP " + mintResp.status };
               });
-              window.showToast(
-                "Could not mint a config token: " + (mintErr.detail || "HTTP error"),
-                "error"
-              );
+              if (typeof window.showToast === "function") {
+                window.showToast(
+                  "Cannot download admin_only server config: " +
+                    (mintErr.detail || "HTTP error") +
+                    ". Sign in with Google to mint an agent-config token.",
+                  "error"
+                );
+              }
+              menu.classList.remove("open");
+              if (onToggle) onToggle(false);
+              return;
             }
           } catch (err) {
             if (typeof window.showToast === "function") {
               window.showToast("Token fetch failed: " + err.message, "error");
             }
+            menu.classList.remove("open");
+            if (onToggle) onToggle(false);
+            return;
           }
         }
         downloadConfigFile(fmt.generator(baseUrl, modelId, generatorOpts), fmt.filename);

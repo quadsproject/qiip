@@ -94,11 +94,13 @@ def _make_node(
     llamacpp_runtime: LlamaCppRuntimeState | None = None,
     self_setup: bool = False,
     admin_only: bool = False,
+    name: str = "",
     owner: str = "",
 ) -> Node:
     """Create a test node with sensible defaults."""
     return Node(
         node_id=node_id,
+        name=name,
         endpoint=endpoint,
         status=status,
         model=model,
@@ -3274,6 +3276,83 @@ class TestOwnerPreservation:
         assert response.status_code == 201
         mock_provisioner.register_self_setup.assert_awaited_once_with(
             "gpu01", port, owner="alice@example.com", admin_only=False, name=""
+        )
+
+    def test_re_adoption_preserves_existing_admin_only_and_name(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """A bare re-adoption must not de-classify an admin-only server or
+        drop its display name (the dashboard "Add to Fleet" form sends only
+        hostname/self_setup)."""
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                self_setup=True,
+                managed=False,
+                admin_only=True,
+                name="DeepSeek (qiip)",
+            )
+        )
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+        mock_provisioner.register_self_setup = AsyncMock(
+            return_value=_make_node(
+                node_id="gpu01",
+                self_setup=True,
+                managed=False,
+                model="org/model",
+                admin_only=True,
+                name="DeepSeek (qiip)",
+            )
+        )
+
+        response = client.post(
+            "/admin/nodes/pool", json={"hostname": "gpu01", "self_setup": True}
+        )
+
+        assert response.status_code == 201
+        mock_provisioner.register_self_setup.assert_awaited_once_with(
+            "gpu01", None, owner="", admin_only=True, name="DeepSeek (qiip)"
+        )
+
+    def test_re_adoption_explicit_admin_only_false_overrides(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """An explicit ``admin_only: false`` on re-adoption intentionally
+        de-classifies a previously admin-only server."""
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                self_setup=True,
+                managed=False,
+                admin_only=True,
+                name="DeepSeek (qiip)",
+            )
+        )
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+        mock_provisioner.register_self_setup = AsyncMock(
+            return_value=_make_node(
+                node_id="gpu01",
+                self_setup=True,
+                managed=False,
+                model="org/model",
+                admin_only=False,
+            )
+        )
+
+        response = client.post(
+            "/admin/nodes/pool",
+            json={"hostname": "gpu01", "self_setup": True, "admin_only": False},
+        )
+
+        assert response.status_code == 201
+        mock_provisioner.register_self_setup.assert_awaited_once_with(
+            "gpu01", None, owner="", admin_only=False, name="DeepSeek (qiip)"
         )
 
     def test_setup_retry_preserves_existing_owner(

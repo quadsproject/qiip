@@ -397,3 +397,72 @@ vm.runInContext(source, sandbox);
             harness.replace("SOURCE_PATH", json.dumps(str(_CONFIG_DOWNLOAD_JS)))
         )
         assert result == {"name": "agent-config"}
+
+    def test_mint_failure_aborts_download(self) -> None:
+        """A failed config-token mint (e.g. local-admin/Basic identity, no
+        Google session) must abort the download instead of shipping a
+        knowingly unusable placeholder config."""
+        harness = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(SOURCE_PATH, "utf8");
+let captured = [];
+let toasts = [];
+const created = [];
+function element() {
+  const el = {
+    children: [], _handlers: {}, textContent: "", className: "", type: "",
+    href: "", download: "",
+    addEventListener(name, fn) { this._handlers[name] = fn; },
+    appendChild(child) { this.children.push(child); return child; },
+    removeChild(child) { return child; },
+    remove() {}, setAttribute() {}, click() {},
+    classList: { add() {}, remove() {}, contains() { return false; } },
+  };
+  created.push(el);
+  return el;
+}
+const sandbox = {
+  console,
+  Blob: function () {},
+  URL: { createObjectURL: function () { return "blob:test"; }, revokeObjectURL: function () {} },
+  document: {
+    createElement: function () { return element(); },
+    body: element(),
+    addEventListener() {},
+    querySelectorAll() { return []; },
+  },
+  window: {
+    showToast: function (msg, type) { toasts.push({ msg: msg, type: type }); },
+    location: { origin: "http://test" },
+  },
+  fetch: async function (url, options) {
+    captured.push({ url, options });
+    return { ok: false, status: 401, json: async function () { return { detail: "Not signed in" }; } };
+  },
+};
+vm.createContext(sandbox);
+vm.runInContext(source, sandbox);
+(async function () {
+  sandbox.createConfigDropdown(
+    "http://proxy:5000", "deepseek-model", function () {}, function () {},
+    { admin_only: true, name: "DeepSeek (qiip)" }
+  );
+  const formatButtons = created.filter(function (el) { return el._handlers.click && el.textContent; });
+  const omp = formatButtons.find(function (el) { return el.textContent === "OMP Agent"; });
+  await omp._handlers.click();
+  const downloads = created.filter(function (el) { return el.download; });
+  process.stdout.write(JSON.stringify({
+    toasts: toasts.length,
+    downloadCount: downloads.length,
+    mintAttempts: captured.filter(function (c) { return c.url === "/profile/tokens"; }).length,
+  }));
+})().catch(function (error) {
+  console.error(error);
+  process.exit(1);
+});
+"""
+        result = _run_node_raw(
+            harness.replace("SOURCE_PATH", json.dumps(str(_CONFIG_DOWNLOAD_JS)))
+        )
+        assert result == {"toasts": 1, "downloadCount": 0, "mintAttempts": 1}

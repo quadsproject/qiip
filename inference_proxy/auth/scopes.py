@@ -24,6 +24,21 @@ def is_full_access(email: str, settings: Settings) -> bool:
     return any(item.lower() == normalized for item in listed)
 
 
+def has_admin_access(
+    email: str,
+    settings: Settings,
+    *,
+    is_admin: bool = False,
+) -> bool:
+    """Return True when *email* holds admin scope for inference routing.
+
+    Admin scope is the full-access trust list OR the admin role; scope
+    resolvers, the endpoint picker, and the token-mint surface all treat
+    them identically so the predicate never diverges.
+    """
+    return is_full_access(email, settings) or is_admin
+
+
 def allowed_node_ids(
     auth: TokenAuth | None,
     settings: Settings,
@@ -35,7 +50,9 @@ def allowed_node_ids(
     An explicit empty list pins to nothing (no reachable endpoints).
     Admin-role users are unpinned, like the full-access trust list.
     """
-    if auth is None or is_full_access(auth.user.email, settings) or auth.user.is_admin:
+    if auth is None or has_admin_access(
+        auth.user.email, settings, is_admin=auth.user.is_admin
+    ):
         return None
     scope = auth.token.endpoint_scope
     if scope is None:
@@ -51,7 +68,7 @@ def scope_owner(auth: TokenAuth | None, settings: Settings) -> str | None:
     """
     if auth is None:
         return ""
-    if is_full_access(auth.user.email, settings) or auth.user.is_admin:
+    if has_admin_access(auth.user.email, settings, is_admin=auth.user.is_admin):
         return None
     return auth.user.email.lower()
 
@@ -68,7 +85,7 @@ def auth_scope(
     """
     if auth is None:
         return (None, "")
-    if is_full_access(auth.user.email, settings) or auth.user.is_admin:
+    if has_admin_access(auth.user.email, settings, is_admin=auth.user.is_admin):
         return (None, None)
     scope = auth.token.endpoint_scope
     allowed = frozenset(scope) if scope is not None else None
@@ -88,7 +105,7 @@ def pickable_endpoints(
     anything, including admin-only servers. Admin-only servers are never
     pickable by non-admin callers.
     """
-    admin = is_full_access(user_email, settings) or is_admin
+    admin = has_admin_access(user_email, settings, is_admin=is_admin)
     email = user_email.lower()
     pickable = []
     for node in nodes:

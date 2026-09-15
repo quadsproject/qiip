@@ -36,7 +36,7 @@ from inference_proxy.auth.models import (
     PublicUser,
     User,
 )
-from inference_proxy.auth.scopes import is_full_access, pickable_endpoints
+from inference_proxy.auth.scopes import has_admin_access, pickable_endpoints
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import get_registry, get_settings
 from inference_proxy.config.settings import Settings
@@ -105,7 +105,7 @@ async def create_token(
     may route to: an unknown hostname is rejected (400) and a node owned by
     someone else is rejected (403). Admins may pin any registered node.
     """
-    admin = is_full_access(user.email, settings)
+    admin = has_admin_access(user.email, settings, is_admin=user.is_admin)
     if settings.auth.enforce_sso_whitelist and not admin:
         try:
             allowed = await enforce_allowlist(user.email, allowlist)
