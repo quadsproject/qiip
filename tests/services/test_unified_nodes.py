@@ -356,7 +356,9 @@ class TestFleetOwnershipFiltering:
     def test_other_users_owned_nodes_excluded(self) -> None:
         svc = _service(registry=self._registry(), include_poller=False)
 
-        nodes = svc.get_unified_nodes(viewer_admin=False, viewer_email="alice@example.com")
+        nodes = svc.get_unified_nodes(
+            viewer_admin=False, viewer_email="alice@example.com"
+        )
 
         assert [n.node_id for n in nodes] == ["mine-1", "shared-1"]
         assert all(n.owner == "" for n in nodes)
@@ -373,7 +375,9 @@ class TestFleetOwnershipFiltering:
     def test_admin_view_ignores_ownership(self) -> None:
         svc = _service(registry=self._registry(), include_poller=False)
 
-        nodes = svc.get_unified_nodes(viewer_admin=True, viewer_email="alice@example.com")
+        nodes = svc.get_unified_nodes(
+            viewer_admin=True, viewer_email="alice@example.com"
+        )
 
         assert [n.node_id for n in nodes] == [
             "mine-1",

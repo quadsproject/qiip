@@ -111,11 +111,7 @@ class UnifiedNodeService:
             item.model_copy(update={"actions": [], "owner": ""})
             for item in result
             if not item.admin_only
-            and not (
-                viewer_email
-                and item.owner
-                and item.owner.lower() != viewer_email
-            )
+            and not (viewer_email and item.owner and item.owner.lower() != viewer_email)
         ]
         return sorted(filtered, key=lambda r: r.node_id)
 

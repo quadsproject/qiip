@@ -102,6 +102,4 @@ class TestMissingSessionMiddleware:
         assert get_session_user_id(cast(Request, _NoMiddlewareRequest())) is None
 
     def test_get_local_admin_session_returns_false(self) -> None:
-        assert (
-            get_local_admin_session(cast(Request, _NoMiddlewareRequest())) is False
-        )
+        assert get_local_admin_session(cast(Request, _NoMiddlewareRequest())) is False

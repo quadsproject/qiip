@@ -62,9 +62,7 @@ class TestBasicOnlyDeployment:
         settings = test_settings.model_copy(
             deep=True,
             update={
-                "auth": test_settings.auth.model_copy(
-                    update={"session_secret": None}
-                )
+                "auth": test_settings.auth.model_copy(update={"session_secret": None})
             },
         )
         application = create_app(settings=settings)

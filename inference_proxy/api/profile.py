@@ -119,9 +119,7 @@ async def create_token(
     # still mint through the whitelist at /v1 use time (auth/dependencies.py)
     # would reject them, so letting them bypass at mint would create tokens
     # that 401 on every call.
-    if settings.auth.enforce_sso_whitelist and not is_full_access(
-        user.email, settings
-    ):
+    if settings.auth.enforce_sso_whitelist and not is_full_access(user.email, settings):
         try:
             allowed = await enforce_allowlist(user.email, allowlist)
         except AllowlistUnavailableError:

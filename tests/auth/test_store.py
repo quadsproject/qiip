@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from contextlib import suppress
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import TypedDict
 import pytest
 
 import inference_proxy.auth.store as store_module
-from inference_proxy.auth.models import User
+from inference_proxy.auth.models import CreatedToken, User
 from inference_proxy.auth.store import AuthStore, _utcnow
 
 _GOOGLE = {
@@ -809,20 +810,22 @@ class _StaleSnapshotConn:
     ``INSERT`` (the exact timing the multi-process race produces).
     """
 
-    _SNAPSHOT_SQL = (
-        "SELECT * FROM tokens WHERE user_id = ? AND name = ? ORDER BY id"
-    )
+    _SNAPSHOT_SQL = "SELECT * FROM tokens WHERE user_id = ? AND name = ? ORDER BY id"
 
-    def __init__(self, real: object, snapshot: tuple[object, ...]) -> None:
+    def __init__(self, real: sqlite3.Connection, snapshot: tuple[object, ...]) -> None:
         self._real = real
         self._snapshot = snapshot
         self._served = False
 
-    def execute(self, sql: str, params: tuple[object, ...] = ()) -> object:
+    def execute(
+        self,
+        sql: str,
+        params: tuple[object, ...] = (),
+    ) -> sqlite3.Cursor | _StaleRows:
         if not self._served and sql == self._SNAPSHOT_SQL:
             self._served = True
             return _StaleRows(self._snapshot)
-        return self._real.execute(sql, params)  # type: ignore[no-any-return]
+        return self._real.execute(sql, params)
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._real, name)
@@ -863,7 +866,7 @@ class TestConfigTokenRaceRecovery:
 
         monkeypatch.setattr(store_module, "_derive_config_token", synchronized)
 
-        results: dict[str, object] = {}
+        results: dict[str, CreatedToken] = {}
 
         def mint(label: str, store: AuthStore) -> None:
             results[label] = store.get_or_create_config_token(user.id, "s3cret")
@@ -877,11 +880,11 @@ class TestConfigTokenRaceRecovery:
         for thread in threads:
             thread.join(timeout=10)
 
-        first = results["a"]
-        second = results["b"]
         # Both callers end up with the same stable agent-config key.
-        assert first.token == second.token  # type: ignore[attr-defined]
-        assert store_a.resolve_token(first.token) is not None  # type: ignore[attr-defined]
+        assert results["a"].token == results["b"].token
+        auth = store_a.resolve_token(results["a"].token)
+        assert auth is not None
+        assert auth.user.id == user.id
         active = store_a._conn.execute(
             "SELECT COUNT(*) FROM tokens WHERE name = 'agent-config' AND revoked = 0"
         ).fetchone()[0]
@@ -902,11 +905,13 @@ class TestConfigTokenRaceRecovery:
         # Second process: its rows snapshot predates the winner's insert, so
         # it derives generation 0 -> collides with the (now revoked) row.
         stale = AuthStore(db)
-        stale._conn = _StaleSnapshotConn(stale._conn, ())
+        stale._conn = _StaleSnapshotConn(stale._conn, ())  # type: ignore[assignment]
         recovered = stale.get_or_create_config_token(user.id, "s3cret")
 
         assert recovered.token != first.token
-        assert stale.resolve_token(recovered.token) is not None
+        auth = stale.resolve_token(recovered.token)
+        assert auth is not None
+        assert auth.user.id == user.id
         active = stale._conn.execute(
             "SELECT COUNT(*) FROM tokens WHERE name = 'agent-config' AND revoked = 0"
         ).fetchone()[0]
@@ -940,7 +945,7 @@ class TestConfigTokenRaceRecovery:
 
         monkeypatch.setattr(store_module, "_derive_config_token", synchronized)
 
-        results: dict[str, object] = {}
+        results: dict[str, CreatedToken] = {}
 
         def mint(label: str, store: AuthStore) -> None:
             results[label] = store.get_or_create_config_token(user.id, "s3cret")
@@ -954,11 +959,16 @@ class TestConfigTokenRaceRecovery:
         for thread in threads:
             thread.join(timeout=10)
 
-        active = stores[0]._conn.execute(
-            "SELECT COUNT(*) FROM tokens WHERE name = 'agent-config' AND revoked = 0"
-        ).fetchone()[0]
+        active = (
+            stores[0]
+            ._conn.execute(
+                "SELECT COUNT(*) FROM tokens WHERE name = 'agent-config' AND revoked = 0"
+            )
+            .fetchone()[0]
+        )
         assert active == 1
         # Every caller resolved to the same active key.
-        tokens = [results[f"s{i}"] for i in range(len(stores))]
-        resolved = {s.resolve_token(t.token).user.id for s, t in zip(stores, tokens, strict=True)}  # type: ignore[attr-defined]
-        assert resolved == {user.id}
+        for i, store in enumerate(stores):
+            auth = store.resolve_token(results[f"s{i}"].token)
+            assert auth is not None
+            assert auth.user.id == user.id

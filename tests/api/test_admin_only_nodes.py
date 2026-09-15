@@ -49,7 +49,9 @@ def _make_node(
     )
 
 
-def _signed_in_client(app: FastAPI, store: AuthStore) -> tuple[TestClient, AdminUserStats]:
+def _signed_in_client(
+    app: FastAPI, store: AuthStore
+) -> tuple[TestClient, AdminUserStats]:
     """Sign a Google user in through the real callback; return client + user."""
     app.dependency_overrides[get_auth_plugin] = lambda: FakeAuthPlugin()
     client = TestClient(app)
@@ -193,7 +195,11 @@ class TestAdminOnlyRoutingScope:
                         "finish_reason": "stop",
                     }
                 ],
-                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                    "total_tokens": 7,
+                },
             },
         )
 
@@ -262,9 +268,7 @@ class TestFleetEndpoint:
     ) -> None:
         """The non-admin fleet view must not disclose who owns a node (owner
         email is private per RFE-107), while the admin view keeps it."""
-        test_registry.add(
-            _make_node("pub1", model="public", owner="alice@example.com")
-        )
+        test_registry.add(_make_node("pub1", model="public", owner="alice@example.com"))
         client, _user = _signed_in_client(app, auth_store)
 
         response = client.get("/fleet/nodes")

@@ -69,9 +69,7 @@ class TestHasAdminAccess:
     def test_admin_role_only(self) -> None:
         # An admin-role user who is NOT on the trust list still holds admin
         # scope — the token-mint surface and picker must agree (RFE #107).
-        assert has_admin_access(
-            "alice@example.com", _settings(), is_admin=True
-        )
+        assert has_admin_access("alice@example.com", _settings(), is_admin=True)
 
     def test_neither_is_not_admin(self) -> None:
         assert not has_admin_access("alice@example.com", _settings())

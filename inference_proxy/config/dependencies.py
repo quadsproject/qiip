@@ -198,6 +198,7 @@ def require_admin_auth(
                 detail="Admin state-changing requests must use application/json",
             )
 
+
 def get_registry(request: Request) -> NodeRegistry:
     """Return the node registry from the current application state.
 
