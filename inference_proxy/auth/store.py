@@ -380,6 +380,20 @@ class AuthStore:
                     token = self._token_from_row(active)
                     if token is not None:  # pragma: no cover - defensive
                         return CreatedToken(**token.model_dump(), token=raw)
+                # The configured session secret changed, so the derived value no
+                # longer matches the active row. Revoke the stale active row(s)
+                # before minting the next generation; otherwise the previous
+                # derived key stays resolvable and a secret rotation fails to
+                # invalidate configs already distributed (the one-active
+                # key-per-user invariant would break).
+                self._conn.execute(
+                    """
+                    UPDATE tokens
+                       SET revoked = 1
+                     WHERE user_id = ? AND name = ? AND revoked = 0
+                    """,
+                    (user_id, _CONFIG_TOKEN_NAME),
+                )
 
             generation = len(rows)
             raw = _derive_config_token(secret, user_id, generation)
@@ -415,10 +429,20 @@ class AuthStore:
                 ).fetchone()
                 if row is None:  # pragma: no cover - defensive
                     raise
+                # Re-read the rows: the snapshot taken before our insert
+                # predates the winner's row, so indexing the stale snapshot
+                # would raise StopIteration (a 500) instead of returning the
+                # winner's token.
+                fresh_rows = self._conn.execute(
+                    "SELECT * FROM tokens WHERE user_id = ? AND name = ? ORDER BY id",
+                    (user_id, _CONFIG_TOKEN_NAME),
+                ).fetchall()
                 raw = _derive_config_token(
                     secret,
                     user_id,
-                    next(i for i, r in enumerate(rows) if r["id"] == row["id"]),
+                    next(
+                        i for i, r in enumerate(fresh_rows) if r["id"] == row["id"]
+                    ),
                 )
         token = self._token_from_row(row)
         if token is None:  # pragma: no cover - defensive

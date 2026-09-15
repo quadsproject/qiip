@@ -97,8 +97,11 @@ class UnifiedNodeService:
         if viewer_admin:
             return sorted(result, key=lambda r: r.node_id)
         filtered = [
-            # Non-admin callers never see admin-only nodes or operational actions.
-            item.model_copy(update={"actions": []})
+            # Non-admin callers never see admin-only nodes, operational
+            # actions, or any node's owner email (ownership is private per
+            # RFE-107: owned nodes are already hidden from /v1/models and the
+            # endpoint picker, so the fleet must not disclose who owns them).
+            item.model_copy(update={"actions": [], "owner": ""})
             for item in result
             if not item.admin_only
         ]

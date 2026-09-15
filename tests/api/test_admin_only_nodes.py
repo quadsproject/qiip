@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pytest_httpx import HTTPXMock
 
 from inference_proxy.auth.dependencies import get_auth_plugin
 from inference_proxy.auth.models import User
@@ -132,6 +133,79 @@ class TestAdminOnlyRoutingScope:
     ) -> None:
         assert app.dependency_overrides[get_node_selector] is not None
 
+    def test_user_token_never_selects_admin_only_node(
+        self,
+        client: TestClient,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        """End-to-end: /v1 must forward the resolved token scope into node
+        selection, so a non-admin bearer token can never reach an admin-only
+        node even when the request names its model by id."""
+        test_registry.add(_make_node("admin_only1", admin_only=True, model="secret"))
+        test_registry.add(_make_node("pub1", model="public"))
+        user = auth_store.upsert_google_user(
+            google_sub="sub-alice",
+            email="alice@example.com",
+            name="Alice",
+            picture="",
+        )
+        token = auth_store.create_token(user.id, "ci-job").token
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "secret", "messages": [{"role": "user", "content": "Hi"}]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        # Never routed: an error body and no backend call for the admin-only model.
+        assert response.status_code != 200
+        assert len(httpx_mock.get_requests()) == 0
+
+    def test_admin_role_token_selects_admin_only_node(
+        self,
+        client: TestClient,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        test_registry.add(_make_node("admin_only1", admin_only=True, model="secret"))
+        user = auth_store.upsert_google_user(
+            google_sub="sub-alice",
+            email="alice@example.com",
+            name="Alice",
+            picture="",
+        )
+        auth_store.set_user_admin(user.id, True)
+        token = auth_store.create_token(user.id, "ci-job").token
+        httpx_mock.add_response(
+            url="http://10.0.1.100:8000/v1/chat/completions",
+            status_code=200,
+            json={
+                "id": "chatcmpl-1",
+                "object": "chat.completion",
+                "model": "secret",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+            },
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "secret", "messages": [{"role": "user", "content": "Hi"}]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        assert len(httpx_mock.get_requests()) == 1
+
 
 class TestFleetEndpoint:
     def test_fleet_node_endpoint_requires_session(self, app: FastAPI) -> None:
@@ -179,6 +253,27 @@ class TestFleetEndpoint:
         nodes = {node["node_id"]: node for node in response.json()}
         assert nodes["admin_only1"]["admin_only"] is True
         assert nodes["pub1"]["admin_only"] is False
+
+    def test_fleet_node_endpoint_strips_owner_email(
+        self,
+        app: FastAPI,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+    ) -> None:
+        """The non-admin fleet view must not disclose who owns a node (owner
+        email is private per RFE-107), while the admin view keeps it."""
+        test_registry.add(
+            _make_node("pub1", model="public", owner="alice@example.com")
+        )
+        client, _user = _signed_in_client(app, auth_store)
+
+        response = client.get("/fleet/nodes")
+        assert response.status_code == 200
+        fleet = {node["node_id"]: node for node in response.json()}
+        assert fleet["pub1"]["owner"] == ""
+
+        admin = TestClient(app).get("/admin/nodes")
+        assert admin.status_code == 401  # no admin identity on the bare client
 
 
 class TestAdminRoles:
@@ -230,6 +325,24 @@ class TestAdminRoles:
         auth_store.set_user_admin(user.id, True)
 
         assert client.get("/admin/metrics").status_code == 200
+
+    def test_demoted_user_loses_admin_access_on_next_request(
+        self,
+        app: FastAPI,
+        auth_store: AuthStore,
+    ) -> None:
+        """The documented security invariant: a demoted user loses admin
+        access on their next request (role is re-read from the store, never
+        cached in the session)."""
+        client, user = _signed_in_client(app, auth_store)
+
+        auth_store.set_user_admin(user.id, True)
+        assert client.get("/admin/metrics").status_code == 200
+        assert 'href="/dashboard/admin"' in client.get("/dashboard").text
+
+        auth_store.set_user_admin(user.id, False)
+        assert client.get("/admin/metrics").status_code == 401
+        assert 'href="/dashboard/admin"' not in client.get("/dashboard").text
 
 
 class TestSessionIsolation:

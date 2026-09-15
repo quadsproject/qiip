@@ -254,7 +254,9 @@ class TestTokens:
 
         assert derived.token != legacy.token
         assert derived.name == "agent-config"
-        # The legacy row stays active/auditable; the derived key wins.
+        # The mismatched pre-reuse row is revoked so exactly one agent-config
+        # key stays active (the derived one).
+        assert auth_store.resolve_token(legacy.token) is None
         count = auth_store._conn.execute(
             "SELECT COUNT(*) FROM tokens WHERE name = 'agent-config'"
         ).fetchone()[0]
@@ -745,6 +747,28 @@ class TestConfigToken:
         assert auth_store.resolve_token(first.token) is None
         assert auth_store.resolve_token(second.token) is not None
 
+    def test_secret_rotation_revokes_stale_derived_key(
+        self,
+        auth_store: AuthStore,
+    ) -> None:
+        """Rotating ``auth.session_secret`` must invalidate previously
+        distributed agent-config keys, not leave them resolvable."""
+        user = self._user(auth_store)
+        first = auth_store.get_or_create_config_token(user.id, "secret-v1")
+
+        second = auth_store.get_or_create_config_token(user.id, "secret-v2")
+
+        assert second.token != first.token
+        assert second.id != first.id
+        # The stale derived key stops resolving after the secret changes.
+        assert auth_store.resolve_token(first.token) is None
+        assert auth_store.resolve_token(second.token) is not None
+        # Exactly one active agent-config row remains.
+        active = auth_store._conn.execute(
+            "SELECT COUNT(*) FROM tokens WHERE name = 'agent-config' AND revoked = 0"
+        ).fetchone()[0]
+        assert active == 1
+
     def test_supersedes_pre_reuse_random_row(
         self,
         auth_store: AuthStore,
@@ -756,6 +780,6 @@ class TestConfigToken:
 
         assert derived.token != random_row.token
         assert derived.id != random_row.id
-        # The old random row is untouched and still valid; the derived one
-        # is what the downloader gets from now on.
-        assert auth_store.resolve_token(random_row.token) is not None
+        # The old random row is revoked so exactly one agent-config key stays
+        # active; the derived one is what the downloader gets from now on.
+        assert auth_store.resolve_token(random_row.token) is None

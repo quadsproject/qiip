@@ -19,7 +19,6 @@ from secrets import compare_digest
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 from inference_proxy.auth.session import get_local_admin_session, get_session_user_id
 from inference_proxy.discovery.registry import NodeRegistry
@@ -38,7 +37,6 @@ from inference_proxy.services.unified_nodes import UnifiedNodeService
 
 from .settings import Settings
 
-_ADMIN_BASIC = HTTPBasic(auto_error=False)
 _JSON_ADMIN_METHODS = frozenset({"POST", "PUT", "PATCH"})
 _ADMIN_AUTH_HEADERS = {
     "WWW-Authenticate": 'Basic realm="inference-proxy-admin", charset="UTF-8"'
@@ -147,46 +145,26 @@ def require_fleet_viewer(
 
 def require_admin_auth(
     request: Request,
-    credentials: Annotated[HTTPBasicCredentials | None, Depends(_ADMIN_BASIC)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> None:
     """Authenticate admin requests and enforce the JSON-only CSRF boundary.
 
     Accepted identities: the HTTP Basic local admin, a signed local-admin
-    session, or a signed-in Google user carrying the admin role.
+    session, or a signed-in Google user carrying the admin role -- the same
+    chain ``viewer_role`` resolves, so the HTML and JSON surfaces can never
+    disagree about who is admin and both parse Basic credentials identically.
 
     A signed-in Google session is authoritative: same-origin browser
     requests replay cached HTTP Basic credentials automatically, so a
     non-admin session is never elevated by incidentally cached admin
-    credentials (mirrors ``viewer_role`` on the HTML surface). Basic still
-    works everywhere for scripts and anonymous browsers.
+    credentials.
     """
-    if get_session_user_id(request) is not None:
-        if _viewer_from_session(request) != "admin":
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid admin credentials",
-                headers=_ADMIN_AUTH_HEADERS,
-            )
-    else:
-        supplied_username = credentials.username if credentials is not None else ""
-        supplied_password = credentials.password if credentials is not None else ""
-        username_matches = compare_digest(
-            supplied_username.encode("utf-8"),
-            settings.admin.username.encode("utf-8"),
+    if viewer_role(request, settings) != "admin":
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid admin credentials",
+            headers=_ADMIN_AUTH_HEADERS,
         )
-        password_matches = compare_digest(
-            supplied_password.encode("utf-8"),
-            settings.admin.password.get_secret_value().encode("utf-8"),
-        )
-        if not (username_matches and password_matches) and not get_local_admin_session(
-            request
-        ):
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid admin credentials",
-                headers=_ADMIN_AUTH_HEADERS,
-            )
 
     if request.method in _JSON_ADMIN_METHODS:
         media_type = request.headers.get("content-type", "").partition(";")[0].lower()
@@ -195,7 +173,6 @@ def require_admin_auth(
                 status_code=415,
                 detail="Admin state-changing requests must use application/json",
             )
-
 
 def get_registry(request: Request) -> NodeRegistry:
     """Return the node registry from the current application state.
