@@ -1,19 +1,6 @@
 // ponytail: vanilla fetch + ReadableStream SSE, no EventSource (POST required)
 "use strict";
 
-function showToast(message, type) {
-  var container = document.getElementById("toast-container");
-  var toast = document.createElement("div");
-  toast.className = "toast toast-" + (type || "info");
-  toast.textContent = message;
-  container.appendChild(toast);
-  requestAnimationFrame(function () { toast.classList.add("toast-visible"); });
-  setTimeout(function () {
-    toast.classList.remove("toast-visible");
-    setTimeout(function () { toast.remove(); }, 300);
-  }, 4000);
-}
-
 var messages = [];
 var messageArea;
 var messageAreaInner;

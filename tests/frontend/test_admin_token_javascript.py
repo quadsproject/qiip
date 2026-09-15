@@ -72,6 +72,7 @@ function byId(id) {{
 }}
 
 const sandbox = {{
+  showToast: function () {{}},
   console,
   POLL_INTERVAL_MS: 10000,
   document: {{
@@ -144,15 +145,143 @@ def test_admin_tokens_renders_users_and_tokens() -> None:
     assert result["usersRows"] == 1
     assert result["usersFirst"][0] == "Alice"
     assert result["usersFirst"][1] == "alice@example.com"
-    assert result["usersFirst"][3] == "2"
-    assert result["usersFirst"][6] == "150"
-    assert result["usersFirst"][7] == "$1.75"
+    assert result["usersFirst"][2] == "no"
+    assert result["usersFirst"][3] == "1 / 1"
+    assert result["usersFirst"][4] == "2"
+    assert result["usersFirst"][7] == "150"
+    assert result["usersFirst"][8] == "$1.75"
     assert result["tokensRows"] == 1
     assert "ci-job" in result["tokensFirst"]
     assert "Full access" in result["tokensFirst"]
     assert result["tokensFirst"][7] == "2"
     assert result["tokensFirst"][10] == "150"
     assert result["tokenCount"] == "1 tokens across 1 users"
+
+
+def _role_harness(user: dict[str, Any]) -> str:
+    """Render the users table and click the Grant/Revoke Admin button.
+
+    Regression: the role-change requests must send
+    ``Content-Type: application/json`` on POST/DELETE; ``require_admin_auth``
+    rejects state-changing admin requests without a JSON media type (415).
+    """
+    return f"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+const elements = new Map();
+const calls = [];
+let domReady = null;
+
+class Element {{
+  constructor(tagName) {{
+    this.tagName = tagName || "div";
+    this.children = [];
+    this.listeners = {{}};
+    this.className = "";
+    this.style = {{}};
+    this.value = "";
+    this.hidden = false;
+    this.disabled = false;
+    this._text = "";
+  }}
+  get textContent() {{ return this._text; }}
+  set textContent(value) {{
+    this._text = String(value);
+    if (value === "") this.children = [];
+  }}
+  appendChild(child) {{ this.children.push(child); return child; }}
+  addEventListener(name, callback) {{ this.listeners[name] = callback; }}
+  setAttribute(name, value) {{ this.attributes = this.attributes || {{}}; this.attributes[name] = String(value); }}
+  focus() {{ this.focused = true; }}
+  remove() {{}}
+}}
+
+function byId(id) {{
+  if (!elements.has(id)) elements.set(id, new Element("div"));
+  return elements.get(id);
+}}
+
+function ok(body) {{ return {{ ok: true, status: 200, json: async function () {{ return body; }} }}; }}
+
+const sandbox = {{
+  showToast: function () {{}},
+  console,
+  POLL_INTERVAL_MS: 10000,
+  document: {{
+    getElementById: byId,
+    addEventListener(name, callback) {{ if (name === "DOMContentLoaded") domReady = callback; }},
+    querySelectorAll() {{ return []; }},
+    createElement(tagName) {{ return new Element(tagName); }},
+    createTextNode(text) {{ const node = new Element("text"); node.textContent = text; return node; }},
+  }},
+  confirmDialog: async function () {{ return true; }},
+  requestAnimationFrame() {{}},
+  setTimeout() {{ return 1; }},
+  setInterval() {{ return 1; }},
+  localStorage: {{ getItem() {{ return null; }}, setItem() {{}} }},
+  fetch: async function (url, options) {{
+    if (url === "/admin/users") return ok([{json.dumps(user)}]);
+    if (url === "/admin/users/1/admin") {{ calls.push({{ url, options }}); return ok({{}}); }}
+    if (url === "/admin/tokens") return ok([]);
+    return {{ ok: false, status: 500, json: async function () {{ return {{}}; }} }};
+  }},
+}};
+
+vm.createContext(sandbox);
+vm.runInContext(source, sandbox);
+
+(async function () {{
+  domReady();
+  await new Promise(function (resolve) {{ setImmediate(resolve); }});
+  const row = byId("users-table-body").children[0];
+  const toggle = row.children[9].children[1];
+  await toggle.listeners.click();
+  await new Promise(function (resolve) {{ setImmediate(resolve); }});
+  process.stdout.write(JSON.stringify({{
+    calls: calls.map(function (c) {{
+      return {{
+        url: c.url,
+        method: c.options ? c.options.method : null,
+        contentType: c.options && c.options.headers
+          ? c.options.headers["Content-Type"]
+          : null,
+      }};
+    }})
+  }}));
+}})().catch(function (error) {{
+  console.error(error);
+  process.exit(1);
+}});
+"""
+
+
+def test_grant_admin_sends_json_content_type() -> None:
+    result = _run_node(
+        _ADMIN_TOKENS_JS,
+        _role_harness(
+            {"id": 1, "email": "kambiz@redhat.com", "name": "K", "is_admin": False}
+        ),
+    )
+    assert result["calls"][0] == {
+        "url": "/admin/users/1/admin",
+        "method": "POST",
+        "contentType": "application/json",
+    }
+
+
+def test_revoke_admin_sends_json_content_type() -> None:
+    result = _run_node(
+        _ADMIN_TOKENS_JS,
+        _role_harness(
+            {"id": 1, "email": "kambiz@redhat.com", "name": "K", "is_admin": True}
+        ),
+    )
+    assert result["calls"][0] == {
+        "url": "/admin/users/1/admin",
+        "method": "DELETE",
+        "contentType": "application/json",
+    }
 
 
 def test_admin_tokens_renders_pinned_to_nothing_not_full_access() -> None:
@@ -225,6 +354,7 @@ function byId(id) {
 }
 
 const sandbox = {
+  showToast: function () {},
   console,
   POLL_INTERVAL_MS: 10000,
   USER_ID: 1,

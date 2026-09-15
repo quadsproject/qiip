@@ -103,7 +103,7 @@ class TestUsers:
             picture="",
         )
 
-        users = auth_store.list_users()
+        users = auth_store.list_users_with_stats()
 
         assert {user.email for user in users} == {
             "alice@example.com",

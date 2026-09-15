@@ -95,6 +95,7 @@ const streamPayload = Buffer.from(
 );
 
 const sandbox = {
+  showToast: function () {},
   console,
   Buffer,
   TextDecoder: class {
@@ -208,6 +209,7 @@ function byId(id) {
 }
 
 const sandbox = {
+  showToast: function () {},
   console,
   document: {
     getElementById: byId,

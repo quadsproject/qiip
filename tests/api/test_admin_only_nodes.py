@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 from pytest_httpx import HTTPXMock
 
 from inference_proxy.auth.dependencies import get_auth_plugin
-from inference_proxy.auth.models import User
+from inference_proxy.auth.models import AdminUserStats
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import get_node_selector
 from inference_proxy.discovery.registry import NodeRegistry
@@ -49,7 +49,7 @@ def _make_node(
     )
 
 
-def _signed_in_client(app: FastAPI, store: AuthStore) -> tuple[TestClient, User]:
+def _signed_in_client(app: FastAPI, store: AuthStore) -> tuple[TestClient, AdminUserStats]:
     """Sign a Google user in through the real callback; return client + user."""
     app.dependency_overrides[get_auth_plugin] = lambda: FakeAuthPlugin()
     client = TestClient(app)
@@ -57,7 +57,7 @@ def _signed_in_client(app: FastAPI, store: AuthStore) -> tuple[TestClient, User]
         "/auth/callback?code=code&state=state", follow_redirects=False
     )
     assert response.status_code == 302
-    users = store.list_users()
+    users = store.list_users_with_stats()
     assert len(users) == 1
     return client, users[0]
 
@@ -471,7 +471,9 @@ class TestDashboardRoles:
         admin_page = client.get("/dashboard/admin")
         assert admin_page.status_code == 200
         assert "Admin_Only Inference Servers" in admin_page.text
-        assert "Admin Users" in admin_page.text
+        # Role management moved to the token dashboard (single users table).
+        assert "Admin Users" not in admin_page.text
+        assert '<th scope="col">Admin</th>' in tokens.text
 
     def test_logout_visible_for_local_admin_session(
         self,

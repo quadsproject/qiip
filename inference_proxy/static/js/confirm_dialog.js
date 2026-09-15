@@ -47,6 +47,41 @@
     return { dialog: dialog, title: title, message: message, cancelBtn: cancelBtn, confirmBtn: confirmBtn };
   }
 
+  // Shared toast helper (D-05): one implementation for every page that loads
+  // this file. `options.persistent` keeps the toast until the close button is
+  // clicked (used by node detail warnings).
+  window.showToast = function (message, type, options) {
+    var container = document.getElementById("toast-container");
+    if (!container) return;
+    var toast = document.createElement("div");
+    toast.className = "toast toast-" + (type || "info");
+    var persistent = options && options.persistent;
+    if (persistent) {
+      var text = document.createElement("span");
+      text.textContent = message;
+      toast.appendChild(text);
+      var btn = document.createElement("button");
+      btn.className = "toast-close";
+      btn.textContent = "×";
+      btn.setAttribute("aria-label", "Dismiss");
+      btn.addEventListener("click", function () {
+        toast.classList.remove("toast-visible");
+        setTimeout(function () { toast.remove(); }, 300);
+      });
+      toast.appendChild(btn);
+    } else {
+      toast.textContent = message;
+    }
+    container.appendChild(toast);
+    requestAnimationFrame(function () { toast.classList.add("toast-visible"); });
+    if (!persistent) {
+      setTimeout(function () {
+        toast.classList.remove("toast-visible");
+        setTimeout(function () { toast.remove(); }, 300);
+      }, 4000);
+    }
+  };
+
   // confirmDialog({ title, message, confirmLabel, cancelLabel, danger }) -> Promise<boolean>
   window.confirmDialog = function (opts) {
     opts = opts || {};

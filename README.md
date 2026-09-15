@@ -50,10 +50,10 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Background model downloads** -- concurrent HuggingFace downloads with status tracking; duplicate-safe and re-downloadable after completion or failure
 - **Hardware-aware model recommendations** -- runs llmfit via SSH on a target host to produce ranked, runtime-normalized recommendations with fit levels, throughput, memory estimates, and typed GGUF sources; auto-installs the binary on first use
 - **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
-- **Admin authentication** -- HTTP Basic required on all `/admin/*` endpoints and `/dashboard*` pages
+- **Admin authentication** -- HTTP Basic credentials or a signed-in admin-role session (local-admin form or Google OAuth) on all `/admin/*` endpoints; browser pages gate with a sign-in page instead of 401ing
 - **Fleet sign-in gate** -- anonymous visitors to the fleet dashboard get a sign-in page with two options: **Sign in with Local Admin** (in-page username/password form that establishes a signed session cookie — no browser Basic challenge popup; HTTP Basic still works for scripts and SSE) and **Sign in with Google Auth** (same flow as the profile page)
 - **Admin roles** -- the HTTP Basic admin user (bootstrap authority) can grant or revoke the admin role to Google-authenticated users on the admin page; role admins then reach the admin surface through their session and see admin-only servers
-- **Admin-only inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). They are routable only to admin callers (Basic, admin-role tokens, and the full-access trust list), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with an `admin_only` badge in the admin fleet view. Token usage from admin-only servers is tracked on the token summary pages exactly like any other node
+- **Admin-only inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). At `/v1` they are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with an `admin_only` badge in the admin fleet view. Token usage from admin-only servers is tracked on the token summary pages exactly like any other node
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
 - **User API tokens** -- each user can mint `qiip_...` bearer tokens on their profile page to call `/v1/chat/completions` and `/v1/completions`; tokens are stored as SHA-256 digests and can be revoked at any time
 - **Config-gated inference auth** -- a valid `qiip_...` bearer token is always accepted on `/v1`; requiring a token for every `/v1` request (`auth.enforce_api_tokens`) is optional and off by default, so existing public deployments keep serving anonymous requests unchanged
@@ -157,9 +157,12 @@ The gateway starts even when etcd or inference nodes are temporarily
 unavailable. Its discovery workers reconnect to etcd in the background, and
 inference requests become routable after a healthy node is registered.
 
-The administrative API and dashboard use HTTP Basic authentication, which sends
-base64-encoded credentials --not encryption --on every request. A trusted work LAN
-may use HTTP; use a TLS terminator whenever that network path is not trusted.
+The administrative JSON API accepts HTTP Basic credentials or a signed-in
+admin-role session; browser pages use a signed session cookie (local-admin
+form or Google OAuth) and never show a native Basic challenge. HTTP Basic
+sends base64-encoded credentials --not encryption --on every request. A trusted
+work LAN may use HTTP; use a TLS terminator whenever that network path is not
+trusted.
 
 ### Verify it's running
 
@@ -253,7 +256,7 @@ signed-in session):
 | `GET` | `/profile/usage` | Aggregated usage per token/model plus headline totals |
 | `GET` | `/profile/endpoints` | Registered nodes the user may pin (unowned nodes plus nodes they own) |
 
-HTTP Basic-protected administrative endpoints:
+Admin-authenticated endpoints (HTTP Basic or admin-role session):
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -278,7 +281,7 @@ HTTP Basic-protected administrative endpoints:
 | `GET` | `/admin/nodes/{hostname}/recommendations` | Run hardware-aware model recommendations |
 | `GET` | `/dashboard` | Authenticated operations dashboard; anonymous visitors get the sign-in page |
 | `GET` | `/dashboard/nodes/{node_id}` | Authenticated node detail page |
-| `GET` | `/dashboard/admin` | Admin page: manage admin-only inference servers and admin users |
+| `GET` | `/dashboard/admin` | Admin page: manage admin-only inference servers (admin-role management lives on `/dashboard/tokens`) |
 
 ### Administrative access
 
@@ -325,9 +328,11 @@ true`) registers an already-running OpenAI-compatible server as an
 **admin-only server**: no provisioning steps are performed, QIIP never owns its
 lifecycle, and its node id is the server hostname. Admin-only servers:
 
-- are routable only to admin callers (HTTP Basic, admin-role tokens, and the
-  `admin_only_tokens_full_access` trust list) — node selection, retries, and
-  `/v1/models` all enforce this;
+- are routable only to bearer tokens of admin-role users or the
+  `admin_only_tokens_full_access` trust list — node selection, retries, and
+  `/v1/models` all enforce this (HTTP Basic covers UI surfaces only; `/v1`
+  accepts Bearer tokens, and anonymous/Basic callers are treated as unowned
+  and rejected by selection);
 - are never listed on the non-admin fleet page or in the public `/v1/models`
   catalog; admins see them in `/admin/nodes` with `"admin_only": true`,
   displayed bold with an `admin_only` badge;

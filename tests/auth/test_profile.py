@@ -441,7 +441,7 @@ class TestTokenEndpointScope:
             ).status_code
             == 302
         )
-        users = auth_store.list_users()
+        users = auth_store.list_users_with_stats()
         assert len(users) == 1
         auth_store.set_user_admin(users[0].id, True)
 

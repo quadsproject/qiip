@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>QIIP - Admin</title>
-    <meta name="description" content="Manage admin_only inference servers and admin users.">
+    <meta name="description" content="Manage admin_only inference servers.">
     <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -33,6 +33,7 @@
                 <div class="admin-add-row">
                     <form id="admin-only-server-form" class="setup-form">
                         <input type="url" id="admin-only-server-url" placeholder="http://hostname:port" required>
+                        <input type="text" id="admin-only-server-name" placeholder="Name (optional, shown in fleet)" maxlength="100" aria-label="Operator-facing name (optional)">
                         <button type="submit" id="admin-only-server-btn" class="btn btn-primary">Add Admin_Only Server</button>
                     </form>
                 </div>
@@ -49,25 +50,6 @@
                         </thead>
                         <tbody id="admin-only-node-body">
                             <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </section>
-
-            <section class="card">
-                <h2 class="card-title">Admin Users</h2>
-                <div class="table-wrap">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th scope="col">User</th>
-                                <th scope="col">Email</th>
-                                <th scope="col">Admin</th>
-                                <th scope="col">Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="admin-user-body">
-                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
                         </tbody>
                     </table>
                 </div>

@@ -12,19 +12,6 @@ let modelsRequestSequence = 0;
 let modelsLastCatalogRendered = 0;
 let modelsLastDownloadsRendered = 0;
 
-function showToast(message, type) {
-  const container = document.getElementById("toast-container");
-  const toast = document.createElement("div");
-  toast.className = "toast toast-" + (type || "info");
-  toast.textContent = message;
-  container.appendChild(toast);
-  requestAnimationFrame(() => toast.classList.add("toast-visible"));
-  setTimeout(() => {
-    toast.classList.remove("toast-visible");
-    setTimeout(() => toast.remove(), 300);
-  }, 4000);
-}
-
 function clearChildren(el) {
   while (el.firstChild) el.removeChild(el.firstChild);
 }

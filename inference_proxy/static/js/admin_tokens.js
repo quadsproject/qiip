@@ -9,19 +9,6 @@
   let requestSequence = 0;
   let lastRenderedSequence = 0;
 
-  function showToast(message, type) {
-    const container = document.getElementById("toast-container");
-    const toast = document.createElement("div");
-    toast.className = "toast toast-" + (type || "info");
-    toast.textContent = message;
-    container.appendChild(toast);
-    requestAnimationFrame(() => toast.classList.add("toast-visible"));
-    setTimeout(() => {
-      toast.classList.remove("toast-visible");
-      setTimeout(() => toast.remove(), 300);
-    }, 4000);
-  }
-
   function clearChildren(el) {
     while (el.firstChild) el.removeChild(el.firstChild);
   }
@@ -108,6 +95,7 @@
       nameCell.appendChild(userLink(user.id, user.name || user.email));
       row.appendChild(nameCell);
       row.appendChild(tdCell(user.email));
+      row.appendChild(tdCell(user.is_admin ? "yes" : "no"));
       row.appendChild(
         tdCell(user.active_token_count + " / " + user.token_count)
       );
@@ -122,6 +110,38 @@
       view.className = "btn btn-neutral btn-sm";
       view.textContent = "View";
       actions.appendChild(view);
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className =
+        "btn btn-sm " + (user.is_admin ? "btn-danger" : "btn-primary");
+      toggle.textContent = user.is_admin ? "Revoke Admin" : "Grant Admin";
+      toggle.addEventListener("click", async () => {
+        toggle.disabled = true;
+        try {
+          const method = user.is_admin ? "DELETE" : "POST";
+          const resp = await fetch("/admin/users/" + user.id + "/admin", {
+            method: method,
+            headers: { "Content-Type": "application/json" },
+          });
+          if (resp.ok) {
+            showToast(
+              user.is_admin
+                ? `Admin revoked for ${user.email}`
+                : `Admin granted to ${user.email}`,
+              "success"
+            );
+            refresh();
+          } else {
+            const data = await resp.json().catch(() => ({}));
+            showToast(data.detail || `HTTP ${resp.status}`, "error");
+            toggle.disabled = false;
+          }
+        } catch (err) {
+          showToast(`Role change failed: ${err.message}`, "error");
+          toggle.disabled = false;
+        }
+      });
+      actions.appendChild(toggle);
       row.appendChild(actions);
       body.appendChild(row);
     }

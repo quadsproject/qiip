@@ -279,14 +279,6 @@ class AuthStore:
             ).fetchone()
         return self._user_from_row(row)
 
-    def list_users(self) -> list[User]:
-        """Return every user row, newest first."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM users ORDER BY created_at DESC, id DESC"
-            ).fetchall()
-        return [user for row in rows if (user := self._user_from_row(row))]
-
     def set_user_admin(self, user_id: int, is_admin: bool) -> bool:
         """Grant or revoke the admin role; False when the user does not exist."""
         with self._lock:

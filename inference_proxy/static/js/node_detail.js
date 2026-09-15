@@ -25,37 +25,6 @@ function setupActionBody(id, node) {
   return setupSelection.buildBody(base);
 }
 
-function showToast(message, type, options) {
-  var container = document.getElementById("toast-container");
-  var toast = document.createElement("div");
-  toast.className = "toast toast-" + (type || "info");
-  var persistent = options && options.persistent;
-  if (persistent) {
-    var text = document.createElement("span");
-    text.textContent = message;
-    toast.appendChild(text);
-    var btn = document.createElement("button");
-    btn.className = "toast-close";
-    btn.textContent = "×";
-    btn.setAttribute("aria-label", "Dismiss");
-    btn.addEventListener("click", function () {
-      toast.classList.remove("toast-visible");
-      setTimeout(function () { toast.remove(); }, 300);
-    });
-    toast.appendChild(btn);
-  } else {
-    toast.textContent = message;
-  }
-  container.appendChild(toast);
-  requestAnimationFrame(function () { toast.classList.add("toast-visible"); });
-  if (!persistent) {
-    setTimeout(function () {
-      toast.classList.remove("toast-visible");
-      setTimeout(function () { toast.remove(); }, 300);
-    }, 4000);
-  }
-}
-
 function renderTableMessage(tbody, colSpan, message) {
   tbody.textContent = "";
   var row = document.createElement("tr");

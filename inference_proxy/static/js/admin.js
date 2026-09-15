@@ -1,18 +1,6 @@
-// Admin page: admin-only inference servers and admin-role users.
+// Admin page: admin-only inference servers (user role management lives on
+// the token dashboard).
 // ponytail: vanilla fetch + DOM, no framework needed
-
-function showAdminToast(message, type) {
-  const container = document.getElementById("toast-container");
-  const toast = document.createElement("div");
-  toast.className = "toast toast-" + (type || "info");
-  toast.textContent = message;
-  container.appendChild(toast);
-  requestAnimationFrame(() => toast.classList.add("toast-visible"));
-  setTimeout(() => {
-    toast.classList.remove("toast-visible");
-    setTimeout(() => toast.remove(), 300);
-  }, 4000);
-}
 
 function parseServerUrl(rawUrl) {
   const url = new URL(rawUrl);
@@ -40,10 +28,10 @@ async function removeAdminOnlyNode(nodeId) {
   );
   const data = await resp.json().catch(() => ({}));
   if (resp.ok) {
-    showAdminToast(`${nodeId} removed`, "success");
+    showToast(`${nodeId} removed`, "success");
     refreshAdminPage();
   } else {
-    showAdminToast(data.detail || `HTTP ${resp.status}`, "error");
+    showToast(data.detail || `HTTP ${resp.status}`, "error");
   }
 }
 
@@ -97,90 +85,17 @@ function renderAdminOnlyNodes(nodes) {
   }
 }
 
-function renderAdminUsers(users) {
-  const tbody = document.getElementById("admin-user-body");
-  tbody.textContent = "";
-  if (users.length === 0) {
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
-    td.colSpan = 4;
-    td.textContent = "No users have signed in yet";
-    tr.appendChild(td);
-    tbody.appendChild(tr);
-    return;
-  }
-  for (const user of users) {
-    const tr = document.createElement("tr");
-    const tdName = document.createElement("td");
-    tdName.textContent = user.name || "—";
-    tr.appendChild(tdName);
-
-    const tdEmail = document.createElement("td");
-    tdEmail.textContent = user.email;
-    tr.appendChild(tdEmail);
-
-    const tdAdmin = document.createElement("td");
-    tdAdmin.textContent = user.is_admin ? "yes" : "no";
-    tr.appendChild(tdAdmin);
-
-    const tdActions = document.createElement("td");
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className =
-      "btn btn-sm " + (user.is_admin ? "btn-danger" : "btn-primary");
-    btn.textContent = user.is_admin ? "Revoke Admin" : "Grant Admin";
-    btn.disabled = false;
-    btn.addEventListener("click", async () => {
-      btn.disabled = true;
-      try {
-        const method = user.is_admin ? "DELETE" : "POST";
-        const resp = await fetch(
-          "/admin/users/" + user.id + "/admin",
-          {
-            method: method,
-            headers: { "Content-Type": "application/json" },
-          }
-        );
-        if (resp.ok) {
-          showAdminToast(
-            user.is_admin
-              ? `Admin revoked for ${user.email}`
-              : `Admin granted to ${user.email}`,
-            "success"
-          );
-          refreshAdminPage();
-        } else {
-          const data = await resp.json().catch(() => ({}));
-          showAdminToast(data.detail || `HTTP ${resp.status}`, "error");
-          btn.disabled = false;
-        }
-      } catch (err) {
-        showAdminToast(`Role change failed: ${err.message}`, "error");
-        btn.disabled = false;
-      }
-    });
-    tdActions.appendChild(btn);
-    tr.appendChild(tdActions);
-
-    tbody.appendChild(tr);
-  }
-}
-
 async function refreshAdminPage() {
   const statusEl = document.getElementById("admin-status");
   try {
-    const [nodesResp, usersResp] = await Promise.all([
-      fetch("/admin/nodes"),
-      fetch("/admin/users"),
-    ]);
-    if (!nodesResp.ok || !usersResp.ok) {
-      throw new Error(`HTTP ${nodesResp.status}/${usersResp.status}`);
+    const nodesResp = await fetch("/admin/nodes");
+    if (!nodesResp.ok) {
+      throw new Error(`HTTP ${nodesResp.status}`);
     }
     const nodes = await nodesResp.json();
-    const users = await usersResp.json();
-    renderAdminOnlyNodes(nodes.filter((node) => node.admin_only));
-    renderAdminUsers(users);
-    statusEl.textContent = `Admin data loaded: ${nodes.filter((node) => node.admin_only).length} admin_only servers, ${users.length} users`;
+    const adminOnly = nodes.filter((node) => node.admin_only);
+    renderAdminOnlyNodes(adminOnly);
+    statusEl.textContent = `Admin data loaded: ${adminOnly.length} admin_only servers`;
     const lastUpdated = document.getElementById("last-updated");
     if (lastUpdated) {
       lastUpdated.textContent = "Updated " + new Date().toLocaleTimeString();
@@ -199,6 +114,7 @@ document.addEventListener("DOMContentLoaded", function () {
     .addEventListener("submit", async function (e) {
       e.preventDefault();
       const input = document.getElementById("admin-only-server-url");
+      const nameInput = document.getElementById("admin-only-server-name");
       const btn = document.getElementById("admin-only-server-btn");
       const rawUrl = input.value.trim();
       if (!rawUrl) return;
@@ -206,7 +122,7 @@ document.addEventListener("DOMContentLoaded", function () {
       try {
         parsed = parseServerUrl(rawUrl);
       } catch (err) {
-        showAdminToast(err.message, "error");
+        showToast(err.message, "error");
         return;
       }
       btn.disabled = true;
@@ -217,6 +133,8 @@ document.addEventListener("DOMContentLoaded", function () {
           admin_only: true,
         };
         if (parsed.port !== null) body.port = parsed.port;
+        const name = nameInput.value.trim();
+        if (name) body.name = name;
         const resp = await fetch("/admin/nodes/pool", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -224,14 +142,15 @@ document.addEventListener("DOMContentLoaded", function () {
         });
         const data = await resp.json().catch(() => ({}));
         if (resp.ok) {
-          showAdminToast(`admin_only server ${parsed.hostname} registered`, "success");
+          showToast(`admin_only server ${parsed.hostname} registered`, "success");
           input.value = "";
+          nameInput.value = "";
           refreshAdminPage();
         } else {
-          showAdminToast(data.detail || `HTTP ${resp.status}`, "error");
+          showToast(data.detail || `HTTP ${resp.status}`, "error");
         }
       } catch (err) {
-        showAdminToast(`Registration failed: ${err.message}`, "error");
+        showToast(`Registration failed: ${err.message}`, "error");
       } finally {
         btn.disabled = false;
       }

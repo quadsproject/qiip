@@ -59,6 +59,15 @@ def clear_local_admin_session(request: Request) -> None:
     request.session.pop(_SESSION_EXPIRY_KEY, None)
 
 
+def _session_state(request: Request, key: str) -> tuple[object, object] | None:
+    """Return ``(marker, expiry)`` for *key*, or None when session middleware
+    is not installed (no ``SessionMiddleware`` on the app; AUTH-02)."""
+    try:
+        return (request.session.get(key), request.session.get(_SESSION_EXPIRY_KEY))
+    except AttributeError:
+        return None
+
+
 def get_local_admin_session(request: Request) -> bool:
     """Return True when the session was established by the local admin login.
 
@@ -66,14 +75,16 @@ def get_local_admin_session(request: Request) -> bool:
     the cookie self-heals). Returns False when the session middleware is not
     installed.
     """
-    try:
-        marker = request.session.get(_SESSION_LOCAL_ADMIN_KEY)
-        expiry = request.session.get(_SESSION_EXPIRY_KEY)
-    except AttributeError:
+    state = _session_state(request, _SESSION_LOCAL_ADMIN_KEY)
+    if state is None:
         return False
+    marker, expiry = state
     if marker is not True:
         return False
-    return isinstance(expiry, int) and expiry >= time.time()
+    if not isinstance(expiry, int) or expiry < time.time():
+        clear_local_admin_session(request)
+        return False
+    return True
 
 
 def get_session_user_id(request: Request) -> int | None:
@@ -83,11 +94,10 @@ def get_session_user_id(request: Request) -> int | None:
     carries no valid user id, or the session has expired (the expired
     identity is cleared so the cookie self-heals on the next request).
     """
-    try:
-        user_id = request.session.get(_SESSION_USER_KEY)
-        expiry = request.session.get(_SESSION_EXPIRY_KEY)
-    except AttributeError:
+    state = _session_state(request, _SESSION_USER_KEY)
+    if state is None:
         return None
+    user_id, expiry = state
     if not isinstance(user_id, int) or not isinstance(expiry, int):
         return None
     if expiry < time.time():

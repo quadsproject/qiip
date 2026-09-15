@@ -44,6 +44,7 @@ function byId(id) {
 }
 
 const sandbox = {
+  showToast: function () {},
   console,
   POLL_INTERVAL_MS: 10000,
   document: {

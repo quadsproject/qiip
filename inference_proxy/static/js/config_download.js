@@ -12,7 +12,7 @@ function configApiKey(opts) {
   // Admin-only servers: a real minted token when the download flow obtained one,
   // otherwise an explicit placeholder (never silently `auth: none`).
   if (opts && opts.admin_only) {
-    return (opts && opts.token) || TOKEN_PLACEHOLDER;
+    return opts.token || TOKEN_PLACEHOLDER;
   }
   return null;
 }
@@ -46,8 +46,9 @@ function generateOpenCodeConfig(baseUrl, modelId, opts) {
 
 function generatePiConfig(baseUrl, modelId, opts) {
   var base = baseUrl.replace(/\/+$/, "");
-  var apiKey = configApiKey(opts);
-  var apiKeyValue = apiKey ? apiKey : (opts && opts.admin_only ? TOKEN_PLACEHOLDER : "none");
+  // configApiKey already returns the placeholder for admin_only servers
+  // without a token, so no re-derivation is needed here.
+  var apiKeyValue = configApiKey(opts) || "none";
   return {
     providers: {
       qiip: {
@@ -81,7 +82,8 @@ function generateOmpConfig(baseUrl, modelId, opts) {
   ];
   if (opts && opts.admin_only) {
     // Admin-only inference servers are reachable only with an admin-role apiKey.
-    var apiKey = opts.token || TOKEN_PLACEHOLDER;
+    // configApiKey returns the placeholder when the download flow has no token.
+    var apiKey = configApiKey(opts);
     lines.push("    auth: apiKey");
     lines.push("    apiKey: " + yamlScalar(apiKey));
   } else {

@@ -60,6 +60,7 @@ function byId(id) {
 }
 
 const sandbox = {
+  showToast: function () {},
   console,
   URL: URL,
   URLSearchParams: URLSearchParams,
@@ -127,6 +128,9 @@ vm.runInContext(source, sandbox);
     rowNames: body.children.map(function (row) {
       return row.children[0] ? row.children[0].textContent : row.textContent;
     }),
+    rowScopes: body.children.map(function (row) {
+      return row.children[5] ? row.children[5].textContent : "";
+    }),
     listValues: list.children.map(function (label) {
       return label.children[0] ? label.children[0].value : "";
     }),
@@ -190,6 +194,14 @@ def test_revoked_tokens_are_dropped_from_display() -> None:
     assert "token-1" in result["rowNames"]
     assert "token-2" not in result["rowNames"]
     assert "token-3" in result["rowNames"]
+
+
+def test_agent_config_token_is_labeled_distinctly() -> None:
+    agent = _token(1, False)
+    agent["name"] = "agent-config"
+    result = _run([_token(2, False), agent], [])
+    assert result["rowScopes"][0] == "Full access"
+    assert result["rowScopes"][1] == "Config (agent)"
 
 
 def test_picker_empty_shows_message_and_zero_summary() -> None:

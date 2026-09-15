@@ -20,19 +20,6 @@
   const $ = (id) => document.getElementById(id);
   let pendingToken = "";
 
-  function showToast(message, type) {
-    const container = $("toast-container");
-    const toast = document.createElement("div");
-    toast.className = "toast toast-" + (type || "info");
-    toast.textContent = message;
-    container.appendChild(toast);
-    requestAnimationFrame(() => toast.classList.add("toast-visible"));
-    setTimeout(() => {
-      toast.classList.remove("toast-visible");
-      setTimeout(() => toast.remove(), 300);
-    }, 4000);
-  }
-
   function clearChildren(el) {
     while (el.firstChild) el.removeChild(el.firstChild);
   }
@@ -133,11 +120,13 @@
       row.appendChild(tdCell(token.revoked ? "revoked" : "active"));
       row.appendChild(
         tdCell(
-          token.endpoint_scope === null
-            ? "Full access"
-            : token.endpoint_scope.length
-              ? token.endpoint_scope.join(", ")
-              : "None"
+          token.name === "agent-config"
+            ? "Config (agent)"
+            : token.endpoint_scope === null
+              ? "Full access"
+              : token.endpoint_scope.length
+                ? token.endpoint_scope.join(", ")
+                : "None"
         )
       );
       const actions = document.createElement("td");
@@ -406,18 +395,10 @@
     );
   }
 
-  function wireLogout() {
-    $("logout-btn").addEventListener("click", async () => {
-      await fetch("/auth/logout", { method: "POST" });
-      window.location.reload();
-    });
-  }
-
   async function init() {
     parseErrorParam();
     wireTokenForm();
     wireEndpointPicker();
-    wireLogout();
 
     let resp;
     try {
