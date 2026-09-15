@@ -294,8 +294,14 @@ async function refreshDashboard() {
         const tr = document.createElement("tr");
 
         const tdId = document.createElement("td");
-        const idLink = document.createElement("a");
-        idLink.href = "/dashboard/nodes/" + encodeURIComponent(node.node_id);
+        // Only admins may open the node detail page (provisioning tasks,
+        // power controls, runtime editor are admin-only); for non-admin
+        // viewers the node id is plain text so a click never lands on the
+        // "Administrator access required" sign-in page.
+        const idLink = document.createElement(viewerAdmin ? "a" : "span");
+        if (viewerAdmin) {
+          idLink.href = "/dashboard/nodes/" + encodeURIComponent(node.node_id);
+        }
         idLink.textContent = node.name || node.node_id.split(".")[0];
         idLink.title = node.node_id;
         tdId.appendChild(idLink);

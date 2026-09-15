@@ -2,18 +2,6 @@
 // the token dashboard).
 // ponytail: vanilla fetch + DOM, no framework needed
 
-function parseServerUrl(rawUrl) {
-  const url = new URL(rawUrl);
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("Only http(s) server URLs are supported");
-  }
-  if (!url.hostname) throw new Error("Server URL must include a hostname");
-  return {
-    hostname: url.hostname,
-    port: url.port ? Number(url.port) : null,
-  };
-}
-
 async function removeAdminOnlyNode(nodeId) {
   const ok = await confirmDialog({
     title: "Remove admin-only server",
@@ -114,25 +102,20 @@ document.addEventListener("DOMContentLoaded", function () {
     .addEventListener("submit", async function (e) {
       e.preventDefault();
       const input = document.getElementById("admin-only-server-url");
+      const portInput = document.getElementById("admin-only-server-port");
       const nameInput = document.getElementById("admin-only-server-name");
       const btn = document.getElementById("admin-only-server-btn");
-      const rawUrl = input.value.trim();
-      if (!rawUrl) return;
-      let parsed;
-      try {
-        parsed = parseServerUrl(rawUrl);
-      } catch (err) {
-        showToast(err.message, "error");
-        return;
-      }
+      const hostname = input.value.trim();
+      if (!hostname) return;
       btn.disabled = true;
       try {
         const body = {
-          hostname: parsed.hostname,
+          hostname: hostname,
           self_setup: true,
           admin_only: true,
         };
-        if (parsed.port !== null) body.port = parsed.port;
+        const port = portInput.value.trim();
+        if (port) body.port = Number(port);
         const name = nameInput.value.trim();
         if (name) body.name = name;
         const resp = await fetch("/admin/nodes/pool", {
@@ -142,8 +125,9 @@ document.addEventListener("DOMContentLoaded", function () {
         });
         const data = await resp.json().catch(() => ({}));
         if (resp.ok) {
-          showToast(`admin-only server ${parsed.hostname} registered`, "success");
+          showToast(`admin-only server ${hostname} registered`, "success");
           input.value = "";
+          portInput.value = "";
           nameInput.value = "";
           refreshAdminPage();
         } else {

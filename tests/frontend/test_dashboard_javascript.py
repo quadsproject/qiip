@@ -24,16 +24,22 @@ _DASHBOARD_JS = _ROOT / "inference_proxy/static/js/dashboard.js"
 _HARNESS = r"""
 const fs = require("fs");
 const vm = require("vm");
+const path = require("path");
 const source = fs.readFileSync(process.argv[1], "utf8");
+const setupSelectionSource = fs.readFileSync(
+  path.join(path.dirname(process.argv[1]), "setup_selection.js"), "utf8"
+);
 
 let captured = [];
 const elements = new Map();
 
 function element() {
   return {
-    addEventListener() {}, appendChild() {}, remove() {},
+    addEventListener() {}, appendChild(child) { this.children.push(child); return child; },
+    remove() {},
     setAttribute() {}, removeAttribute() {}, textContent: "", innerHTML: "",
     value: "", className: "", style: {}, dataset: {}, hidden: false,
+    tagName: "", children: [],
     classList: { add() {}, remove() {}, contains() { return false; } },
   };
 }
@@ -47,12 +53,15 @@ const sandbox = {
   showToast: function () {},
   console,
   POLL_INTERVAL_MS: 10000,
+  // Rows render a config download dropdown from config_download.js, which is
+  // not loaded by the harness; a stub keeps the row construction path real.
+  createConfigDropdown: function () { return element(); },
   document: {
     getElementById: byId,
     addEventListener() {},
     querySelectorAll() { return []; },
     querySelector() { return element(); },
-    createElement() { return element(); },
+    createElement(tagName) { const el = element(); el.tagName = tagName; return el; },
     createTextNode(text) { return { textContent: text }; },
   },
   window: { location: { origin: "http://test" }, confirm() { return true; } },
@@ -64,8 +73,8 @@ const sandbox = {
   fetch: async function (url, options) {
     captured.push({ url, options });
     const body = {
-      "/admin/nodes": [],
-      "/fleet/nodes": [],
+      "/admin/nodes": ADMIN_NODES,
+      "/fleet/nodes": FLEET_NODES,
       "/admin/metrics": { per_node: {} },
       "/admin/quads/status": { status: "connected", last_sync: new Date().toISOString() },
       "/admin/billing": { totals: null },
@@ -80,6 +89,7 @@ const sandbox = {
 };
 
 vm.createContext(sandbox);
+vm.runInContext(setupSelectionSource, sandbox);
 __PRESCRIPT__
 vm.runInContext(source, sandbox);
 
@@ -88,6 +98,12 @@ vm.runInContext(source, sandbox);
   process.stdout.write(JSON.stringify({
     captured: captured.map(function (c) { return c.url; }),
     nodeCount: byId("node-count").textContent,
+    nodeIdLink: (function () {
+      var row = byId("node-table-body").children[0];
+      if (!row || !row.children[0] || !row.children[0].children[0]) return null;
+      var el = row.children[0].children[0];
+      return { tag: el.tagName, href: el.href || null, text: el.textContent };
+    })(),
   }));
 })().catch(function (error) {
   console.error(error);
@@ -97,7 +113,10 @@ vm.runInContext(source, sandbox);
 
 
 def _run_harness(
-    lexical_role: str | None = None, window_role: str | None = None
+    lexical_role: str | None = None,
+    window_role: str | None = None,
+    admin_nodes: list[dict[str, Any]] | None = None,
+    fleet_nodes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -111,7 +130,11 @@ def _run_harness(
         prescript += f"vm.runInContext('const VIEWER_ROLE = {json.dumps(lexical_role)};', sandbox);\n"
     if window_role is not None:
         prescript += f"vm.runInContext('window.VIEWER_ROLE = {json.dumps(window_role)};', sandbox);\n"
-    harness = _HARNESS.replace("__PRESCRIPT__", prescript)
+    harness = (
+        _HARNESS.replace("__PRESCRIPT__", prescript)
+        .replace("ADMIN_NODES", json.dumps(admin_nodes or []))
+        .replace("FLEET_NODES", json.dumps(fleet_nodes or []))
+    )
 
     result = subprocess.run(
         [node, "-e", harness, str(_DASHBOARD_JS)],
@@ -126,6 +149,23 @@ def _run_harness(
     return parsed
 
 
+def _node_payload() -> dict[str, Any]:
+    return {
+        "node_id": "gpu01",
+        "name": "gpu01",
+        "endpoint": "10.0.0.1:8000",
+        "model": "llama-3",
+        "state": "healthy",
+        "managed": True,
+        "self_setup": False,
+        "admin_only": False,
+        "engine": None,
+        "gpu_vendor": None,
+        "gpu_model": None,
+        "actions": [],
+    }
+
+
 def test_user_role_fetches_fleet_endpoint() -> None:
     """The dashboard template renders `const VIEWER_ROLE` -- Lexical only."""
     result = _run_harness(lexical_role="user")
@@ -133,6 +173,25 @@ def test_user_role_fetches_fleet_endpoint() -> None:
     # the old code took the admin branch and fetched /admin/nodes.
     assert result["captured"] == ["/fleet/nodes"]
     assert result["nodeCount"] == "0 nodes"
+
+
+def test_non_admin_node_id_is_plain_text_not_link() -> None:
+    """Regression (grafuls review): a non-admin clicking a node must not land
+    on the 'Administrator access required' sign-in page -- the node id is
+    plain text for non-admin viewers."""
+    result = _run_harness(lexical_role="user", fleet_nodes=[_node_payload()])
+    assert result["nodeIdLink"] == {
+        "tag": "span",
+        "href": None,
+        "text": "gpu01",
+    }
+
+
+def test_admin_node_id_links_to_node_detail() -> None:
+    result = _run_harness(lexical_role="admin", admin_nodes=[_node_payload()])
+    assert result["nodeIdLink"]["tag"] == "a"
+    assert result["nodeIdLink"]["href"].endswith("/dashboard/nodes/gpu01")
+    assert result["nodeIdLink"]["text"] == "gpu01"
 
 
 def test_admin_role_fetches_admin_endpoints() -> None:
