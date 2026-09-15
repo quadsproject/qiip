@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>QIIP - Admin</title>
+    <meta name="description" content="Manage admin-only inference servers and admin users.">
+    <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
+    <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
+</head>
+<body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    {% include "partials/navbar.html" %}
+
+    <div class="dashboard">
+        <header class="dashboard-header">
+            <div>
+                <h1>Admin</h1>
+                <p id="admin-status">Loading admin data...</p>
+            </div>
+            <div class="header-right">
+                <p id="last-updated"></p>
+            </div>
+        </header>
+
+        <main id="main-content">
+            <section class="card">
+                <h2 class="card-title">Admin-only Inference Servers</h2>
+                <div class="admin-add-row">
+                    <form id="admin-only-server-form" class="setup-form">
+                        <input type="text" id="admin-only-server-url" placeholder="Enter hostname" required>
+                        <input type="number" id="admin-only-server-port" placeholder="Port (optional)" min="1" max="65535" title="Only used for an existing OpenAI-compatible server">
+                        <input type="text" id="admin-only-server-name" placeholder="Name (optional, shown in fleet)" maxlength="100" aria-label="Operator-facing name (optional)">
+                        <button type="submit" id="admin-only-server-btn" class="btn btn-primary">Add Admin-only Server</button>
+                    </form>
+                    <p class="muted-status">Registers an already-running OpenAI-compatible server as admin-only (no provisioning); to provision a new managed node, use the dashboard's Manual setup.</p>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">Hostname</th>
+                                <th scope="col">Endpoint</th>
+                                <th scope="col">Model</th>
+                                <th scope="col">State</th>
+                                <th scope="col">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="admin-only-node-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="card">
+                <h2 class="card-title">Users</h2>
+                <p class="muted-status">Signed-in OAuth users; grant or revoke the admin role per user.</p>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">User</th>
+                                <th scope="col">Email</th>
+                                <th scope="col">Admin</th>
+                                <th scope="col">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="admin-user-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <footer>
+        <p>QIIP Inference Proxy</p>
+    </footer>
+
+    <script>const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};</script>
+    <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/admin.js') }}"></script>
+</body>
+</html>

@@ -50,9 +50,13 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Background model downloads** -- concurrent HuggingFace downloads with status tracking; duplicate-safe and re-downloadable after completion or failure
 - **Hardware-aware model recommendations** -- runs llmfit via SSH on a target host to produce ranked, runtime-normalized recommendations with fit levels, throughput, memory estimates, and typed GGUF sources; auto-installs the binary on first use
 - **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
-- **Admin authentication** -- HTTP Basic required on all `/admin/*` endpoints and `/dashboard*` pages
+- **Admin authentication** -- HTTP Basic credentials or a signed-in admin-role session (local-admin form or Google OAuth) on all `/admin/*` endpoints; browser pages gate with a sign-in page instead of 401ing
+- **Fleet sign-in gate** -- anonymous visitors to the fleet dashboard get a sign-in page with two options: **Sign in with Local Admin** (in-page username/password form that establishes a signed session cookie — no browser Basic challenge popup; HTTP Basic still works for scripts and SSE) and **Sign in with Google Auth** (same flow as the profile page)
+- **Admin roles** -- the HTTP Basic admin user (bootstrap authority) can grant or revoke the admin role to Google-authenticated users on the token dashboard (`/dashboard/tokens`); role admins then reach the admin surface through their session and see admin-only servers
+- **Admin-only inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). At `/v1` they are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with an `admin_only` badge in the admin fleet view. Token usage from admin-only servers is tracked on the token summary pages exactly like any other node
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
 - **User API tokens** -- each user can mint `qiip_...` bearer tokens on their profile page to call `/v1/chat/completions` and `/v1/completions`; tokens are stored as SHA-256 digests and can be revoked at any time
+- **Stable agent-config token** -- one derived per-user key (`agent-config`) is shared by every config download across servers and browsers; its raw value is derived from `auth.session_secret` + user + generation and never stored, so revoking it rotates the key embedded in already-downloaded configs (configuration downloads for admin-only servers require the Google session that can mint it)
 - **Config-gated inference auth** -- a valid `qiip_...` bearer token is always accepted on `/v1`; requiring a token for every `/v1` request (`auth.enforce_api_tokens`) is optional and off by default, so existing public deployments keep serving anonymous requests unchanged
 - **Token usage tracking** -- token-authenticated requests record OpenAI token usage per token/model for reporting on the profile page
 - **Backend endpoint allowlist** -- configurable hostname wildcard, CIDR network, and port allowlists; rejects non-matching registrations with loopback-only defaults
@@ -147,21 +151,24 @@ cp .env.example .env
 # INFERENCE_PROXY_ADMIN__PASSWORD values in .env
 
 # Run the gateway
-uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 8080
+uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 5000
 ```
 
 The gateway starts even when etcd or inference nodes are temporarily
 unavailable. Its discovery workers reconnect to etcd in the background, and
 inference requests become routable after a healthy node is registered.
 
-The administrative API and dashboard use HTTP Basic authentication, which sends
-base64-encoded credentials --not encryption --on every request. A trusted work LAN
-may use HTTP; use a TLS terminator whenever that network path is not trusted.
+The administrative JSON API accepts HTTP Basic credentials or a signed-in
+admin-role session; browser pages use a signed session cookie (local-admin
+form or Google OAuth) and never show a native Basic challenge. HTTP Basic
+sends base64-encoded credentials --not encryption --on every request. A trusted
+work LAN may use HTTP; use a TLS terminator whenever that network path is not
+trusted.
 
 ### Verify it's running
 
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:5000/health
 # {"status": "ok", "nodes_registered": 2}
 ```
 
@@ -169,7 +176,7 @@ curl http://localhost:8080/health
 
 ```bash
 # Non-streaming
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "meta-llama/Llama-3-8B-Instruct",
@@ -177,7 +184,7 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 
 # Streaming
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "meta-llama/Llama-3-8B-Instruct",
@@ -192,7 +199,7 @@ curl http://localhost:8080/v1/chat/completions \
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8080/v1",
+    base_url="http://localhost:5000/v1",
     api_key="not-needed",  # no auth in v1
 )
 
@@ -202,6 +209,25 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 ```
+
+### Deploy with systemd
+
+A production deployment ships a systemd unit (`systemd/inference-proxy.service`)
+matching the stage/dev convention: repo checkout at `/opt/inference-proxy`
+(uv-synced), settings in `/opt/inference-proxy/.env`, the service listening on
+port **5000**, and nginx terminating TLS and proxying to it
+(`nginx/nginx.conf`). Install it with:
+
+```bash
+sudo cp systemd/inference-proxy.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now inference-proxy
+```
+
+The unit runs as `root` because provisioning stores host SSH keys under
+`/root/.ssh`; tighten it if the deployment does not provision nodes. Use the
+same port (`5000`) for the gateway and the nginx upstream — a deployer mixing
+the quick-start port with the shipped unit behind nginx gets 502s.
 
 ### Chat playground
 
@@ -227,8 +253,16 @@ Public endpoints:
 | `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage |
 | `GET` | `/auth/login` | Start Google OAuth sign-in (302 to Google) |
 | `GET` | `/auth/callback` | Google redirect target; signs the session cookie |
+| `GET` | `/auth/local-admin` | Local admin login page entry (302 to `/dashboard`; the sign-in form POSTs here) |
+| `POST` | `/auth/local-admin` | Sign in as the local admin via the form; sets the session cookie and 302s to `/dashboard` |
 | `POST` | `/auth/logout` | Clear the session cookie |
 | `GET` | `/auth/me` | JSON identity of the signed-in user (401 when anonymous) |
+
+Fleet (any signed-in user, or HTTP Basic local admin):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/fleet/nodes` | Fleet view for non-admin viewers: registered nodes without admin-only servers or operational actions |
 
 User-session-protected profile endpoints (require `auth.session_secret` and a
 signed-in session):
@@ -237,12 +271,12 @@ signed-in session):
 |--------|------|-------------|
 | `GET` | `/profile/me` | Public identity of the signed-in user |
 | `GET` | `/profile/tokens` | List the user's API tokens (prefix only) |
-| `POST` | `/profile/tokens` | Mint a token; accepts an optional `endpoints` pin (hostnames); returns the raw secret exactly once |
+| `POST` | `/profile/tokens` | Mint a token; accepts an optional `endpoints` pin (hostnames); returns the raw secret exactly once (except `name: agent-config`, the reusable derived config key) |
 | `DELETE` | `/profile/tokens/{id}` | Revoke a token |
 | `GET` | `/profile/usage` | Aggregated usage per token/model plus headline totals |
 | `GET` | `/profile/endpoints` | Registered nodes the user may pin (unowned nodes plus nodes they own) |
 
-HTTP Basic-protected administrative endpoints:
+Admin-authenticated endpoints (HTTP Basic or admin-role session):
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -252,23 +286,29 @@ HTTP Basic-protected administrative endpoints:
 | `POST` | `/admin/models/download` | Start or inspect a duplicate-safe model download |
 | `GET` | `/admin/models/downloads` | List tracked model-download states |
 | `POST` | `/admin/nodes/setup` | Start background node provisioning |
-| `POST` | `/admin/nodes/pool` | Add a node to the available pool, or adopt an already-running OpenAI-compatible server (`self_setup`) |
+| `POST` | `/admin/nodes/pool` | Add a node to the available pool, or adopt an already-running OpenAI-compatible server; `"admin_only": true` registers an admin-only server (implies `self_setup`) |
 | `POST` | `/admin/nodes/{hostname}/llamacpp/relaunch` | Drain and relaunch a healthy managed llama.cpp node with a typed sizing policy |
 | `DELETE` | `/admin/nodes/{node_id}` | Drain and tear down a node; supports force and the scoped recovery procedure below |
 | `PATCH` | `/admin/nodes/{node_id}/owner` | Set or clear a node's owner email (`"owner": ""` clears it) |
+| `GET` | `/admin/users` | List Google users with token usage and `is_admin` |
+| `POST` | `/admin/users/{user_id}/admin` | Grant the admin role (204) |
+| `DELETE` | `/admin/users/{user_id}/admin` | Revoke the admin role (204) |
 | `GET` | `/admin/provisioning/tasks` | List provisioning task states |
 | `GET` | `/admin/provisioning/{hostname}/logs` | Stream provisioning logs over SSE |
 | `GET` | `/admin/quads/status` | QUADS integration and cache status |
 | `GET` | `/admin/nodes/{hostname}/power` | Read Redfish power state |
 | `POST` | `/admin/nodes/{hostname}/power` | Execute an allowed Redfish power action |
 | `GET` | `/admin/nodes/{hostname}/recommendations` | Run hardware-aware model recommendations |
-| `GET` | `/dashboard` | Authenticated operations dashboard |
+| `GET` | `/dashboard` | Authenticated operations dashboard; anonymous visitors get the sign-in page |
 | `GET` | `/dashboard/nodes/{node_id}` | Authenticated node detail page |
+| `GET` | `/dashboard/admin` | Admin page: manage admin-only inference servers (admin-role management lives on `/dashboard/tokens`) |
 
 ### Administrative access
 
-All `/admin/*` API endpoints and `/dashboard*` pages require the shared HTTP
-Basic credentials configured below. The inference API, chat page, profile page,
+All `/admin/*` API endpoints and `/dashboard` admin pages accept either the
+shared HTTP Basic credentials configured below or a signed-in Google user
+carrying the **admin role** (granted by the HTTP Basic admin user on the
+token dashboard at `/dashboard/tokens`). The inference API, chat page, profile page,
 and health endpoint are public; the inference API may additionally require a
 user API token (see [User authentication (Google OAuth)](#user-authentication-google-oauth)).
 For example:
@@ -277,6 +317,17 @@ For example:
 curl -u "$INFERENCE_PROXY_ADMIN__USERNAME:$INFERENCE_PROXY_ADMIN__PASSWORD" \
   http://gateway.example.com/admin/nodes
 ```
+
+The fleet page (`/dashboard`) is available to every authenticated viewer:
+anonymous visitors receive a sign-in page with **Sign in with Local Admin**
+(an in-page username/password form that creates a signed admin session; the
+browser native Basic prompt is no longer used, though HTTP Basic requests and
+SSE still pass through unchanged) and **Sign in with Google Auth** (the same
+flow as the profile page).
+Signed-in non-admin users see the fleet with admin-only servers removed, no
+operational actions, and nodes owned by another user excluded (ownership is
+private: `/v1/models` and the endpoint picker treat it the same way); node
+detail, model catalog, token dashboards, and the admin page remain admin-only.
 
 On a trusted work LAN, the administrative surface may run over HTTP. Anyone able
 to observe that traffic can recover the reusable credential, so deploy a
@@ -290,6 +341,31 @@ boundary: cross-origin JSON requests and all DELETE requests require a browser
 preflight. Do not add form-encoded, multipart, or plain-text state-changing
 admin endpoints without adding explicit CSRF protection. Authentication also
 does not protect an already-authenticated browser from same-origin XSS.
+
+### Admin-only inference servers
+
+`POST /admin/nodes/pool` with `"admin_only": true` (which implies `"self_setup":
+true`) registers an already-running OpenAI-compatible server as an
+**admin-only server**: no provisioning steps are performed, QIIP never owns its
+lifecycle, and its node id is the server hostname. Admin-only servers:
+
+- are routable only to bearer tokens of admin-role users or the
+  `admin_only_tokens_full_access` trust list — node selection, retries, and
+  `/v1/models` all enforce this (HTTP Basic covers UI surfaces only; `/v1`
+  accepts Bearer tokens, and anonymous/Basic callers are treated as unowned
+  and rejected by selection);
+- are never listed on the non-admin fleet page or in the public `/v1/models`
+  catalog; admins see them in `/admin/nodes` with `"admin_only": true`,
+  displayed bold with an `admin_only` badge;
+- track per-token usage on the profile and admin token summary pages exactly
+  like any other node;
+- may carry an operator-facing display `name` (e.g. `"DeepSeek-V4-Flash-Vision-Exp (qiip)"`)
+  that is shown in place of the raw short hostname in the admin fleet view;
+- are removed with the normal pool removal endpoint
+  (`DELETE /admin/nodes/{node_id}/pool`) — the server itself keeps running.
+
+The server URL host and port must satisfy the configured endpoint allowlist
+before registration is accepted.
 
 ### Node inventory identity
 
@@ -513,8 +589,9 @@ the signed user id and expiry.
 | `INFERENCE_PROXY_OAUTH__CLIENT_SECRET` | required (to enable) | Google OAuth 2.0 client secret, stored as a masked secret |
 | `INFERENCE_PROXY_OAUTH__REDIRECT_URI` | required (to enable) | Absolute `http(s)://` callback URI, e.g. `https://gateway.example.com/auth/callback` |
 | `INFERENCE_PROXY_OAUTH__ALLOWED_DOMAINS` | `[]` | JSON array of hosted domains allowed to sign in; empty allows any Google account |
+| `INFERENCE_PROXY_OAUTH__ALLOWED_REDIRECT_HOSTS` | `[]` | JSON array of extra hostnames that may start an OAuth flow (multi-name deployments behind one wildcard cert, e.g. `["inference-proxy.scalelab.redhat.com"]`); the callback returns to the hostname used to sign in. Hosts outside the list fall back to `REDIRECT_URI`, so single-name deployments are unchanged |
 | `INFERENCE_PROXY_AUTH__DB_PATH` | `data/qiip.db` | SQLite file holding users, token digests, and usage |
-| `INFERENCE_PROXY_AUTH__SESSION_SECRET` | required with OAuth | Long random secret signing the session cookie |
+| `INFERENCE_PROXY_AUTH__SESSION_SECRET` | required for browser sign-in | Long random secret signing the session cookie (local-admin form and Google OAuth) |
 | `INFERENCE_PROXY_AUTH__SESSION_COOKIE` | `qiip_session` | Session cookie name (alphanumeric plus `_` and `-`) |
 | `INFERENCE_PROXY_AUTH__SESSION_TTL_SECONDS` | `43200` | Session lifetime (300 to 7 days) |
 | `INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS` | `false` | Require a valid bearer token for every `/v1` inference request |
@@ -527,7 +604,7 @@ the signed user id and expiry.
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_CACHE_FILE` | unset | Optional flat-file cache of the last successful document (warm start + inspection, atomically replaced) |
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_EXTRA_USERS` | `[]` | Extra emails always allowed, merged over the fetched document |
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_EXTRA_DOMAINS` | `[]` | Extra domains where any username is allowed, merged over the fetched document |
-| `INFERENCE_PROXY_AUTH__ADMIN_ONLY_TOKENS_FULL_ACCESS` | `[]` | Emails whose tokens bypass endpoint scoping, owner isolation, and the SSO whitelist gate; they may pin tokens to any endpoint |
+| `INFERENCE_PROXY_AUTH__ADMIN_ONLY_TOKENS_FULL_ACCESS` | `[]` | Emails whose tokens get unrestricted access — no owner isolation, no endpoint pin, no SSO whitelist gate — but only when unpinned: stored pins are still honored; they may pin tokens to any endpoint |
 
 Enablement and guardrails:
 
@@ -609,7 +686,9 @@ Endpoint scoping (per-token pins and owner isolation):
   (`POST /profile/tokens` with `endpoints: ["host1.example.com"]`, selected
   via the profile page). A pinned token routes only to those nodes — node
   selection and retry/failover stay inside the pin — and requests whose
-  model exists only off-pin get the normal 404/503 error mapping.
+  model exists only off-pin get the normal 404/503 error mapping. The pin is
+  enforced for every token, admin-role and full-access tokens included
+  (admins may pin any registered node, but the pin still binds them).
 - Nodes may carry an `owner` (email) set at registration
   (`POST /admin/nodes/pool`, `POST /admin/nodes/setup`) or later with
   `PATCH /admin/nodes/{node_id}/owner` (empty string clears it). An owned
@@ -625,9 +704,10 @@ Endpoint scoping (per-token pins and owner isolation):
 - `/v1/models` never lists models served by owner-private nodes, so ownership
   stays private even on the public catalog.
 - `admin_only_tokens_full_access` is a small static trust list of emails.
-  Those users' tokens bypass the endpoint pin, owner isolation, and the SSO
-  whitelist gate (login, mint, and use time), and may pin tokens to any
-  endpoint. Tokens are still required and OAuth sign-in still applies.
+  Unpinned tokens of those users are unrestricted — no owner isolation, no
+  endpoint pin, no SSO whitelist gate (login, mint, and use time) — and they
+  may pin tokens to any endpoint; a stored pin is still enforced. Tokens are
+  still required and OAuth sign-in still applies.
 - Scoping is enforced at the gateway. Node detail pages and dashboards are
   admin-only (HTTP Basic), but backend origins are operator-visible
   surface: keep backends of owned nodes off untrusted networks, because a

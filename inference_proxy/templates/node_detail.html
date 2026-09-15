@@ -227,6 +227,10 @@
     <script>
         const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};
         const NODE_ID = {{ node_id | tojson }};
+        // Default false: any renderer without the flag gets the safe
+        // operational assumption (only guards never degrade instead of
+        // locking an admin out of the page).
+        const READ_ONLY = {{ read_only | default(false) | tojson }};
     </script>
     <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/config_download.js') }}"></script>

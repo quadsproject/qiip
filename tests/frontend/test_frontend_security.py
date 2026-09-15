@@ -32,6 +32,8 @@ class _TemplateRequest:
     def url_for(self, _name: str, **params: str) -> str:
         return f"/static/{params['path']}"
 
+    headers: dict[str, str] = {}
+
 
 def _node() -> str:
     executable = shutil.which("node")
@@ -93,6 +95,7 @@ const streamPayload = Buffer.from(
 );
 
 const sandbox = {
+  showToast: function () {},
   console,
   Buffer,
   TextDecoder: class {
@@ -206,6 +209,7 @@ function byId(id) {
 }
 
 const sandbox = {
+  showToast: function () {},
   console,
   document: {
     getElementById: byId,

@@ -49,21 +49,32 @@
                             <p class="profile-name" id="user-name"></p>
                             <p class="muted-status" id="user-email"></p>
                         </div>
-                        <button type="button" id="logout-btn" class="btn btn-neutral">Sign out</button>
                     </div>
                 </section>
 
                 <section class="card">
                     <h2 class="card-title">API Tokens <button type="button" class="manual-setup-toggle" id="token-toggle">+ New token</button></h2>
+                    <p id="token-required-note" class="signin-notice" hidden>
+                        Agent configuration downloads mint the per-user
+                        agent-config key on demand from your session (admin-only
+                        inference servers additionally require the admin role);
+                        no existing token is needed for them. Create a token
+                        below only if you need one for direct API use — it is
+                        shown only once.
+                    </p>
                     <form id="token-form" class="setup-form" hidden>
                         <input type="text" id="token-name" placeholder="Token name (e.g. ci-job, laptop)" maxlength="100" required aria-label="Token name">
-                        <div class="form-field">
-                            <label for="token-endpoints">Pin to endpoints (optional)</label>
-                            <select id="token-endpoints" multiple aria-label="Pin to endpoints">
-                                <option value="" disabled>No registered endpoints</option>
-                            </select>
-                            <p class="muted-status">Leave empty for full access to every endpoint you may reach.</p>
+                        <label id="token-endpoints-label">Pin to endpoints (optional)</label>
+                        <div class="endpoint-picker" id="endpoint-picker">
+                            <button type="button" id="endpoint-toggle" class="btn btn-neutral endpoint-toggle" aria-expanded="false" aria-controls="endpoint-list">
+                                <span id="endpoint-summary">All Endpoints (0 selected)</span>
+                                <span class="endpoint-caret" aria-hidden="true">▾</span>
+                            </button>
+                            <div class="endpoint-list" id="endpoint-list" hidden>
+                                <p class="muted-status endpoint-empty" id="endpoint-empty">No endpoints available to pin</p>
+                            </div>
                         </div>
+                        <select id="token-endpoints" multiple aria-label="Pin to endpoints" hidden></select>
                         <button type="submit" id="token-create-btn" class="btn btn-primary">Create</button>
                     </form>
                     <div id="token-secret" class="token-secret-box" hidden>

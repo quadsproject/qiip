@@ -24,17 +24,36 @@ def is_full_access(email: str, settings: Settings) -> bool:
     return any(item.lower() == normalized for item in listed)
 
 
+def has_admin_access(
+    email: str,
+    settings: Settings,
+    *,
+    is_admin: bool = False,
+) -> bool:
+    """Return True when *email* holds admin scope for inference routing.
+
+    Admin scope is the full-access trust list OR the admin role; scope
+    resolvers, the endpoint picker, and the token-mint surface all treat
+    them identically so the predicate never diverges.
+    """
+    return is_full_access(email, settings) or is_admin
+
+
 def allowed_node_ids(
     auth: TokenAuth | None,
     settings: Settings,
 ) -> frozenset[str] | None:
     """Return the hostnames a token may route to (None = no pin).
 
-    Anonymous requests and admin full-access tokens are unpinned; a
-    token with an endpoint scope is pinned to its stored hostnames.
+    A token with an endpoint scope is always pinned to its stored
+    hostnames -- admins included. Without this, an admin-role token that
+    ``create_token`` accepted a pin for would silently route to every
+    healthy node (the selector treats the token as unpinned), and the
+    token list would claim "pinned" while selection ignores it.
     An explicit empty list pins to nothing (no reachable endpoints).
+    Anonymous requests and unpinned tokens are unrestricted.
     """
-    if auth is None or is_full_access(auth.user.email, settings):
+    if auth is None:
         return None
     scope = auth.token.endpoint_scope
     if scope is None:
@@ -50,7 +69,7 @@ def scope_owner(auth: TokenAuth | None, settings: Settings) -> str | None:
     """
     if auth is None:
         return ""
-    if is_full_access(auth.user.email, settings):
+    if has_admin_access(auth.user.email, settings, is_admin=auth.user.is_admin):
         return None
     return auth.user.email.lower()
 
@@ -62,14 +81,16 @@ def auth_scope(
     """Resolve both selection filters for *auth* in one admin check.
 
     Returns ``(allowed_node_ids, owner)``; callers use the pair
-    together for node selection.
+    together for node selection. A stored endpoint pin binds every token,
+    admins included (the pin must never be silently ignored). Admin-role
+    users and the full-access trust list bypass only the owner filter.
     """
     if auth is None:
         return (None, "")
-    if is_full_access(auth.user.email, settings):
-        return (None, None)
     scope = auth.token.endpoint_scope
     allowed = frozenset(scope) if scope is not None else None
+    if has_admin_access(auth.user.email, settings, is_admin=auth.user.is_admin):
+        return (allowed, None)
     return (allowed, auth.user.email.lower())
 
 
@@ -77,16 +98,21 @@ def pickable_endpoints(
     user_email: str,
     settings: Settings,
     nodes: Iterable[Node],
+    *,
+    is_admin: bool = False,
 ) -> list[str]:
     """Return hostnames *user_email* may pin a token to, sorted.
 
     A user may pin unowned nodes and nodes they own; admins may pin
-    anything.
+    anything, including admin-only servers. Admin-only servers are never
+    pickable by non-admin callers.
     """
-    admin = is_full_access(user_email, settings)
+    admin = has_admin_access(user_email, settings, is_admin=is_admin)
     email = user_email.lower()
     pickable = []
     for node in nodes:
+        if not admin and node.admin_only:
+            continue
         if admin or not node.owner or node.owner.lower() == email:
             pickable.append(node.node_id)
     return sorted(pickable)

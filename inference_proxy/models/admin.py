@@ -54,6 +54,7 @@ class AdminNodeResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     node_id: str
+    name: str = ""
     endpoint: str
     model: str
     status: str
@@ -69,6 +70,7 @@ class AdminNodeResponse(BaseModel):
     gpu_count: int | None = None
     managed: bool = True
     self_setup: bool = False
+    admin_only: bool = False
     failed_step: str | None = None
     error: str | None = None
     owner: str = ""
@@ -95,6 +97,8 @@ class RegisterRequest(BaseModel):
 
     hostname: str
     self_setup: bool = False
+    admin_only: bool = False
+    name: str = Field(default="", max_length=256)
     port: int | None = Field(default=None, ge=1, le=65535)
     owner: str = ""
 
@@ -103,10 +107,27 @@ class RegisterRequest(BaseModel):
     def validate_hostname(cls, v: str) -> str:
         return clean_hostname(v)
 
+    @field_validator("name")
+    @classmethod
+    def strip_name(cls, v: str) -> str:
+        return v.strip()
+
     @field_validator("owner")
     @classmethod
     def validate_owner(cls, v: str) -> str:
         return clean_owner(v)
+
+    @model_validator(mode="before")
+    @classmethod
+    def admin_only_implies_self_setup(cls, data: object) -> object:
+        """An admin-only server is always an adopted existing server."""
+        if (
+            isinstance(data, dict)
+            and data.get("admin_only")
+            and not data.get("self_setup")
+        ):
+            return {**data, "self_setup": True}
+        return data
 
 
 class OwnerUpdateRequest(BaseModel):

@@ -1,36 +1,5 @@
 // ponytail: vanilla fetch + DOM, no framework needed
 
-function showToast(message, type, options) {
-  const container = document.getElementById("toast-container");
-  const toast = document.createElement("div");
-  toast.className = "toast toast-" + (type || "info");
-  const persistent = options && options.persistent;
-  if (persistent) {
-    const text = document.createElement("span");
-    text.textContent = message;
-    toast.appendChild(text);
-    const btn = document.createElement("button");
-    btn.className = "toast-close";
-    btn.textContent = "×";
-    btn.setAttribute("aria-label", "Dismiss");
-    btn.addEventListener("click", () => {
-      toast.classList.remove("toast-visible");
-      setTimeout(() => toast.remove(), 300);
-    });
-    toast.appendChild(btn);
-  } else {
-    toast.textContent = message;
-  }
-  container.appendChild(toast);
-  requestAnimationFrame(() => toast.classList.add("toast-visible"));
-  if (!persistent) {
-    setTimeout(() => {
-      toast.classList.remove("toast-visible");
-      setTimeout(() => toast.remove(), 300);
-    }, 4000);
-  }
-}
-
 // ponytail: data-driven action dispatch replaces per-action functions
 const ACTION_CONFIG = {
   setup: {
@@ -122,6 +91,18 @@ let openConfigMenuNode = null;
 let dashboardPollInFlight = false;
 let dashboardRequestSequence = 0;
 let dashboardLastRenderedSequence = 0;
+// Non-admin viewers use the trimmed fleet endpoint; admin-only nodes and
+// operational actions never reach them. VIEWER_ROLE is always rendered by
+// the dashboard HTML as a top-level `const`, which does NOT create a
+// window property -- read the lexical binding, with a window fallback for
+// legacy/test shells. The admin default covers those shells only.
+const viewerRole =
+  typeof window.VIEWER_ROLE !== "undefined"
+    ? window.VIEWER_ROLE
+    : typeof VIEWER_ROLE !== "undefined"
+      ? VIEWER_ROLE
+      : "admin";
+const viewerAdmin = viewerRole !== "user";
 
 async function handleAction(action, nodeId, node, onStart) {
   const config = ACTION_CONFIG[action];
@@ -231,55 +212,67 @@ async function refreshDashboard() {
   const lastUpdatedEl = document.getElementById("last-updated");
   const warningEl = document.getElementById("poll-warning");
   try {
-    const [nodesResp, metricsResp, quadsResp] = await Promise.all([
-      fetch("/admin/nodes"),
-      fetch("/admin/metrics"),
-      fetch("/admin/quads/status"),
-    ]);
+    // Admin viewers get the full operational view; signed-in non-admins get
+    // the trimmed fleet view (admin-only servers and actions already stripped
+    // server-side).
+    const nodesResp = viewerAdmin
+      ? await fetch("/admin/nodes")
+      : await fetch("/fleet/nodes");
     if (!nodesResp.ok) throw new Error(`HTTP ${nodesResp.status}`);
-    if (!metricsResp.ok) throw new Error(`HTTP ${metricsResp.status}`);
     const nodes = await nodesResp.json();
-    const metrics = await metricsResp.json();
-    const perNode = metrics.per_node || {};
+    let perNode = {};
 
-    if (requestSequence < dashboardLastRenderedSequence) return false;
-    dashboardLastRenderedSequence = requestSequence;
+    if (viewerAdmin) {
+      const [metricsResp, quadsResp] = await Promise.all([
+        fetch("/admin/metrics"),
+        fetch("/admin/quads/status"),
+      ]);
+      if (!metricsResp.ok) throw new Error(`HTTP ${metricsResp.status}`);
+      const metrics = await metricsResp.json();
+      perNode = metrics.per_node || {};
 
-    // ponytail: graceful degradation if QUADS endpoint unavailable
-    if (quadsResp.ok) {
-      renderQuadsStatus(await quadsResp.json());
-    }
+      if (requestSequence < dashboardLastRenderedSequence) return false;
+      dashboardLastRenderedSequence = requestSequence;
 
-    // Grand-total token budget saved for all users (RFE #113). Non-fatal:
-    // the fleet table must render even if the billing endpoint errors, and a
-    // stale figure must not survive a failed refresh.
-    let billing = null;
-    try {
-      const billingResp = await fetch("/admin/billing");
-      if (billingResp.ok) billing = await billingResp.json();
-    } catch (_err) {
-      billing = null;
-    }
-    const budgetEl = document.getElementById("token-budget");
-    if (budgetEl) {
-      if (
-        billing &&
-        billing.totals &&
-        typeof billing.totals.request_count === "number" &&
-        typeof billing.totals.total_tokens === "number"
-      ) {
-        const total = billing.totals.total_tokens || 0;
-        budgetEl.textContent =
-          `Token budget saved for all token-attributed requests: ${total.toLocaleString()} tokens` +
-          ` (${billing.totals.request_count.toLocaleString()} requests), ` +
-          `equivalent to $${Number(billing.estimated_cost_usd).toLocaleString(
-            undefined,
-            { minimumFractionDigits: 2, maximumFractionDigits: 2 }
-          )} at ${billing.model_label} rates`;
-        budgetEl.hidden = false;
-      } else {
-        budgetEl.hidden = true;
+      // ponytail: graceful degradation if QUADS endpoint unavailable
+      if (quadsResp.ok) {
+        renderQuadsStatus(await quadsResp.json());
       }
+
+      // Grand-total token budget saved for all users (RFE #113). Non-fatal:
+      // the fleet table must render even if the billing endpoint errors, and a
+      // stale figure must not survive a failed refresh.
+      let billing = null;
+      try {
+        const billingResp = await fetch("/admin/billing");
+        if (billingResp.ok) billing = await billingResp.json();
+      } catch (_err) {
+        billing = null;
+      }
+      const budgetEl = document.getElementById("token-budget");
+      if (budgetEl) {
+        if (
+          billing &&
+          billing.totals &&
+          typeof billing.totals.request_count === "number" &&
+          typeof billing.totals.total_tokens === "number"
+        ) {
+          const total = billing.totals.total_tokens || 0;
+          budgetEl.textContent =
+            `Token budget saved for all token-attributed requests: ${total.toLocaleString()} tokens` +
+            ` (${billing.totals.request_count.toLocaleString()} requests), ` +
+            `equivalent to $${Number(billing.estimated_cost_usd).toLocaleString(
+              undefined,
+              { minimumFractionDigits: 2, maximumFractionDigits: 2 }
+            )} at ${billing.model_label} rates`;
+          budgetEl.hidden = false;
+        } else {
+          budgetEl.hidden = true;
+        }
+      }
+    } else {
+      if (requestSequence < dashboardLastRenderedSequence) return false;
+      dashboardLastRenderedSequence = requestSequence;
     }
 
     renderTaskDataWarning(nodesResp, warningEl);
@@ -301,9 +294,12 @@ async function refreshDashboard() {
         const tr = document.createElement("tr");
 
         const tdId = document.createElement("td");
+        // Every viewer may open the node detail page: non-admins get the
+        // read-only view (node info, provisioning tasks, installation log —
+        // no setup/teardown/remove/power), admins the operational page.
         const idLink = document.createElement("a");
         idLink.href = "/dashboard/nodes/" + encodeURIComponent(node.node_id);
-        idLink.textContent = node.node_id.split(".")[0];
+        idLink.textContent = node.name || node.node_id.split(".")[0];
         idLink.title = node.node_id;
         tdId.appendChild(idLink);
         if (node.self_setup) {
@@ -316,6 +312,14 @@ async function refreshDashboard() {
           const tag = document.createElement("span");
           tag.className = "badge badge-standalone";
           tag.textContent = "standalone";
+          tdId.appendChild(document.createTextNode(" "));
+          tdId.appendChild(tag);
+        }
+        if (node.admin_only) {
+          idLink.classList.add("node-id-admin-only");
+          const tag = document.createElement("span");
+          tag.className = "badge badge-admin-only";
+          tag.textContent = "admin_only";
           tdId.appendChild(document.createTextNode(" "));
           tdId.appendChild(tag);
         }
@@ -344,7 +348,8 @@ async function refreshDashboard() {
             function (menuOpen) {
               openActionMenuNode = null;
               openConfigMenuNode = menuOpen ? node.node_id : null;
-            }
+            },
+            node
           );
           if (openConfigMenuNode === node.node_id) {
             const cfgMenu = cfgDropdown.querySelector(".action-menu");
@@ -514,6 +519,10 @@ document.addEventListener("DOMContentLoaded", function () {
   // Manual setup toggle (D-05)
   const toggle = document.getElementById("manual-setup-toggle");
   const setupRow = document.getElementById("manual-setup-row");
+  if (!viewerAdmin) {
+    // Fleet pages owned by signed-in non-admins never expose pool mutation.
+    toggle.style.display = "none";
+  }
   toggle.addEventListener("click", function (e) {
     e.preventDefault();
     if (setupRow.style.display === "none") {

@@ -8,6 +8,7 @@ from inference_proxy.auth.models import ApiToken, TokenAuth, User
 from inference_proxy.auth.scopes import (
     allowed_node_ids,
     auth_scope,
+    has_admin_access,
     is_full_access,
     pickable_endpoints,
     scope_owner,
@@ -20,23 +21,27 @@ def _settings(admins: list[str] | None = None) -> Settings:
     return Settings(auth=AuthSettings(admin_only_tokens_full_access=admins or []))
 
 
-def _user(email: str = "alice@example.com") -> User:
+def _user(email: str = "alice@example.com", *, is_admin: bool = False) -> User:
     return User(
         id=1,
         google_sub="sub-1",
         email=email,
         name="Alice",
         picture="",
+        is_admin=is_admin,
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
 
 
 def _auth(
-    email: str = "alice@example.com", scopes: list[str] | None = None
+    email: str = "alice@example.com",
+    scopes: list[str] | None = None,
+    *,
+    is_admin: bool = False,
 ) -> TokenAuth:
     return TokenAuth(
-        user=_user(email),
+        user=_user(email, is_admin=is_admin),
         token=ApiToken(
             id=1,
             user_id=1,
@@ -61,6 +66,22 @@ class TestIsFullAccess:
         assert not is_full_access("ops@example.com", _settings())
 
 
+class TestHasAdminAccess:
+    def test_full_access_trust_list(self) -> None:
+        assert has_admin_access("ops@example.com", _settings(["ops@example.com"]))
+
+    def test_admin_role_only(self) -> None:
+        # An admin-role user who is NOT on the trust list still holds admin
+        # scope — the token-mint surface and picker must agree (RFE #107).
+        assert has_admin_access("alice@example.com", _settings(), is_admin=True)
+
+    def test_neither_is_not_admin(self) -> None:
+        assert not has_admin_access("alice@example.com", _settings())
+        assert not has_admin_access(
+            "alice@example.com", _settings(["ops@example.com"]), is_admin=False
+        )
+
+
 class TestAllowedNodeIds:
     def test_anonymous_is_unpinned(self) -> None:
         assert allowed_node_ids(None, _settings()) is None
@@ -71,10 +92,20 @@ class TestAllowedNodeIds:
 
     def test_scoped_token_is_pinned(self) -> None:
         auth = _auth("ops@example.com", scopes=["h1", "h2"])
-        assert allowed_node_ids(auth, _settings(["ops@example.com"])) is None
+        # A stored pin binds every token, admins included (regression: the
+        # selector used to ignore the pin for admin callers, silently routing
+        # the token everywhere).
+        assert allowed_node_ids(auth, _settings(["ops@example.com"])) == frozenset(
+            {"h1", "h2"}
+        )
         assert allowed_node_ids(_auth(scopes=["h1", "h2"]), _settings()) == frozenset(
             {"h1", "h2"}
         )
+
+    def test_admin_role_pin_is_enforced(self) -> None:
+        auth = _auth("alice@example.com", scopes=["h1"], is_admin=True)
+        assert allowed_node_ids(auth, _settings()) == frozenset({"h1"})
+        assert auth_scope(auth, _settings()) == (frozenset({"h1"}), None)
 
     def test_unscoped_token_is_unpinned(self) -> None:
         assert allowed_node_ids(_auth(), _settings()) is None

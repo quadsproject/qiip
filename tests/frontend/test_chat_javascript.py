@@ -154,6 +154,7 @@ function byId(id) {
 }
 
 const sandbox = {
+  showToast: function () {},
   console,
   Buffer,
   TextDecoder,
@@ -314,6 +315,7 @@ byId("system-prompt-toggle").setAttribute("aria-expanded", "false");
 
 const templateMessage = "Conversation roles must alternate user/assistant/user/assistant/...";
 const sandbox = {
+  showToast: function () {},
   console,
   Buffer,
   TextDecoder,

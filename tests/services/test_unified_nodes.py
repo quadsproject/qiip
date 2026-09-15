@@ -52,6 +52,8 @@ def _node(
     artifact_id: str | None = None,
     llamacpp_runtime: LlamaCppRuntimeState | None = None,
     self_setup: bool = False,
+    owner: str = "",
+    admin_only: bool = False,
 ) -> Node:
     return Node(
         node_id=node_id,
@@ -63,6 +65,8 @@ def _node(
         artifact_id=artifact_id,
         llamacpp_runtime=llamacpp_runtime,
         self_setup=self_setup,
+        owner=owner,
+        admin_only=admin_only,
     )
 
 
@@ -335,6 +339,52 @@ class TestFiltering:
         nodes = svc.get_unified_nodes()
         assert len(nodes) == 1
         assert nodes[0].state == "healthy"
+
+
+class TestFleetOwnershipFiltering:
+    """Non-admin fleet view: nodes owned by another user are excluded
+    (RFE-107 privacy, matching /v1/models and the endpoint picker)."""
+
+    def _registry(self) -> NodeRegistry:
+        registry = NodeRegistry()
+        registry.add(_node("shared-1", owner=""))
+        registry.add(_node("mine-1", owner="alice@example.com"))
+        registry.add(_node("theirs-1", owner="bob@example.com"))
+        registry.add(_node("secret-1", owner="bob@example.com", admin_only=True))
+        return registry
+
+    def test_other_users_owned_nodes_excluded(self) -> None:
+        svc = _service(registry=self._registry(), include_poller=False)
+
+        nodes = svc.get_unified_nodes(
+            viewer_admin=False, viewer_email="alice@example.com"
+        )
+
+        assert [n.node_id for n in nodes] == ["mine-1", "shared-1"]
+        assert all(n.owner == "" for n in nodes)
+
+    def test_viewer_without_google_identity_keeps_others_nodes(self) -> None:
+        """Local-admin / Basic viewers (no Google email) keep the current
+        non-admin_only set: ownership exclusion needs the viewer identity."""
+        svc = _service(registry=self._registry(), include_poller=False)
+
+        nodes = svc.get_unified_nodes(viewer_admin=False, viewer_email=None)
+
+        assert [n.node_id for n in nodes] == ["mine-1", "shared-1", "theirs-1"]
+
+    def test_admin_view_ignores_ownership(self) -> None:
+        svc = _service(registry=self._registry(), include_poller=False)
+
+        nodes = svc.get_unified_nodes(
+            viewer_admin=True, viewer_email="alice@example.com"
+        )
+
+        assert [n.node_id for n in nodes] == [
+            "mine-1",
+            "secret-1",
+            "shared-1",
+            "theirs-1",
+        ]
 
 
 class TestGracefulDegradation:

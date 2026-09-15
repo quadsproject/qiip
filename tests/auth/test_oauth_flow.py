@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
@@ -14,17 +14,34 @@ from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.settings import OAuthSettings, Settings
 
-from .conftest import FakeAllowlist, FakeAuthPluginBuilder
+from .conftest import FakeAllowlist, FakeAuthPlugin, FakeAuthPluginBuilder
+
+
+class _RecordingPlugin(FakeAuthPlugin):
+    """FakeAuthPlugin that records the redirect_uri passed to start_login."""
+
+    def __init__(
+        self,
+        userinfo: dict[str, object] | None = None,
+        error: str | None = None,
+    ) -> None:
+        super().__init__(userinfo, error)
+        self.last_redirect_uri: str | None = None
+
+    async def start_login(self, request: Request, redirect_uri: str):  # type: ignore[no-untyped-def]
+        self.last_redirect_uri = redirect_uri
+        return await super().start_login(request, redirect_uri)
 
 
 def _client_with_auth(
     app: FastAPI,
     auth: object,
     settings: Settings,
+    base_url: str = "http://testserver",
 ) -> TestClient:
     app.dependency_overrides[get_auth_plugin] = lambda: auth
     app.dependency_overrides[get_settings] = lambda: settings
-    return TestClient(app)
+    return TestClient(app, base_url=base_url)
 
 
 class TestOAuthLogin:
@@ -48,6 +65,65 @@ class TestOAuthLogin:
         assert response.headers["location"].startswith(
             "https://accounts.google.com/o/oauth2/auth"
         )
+
+    def test_login_uses_request_host_when_allowlisted(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+    ) -> None:
+        """Multi-name deployments send the callback to the hostname the user
+        started from, so the OAuth state nonce (host-scoped cookie) is still
+        visible at the callback (regression: bare-name sign-in always failed
+        with "Sign-in was not completed")."""
+        oauth = OAuthSettings(
+            client_id="123.apps.googleusercontent.com",
+            client_secret=SecretStr("s3cret"),
+            redirect_uri="https://proxy.example.com/auth/callback",
+            allowed_redirect_hosts=["inference-proxy.scalelab.redhat.com"],
+        )
+        settings = test_settings.model_copy(update={"oauth": oauth})
+        plugin = _RecordingPlugin()
+        client = _client_with_auth(
+            app,
+            plugin,
+            settings,
+            base_url="https://inference-proxy.scalelab.redhat.com",
+        )
+
+        response = client.get("/auth/login", follow_redirects=False)
+
+        assert response.status_code == 302
+        assert (
+            plugin.last_redirect_uri
+            == "https://inference-proxy.scalelab.redhat.com/auth/callback"
+        )
+
+    def test_login_falls_back_to_configured_uri_for_unlisted_host(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+    ) -> None:
+        """A never-trusted Host header can never steer the redirect: any host
+        outside the allowlist uses the configured redirect_uri, so single-name
+        deployments are unchanged."""
+        oauth = OAuthSettings(
+            client_id="123.apps.googleusercontent.com",
+            client_secret=SecretStr("s3cret"),
+            redirect_uri="https://proxy.example.com/auth/callback",
+        )
+        settings = test_settings.model_copy(update={"oauth": oauth})
+        plugin = _RecordingPlugin()
+        client = _client_with_auth(
+            app,
+            plugin,
+            settings,
+            base_url="https://evil.example.com",
+        )
+
+        response = client.get("/auth/login", follow_redirects=False)
+
+        assert response.status_code == 302
+        assert plugin.last_redirect_uri == "https://proxy.example.com/auth/callback"
 
     def test_login_returns_404_when_oauth_disabled(self, app: FastAPI) -> None:
         client = TestClient(app)
@@ -358,6 +434,24 @@ class TestAuthMe:
         payload: dict[str, Any] = me.json()
         assert payload["id"] >= 1
 
+    def test_me_reports_admin_role_after_grant(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        make_fake_auth_plugin: FakeAuthPluginBuilder,
+        auth_store: AuthStore,
+    ) -> None:
+        """/auth/me must surface the live admin role (regression)."""
+        client = _client_with_auth(app, make_fake_auth_plugin(), test_settings)
+        client.get("/auth/callback?code=code&state=state", follow_redirects=False)
+
+        me = client.get("/auth/me").json()
+        assert me["is_admin"] is False
+
+        assert auth_store.set_user_admin(me["id"], True)
+        me = client.get("/auth/me").json()
+        assert me["is_admin"] is True
+
 
 class TestOAuthLogout:
     def test_logout_without_sessions_redirects(self, test_settings: Settings) -> None:
@@ -374,7 +468,7 @@ class TestOAuthLogout:
         response = client.post("/auth/logout", follow_redirects=False)
 
         assert response.status_code == 302
-        assert response.headers["location"] == "/profile"
+        assert response.headers["location"] == "/dashboard"
 
     def test_logout_clears_session(
         self,

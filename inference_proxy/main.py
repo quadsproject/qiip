@@ -37,7 +37,11 @@ from inference_proxy.api.auth import auth_router
 from inference_proxy.api.chat import chat_router
 from inference_proxy.api.dashboard import dashboard_router
 from inference_proxy.api.errors import ApiAuthError
-from inference_proxy.api.middleware import RequestLoggingMiddleware
+from inference_proxy.api.fleet import fleet_router
+from inference_proxy.api.middleware import (
+    NoStoreMiddleware,
+    RequestLoggingMiddleware,
+)
 from inference_proxy.api.profile import profile_router
 from inference_proxy.api.routes import router
 from inference_proxy.auth.allowlist import SSOAllowlist
@@ -545,9 +549,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    application.state.settings = resolved_settings
     application.dependency_overrides[get_settings] = lambda: resolved_settings
 
     application.add_middleware(RequestLoggingMiddleware)
+    application.add_middleware(NoStoreMiddleware)
 
     if resolved_settings.auth.session_secret is not None:
         application.add_middleware(
@@ -595,6 +601,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(admin_router)
     application.include_router(admin_tokens_router)
     application.include_router(dashboard_router)
+    application.include_router(fleet_router)
     application.include_router(chat_router)
     application.include_router(auth_router)
     application.include_router(profile_router)

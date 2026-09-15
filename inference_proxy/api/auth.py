@@ -17,11 +17,14 @@ leaves the user on a bare error screen.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Annotated
+from urllib.parse import urlsplit
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
+from pydantic import BaseModel, ValidationError
 
 from inference_proxy.auth.allowlist import (
     AllowlistUnavailableError,
@@ -37,12 +40,14 @@ from inference_proxy.auth.dependencies import (
 from inference_proxy.auth.models import PublicUser, User
 from inference_proxy.auth.scopes import is_full_access
 from inference_proxy.auth.session import (
+    clear_local_admin_session,
     clear_session_user,
     get_session_user_id,
+    set_local_admin_session,
     set_session_user,
 )
 from inference_proxy.auth.store import AuthStore
-from inference_proxy.config.dependencies import get_settings
+from inference_proxy.config.dependencies import _credentials_match, get_settings
 from inference_proxy.config.settings import Settings
 from inference_proxy.plugins.interfaces.auth import AuthCallbackError, AuthPlugin
 
@@ -51,11 +56,100 @@ logger = structlog.get_logger()
 auth_router = APIRouter(prefix="/auth", tags=["auth"])
 
 _PROFILE_HOME = "/profile"
+_DASHBOARD_HOME = "/dashboard"
 
 
 def _error_redirect(error: str) -> RedirectResponse:
     """Redirect back to the profile page carrying a short error code."""
     return RedirectResponse(f"{_PROFILE_HOME}?error={error}", status_code=302)
+
+
+class LocalAdminLogin(BaseModel):
+    """JSON body for the local-admin sign-in form (JSON-only CSRF boundary)."""
+
+    username: str
+    password: str
+
+
+def _oauth_redirect_uri(request: Request, settings: Settings) -> str | None:
+    """Return the provider callback URI for this request, host-aware.
+
+    Multi-name deployments (e.g. one wildcard certificate serving several
+    hostnames) must return the user to the *same* hostname they started the
+    flow from; otherwise the OAuth state nonce — stored in the host-scoped
+    session cookie at ``/auth/login`` — is invisible to the callback and
+    the sign-in fails. When the request host is allowlisted (including the
+    ``redirect_uri`` host itself) the callback URI is therefore rebuilt
+    from the request host; any other host falls back to the configured
+    ``redirect_uri`` so a never-trusted ``Host`` header can never steer
+    the flow.
+    """
+    configured = settings.oauth.redirect_uri
+    if configured is None:
+        return None
+    configured_host = urlsplit(configured).hostname
+    allowed = {host.lower() for host in settings.oauth.allowed_redirect_hosts}
+    if configured_host:
+        allowed.add(configured_host.lower())
+    host = request.url.hostname
+    if host and host.lower() in allowed:
+        return f"{request.url.scheme}://{host}/auth/callback"
+    return configured
+
+
+@auth_router.get("/local-admin")
+async def local_admin_login_page() -> RedirectResponse:
+    """Send direct visitors to the sign-in page (no Basic challenge popup)."""
+    return RedirectResponse(_DASHBOARD_HOME, status_code=302)
+
+
+@auth_router.post("/local-admin")
+async def local_admin_login(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Response:
+    """Sign in as the local admin through the sign-in page form.
+
+    Accepts a JSON body (``{"username": ..., "password": ...}``) — the same
+    JSON-only state-changing convention as the admin API, so the login cannot
+    be CSRF'd by a cross-origin form (a browser form can only send
+    ``text/plain``-style bodies that never pass preflight). On success a
+    signed session cookie is set and the browser is redirected to the fleet
+    page; invalid credentials return 401 with a visible error message.
+    """
+    if settings.auth.session_secret is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Session storage is not configured; cannot sign in via the form",
+        )
+    media_type = request.headers.get("content-type", "").partition(";")[0].lower()
+    if media_type != "application/json":
+        raise HTTPException(
+            status_code=415,
+            detail="Login requires Content-Type: application/json",
+        )
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=422, detail="Login body must be valid JSON"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Login body must be a JSON object")
+    try:
+        body = LocalAdminLogin.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422, detail="Login body must be a JSON object"
+        ) from exc
+    username = body.username.strip()
+    password = body.password
+    if not _credentials_match(username, password, settings):
+        logger.warning("local admin login rejected", username=username)
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    set_local_admin_session(request, settings.auth.session_ttl_seconds)
+    logger.info("local admin signed in")
+    return RedirectResponse(_DASHBOARD_HOME, status_code=302)
 
 
 @auth_router.get("/login")
@@ -71,7 +165,7 @@ async def oauth_login(
     """
     if get_session_user_id(request) is not None:
         return RedirectResponse(_PROFILE_HOME, status_code=302)
-    redirect_uri = settings.oauth.redirect_uri
+    redirect_uri = _oauth_redirect_uri(request, settings)
     if redirect_uri is None:
         raise HTTPException(
             status_code=503, detail="OAuth redirect URI is not configured"
@@ -156,7 +250,8 @@ async def oauth_logout(
     """
     if settings.auth.session_secret is not None:
         clear_session_user(request)
-    return RedirectResponse(_PROFILE_HOME, status_code=302)
+        clear_local_admin_session(request)
+    return RedirectResponse(_DASHBOARD_HOME, status_code=302)
 
 
 @auth_router.get("/me")
@@ -167,4 +262,5 @@ async def oauth_me(user: Annotated[User, Depends(require_profile_user)]) -> Publ
         email=user.email,
         name=user.name,
         picture=user.picture,
+        is_admin=user.is_admin,
     )

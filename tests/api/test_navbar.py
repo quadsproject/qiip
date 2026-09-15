@@ -9,12 +9,16 @@ others -- which is the exact failure the shared partial prevents.
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from inference_proxy.api.templating import templates
+from inference_proxy.config.dependencies import get_settings
+from inference_proxy.config.settings import Settings
 
 _TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "inference_proxy" / "templates"
 _PARTIAL = _TEMPLATES_DIR / "partials" / "navbar.html"
@@ -33,6 +37,8 @@ _ALL_PAGES = (
 class _TemplateRequest:
     def url_for(self, _name: str, **params: str) -> str:
         return f"/static/{params['path']}"
+
+    headers: dict[str, str] = {}
 
 
 class TestNavbarRenderedOnEveryPage:
@@ -157,6 +163,26 @@ class TestNavbarIsSingleSourceOfTruth:
         assert 'class="nav-link' not in text
 
 
+class TestNavbarLogout:
+    """The Logout control appears for every signed-in viewer, next to the theme toggle."""
+
+    def test_logout_visible_for_basic_admin(self, client: TestClient) -> None:
+        response = client.get("/chat")
+
+        assert response.status_code == 200
+        assert ">Logout</button>" in response.text
+        # Placed just left of the theme toggle.
+        assert response.text.index(">Logout</button>") < response.text.index(
+            'class="theme-toggle"'
+        )
+
+    def test_logout_hidden_for_anonymous(self, app: FastAPI) -> None:
+        response = TestClient(app).get("/chat")
+
+        assert response.status_code == 200
+        assert ">Logout</button>" not in response.text
+
+
 class TestNavbarRendersDirectly:
     """The partial renders in isolation (used by frontend security harness)."""
 
@@ -167,3 +193,27 @@ class TestNavbarRendersDirectly:
         )
         assert '<nav class="top-bar" aria-label="Primary">' in rendered
         assert '<a href="/profile"' in rendered
+
+
+def test_navbar_resolves_app_settings_not_env(
+    app: FastAPI,
+    test_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (sjug review): the navbar helpers called get_settings()
+    directly, bypassing create_app(settings=...). An injected app therefore
+    showed the wrong admin links (or failed to render) when the environment
+    held different or missing credentials.
+    """
+    monkeypatch.setenv("INFERENCE_PROXY_ADMIN__USERNAME", "other-admin")
+    monkeypatch.setenv("INFERENCE_PROXY_ADMIN__PASSWORD", "other-pass")
+    get_settings.cache_clear()
+
+    token = base64.b64encode(b"test-admin:test-password").decode()
+    client = TestClient(app, headers={"Authorization": "Basic " + token})
+    response = client.get("/dashboard")
+
+    assert response.status_code == 200
+    # Admin-only navigation is visible because the navbar resolves the same
+    # settings the app was created with (test_settings), not the env cache.
+    assert '<a href="/dashboard/tokens"' in response.text

@@ -9,7 +9,9 @@ from starlette.requests import Request
 
 from inference_proxy.auth.session import (
     clear_session_user,
+    get_local_admin_session,
     get_session_user_id,
+    set_local_admin_session,
     set_session_user,
 )
 
@@ -59,3 +61,45 @@ class TestSessionHelpers:
 
         assert get_session_user_id(_as_request(request)) is None
         assert request.session == {}
+
+    def test_google_login_clears_local_admin_marker(self) -> None:
+        request = _SessionRequest()
+        set_local_admin_session(_as_request(request), 3600)
+        assert get_local_admin_session(_as_request(request)) is True
+
+        set_session_user(_as_request(request), 42, ttl_seconds=3600)
+
+        assert get_session_user_id(_as_request(request)) == 42
+        assert get_local_admin_session(_as_request(request)) is False
+
+    def test_local_admin_login_clears_google_user(self) -> None:
+        request = _SessionRequest()
+        set_session_user(_as_request(request), 42, ttl_seconds=3600)
+
+        set_local_admin_session(_as_request(request), 3600)
+
+        assert get_session_user_id(_as_request(request)) is None
+        assert get_local_admin_session(_as_request(request)) is True
+
+
+class _NoMiddlewareRequest:
+    """Starlette's ``Request.session`` raises ``AssertionError`` (not
+    ``AttributeError``) when ``SessionMiddleware`` is not installed
+    (starlette/requests.py:170-171) — the no-session-secret deployment."""
+
+    @property
+    def session(self) -> dict[str, object]:
+        raise AssertionError(
+            "SessionMiddleware must be installed to access request.session"
+        )
+
+
+class TestMissingSessionMiddleware:
+    """Regression (second review, blocking): a Basic-only deployment (no
+    ``auth.session_secret``) must never 500 while reading the session."""
+
+    def test_get_session_user_id_returns_none(self) -> None:
+        assert get_session_user_id(cast(Request, _NoMiddlewareRequest())) is None
+
+    def test_get_local_admin_session_returns_false(self) -> None:
+        assert get_local_admin_session(cast(Request, _NoMiddlewareRequest())) is False

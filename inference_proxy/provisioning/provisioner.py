@@ -1332,7 +1332,12 @@ class NodeProvisioner:
             self._registry.add(node)
 
     async def register_self_setup(
-        self, hostname: str, port: int | None = None, owner: str = ""
+        self,
+        hostname: str,
+        port: int | None = None,
+        owner: str = "",
+        admin_only: bool = False,
+        name: str = "",
     ) -> Node:
         """Adopt an already-running OpenAI-compatible server into the fleet.
 
@@ -1375,6 +1380,7 @@ class NodeProvisioner:
             )
         node = Node(
             node_id=hostname,
+            name=name,
             endpoint=endpoint,
             status=NodeStatus.HEALTHY,
             model=model,
@@ -1382,6 +1388,7 @@ class NodeProvisioner:
             last_heartbeat=datetime.now(UTC),
             managed=False,
             self_setup=True,
+            admin_only=admin_only,
             owner=owner,
         )
         key, value = node_to_etcd(node, self._etcd_client.prefix)

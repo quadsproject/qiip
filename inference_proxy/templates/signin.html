@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>QIIP - Sign In</title>
+    <meta name="description" content="Sign in to the QIIP node fleet: use local admin credentials or Google authentication.">
+    <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
+    <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
+</head>
+<body>
+    <main class="signin-page" id="main-content">
+        <div class="signin-card">
+            <img class="signin-mark" src="{{ static_asset_url(request, 'img/qiip.svg') }}" alt="QIIP" width="56" height="46">
+            <h1>Sign in to the Node Fleet</h1>
+            {% if notice %}
+            <p class="signin-notice">{{ notice }}</p>
+            {% endif %}
+            <div class="signin-options">
+                {% if sessions_available %}
+                <form method="post" action="/auth/local-admin" class="signin-form">
+                    <label class="signin-label" for="signin-username">Local Admin</label>
+                    <input class="signin-input" type="text" id="signin-username" name="username"
+                           placeholder="Admin username" required autocomplete="username">
+                    <input class="signin-input" type="password" name="password"
+                           placeholder="Password" required autocomplete="current-password">
+                    <button type="submit" class="btn btn-primary">Sign in with Local Admin</button>
+                </form>
+                {% endif %}
+                {% if oauth_enabled %}
+                <a class="btn" href="/auth/login">Sign in with Google Auth</a>
+                {% endif %}
+                {% if not sessions_available and not oauth_enabled %}
+                <p class="muted-status">Browser sign-in is not configured on this gateway. Use the
+                    HTTP Basic admin credentials (from <code>INFERENCE_PROXY_ADMIN__*</code> in your
+                    <code>.env</code>) with scripts and <code>curl</code>; configure
+                    <code>auth.session_secret</code> for the local-admin form or the OAuth
+                    integration for Google sign-in.</p>
+                {% endif %}
+            </div>
+        </div>
+    </main>
+    <script>
+      (function () {
+        var form = document.querySelector(".signin-form");
+        if (!form) return; // local-admin option hidden (no session_secret)
+        form.addEventListener("submit", async function (e) {
+        e.preventDefault();
+        const form = e.target;
+        const btn = form.querySelector("button");
+        const notice = document.querySelector(".signin-notice");
+        btn.disabled = true;
+        try {
+          const resp = await fetch("/auth/local-admin", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              username: form.username.value,
+              password: form.password.value,
+            }),
+          });
+          if (resp.ok) {
+            window.location.assign("/dashboard");
+            return;
+          }
+          const data = await resp.json().catch(function () { return {}; });
+          const message = data.detail || "Login failed";
+          if (notice) {
+            notice.textContent = message;
+          } else {
+            const p = document.createElement("p");
+            p.className = "signin-notice";
+            p.textContent = message;
+            form.closest(".signin-options").prepend(p);
+          }
+        } catch (err) {
+          if (notice) notice.textContent = "Login failed: " + err.message;
+        } finally {
+          btn.disabled = false;
+        }
+        });
+      })();
+    </script>
+</body>
+</html>

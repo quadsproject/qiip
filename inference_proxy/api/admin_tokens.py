@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from inference_proxy.auth.billing import premium_equivalent_cost
@@ -28,6 +28,7 @@ from inference_proxy.auth.models import (
     PublicUser,
     UsageTotals,
 )
+from inference_proxy.auth.session import get_session_user_id
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import get_settings, require_admin_auth
 from inference_proxy.config.settings import Settings
@@ -116,7 +117,11 @@ async def user_detail(
     ]
     return AdminUserDetail(
         user=PublicUser(
-            id=user.id, email=user.email, name=user.name, picture=user.picture
+            id=user.id,
+            email=user.email,
+            name=user.name,
+            picture=user.picture,
+            is_admin=user.is_admin,
         ),
         tokens=views,
         usage=usage,
@@ -155,3 +160,36 @@ async def billing_summary(
         ),
         model_label=settings.pricing.model_label,
     )
+
+
+@admin_tokens_router.post("/users/{user_id}/admin", status_code=204)
+async def grant_admin_role(
+    user_id: int,
+    store: Annotated[AuthStore, Depends(get_auth_store)],
+) -> None:
+    """Grant the admin role to a Google-authenticated user."""
+    updated = await asyncio.to_thread(store.set_user_admin, user_id, True)
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+
+
+@admin_tokens_router.delete("/users/{user_id}/admin", status_code=204)
+async def revoke_admin_role(
+    user_id: int,
+    request: Request,
+    store: Annotated[AuthStore, Depends(get_auth_store)],
+) -> Response:
+    """Revoke the admin role from a Google-authenticated user.
+
+    When an admin revokes their own role, the browser session stays valid
+    (the user row still exists) — the UI redirects to the dashboard, whose
+    trimmed fleet view now applies. The session never gets a Basic
+    challenge, so no native browser auth pop-up can appear.
+    """
+    updated = await asyncio.to_thread(store.set_user_admin, user_id, False)
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+    response = Response(status_code=204)
+    if get_session_user_id(request) == user_id:
+        response.headers["X-Qiip-Self-Revoked"] = "true"
+    return response

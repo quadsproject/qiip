@@ -93,11 +93,14 @@ def _make_node(
     artifact_id: str | None = None,
     llamacpp_runtime: LlamaCppRuntimeState | None = None,
     self_setup: bool = False,
+    admin_only: bool = False,
+    name: str = "",
     owner: str = "",
 ) -> Node:
     """Create a test node with sensible defaults."""
     return Node(
         node_id=node_id,
+        name=name,
         endpoint=endpoint,
         status=status,
         model=model,
@@ -106,6 +109,7 @@ def _make_node(
         artifact_id=artifact_id,
         llamacpp_runtime=llamacpp_runtime,
         self_setup=self_setup,
+        admin_only=admin_only,
         owner=owner,
     )
 
@@ -191,6 +195,7 @@ class TestAdminNodesPopulated:
         node = data[0]
         expected = {
             "node_id",
+            "name",
             "endpoint",
             "model",
             "status",
@@ -206,6 +211,7 @@ class TestAdminNodesPopulated:
             "gpu_count",
             "managed",
             "self_setup",
+            "admin_only",
             "failed_step",
             "error",
             "owner",
@@ -323,6 +329,8 @@ class TestAdminNodesPopulated:
                 "gpu_count": None,
                 "managed": True,
                 "self_setup": False,
+                "admin_only": False,
+                "name": "",
                 "failed_step": None,
                 "error": None,
             }
@@ -1236,7 +1244,7 @@ class TestNodePool:
         assert response.status_code == 201
         mock_provisioner.validate_endpoint.assert_called_once_with("gpu01", 9000)
         mock_provisioner.register_self_setup.assert_awaited_once_with(
-            "gpu01", 9000, owner=owner.lower()
+            "gpu01", 9000, owner=owner.lower(), admin_only=False, name=""
         )
 
     def test_register_pool_rejects_out_of_range_port(
@@ -1277,9 +1285,11 @@ class TestNodePool:
             "state": "healthy",
             "model": "org/model",
             "self_setup": True,
+            "admin_only": False,
+            "name": "",
         }
         mock_provisioner.register_self_setup.assert_awaited_once_with(
-            "gpu01", None, owner=""
+            "gpu01", None, owner="", admin_only=False, name=""
         )
         mock_provisioner.register_available.assert_not_called()
 
@@ -1413,9 +1423,13 @@ class TestNodePool:
         release_probes = threading.Event()
 
         async def paused_register(
-            hostname: str, port: int | None = None, owner: str = ""
+            hostname: str,
+            port: int | None = None,
+            owner: str = "",
+            admin_only: bool = False,
+            name: str = "",
         ) -> Node:
-            del owner
+            del owner, admin_only, name
             probes_started.set()
             while not release_probes.is_set():
                 await asyncio.sleep(0.01)
@@ -1463,9 +1477,11 @@ class TestNodePool:
             "state": "healthy",
             "model": "org/model",
             "self_setup": True,
+            "admin_only": False,
+            "name": "",
         }
         mock_provisioner.register_self_setup.assert_awaited_once_with(
-            "gpu01", None, owner=""
+            "gpu01", None, owner="", admin_only=False, name=""
         )
 
     def test_readoption_reconciles_reported_model(
@@ -1503,7 +1519,7 @@ class TestNodePool:
         assert response.status_code == 201
         assert response.json()["model"] == "org/new"
         mock_provisioner.register_self_setup.assert_awaited_once_with(
-            "gpu01", None, owner=""
+            "gpu01", None, owner="", admin_only=False, name=""
         )
 
     def test_self_setup_flag_cannot_adopt_managed_node(
@@ -3259,7 +3275,84 @@ class TestOwnerPreservation:
 
         assert response.status_code == 201
         mock_provisioner.register_self_setup.assert_awaited_once_with(
-            "gpu01", port, owner="alice@example.com"
+            "gpu01", port, owner="alice@example.com", admin_only=False, name=""
+        )
+
+    def test_re_adoption_preserves_existing_admin_only_and_name(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """A bare re-adoption must not de-classify an admin-only server or
+        drop its display name (the dashboard "Add to Fleet" form sends only
+        hostname/self_setup)."""
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                self_setup=True,
+                managed=False,
+                admin_only=True,
+                name="DeepSeek (qiip)",
+            )
+        )
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+        mock_provisioner.register_self_setup = AsyncMock(
+            return_value=_make_node(
+                node_id="gpu01",
+                self_setup=True,
+                managed=False,
+                model="org/model",
+                admin_only=True,
+                name="DeepSeek (qiip)",
+            )
+        )
+
+        response = client.post(
+            "/admin/nodes/pool", json={"hostname": "gpu01", "self_setup": True}
+        )
+
+        assert response.status_code == 201
+        mock_provisioner.register_self_setup.assert_awaited_once_with(
+            "gpu01", None, owner="", admin_only=True, name="DeepSeek (qiip)"
+        )
+
+    def test_re_adoption_explicit_admin_only_false_overrides(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """An explicit ``admin_only: false`` on re-adoption intentionally
+        de-classifies a previously admin-only server."""
+        test_registry.add(
+            _make_node(
+                node_id="gpu01",
+                self_setup=True,
+                managed=False,
+                admin_only=True,
+                name="DeepSeek (qiip)",
+            )
+        )
+        mock_provisioner.validate_endpoint.return_value = "http://gpu01:8000"
+        mock_provisioner.register_self_setup = AsyncMock(
+            return_value=_make_node(
+                node_id="gpu01",
+                self_setup=True,
+                managed=False,
+                model="org/model",
+                admin_only=False,
+            )
+        )
+
+        response = client.post(
+            "/admin/nodes/pool",
+            json={"hostname": "gpu01", "self_setup": True, "admin_only": False},
+        )
+
+        assert response.status_code == 201
+        mock_provisioner.register_self_setup.assert_awaited_once_with(
+            "gpu01", None, owner="", admin_only=False, name="DeepSeek (qiip)"
         )
 
     def test_setup_retry_preserves_existing_owner(

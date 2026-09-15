@@ -83,6 +83,7 @@
     </footer>
 
     <script>const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};</script>
+    <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/models.js') }}"></script>
 </body>
 </html>

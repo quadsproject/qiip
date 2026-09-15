@@ -16,7 +16,9 @@ below anything WAL-mode SQLite cannot absorb on one process.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
 import json
 import secrets
 import sqlite3
@@ -48,6 +50,7 @@ CREATE TABLE IF NOT EXISTS users (
     email       TEXT    NOT NULL UNIQUE,
     name        TEXT    NOT NULL DEFAULT '',
     picture     TEXT    NOT NULL DEFAULT '',
+    is_admin    INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT    NOT NULL,
     updated_at  TEXT    NOT NULL
 );
@@ -61,7 +64,8 @@ CREATE TABLE IF NOT EXISTS tokens (
     created_at      TEXT    NOT NULL,
     last_used_at    TEXT,
     revoked         INTEGER NOT NULL DEFAULT 0,
-    endpoint_scope  TEXT
+    endpoint_scope  TEXT,
+    purpose         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS usage (
@@ -81,6 +85,9 @@ CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_usage_user ON usage(user_id);
 CREATE INDEX IF NOT EXISTS idx_usage_token ON usage(token_id);
 CREATE INDEX IF NOT EXISTS idx_usage_user_created ON usage(user_id, created_at);
+-- The one-active agent-config key per user index is created in _migrate()
+-- AFTER duplicate active rows are revoked, so pre-index databases reopen
+-- cleanly (see the migration below).
 """
 
 
@@ -109,6 +116,46 @@ def _hash_token(raw: str) -> str:
 def _generate_token() -> str:
     """Mint a fresh bearer token with 256 bits of entropy."""
     return f"{TOKEN_PREFIX}{secrets.token_urlsafe(32)}"
+
+
+# Reusable agent-config token (AUTH-02-compatible): the raw value is never
+# stored -- it is deterministically re-derived from the session secret, the
+# user id, and a generation counter tracked by the token-row history. The
+# same config key therefore works across browsers and machines, and a revoke
+# rotates it (the next download derives the next generation).
+_CONFIG_TOKEN_NAME = "agent-config"
+_CONFIG_TOKEN_PURPOSE = "agent-config"
+
+# Generated agent-config keys are matched by purpose; pre-marker legacy rows
+# are matched by name (their purpose column is NULL). The two variants are
+# disambiguated by token hash: only a row whose hash equals the derived value
+# for its generation is a generated key — a user-created token named
+# 'agent-config' (minted from a random value) never matches.
+_CONFIG_ROWS_SQL = """
+SELECT * FROM tokens
+ WHERE user_id = ?
+   AND (purpose = ? OR (purpose IS NULL AND name = ?))
+ ORDER BY id
+"""
+_CONFIG_ACTIVE_SQL = """
+SELECT * FROM tokens
+ WHERE user_id = ?
+   AND (purpose = ? OR (purpose IS NULL AND name = ?))
+   AND revoked = 0
+ ORDER BY id DESC LIMIT 1
+"""
+_CONFIG_TOKEN_INFO = b"qiip-agent-config-token-v1"
+
+
+def _derive_config_token(secret: str, user_id: int, generation: int) -> str:
+    """Derive the stable raw value for the user's agent-config token."""
+    material = f"{_CONFIG_TOKEN_INFO.decode()}:{user_id}:{generation}"
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        material.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return f"{TOKEN_PREFIX}{base64.urlsafe_b64encode(digest).decode().rstrip('=')}"
 
 
 def _dump_scopes(scopes: list[str] | None) -> str | None:
@@ -158,6 +205,10 @@ class AuthStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
+            # Multi-worker deployments share one db file: concurrent writers
+            # wait (bounded) for the writer lock instead of failing with
+            # "database is locked" mid-recovery.
+            self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.executescript(_SCHEMA)
             self._migrate()
         logger.info("auth store opened", db_path=str(db_path))
@@ -168,12 +219,33 @@ class AuthStore:
         ``CREATE TABLE IF NOT EXISTS`` handles fresh databases; tables
         created before a column existed need a guarded ALTER here.
         """
-        columns = {
+        token_columns = {
             row["name"]
             for row in self._conn.execute("PRAGMA table_info(tokens)").fetchall()
         }
-        if "endpoint_scope" not in columns:
+        if "endpoint_scope" not in token_columns:
             self._conn.execute("ALTER TABLE tokens ADD COLUMN endpoint_scope TEXT")
+        user_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "is_admin" not in user_columns:
+            self._conn.execute(
+                "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"
+            )
+        if "purpose" not in token_columns:
+            self._conn.execute("ALTER TABLE tokens ADD COLUMN purpose TEXT")
+        # Generated agent-config keys are distinguished by the purpose marker,
+        # never by their display name: earlier versions let users create their
+        # own tokens named "agent-config" (possibly pinned), and those must
+        # survive the migration untouched — with their scopes. Legacy rows
+        # keep working exactly as before; only purpose-marked rows are
+        # governed by the one-active-per-user invariant below.
+        self._conn.execute("DROP INDEX IF EXISTS idx_tokens_user_name_active_config")
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_user_purpose_active_config "
+            "ON tokens(user_id) WHERE revoked = 0 AND purpose = 'agent-config'"
+        )
 
     def close(self) -> None:
         """Close the underlying connection (idempotent)."""
@@ -248,6 +320,16 @@ class AuthStore:
             ).fetchone()
         return self._user_from_row(row)
 
+    def set_user_admin(self, user_id: int, is_admin: bool) -> bool:
+        """Grant or revoke the admin role; False when the user does not exist."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE users SET is_admin = ?, updated_at = ? WHERE id = ?",
+                (1 if is_admin else 0, _iso(_utcnow()), user_id),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
     # ------------------------------------------------------------------
     # API tokens
     # ------------------------------------------------------------------
@@ -296,6 +378,195 @@ class AuthStore:
             raise RuntimeError("token row vanished after insert")
         return CreatedToken(**token.model_dump(), token=raw)
 
+    def get_or_create_config_token(self, user_id: int, secret: str) -> CreatedToken:
+        """Return the user's reusable agent-config token, minting on first use.
+
+        One stable raw value is shared by every agent-config download
+        (across servers, browsers, and machines). The value is derived
+        deterministically from *secret* + user id + a generation counter;
+        only its digest is stored. Generation equals the number of prior
+        ``agent-config`` rows, so revoking the token rotates the value: the
+        next download derives (and stores) a fresh one. A pre-existing row
+        minted with a random secret (pre-reuse deployments) is detected by
+        hash mismatch and superseded by a derived token.
+
+        Raises ``KeyError`` when *user_id* does not exist.
+        """
+        now = _iso(_utcnow())
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT id FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if exists is None:
+                raise KeyError(user_id)
+            rows = self._conn.execute(
+                _CONFIG_ROWS_SQL,
+                (user_id, _CONFIG_TOKEN_PURPOSE, _CONFIG_TOKEN_NAME),
+            ).fetchall()
+            active = next((r for r in reversed(rows) if not r["revoked"]), None)
+            if active is not None:
+                generation = next(
+                    i for i, r in enumerate(rows) if r["id"] == active["id"]
+                )
+                raw = _derive_config_token(secret, user_id, generation)
+                if _hash_token(raw) == active["token_hash"]:
+                    # Reusing a pre-marker generated row: hash match proves it
+                    # is generated, so backfill the missing marker.
+                    if active["purpose"] is None:
+                        self._conn.execute(
+                            "UPDATE tokens SET purpose = ? WHERE id = ?",
+                            (_CONFIG_TOKEN_PURPOSE, active["id"]),
+                        )
+                        self._conn.commit()
+                    token = self._token_from_row(active)
+                    if token is not None:  # pragma: no cover - defensive
+                        return CreatedToken(**token.model_dump(), token=raw)
+                # The configured session secret changed, so the derived value no
+                # longer matches the active row. Revoke the stale active row(s)
+                # before minting the next generation; otherwise the previous
+                # derived key stays resolvable and a secret rotation fails to
+                # invalidate configs already distributed (the one-active
+                # key-per-user invariant would break).
+                self._conn.execute(
+                    """
+                    UPDATE tokens
+                       SET revoked = 1
+                     WHERE user_id = ? AND purpose = ? AND revoked = 0
+                    """,
+                    (user_id, _CONFIG_TOKEN_PURPOSE),
+                )
+
+            # Pre-marker databases store the generated key without a purpose
+            # marker. If the derived value for a stored generation matches a
+            # row, the downloader keeps the key it already has (never mint
+            # into a token_hash collision); a revoked legacy generation is
+            # skipped by minting one past it.
+            for index, row in enumerate(rows):
+                candidate = _derive_config_token(secret, user_id, index)
+                if _hash_token(candidate) == row["token_hash"]:
+                    if row["revoked"] == 0:
+                        # A hash match proves this is a generated key (only
+                        # the secret holder can derive the value), so it is
+                        # safe to backfill the marker that was missing from
+                        # pre-marker databases.
+                        self._conn.execute(
+                            "UPDATE tokens SET purpose = ? WHERE id = ?",
+                            (_CONFIG_TOKEN_PURPOSE, row["id"]),
+                        )
+                        self._conn.commit()
+                        token = self._token_from_row(row)
+                        if token is not None:
+                            return CreatedToken(**token.model_dump(), token=candidate)
+                    break
+            generation = len(rows)
+            raw = _derive_config_token(secret, user_id, generation)
+            try:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO tokens
+                        (user_id, name, token_hash, prefix, created_at, endpoint_scope,
+                         purpose)
+                    VALUES (?, ?, ?, ?, ?, NULL, ?)
+                    """,
+                    (
+                        user_id,
+                        _CONFIG_TOKEN_NAME,
+                        _hash_token(raw),
+                        raw[: len(TOKEN_PREFIX) + 8],
+                        now,
+                        _CONFIG_TOKEN_PURPOSE,
+                    ),
+                )
+                self._conn.commit()
+                row = self._conn.execute(
+                    "SELECT * FROM tokens WHERE id = ?", (cursor.lastrowid,)
+                ).fetchone()
+            except sqlite3.IntegrityError:
+                # Lost a concurrent mint race (another worker holds the
+                # one-active-row slot, or a same-generation row already
+                # exists). Reconcile with current state: return the winner's
+                # key when it matches our secret and is still active; when it
+                # was minted with a different session secret (rolling
+                # rotation) or revoked mid-race, revoke stale actives and
+                # mint the next generation. The partial unique index makes a
+                # competing insert always conflict, so this never 500s.
+                self._conn.rollback()
+                while True:
+                    fresh_rows = self._conn.execute(
+                        _CONFIG_ROWS_SQL,
+                        (user_id, _CONFIG_TOKEN_PURPOSE, _CONFIG_TOKEN_NAME),
+                    ).fetchall()
+                    # Re-read the full history: the snapshot taken before our
+                    # insert predates the winner's row, so indexing it would
+                    # raise StopIteration (a 500) instead of recovering.
+                    reused = None
+                    for index, row in enumerate(fresh_rows):
+                        candidate = _derive_config_token(secret, user_id, index)
+                        if _hash_token(candidate) == row["token_hash"]:
+                            if row["revoked"] == 0:
+                                reused = row
+                            break
+                    if reused is not None:
+                        generation = next(
+                            i
+                            for i, r in enumerate(fresh_rows)
+                            if r["id"] == reused["id"]
+                        )
+                        raw = _derive_config_token(secret, user_id, generation)
+                        self._conn.execute(
+                            "UPDATE tokens SET purpose = ? WHERE id = ?",
+                            (_CONFIG_TOKEN_PURPOSE, reused["id"]),
+                        )
+                        self._conn.commit()
+                        row = reused
+                        break
+                    # Stale secret or revoked-between-our-snapshot-and-this-
+                    # insert: drop the stale purpose-marked active row(s) so
+                    # exactly one generated key stays active, then mint the
+                    # next generation. Legacy (pre-purpose) rows are left
+                    # untouched: a same-named user token is indistinguishable
+                    # from a generated key without the old secret.
+                    self._conn.execute(
+                        """
+                        UPDATE tokens
+                           SET revoked = 1
+                         WHERE user_id = ? AND purpose = ? AND revoked = 0
+                        """,
+                        (user_id, _CONFIG_TOKEN_PURPOSE),
+                    )
+                    generation = len(fresh_rows)
+                    raw = _derive_config_token(secret, user_id, generation)
+                    try:
+                        cursor = self._conn.execute(
+                            """
+                            INSERT INTO tokens
+                                (user_id, name, token_hash, prefix,
+                                 created_at, endpoint_scope, purpose)
+                            VALUES (?, ?, ?, ?, ?, NULL, ?)
+                            """,
+                            (
+                                user_id,
+                                _CONFIG_TOKEN_NAME,
+                                _hash_token(raw),
+                                raw[: len(TOKEN_PREFIX) + 8],
+                                now,
+                                _CONFIG_TOKEN_PURPOSE,
+                            ),
+                        )
+                        self._conn.commit()
+                    except sqlite3.IntegrityError:
+                        # Someone else won this generation; re-read and retry.
+                        self._conn.rollback()
+                        continue
+                    row = self._conn.execute(
+                        "SELECT * FROM tokens WHERE id = ?", (cursor.lastrowid,)
+                    ).fetchone()
+                    break
+        token = self._token_from_row(row)
+        if token is None:  # pragma: no cover - defensive
+            raise RuntimeError("token row vanished after insert")
+        return CreatedToken(**token.model_dump(), token=raw)
+
     def list_tokens(self, user_id: int) -> list[ApiToken]:
         """Return all token rows for a user, newest first."""
         with self._lock:
@@ -328,24 +599,32 @@ class AuthStore:
 
         Returns None for unknown, malformed, or revoked tokens. The raw
         value is never stored or logged (AUTH-02).
+
+        The token and user are fetched as two single-table rows rather than
+        a ``tokens.*, users.*`` join: both tables carry ``id``, ``name`` and
+        ``created_at``, so a joined ``row["id"]`` is ambiguous and resolves to
+        the token id, collapsing the user's id onto the token's id and
+        orphaning usage rows under a phantom user id (AUTH-04).
         """
         if not raw or not str(raw).startswith(TOKEN_PREFIX):
             return None
         with self._lock:
-            row = self._conn.execute(
+            token_row = self._conn.execute(
                 """
-                SELECT tokens.*, users.*
-                  FROM tokens
-                  JOIN users ON users.id = tokens.user_id
-                 WHERE tokens.token_hash = ? AND tokens.revoked = 0
+                SELECT * FROM tokens
+                 WHERE token_hash = ? AND revoked = 0
                 """,
                 (_hash_token(raw),),
             ).fetchone()
-        if row is None:
-            return None
-        user = self._user_from_row(row)
-        token = self._token_from_row(row)
-        if user is None or token is None:  # pragma: no cover - defensive
+            token = self._token_from_row(token_row)
+            if token is None:
+                return None
+            user_row = self._conn.execute(
+                "SELECT * FROM users WHERE id = ?",
+                (token.user_id,),
+            ).fetchone()
+            user = self._user_from_row(user_row)
+        if user is None:  # pragma: no cover - defensive
             return None
         return TokenAuth(user=user, token=token)
 
@@ -460,7 +739,7 @@ class AuthStore:
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT u.id, u.email, u.name, u.picture, u.created_at,
+                SELECT u.id, u.email, u.name, u.picture, u.is_admin, u.created_at,
                        (SELECT COUNT(*) FROM tokens t
                           WHERE t.user_id = u.id) AS token_count,
                        (SELECT COUNT(*) FROM tokens t
@@ -484,6 +763,7 @@ class AuthStore:
                 email=row["email"],
                 name=row["name"],
                 picture=row["picture"],
+                is_admin=bool(row["is_admin"]),
                 created_at=_parse_iso(row["created_at"]),
                 token_count=row["token_count"],
                 active_token_count=row["active_token_count"],
@@ -618,6 +898,7 @@ class AuthStore:
             email=row["email"],
             name=row["name"],
             picture=row["picture"],
+            is_admin=bool(row["is_admin"]),
             created_at=_parse_iso(row["created_at"]),
             updated_at=_parse_iso(row["updated_at"]),
         )

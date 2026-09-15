@@ -369,9 +369,27 @@ async def register_node(
                 if "owner" in body.model_fields_set
                 else (node.owner if node else "")
             )
+            # The same rule applies to the admin-only flag and the display
+            # name: a bare re-adoption (e.g. the dashboard "Add to Fleet"
+            # form, which sends only hostname/self_setup) must not silently
+            # de-classify an admin-only server or drop its name.
+            admin_only = (
+                body.admin_only
+                if "admin_only" in body.model_fields_set
+                else (node.admin_only if node else False)
+            )
+            name = (
+                body.name
+                if "name" in body.model_fields_set
+                else (node.name if node else "")
+            )
             try:
                 adopted = await provisioner.register_self_setup(
-                    hostname, body.port, owner=owner
+                    hostname,
+                    body.port,
+                    owner=owner,
+                    admin_only=admin_only,
+                    name=name,
                 )
             except SelfSetupError as exc:
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -382,6 +400,8 @@ async def register_node(
                     "state": adopted.status.value,
                     "model": adopted.model,
                     "self_setup": True,
+                    "admin_only": adopted.admin_only,
+                    "name": adopted.name,
                 },
             )
         await provisioner.register_available(hostname, body.port, owner=body.owner)

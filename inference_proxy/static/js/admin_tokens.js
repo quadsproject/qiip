@@ -9,19 +9,6 @@
   let requestSequence = 0;
   let lastRenderedSequence = 0;
 
-  function showToast(message, type) {
-    const container = document.getElementById("toast-container");
-    const toast = document.createElement("div");
-    toast.className = "toast toast-" + (type || "info");
-    toast.textContent = message;
-    container.appendChild(toast);
-    requestAnimationFrame(() => toast.classList.add("toast-visible"));
-    setTimeout(() => {
-      toast.classList.remove("toast-visible");
-      setTimeout(() => toast.remove(), 300);
-    }, 4000);
-  }
-
   function clearChildren(el) {
     while (el.firstChild) el.removeChild(el.firstChild);
   }
@@ -95,7 +82,7 @@
     if (users.length === 0) {
       const row = document.createElement("tr");
       const td = document.createElement("td");
-      td.colSpan = 9;
+      td.colSpan = 10;
       td.textContent = "No users yet.";
       td.className = "muted-status";
       row.appendChild(td);
@@ -108,6 +95,7 @@
       nameCell.appendChild(userLink(user.id, user.name || user.email));
       row.appendChild(nameCell);
       row.appendChild(tdCell(user.email));
+      row.appendChild(tdCell(user.is_admin ? "yes" : "no"));
       row.appendChild(
         tdCell(user.active_token_count + " / " + user.token_count)
       );
@@ -122,6 +110,45 @@
       view.className = "btn btn-neutral btn-sm";
       view.textContent = "View";
       actions.appendChild(view);
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className =
+        "btn btn-sm " + (user.is_admin ? "btn-danger" : "btn-primary");
+      toggle.textContent = user.is_admin ? "Revoke Admin" : "Grant Admin";
+      toggle.addEventListener("click", async () => {
+        toggle.disabled = true;
+        try {
+          const method = user.is_admin ? "DELETE" : "POST";
+          const resp = await fetch("/admin/users/" + user.id + "/admin", {
+            method: method,
+            headers: { "Content-Type": "application/json" },
+          });
+          if (resp.ok) {
+            if (resp.headers.get("x-qiip-self-revoked") === "true") {
+              // Self-revocation: the OAuth session stays valid, so land on
+              // the dashboard's trimmed fleet view directly — never the
+              // sign-in page, never a native Basic pop-up.
+              window.location.assign("/dashboard");
+              return;
+            }
+            showToast(
+              user.is_admin
+                ? `Admin revoked for ${user.email}`
+                : `Admin granted to ${user.email}`,
+              "success"
+            );
+            refresh();
+          } else {
+            const data = await resp.json().catch(() => ({}));
+            showToast(data.detail || `HTTP ${resp.status}`, "error");
+            toggle.disabled = false;
+          }
+        } catch (err) {
+          showToast(`Role change failed: ${err.message}`, "error");
+          toggle.disabled = false;
+        }
+      });
+      actions.appendChild(toggle);
       row.appendChild(actions);
       body.appendChild(row);
     }

@@ -20,19 +20,6 @@
   const $ = (id) => document.getElementById(id);
   let pendingToken = "";
 
-  function showToast(message, type) {
-    const container = $("toast-container");
-    const toast = document.createElement("div");
-    toast.className = "toast toast-" + (type || "info");
-    toast.textContent = message;
-    container.appendChild(toast);
-    requestAnimationFrame(() => toast.classList.add("toast-visible"));
-    setTimeout(() => {
-      toast.classList.remove("toast-visible");
-      setTimeout(() => toast.remove(), 300);
-    }, 4000);
-  }
-
   function clearChildren(el) {
     while (el.firstChild) el.removeChild(el.firstChild);
   }
@@ -108,7 +95,12 @@
     } catch (_err) {
       // fall through to the empty-state row below
     }
+    // Revoked tokens are hash-disabled. Keep the audit rows in the store
+    // but drop them from the user-facing list -- they only add noise.
+    tokens = tokens.filter((token) => !token.revoked);
     clearChildren(body);
+    const note = $("token-required-note");
+    if (note) note.hidden = tokens.length !== 0;
     if (tokens.length === 0) {
       const row = document.createElement("tr");
       const td = document.createElement("td");
@@ -128,11 +120,13 @@
       row.appendChild(tdCell(token.revoked ? "revoked" : "active"));
       row.appendChild(
         tdCell(
-          token.endpoint_scope === null
-            ? "Full access"
-            : token.endpoint_scope.length
-              ? token.endpoint_scope.join(", ")
-              : "None"
+          token.name === "agent-config"
+            ? "Config (agent)"
+            : token.endpoint_scope === null
+              ? "Full access"
+              : token.endpoint_scope.length
+                ? token.endpoint_scope.join(", ")
+                : "None"
         )
       );
       const actions = document.createElement("td");
@@ -165,33 +159,93 @@
     loadTokens();
   }
 
+  function updateEndpointSummary() {
+    const select = $("token-endpoints");
+    const count = Array.from(select.children).filter((option) => option.selected).length;
+    $("endpoint-summary").textContent =
+      count === 0 ? "All Endpoints (0 selected)" : count + " Endpoints Selected";
+  }
+
+  function renderEndpointList(endpoints) {
+    const list = $("endpoint-list");
+    const empty = $("endpoint-empty");
+    const select = $("token-endpoints");
+    // Remove previous generated rows but keep the empty-state paragraph
+    // (it is the first child of #endpoint-list). The old loop stopped when
+    // the first child was the paragraph, so stale checked boxes survived a
+    // reopen and could mint an unpinned token while a selection was shown.
+    for (const child of Array.from(list.children)) {
+      if (child !== empty) list.removeChild(child);
+    }
+    if (endpoints.length === 0) {
+      empty.hidden = false;
+      updateEndpointSummary();
+      return;
+    }
+    empty.hidden = true;
+    for (const endpoint of endpoints) {
+      const label = document.createElement("label");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.value = endpoint.node_id;
+      checkbox.addEventListener("change", () => {
+        const option = Array.from(select.children).find(
+          (item) => item.value === endpoint.node_id
+        );
+        if (option) option.selected = checkbox.checked;
+        updateEndpointSummary();
+      });
+      label.appendChild(checkbox);
+      label.appendChild(
+        document.createTextNode(
+          endpoint.model
+            ? endpoint.node_id + " (" + endpoint.model + ")"
+            : endpoint.node_id
+        )
+      );
+      list.appendChild(label);
+    }
+    updateEndpointSummary();
+  }
+
   async function loadEndpoints() {
     const select = $("token-endpoints");
     clearChildren(select);
+    let endpoints = [];
     try {
       const resp = await fetch("/profile/endpoints");
-      if (resp.ok) {
-        const endpoints = await resp.json();
-        if (endpoints.length === 0) {
-          const option = document.createElement("option");
-          option.value = "";
-          option.textContent = "No endpoints available to pin";
-          option.disabled = true;
-          select.appendChild(option);
-          return;
-        }
-        for (const endpoint of endpoints) {
-          const option = document.createElement("option");
-          option.value = endpoint.node_id;
-          option.textContent = endpoint.model
-            ? endpoint.node_id + " (" + endpoint.model + ")"
-            : endpoint.node_id;
-          select.appendChild(option);
-        }
-      }
+      if (resp.ok) endpoints = await resp.json();
     } catch (_err) {
-      // leave the empty option in place; scoping is optional
+      // Scoping is optional; the picker shows the empty state below.
     }
+    for (const endpoint of endpoints) {
+      const option = document.createElement("option");
+      option.value = endpoint.node_id;
+      option.textContent = endpoint.model
+        ? endpoint.node_id + " (" + endpoint.model + ")"
+        : endpoint.node_id;
+      select.appendChild(option);
+    }
+    renderEndpointList(endpoints);
+  }
+
+  function wireEndpointPicker() {
+    const toggle = $("endpoint-toggle");
+    const list = $("endpoint-list");
+    const picker = $("endpoint-picker");
+    toggle.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const expanded = toggle.getAttribute("aria-expanded") === "true";
+      toggle.setAttribute("aria-expanded", String(!expanded));
+      list.hidden = expanded;
+    });
+    // Close the popover when clicking anywhere outside the picker.
+    document.addEventListener("click", (event) => {
+      if (!picker.contains(event.target)) {
+        list.hidden = true;
+        toggle.setAttribute("aria-expanded", "false");
+      }
+    });
   }
 
   function wireTokenForm() {
@@ -344,17 +398,10 @@
     );
   }
 
-  function wireLogout() {
-    $("logout-btn").addEventListener("click", async () => {
-      await fetch("/auth/logout", { method: "POST" });
-      window.location.reload();
-    });
-  }
-
   async function init() {
     parseErrorParam();
     wireTokenForm();
-    wireLogout();
+    wireEndpointPicker();
 
     let resp;
     try {

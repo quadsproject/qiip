@@ -34,6 +34,7 @@
 }
 
 [data-theme="dark"] {
+  color-scheme: dark;
   --primary: #29D6D0;
   --primary-hover: #3AD9D4;
   --primary-soft: rgba(41, 214, 208, 0.1);
@@ -212,6 +213,46 @@ main { padding: 0; }
 .theme-toggle .icon-moon { display: none; }
 [data-theme="dark"] .theme-toggle .icon-sun { display: none; }
 [data-theme="dark"] .theme-toggle .icon-moon { display: block; }
+
+/* --- Nav actions (identity + logout + theme toggle) --- */
+.nav-actions {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.nav-actions .theme-toggle { margin-left: 0; }
+
+.nav-identity {
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+}
+
+.nav-logout-form {
+  display: inline-flex;
+  margin: 0;
+}
+
+.nav-logout-btn {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-family: var(--font-sans);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-light);
+  line-height: 1.3;
+}
+
+.nav-logout-btn:hover {
+  color: var(--text);
+  background: var(--bg);
+}
 
 /* --- Dashboard layout --- */
 .dashboard {
@@ -599,6 +640,11 @@ h1 {
   margin-bottom: 1rem;
 }
 
+/* Author `display` rules override the UA's [hidden] style; restore it. */
+.setup-form[hidden] {
+  display: none;
+}
+
 .setup-form input[type="text"] {
   flex: 1;
   max-width: 20rem;
@@ -637,6 +683,68 @@ h1 {
 }
 
 .setup-engine-select { min-width: 6.5rem; }
+
+/* Endpoint pin popover: a narrow summary button that expands into a
+   scrollable checkbox list (replaces the old native multi-select). */
+.endpoint-picker {
+  position: relative;
+  display: inline-block;
+}
+
+.endpoint-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.endpoint-toggle .endpoint-caret {
+  font-size: 0.7rem;
+  color: var(--text-light);
+  transition: transform 0.15s;
+}
+
+.endpoint-toggle[aria-expanded="true"] .endpoint-caret {
+  transform: rotate(180deg);
+}
+
+.endpoint-list {
+  position: absolute;
+  z-index: 30;
+  margin-top: 0.25rem;
+  min-width: 16rem;
+  max-width: 25rem;
+  max-height: 12rem;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  padding: 0.25rem 0;
+}
+
+.endpoint-list label {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.75rem;
+  font-size: 0.8125rem;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.endpoint-list label:hover {
+  background: var(--bg);
+}
+
+.endpoint-list input[type="checkbox"] {
+  accent-color: var(--primary);
+  flex-shrink: 0;
+}
+
+.endpoint-list .endpoint-empty {
+  padding: 0.5rem 0.75rem;
+  margin: 0;
+}
 
 .setup-config {
   display: flex;
@@ -784,6 +892,92 @@ tbody tr:last-child td { border-bottom: none; }
 
 .badge-standalone::before,
 .badge-self-setup::before { display: none; }
+
+.badge-admin-only {
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.node-id-admin-only {
+  font-weight: 700;
+}
+
+/* --- Sign-in page --- */
+.signin-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 2rem;
+}
+
+.signin-card {
+  max-width: 26rem;
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 2.5rem 2rem;
+  text-align: center;
+}
+
+.signin-mark {
+  margin-bottom: 0.75rem;
+}
+
+.signin-card h1 {
+  font-family: var(--font-display);
+  font-size: 1.375rem;
+  margin: 0 0 0.5rem;
+}
+
+.signin-notice {
+  color: var(--warning);
+  background: var(--warning-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8125rem;
+  margin: 0 0 1rem;
+}
+
+.signin-options {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1.25rem;
+}
+
+.signin-form {
+  display: grid;
+  gap: 0.625rem;
+  text-align: left;
+}
+
+.signin-label {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-light);
+}
+
+.signin-input {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+}
+
+.signin-input:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-soft);
+}
+
+.admin-add-row {
+  margin-bottom: 1rem;
+}
 
 /* --- Buttons --- */
 .btn {
@@ -1086,6 +1280,11 @@ footer p { margin: 0; }
   flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem;
+}
+
+/* Author `display` rules override the UA's [hidden] style; restore it. */
+.token-secret-box[hidden] {
+  display: none;
 }
 
 .token-secret-box code {
