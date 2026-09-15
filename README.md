@@ -603,7 +603,7 @@ the signed user id and expiry.
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_CACHE_FILE` | unset | Optional flat-file cache of the last successful document (warm start + inspection, atomically replaced) |
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_EXTRA_USERS` | `[]` | Extra emails always allowed, merged over the fetched document |
 | `INFERENCE_PROXY_AUTH__SSO_WHITELIST_EXTRA_DOMAINS` | `[]` | Extra domains where any username is allowed, merged over the fetched document |
-| `INFERENCE_PROXY_AUTH__ADMIN_ONLY_TOKENS_FULL_ACCESS` | `[]` | Emails whose tokens bypass endpoint scoping, owner isolation, and the SSO whitelist gate; they may pin tokens to any endpoint |
+| `INFERENCE_PROXY_AUTH__ADMIN_ONLY_TOKENS_FULL_ACCESS` | `[]` | Emails whose tokens get unrestricted access — no owner isolation, no endpoint pin, no SSO whitelist gate — but only when unpinned: stored pins are still honored; they may pin tokens to any endpoint |
 
 Enablement and guardrails:
 
@@ -703,9 +703,10 @@ Endpoint scoping (per-token pins and owner isolation):
 - `/v1/models` never lists models served by owner-private nodes, so ownership
   stays private even on the public catalog.
 - `admin_only_tokens_full_access` is a small static trust list of emails.
-  Those users' tokens bypass the endpoint pin, owner isolation, and the SSO
-  whitelist gate (login, mint, and use time), and may pin tokens to any
-  endpoint. Tokens are still required and OAuth sign-in still applies.
+  Unpinned tokens of those users are unrestricted — no owner isolation, no
+  endpoint pin, no SSO whitelist gate (login, mint, and use time) — and they
+  may pin tokens to any endpoint; a stored pin is still enforced. Tokens are
+  still required and OAuth sign-in still applies.
 - Scoping is enforced at the gateway. Node detail pages and dashboards are
   admin-only (HTTP Basic), but backend origins are operator-visible
   surface: keep backends of owned nodes off untrusted networks, because a
