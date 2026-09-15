@@ -151,7 +151,7 @@ cp .env.example .env
 # INFERENCE_PROXY_ADMIN__PASSWORD values in .env
 
 # Run the gateway
-uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 8080
+uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 5000
 ```
 
 The gateway starts even when etcd or inference nodes are temporarily
@@ -168,7 +168,7 @@ trusted.
 ### Verify it's running
 
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:5000/health
 # {"status": "ok", "nodes_registered": 2}
 ```
 
@@ -176,7 +176,7 @@ curl http://localhost:8080/health
 
 ```bash
 # Non-streaming
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "meta-llama/Llama-3-8B-Instruct",
@@ -184,7 +184,7 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 
 # Streaming
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "meta-llama/Llama-3-8B-Instruct",
@@ -199,7 +199,7 @@ curl http://localhost:8080/v1/chat/completions \
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8080/v1",
+    base_url="http://localhost:5000/v1",
     api_key="not-needed",  # no auth in v1
 )
 
@@ -209,6 +209,25 @@ response = client.chat.completions.create(
 )
 print(response.choices[0].message.content)
 ```
+
+### Deploy with systemd
+
+A production deployment ships a systemd unit (`systemd/inference-proxy.service`)
+matching the stage/dev convention: repo checkout at `/opt/inference-proxy`
+(uv-synced), settings in `/opt/inference-proxy/.env`, the service listening on
+port **5000**, and nginx terminating TLS and proxying to it
+(`nginx/nginx.conf`). Install it with:
+
+```bash
+sudo cp systemd/inference-proxy.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now inference-proxy
+```
+
+The unit runs as `root` because provisioning stores host SSH keys under
+`/root/.ssh`; tighten it if the deployment does not provision nodes. Use the
+same port (`5000`) for the gateway and the nginx upstream — a deployer mixing
+the quick-start port with the shipped unit behind nginx gets 502s.
 
 ### Chat playground
 
@@ -571,7 +590,7 @@ the signed user id and expiry.
 | `INFERENCE_PROXY_OAUTH__REDIRECT_URI` | required (to enable) | Absolute `http(s)://` callback URI, e.g. `https://gateway.example.com/auth/callback` |
 | `INFERENCE_PROXY_OAUTH__ALLOWED_DOMAINS` | `[]` | JSON array of hosted domains allowed to sign in; empty allows any Google account |
 | `INFERENCE_PROXY_AUTH__DB_PATH` | `data/qiip.db` | SQLite file holding users, token digests, and usage |
-| `INFERENCE_PROXY_AUTH__SESSION_SECRET` | required with OAuth | Long random secret signing the session cookie |
+| `INFERENCE_PROXY_AUTH__SESSION_SECRET` | required for browser sign-in | Long random secret signing the session cookie (local-admin form and Google OAuth) |
 | `INFERENCE_PROXY_AUTH__SESSION_COOKIE` | `qiip_session` | Session cookie name (alphanumeric plus `_` and `-`) |
 | `INFERENCE_PROXY_AUTH__SESSION_TTL_SECONDS` | `43200` | Session lifetime (300 to 7 days) |
 | `INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS` | `false` | Require a valid bearer token for every `/v1` inference request |
@@ -666,7 +685,9 @@ Endpoint scoping (per-token pins and owner isolation):
   (`POST /profile/tokens` with `endpoints: ["host1.example.com"]`, selected
   via the profile page). A pinned token routes only to those nodes — node
   selection and retry/failover stay inside the pin — and requests whose
-  model exists only off-pin get the normal 404/503 error mapping.
+  model exists only off-pin get the normal 404/503 error mapping. The pin is
+  enforced for every token, admin-role and full-access tokens included
+  (admins may pin any registered node, but the pin still binds them).
 - Nodes may carry an `owner` (email) set at registration
   (`POST /admin/nodes/pool`, `POST /admin/nodes/setup`) or later with
   `PATCH /admin/nodes/{node_id}/owner` (empty string clears it). An owned

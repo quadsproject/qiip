@@ -16,12 +16,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from pytest_httpx import HTTPXMock
 
 from inference_proxy.auth.dependencies import get_auth_plugin
 from inference_proxy.auth.models import AdminUserStats
 from inference_proxy.auth.store import AuthStore
-from inference_proxy.config.dependencies import get_node_selector
+from inference_proxy.config.dependencies import get_node_selector, get_settings
+from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.admin import RegisterRequest
 from inference_proxy.models.node import Node, NodeStatus
@@ -210,6 +212,69 @@ class TestAdminOnlyRoutingScope:
         )
 
         assert response.status_code == 200
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_admin_role_pinned_token_stays_inside_pin(
+        self,
+        client: TestClient,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        """Regression (third review): a stored pin must bind admin-role tokens
+        too. create_token accepts and stores the pin, so /v1 selection has to
+        honor it instead of silently routing the token to every healthy node
+        (including other users' privately-owned nodes)."""
+        test_registry.add(_make_node("admin_only1", admin_only=True, model="secret"))
+        test_registry.add(_make_node("pub1", model="public"))
+        user = auth_store.upsert_google_user(
+            google_sub="sub-alice",
+            email="alice@example.com",
+            name="Alice",
+            picture="",
+        )
+        auth_store.set_user_admin(user.id, True)
+        token = auth_store.create_token(
+            user.id, "ci-job", endpoint_scope=["pub1"]
+        ).token
+        httpx_mock.add_response(
+            url="http://10.0.1.100:8000/v1/chat/completions",
+            status_code=200,
+            json={
+                "id": "chatcmpl-2",
+                "object": "chat.completion",
+                "model": "public",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 5,
+                    "completion_tokens": 2,
+                    "total_tokens": 7,
+                },
+            },
+        )
+
+        # The admin-only node is not part of the pin: never routed.
+        outside_pin = client.post(
+            "/v1/chat/completions",
+            json={"model": "secret", "messages": [{"role": "user", "content": "Hi"}]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert outside_pin.status_code != 200
+        assert len(httpx_mock.get_requests()) == 0
+
+        # The pinned node is routable, so the token still works as scoped.
+        inside_pin = client.post(
+            "/v1/chat/completions",
+            json={"model": "public", "messages": [{"role": "user", "content": "Hi"}]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert inside_pin.status_code == 200
         assert len(httpx_mock.get_requests()) == 1
 
 
@@ -436,7 +501,28 @@ class TestSessionIsolation:
 
 
 class TestDashboardRoles:
-    def test_anonymous_gets_signin_page(self, app: FastAPI) -> None:
+    def test_anonymous_gets_signin_page(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+    ) -> None:
+        # With the OAuth integration configured both sign-in options render;
+        # with OAuth off the Google button is hidden (see the Basic-only
+        # regression in test_admin_auth.py).
+        enabled = test_settings.model_copy(
+            deep=True,
+            update={
+                "oauth": test_settings.oauth.model_copy(
+                    update={
+                        "client_id": "test-client",
+                        "client_secret": SecretStr("test-secret"),
+                        "redirect_uri": "https://gateway.example.com/auth/callback",
+                    }
+                )
+            },
+        )
+        app.dependency_overrides[get_settings] = lambda: enabled
+
         response = TestClient(app).get("/dashboard")
 
         assert response.status_code == 200

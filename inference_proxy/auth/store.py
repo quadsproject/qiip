@@ -84,6 +84,9 @@ CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_usage_user ON usage(user_id);
 CREATE INDEX IF NOT EXISTS idx_usage_token ON usage(token_id);
 CREATE INDEX IF NOT EXISTS idx_usage_user_created ON usage(user_id, created_at);
+-- The one-active agent-config key per user index is created in _migrate()
+-- AFTER duplicate active rows are revoked, so pre-index databases reopen
+-- cleanly (see the migration below).
 """
 
 
@@ -205,6 +208,34 @@ class AuthStore:
             self._conn.execute(
                 "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"
             )
+        # One active agent-config key per user (rolling rotation / multi-worker
+        # safety). Pre-index databases may hold duplicates: keep the newest
+        # active row per user, then create the partial unique index.
+        duplicates = self._conn.execute(
+            """
+            SELECT user_id FROM tokens
+             WHERE name = 'agent-config' AND revoked = 0
+             GROUP BY user_id
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        if duplicates:
+            self._conn.execute(
+                """
+                UPDATE tokens SET revoked = 1
+                 WHERE name = 'agent-config' AND revoked = 0
+                   AND id NOT IN (
+                       SELECT MAX(id) FROM tokens
+                        WHERE name = 'agent-config' AND revoked = 0
+                        GROUP BY user_id
+                   )
+                """
+            )
+            self._conn.commit()
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_user_name_active_config "
+            "ON tokens(user_id, name) WHERE revoked = 0 AND name = 'agent-config'"
+        )
 
     def close(self) -> None:
         """Close the underlying connection (idempotent)."""
@@ -409,71 +440,85 @@ class AuthStore:
                     "SELECT * FROM tokens WHERE id = ?", (cursor.lastrowid,)
                 ).fetchone()
             except sqlite3.IntegrityError:
-                # Lost a concurrent mint race: return the winner's row, or
-                # mint the next generation if the winner was revoked between
-                # our snapshot and this insert (user revoke, or another
-                # worker's rotation revoke -- the exact multi-process case
-                # this branch exists for). Re-raising would 500 the caller.
+                # Lost a concurrent mint race (another worker holds the
+                # one-active-row slot, or a same-generation row already
+                # exists). Reconcile with current state: return the winner's
+                # key when it matches our secret and is still active; when it
+                # was minted with a different session secret (rolling
+                # rotation) or revoked mid-race, revoke stale actives and
+                # mint the next generation. The partial unique index makes a
+                # competing insert always conflict, so this never 500s.
                 self._conn.rollback()
-                row = self._conn.execute(
-                    """
-                    SELECT * FROM tokens
-                     WHERE user_id = ? AND name = ? AND revoked = 0
-                     ORDER BY id DESC LIMIT 1
-                    """,
-                    (user_id, _CONFIG_TOKEN_NAME),
-                ).fetchone()
-                # Re-read the rows: the snapshot taken before our insert
-                # predates the winner's row, so indexing the stale snapshot
-                # would raise StopIteration (a 500) instead of returning the
-                # winner's token.
-                fresh_rows = self._conn.execute(
-                    "SELECT * FROM tokens WHERE user_id = ? AND name = ? ORDER BY id",
-                    (user_id, _CONFIG_TOKEN_NAME),
-                ).fetchall()
-                if row is not None:
-                    raw = _derive_config_token(
-                        secret,
-                        user_id,
-                        next(
-                            i for i, r in enumerate(fresh_rows) if r["id"] == row["id"]
-                        ),
-                    )
-                else:
-                    # No active row (the colliding one was revoked). Mint the
-                    # next generation; if another worker inserts the same
-                    # generation before us, re-read and retry.
-                    while True:
-                        generation = len(fresh_rows)
-                        raw = _derive_config_token(secret, user_id, generation)
-                        try:
-                            cursor = self._conn.execute(
-                                """
-                                INSERT INTO tokens
-                                    (user_id, name, token_hash, prefix,
-                                     created_at, endpoint_scope)
-                                VALUES (?, ?, ?, ?, ?, NULL)
-                                """,
-                                (
-                                    user_id,
-                                    _CONFIG_TOKEN_NAME,
-                                    _hash_token(raw),
-                                    raw[: len(TOKEN_PREFIX) + 8],
-                                    now,
-                                ),
-                            )
-                            self._conn.commit()
-                        except sqlite3.IntegrityError:
-                            self._conn.rollback()
-                            fresh_rows = self._conn.execute(
-                                "SELECT * FROM tokens WHERE user_id = ? AND name = ? ORDER BY id",
-                                (user_id, _CONFIG_TOKEN_NAME),
-                            ).fetchall()
-                            continue
-                        row = self._conn.execute(
-                            "SELECT * FROM tokens WHERE id = ?", (cursor.lastrowid,)
-                        ).fetchone()
-                        break
+                while True:
+                    active = self._conn.execute(
+                        """
+                        SELECT * FROM tokens
+                         WHERE user_id = ? AND name = ? AND revoked = 0
+                         ORDER BY id DESC LIMIT 1
+                        """,
+                        (user_id, _CONFIG_TOKEN_NAME),
+                    ).fetchone()
+                    # Re-read the full history: the snapshot taken before our
+                    # insert predates the winner's row, so indexing it would
+                    # raise StopIteration (a 500) instead of recovering.
+                    fresh_rows = self._conn.execute(
+                        "SELECT * FROM tokens WHERE user_id = ? AND name = ? ORDER BY id",
+                        (user_id, _CONFIG_TOKEN_NAME),
+                    ).fetchall()
+                    if active is not None:
+                        generation = next(
+                            i
+                            for i, r in enumerate(fresh_rows)
+                            if r["id"] == active["id"]
+                        )
+                        candidate = _derive_config_token(secret, user_id, generation)
+                        if (
+                            active["revoked"] == 0
+                            and _hash_token(candidate) == active["token_hash"]
+                        ):
+                            # Current key (same secret, still active): hand
+                            # the winner's key back.
+                            raw = candidate
+                            row = active
+                            break
+                        # Stale secret or revoked-between-our-snapshot-and-
+                        # this-insert: drop the stale active row(s) so exactly
+                        # one key stays active, then mint the next generation.
+                        self._conn.execute(
+                            """
+                            UPDATE tokens
+                               SET revoked = 1
+                             WHERE user_id = ? AND name = ? AND revoked = 0
+                            """,
+                            (user_id, _CONFIG_TOKEN_NAME),
+                        )
+                    generation = len(fresh_rows)
+                    raw = _derive_config_token(secret, user_id, generation)
+                    try:
+                        cursor = self._conn.execute(
+                            """
+                            INSERT INTO tokens
+                                (user_id, name, token_hash, prefix,
+                                 created_at, endpoint_scope)
+                            VALUES (?, ?, ?, ?, ?, NULL)
+                            """,
+                            (
+                                user_id,
+                                _CONFIG_TOKEN_NAME,
+                                _hash_token(raw),
+                                raw[: len(TOKEN_PREFIX) + 8],
+                                now,
+                            ),
+                        )
+                        self._conn.commit()
+                    except sqlite3.IntegrityError:
+                        # Someone else won this generation; re-read and retry.
+                        self._conn.rollback()
+                        continue
+                    row = self._conn.execute(
+                        "SELECT * FROM tokens WHERE id = ?", (cursor.lastrowid,)
+                    ).fetchone()
+                    break
         token = self._token_from_row(row)
         if token is None:  # pragma: no cover - defensive
             raise RuntimeError("token row vanished after insert")

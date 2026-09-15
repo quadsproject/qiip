@@ -12,6 +12,7 @@ In tests, use ``app.dependency_overrides[get_settings]``,
 instances.
 """
 
+import asyncio
 import base64
 import binascii
 from functools import lru_cache
@@ -20,6 +21,7 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request
 
+from inference_proxy.auth.models import User
 from inference_proxy.auth.session import get_local_admin_session, get_session_user_id
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.huggingface.catalog import ModelCatalogService
@@ -143,7 +145,7 @@ def require_fleet_viewer(
     return role
 
 
-def require_fleet_viewer_email(
+async def require_fleet_viewer_email(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> str | None:
@@ -153,8 +155,9 @@ def require_fleet_viewer_email(
     the non-admin fleet view, so the endpoint/model/GPU identity of another
     user's node is never disclosed. Local-admin/HTTP Basic viewers have no
     Google identity and get None (the node filter then keeps the current
-    non-admin_only set). Raises 401 for anonymous callers, same gate as
-    ``require_fleet_viewer``.
+    non-admin_only set). A session whose user row vanished fails closed
+    (401) instead of degrading to the unfiltered node set. Raises 401 for
+    anonymous callers, same gate as ``require_fleet_viewer``.
     """
     require_fleet_viewer(request, settings)
     user_id = get_session_user_id(request)
@@ -163,8 +166,17 @@ def require_fleet_viewer_email(
     store = getattr(request.app.state, "auth_store", None)
     if store is None:
         return None
-    user = store.get_user(user_id)
-    return user.email.lower() if user is not None else None
+    user: User | None = await asyncio.to_thread(store.get_user, user_id)
+    if user is None:
+        # The session user was deleted between the role read in this request
+        # and this lookup: fail closed rather than silently dropping the
+        # ownership filter (which would disclose other users' nodes).
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid admin credentials",
+            headers=_ADMIN_AUTH_HEADERS,
+        )
+    return user.email.lower()
 
 
 def require_admin_auth(

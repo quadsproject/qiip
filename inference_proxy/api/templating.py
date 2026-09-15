@@ -29,16 +29,29 @@ def static_asset_url(request: Request, path: str) -> str:
     return f"{request.url_for('static', path=path)}?v={digest}"
 
 
-def signin_response(request: Request, notice: str = "") -> HTMLResponse:
-    """Render the sign-in page with its two sign-in options.
+def signin_response(
+    request: Request,
+    notice: str = "",
+    *,
+    oauth_enabled: bool = True,
+    sessions_available: bool = True,
+) -> HTMLResponse:
+    """Render the sign-in page, gating each option by what is configured.
 
     The local admin option is a username/password form (no native Basic
-    challenge popup); the Google option starts the OAuth flow.
+    challenge popup) and needs ``auth.session_secret``; the Google option
+    starts the OAuth flow and needs the OAuth integration enabled. Options
+    that would fail (404/503) are hidden and replaced by an HTTP-Basic hint.
     """
     return templates.TemplateResponse(
         request=request,
         name="signin.html",
-        context={"notice": notice, "active_page": "dashboard"},
+        context={
+            "notice": notice,
+            "active_page": "dashboard",
+            "oauth_enabled": oauth_enabled,
+            "sessions_available": sessions_available,
+        },
     )
 
 

@@ -13,16 +13,26 @@ import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 import inference_proxy.api.admin as admin_module
 import inference_proxy.config.dependencies as dependencies
 from inference_proxy.auth.dependencies import get_auth_store
 from inference_proxy.auth.store import AuthStore
-from inference_proxy.config.dependencies import get_request_metrics
+from inference_proxy.config.dependencies import (
+    get_request_metrics,
+    get_settings,
+    get_unified_node_service,
+)
 from inference_proxy.config.settings import Settings
+from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.main import create_app
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
+from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
+from inference_proxy.routing.connection_tracker import ConnectionTracker
+from inference_proxy.routing.node_selector import NodeSelector
 from inference_proxy.routing.request_metrics import RequestMetrics
+from inference_proxy.services.unified_nodes import UnifiedNodeService
 
 
 def _basic_header(username: str, password: str) -> dict[str, str]:
@@ -72,6 +82,19 @@ class TestBasicOnlyDeployment:
         application.dependency_overrides[get_request_metrics] = lambda: (
             application.state.request_metrics
         )
+        application.state.registry = NodeRegistry()
+        application.state.node_selector = NodeSelector(
+            application.state.registry, ConnectionTracker()
+        )
+        application.state.circuit_breaker_registry = CircuitBreakerRegistry()
+        application.dependency_overrides[get_unified_node_service] = lambda: (
+            UnifiedNodeService(
+                registry=application.state.registry,
+                poller=None,
+                cb_registry=application.state.circuit_breaker_registry,
+                tracker=application.state.node_selector.tracker,
+            )
+        )
         return application
 
     async def test_dashboard_renders_without_session_secret(
@@ -84,7 +107,12 @@ class TestBasicOnlyDeployment:
         response = await _request(app, "GET", "/dashboard")
 
         assert response.status_code == 200
-        assert "Sign in with Local Admin" in response.text
+        # Neither browser option can work here (no session_secret, OAuth off):
+        # both must be gated off and the HTTP-Basic hint shown instead.
+        assert "Sign in with Local Admin" not in response.text
+        assert "Sign in with Google Auth" not in response.text
+        assert 'class="signin-form"' not in response.text
+        assert "Browser sign-in is not configured" in response.text
 
     async def test_admin_api_works_with_valid_basic_without_session_secret(
         self,
@@ -101,6 +129,27 @@ class TestBasicOnlyDeployment:
         )
 
         assert response.status_code == 200
+
+    async def test_fleet_nodes_works_with_valid_basic_without_session_secret(
+        self,
+        test_settings: Settings,
+        auth_store: AuthStore,
+    ) -> None:
+        """The fleet route runs the distinct chain require_fleet_viewer ->
+        viewer_role -> get_session_user_id + require_fleet_viewer_email
+        (Basic: no session user, ownership filter stays off) -- the exact
+        AssertionError path this guard fixes."""
+        app = self._app_without_session_secret(test_settings, auth_store)
+
+        response = await _request(
+            app,
+            "GET",
+            "/fleet/nodes",
+            headers=_basic_header("test-admin", "test-password"),
+        )
+
+        assert response.status_code == 200
+        assert response.json() == []
 
 
 class TestAdminBasicAuthentication:
@@ -247,9 +296,27 @@ class TestAdminBasicAuthentication:
     async def test_dashboard_routes_require_signin(
         self,
         app: FastAPI,
+        test_settings: Settings,
         path: str,
     ) -> None:
-        """Anonymous visitors get the two-option sign-in page; Basic admins pass."""
+        """Anonymous visitors get the two-option sign-in page; Basic admins pass.
+
+        OAuth must be configured for the Google option to render (it is gated
+        off with the default test settings; see TestBasicOnlyDeployment).
+        """
+        enabled = test_settings.model_copy(
+            deep=True,
+            update={
+                "oauth": test_settings.oauth.model_copy(
+                    update={
+                        "client_id": "test-client",
+                        "client_secret": SecretStr("test-secret"),
+                        "redirect_uri": "https://gateway.example.com/auth/callback",
+                    }
+                )
+            },
+        )
+        app.dependency_overrides[get_settings] = lambda: enabled
         unauthenticated = await _request(app, "GET", path)
         authenticated = await _request(
             app,

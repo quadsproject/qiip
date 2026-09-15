@@ -33,7 +33,7 @@ class TestProfilePage:
 
         assert response.status_code == 200
         assert 'id="token-required-note"' in response.text
-        assert "At least one API token is required" in response.text
+        assert "Agent configuration downloads mint the per-user" in response.text
 
 
 class TestProfileMe:

@@ -55,9 +55,12 @@
                 <section class="card">
                     <h2 class="card-title">API Tokens <button type="button" class="manual-setup-toggle" id="token-toggle">+ New token</button></h2>
                     <p id="token-required-note" class="signin-notice" hidden>
-                        At least one API token is required to use agent configuration
-                        downloads (admin-only inference servers additionally require the
-                        admin role). Create a token below — it is shown only once.
+                        Agent configuration downloads mint the per-user
+                        agent-config key on demand from your session (admin-only
+                        inference servers additionally require the admin role);
+                        no existing token is needed for them. Create a token
+                        below only if you need one for direct API use — it is
+                        shown only once.
                     </p>
                     <form id="token-form" class="setup-form" hidden>
                         <input type="text" id="token-name" placeholder="Token name (e.g. ci-job, laptop)" maxlength="100" required aria-label="Token name">

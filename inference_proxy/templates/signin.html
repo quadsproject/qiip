@@ -21,6 +21,7 @@
             <p class="signin-notice">{{ notice }}</p>
             {% endif %}
             <div class="signin-options">
+                {% if sessions_available %}
                 <form method="post" action="/auth/local-admin" class="signin-form">
                     <label class="signin-label" for="signin-username">Local Admin</label>
                     <input class="signin-input" type="text" id="signin-username" name="username"
@@ -29,12 +30,25 @@
                            placeholder="Password" required autocomplete="current-password">
                     <button type="submit" class="btn btn-primary">Sign in with Local Admin</button>
                 </form>
+                {% endif %}
+                {% if oauth_enabled %}
                 <a class="btn" href="/auth/login">Sign in with Google Auth</a>
+                {% endif %}
+                {% if not sessions_available and not oauth_enabled %}
+                <p class="muted-status">Browser sign-in is not configured on this gateway. Use the
+                    HTTP Basic admin credentials (from <code>INFERENCE_PROXY_ADMIN__*</code> in your
+                    <code>.env</code>) with scripts and <code>curl</code>; configure
+                    <code>auth.session_secret</code> for the local-admin form or the OAuth
+                    integration for Google sign-in.</p>
+                {% endif %}
             </div>
         </div>
     </main>
     <script>
-      document.querySelector(".signin-form").addEventListener("submit", async function (e) {
+      (function () {
+        var form = document.querySelector(".signin-form");
+        if (!form) return; // local-admin option hidden (no session_secret)
+        form.addEventListener("submit", async function (e) {
         e.preventDefault();
         const form = e.target;
         const btn = form.querySelector("button");
@@ -68,7 +82,8 @@
         } finally {
           btn.disabled = false;
         }
-      });
+        });
+      })();
     </script>
 </body>
 </html>

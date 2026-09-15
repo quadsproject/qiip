@@ -922,8 +922,10 @@ class TestConfigTokenRaceRecovery:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The retry loop keeps a third process from 500ing when the recovery
-        mint itself collides with another worker's next-generation insert."""
+        """Three workers race the same generation with the same secret: the
+        partial unique index forces the losers into the recovery branch,
+        exactly one active row remains, and every caller receives the same
+        winner key (no 500, no duplicate key)."""
         db = tmp_path / "race-triple.db"
         stores = [AuthStore(db) for _ in range(3)]
         user = stores[0].upsert_google_user(**_GOOGLE)
@@ -972,3 +974,66 @@ class TestConfigTokenRaceRecovery:
             auth = store.resolve_token(results[f"s{i}"].token)
             assert auth is not None
             assert auth.user.id == user.id
+
+    def test_mixed_secret_rotation_keeps_one_active_key(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Regression (third review): workers holding different session secrets
+        (rolling rotation) must not both mint active agent-config rows. The
+        partial unique index forces the new-secret worker into recovery, which
+        revokes the stale-secret winner and mints the next generation -- one
+        active key, old key dead, no churn."""
+        db = tmp_path / "rotation-race.db"
+        store_v1 = AuthStore(db)
+        user = store_v1.upsert_google_user(**_GOOGLE)
+        first = store_v1.get_or_create_config_token(user.id, "secret-v1")
+
+        # Second worker with the rotated secret and a stale rows snapshot: it
+        # derives generation 0 (collides with the index), recovery sees a
+        # mismatched-secret winner, revokes it, mints generation 1.
+        store_v2 = AuthStore(db)
+        store_v2._conn = _StaleSnapshotConn(store_v2._conn, ())  # type: ignore[assignment]
+        rotated = store_v2.get_or_create_config_token(user.id, "secret-v2")
+
+        assert rotated.token != first.token
+        assert store_v1.resolve_token(rotated.token) is not None
+        auth = store_v2.resolve_token(rotated.token)
+        assert auth is not None
+        assert auth.user.id == user.id
+        assert store_v2.resolve_token(first.token) is None
+        active = store_v2._conn.execute(
+            "SELECT COUNT(*) FROM tokens WHERE name = 'agent-config' AND revoked = 0"
+        ).fetchone()[0]
+        assert active == 1
+
+    def test_migrate_dedupes_pre_index_active_config_rows(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Pre-index databases with duplicate active agent-config rows keep
+        only the newest on reopen, and the partial unique index is created."""
+        db = tmp_path / "dedupe.db"
+        store = AuthStore(db)
+        user = store.upsert_google_user(**_GOOGLE)
+        store.get_or_create_config_token(user.id, "s3cret")
+        # Simulate a pre-index database: drop the index, add a second active
+        # agent-config row.
+        store._conn.execute("DROP INDEX IF EXISTS idx_tokens_user_name_active_config")
+        store._conn.execute(
+            """
+            INSERT INTO tokens
+                (user_id, name, token_hash, prefix, created_at, revoked, endpoint_scope)
+            VALUES (?, 'agent-config', ?, ?, ?, 0, NULL)
+            """,
+            (user.id, "dup-hash", "qiip_dup", _utcnow().isoformat()),
+        )
+        store._conn.commit()
+
+        reopened = AuthStore(db)
+
+        active = reopened._conn.execute(
+            "SELECT id, token_hash FROM tokens WHERE name = 'agent-config' AND revoked = 0"
+        ).fetchall()
+        assert len(active) == 1
+        assert active[0]["token_hash"] == "dup-hash"  # newest row kept

@@ -42,9 +42,18 @@ def _admin_or_signin(
     """
     role = viewer_role(request, settings)
     if role is None:
-        return False, signin_response(request)
+        return False, signin_response(
+            request,
+            oauth_enabled=settings.oauth.enabled,
+            sessions_available=settings.auth.session_secret is not None,
+        )
     if role != "admin":
-        return False, signin_response(request, notice=_ADMIN_REQUIRED_NOTICE)
+        return False, signin_response(
+            request,
+            notice=_ADMIN_REQUIRED_NOTICE,
+            oauth_enabled=settings.oauth.enabled,
+            sessions_available=settings.auth.session_secret is not None,
+        )
     return True, None
 
 
@@ -56,7 +65,11 @@ async def dashboard(
     """Render the operations dashboard HTML shell."""
     role = viewer_role(request, settings)
     if role is None:
-        return signin_response(request)
+        return signin_response(
+            request,
+            oauth_enabled=settings.oauth.enabled,
+            sessions_available=settings.auth.session_secret is not None,
+        )
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
@@ -153,7 +166,8 @@ async def admin_page(
     request: Request,
     settings: Settings = Depends(get_settings),
 ) -> HTMLResponse:
-    """Render the admin page: admin-only inference servers and admin users."""
+    """Render the admin page: manage admin-only inference servers (admin-role
+    management lives on /dashboard/tokens)."""
     _, denied = _admin_or_signin(request, settings)
     if denied is not None:
         return denied

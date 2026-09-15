@@ -38,7 +38,7 @@ The import-time `inference_proxy.main:app` object no longer exists. Launch Uvico
 uv run uvicorn inference_proxy.main:create_app \
   --factory \
   --host 0.0.0.0 \
-  --port 8080
+  --port 5000
 ```
 
 Update systemd units, containers, shell wrappers, probes, and development commands that still name `inference_proxy.main:app`.
