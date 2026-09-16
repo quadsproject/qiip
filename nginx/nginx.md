@@ -131,6 +131,17 @@ config's port-80 308 redirect targets 443, so with the fallback either drop
 the HTTP listener or edit the redirect target, and the [verify
 commands](#verify-the-proxy) use 443 (switch to 8443).
 
+Open the fallback ports instead of the http/https services above (and keep
+5000 closed externally - the `/v1/*` inference endpoints are unauthenticated):
+
+```bash
+sudo firewall-cmd --permanent --add-port=8443/tcp
+# only if you kept the HTTP listener:
+# sudo firewall-cmd --permanent --add-port=8080/tcp
+sudo firewall-cmd --permanent --remove-port=5000/tcp
+sudo firewall-cmd --reload
+```
+
 #### Logging
 
 nginx logs land on the container host: the Quadlet bind-mounts
