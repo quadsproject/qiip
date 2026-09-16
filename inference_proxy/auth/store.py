@@ -137,13 +137,6 @@ SELECT * FROM tokens
    AND (purpose = ? OR (purpose IS NULL AND name = ?))
  ORDER BY id
 """
-_CONFIG_ACTIVE_SQL = """
-SELECT * FROM tokens
- WHERE user_id = ?
-   AND (purpose = ? OR (purpose IS NULL AND name = ?))
-   AND revoked = 0
- ORDER BY id DESC LIMIT 1
-"""
 _CONFIG_TOKEN_INFO = b"qiip-agent-config-token-v1"
 
 
