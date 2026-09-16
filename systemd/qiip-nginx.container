@@ -10,7 +10,7 @@
 #   mkdir -p ~/.config/containers/systemd
 #   cp systemd/qiip-nginx.container ~/.config/containers/systemd/
 #   systemctl --user daemon-reload
-#   systemctl --user enable --now qiip-nginx
+#   systemctl --user start qiip-nginx   (Quadlet-generated units cannot be enabled; linger + WantedBy=default.target handle boot)
 #   sudo loginctl enable-linger "$USER"   # start at boot without a login session
 
 [Unit]
@@ -73,7 +73,10 @@ Volume=%h/.config/qiip-nginx/logs:/var/log/nginx:Z
 Label=name=qiip-nginx
 Label=org.opencontainers.image.source=https://github.com/quadsproject/qiip
 
-# Graceful stop: nginx finishes in-flight requests on SIGTERM before exit.
+# Graceful stop: SIGQUIT makes nginx finish in-flight requests before exit
+# (SIGTERM would cut active SSE/generation connections); StopTimeout bounds
+# the drain and Podman then escalates to SIGKILL.
+StopSignal=SIGQUIT
 StopTimeout=20
 
 [Service]

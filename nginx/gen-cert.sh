@@ -25,7 +25,7 @@ if [ ! -s "$CERT" ] || [ ! -s "$KEY" ]; then
     [ -s "$CERT" ] && mv -f "$CERT" "$CERT.stale"
     [ -s "$KEY" ] && mv -f "$KEY" "$KEY.stale"
     echo "generating self-signed pair for $FQDN into $CERTS_DIR" >&2
-    export TMPDIR="${TMPDIR:-/var/cache/nginx}"   # writable tmpfs under ReadOnly=true
+    export TMPDIR="${TMPDIR:-/tmp}"   # exists everywhere: container /tmp is a writable podman tmpfs; a host first-run never needs /var/cache/nginx
     openssl req -x509 -newkey rsa:4096 \
         -keyout "$KEY" -out "$CERT" \
         -days 3650 -nodes \

@@ -106,17 +106,20 @@ echo 'net.ipv4.ip_unprivileged_port_start=0' | sudo tee /etc/sysctl.d/99-qiip-ng
 sudo sysctl --system
 
 systemctl --user daemon-reload
-systemctl --user enable --now qiip-nginx
-sudo loginctl enable-linger "$USER"     # start at boot without a login session
+systemctl --user start qiip-nginx       # Quadlet-generated units cannot be `systemctl enable`d
+sudo loginctl enable-linger "$USER"     # boot start: linger + the unit's WantedBy=default.target
 
 systemctl --user status qiip-nginx --no-pager
 podman exec qiip-nginx nginx -t         # configuration file test is successful
 ```
 
-The container reaches the gateway through the host interface, so keep port
-5000 closed externally (the `/v1/*` inference endpoints are unauthenticated):
+Pasta publishes the container's ports through the host firewall, so open
+80/443 there and keep port 5000 closed externally (the `/v1/*` inference
+endpoints are unauthenticated):
 
 ```bash
+sudo firewall-cmd --permanent --add-service=http
+sudo firewall-cmd --permanent --add-service=https
 sudo firewall-cmd --permanent --remove-port=5000/tcp
 sudo firewall-cmd --reload
 ```
@@ -163,12 +166,7 @@ hosts that already run nginx as a system service, and the path where the
 [ansible-sslcerts](#rpm-ansible-sslcerts) playbook's normal handler
 (restart of the system `nginx` unit) works unchanged.
 
-Steps for RPM install:
-
-1. Install nginx
-2. Deploy the config
-3. SELinux and firewall
-4. Install and start
+Steps for RPM install (sections below, in order).
 
 ### Install nginx
 
@@ -394,7 +392,7 @@ years so this is a lifetime away).
 Container method:
 
 ```bash
-systemctl --user disable --now qiip-nginx
+systemctl --user stop qiip-nginx
 rm ~/.config/containers/systemd/qiip-nginx.container
 systemctl --user daemon-reload
 loginctl disable-linger "$USER"          # optional
@@ -453,7 +451,7 @@ For the container, nginx logs are host files under
 | `Permission denied` on the cert | SELinux label missing | Ensure `:Z` on the `Volume=`/mount; `sudo chcon -R -t container_file_t ~/.config/qiip-nginx/certs`, then restart. |
 | `bind: address already in use` on 80/443 | Bare-metal nginx still runs | This proxy replaces it: `sudo systemctl stop nginx && sudo systemctl disable nginx`, then restart the new unit. |
 | Container exits: `mkdir() /var/lib/nginx/tmp/client_body failed (13: Permission denied)` | Read-only rootfs without the nginx temp dirs | The Quadlet ships `Tmpfs=/var/cache/nginx`; the config sets temp paths under `/var/cache/nginx`. |
-| `nginx -t`/start: `socket() [::]:443 failed (97: Address family not supported by protocol)` | Host has no IPv6; the `listen [::]:...` lines are fatal without IPv6 | Strip the `[::]` lines: `sudo sed -i '/listen \[::\]/d' <config>` (`/etc/nginx/nginx.conf` or `~/.config/qiip-nginx/nginx.conf`), then `nginx -t` and restart. |
+| `nginx -t`/start: `socket() [::]:443 failed (97: Address family not supported by protocol)` | Host has no IPv6; the `listen [::]:...` lines are fatal without IPv6 | Strip the `[::]` lines: `sudo sed -iE '/listen[[:space:]]*\[::\]/d' <config>` (`/etc/nginx/nginx.conf` or `~/.config/qiip-nginx/nginx.conf`), then `nginx -t` and restart. |
 | `curl http://host/health` returns 308 | Intentional: port 80 redirects to HTTPS | Use `https://host/health` (with `-k` for self-signed). |
 | `*.stale` files appear in the cert dir | A half pair existed (one of `$FQDN.pem`/`$FQDN.key` was missing); the script preserved the survivor and generated a fresh self-signed pair | If the preserved file was CA-signed, re-push the matching pair via ansible-sslcerts and remove the `.stale` files; otherwise just remove them. |
 

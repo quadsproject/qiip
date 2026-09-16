@@ -3,7 +3,7 @@
 # Base: Fedora Minimal 43 - the smallest functional Fedora base that ships a
 # package manager (microdnf) and matches the fc43 host. No Docker Hub (quay.io
 # only); digest-pinned for reproducible builds. See nginx/nginx.md.
-FROM quay.io/fedora/fedora-minimal:43@sha256:83f1e0c179bda198602a25d19aba9f83d54536fa4d7971a983143aa933504ffe
+FROM quay.io/fedora/fedora-minimal:43@sha256:f192b939a8731ce26e7e9476844d5bba68dbf840e97465ddf773d12cd1152299
 
 # nginx for the proxy; openssl for first-run self-signed cert generation
 # (fedora-minimal has no openssl CLI; the nginx package depends only on
