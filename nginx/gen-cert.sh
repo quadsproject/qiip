@@ -9,6 +9,8 @@
 #
 # Idempotent: an existing non-empty pair is never touched, so certs pushed by
 # an internal CA (or the ansible-sslcerts playbook) survive container restarts.
+# If only one file of the pair exists, both are regenerated and the surviving
+# file is preserved as <name>.stale instead of being clobbered.
 set -eu
 FQDN="${QIIP_FQDN:?set QIIP_FQDN (<fqdn>)}"
 case "$FQDN" in
@@ -18,9 +20,13 @@ CERTS_DIR="${CERTS_DIR:-/etc/pki/tls/certs}"
 CERT="$CERTS_DIR/$FQDN.pem"
 KEY="$CERTS_DIR/$FQDN.key"
 if [ ! -s "$CERT" ] || [ ! -s "$KEY" ]; then
+    # Half pair (interrupted generation, or one file deleted after a CA push):
+    # preserve the survivor, then regenerate both.
+    [ -s "$CERT" ] && mv -f "$CERT" "$CERT.stale"
+    [ -s "$KEY" ] && mv -f "$KEY" "$KEY.stale"
     echo "generating self-signed pair for $FQDN into $CERTS_DIR" >&2
     export TMPDIR="${TMPDIR:-/var/cache/nginx}"   # writable tmpfs under ReadOnly=true
-    openssl req -x509 -newkey rsa:4096 -quiet \
+    openssl req -x509 -newkey rsa:4096 \
         -keyout "$KEY" -out "$CERT" \
         -days 3650 -nodes \
         -subj "/CN=$FQDN" -addext "subjectAltName=DNS:$FQDN"

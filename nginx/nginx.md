@@ -46,9 +46,12 @@ methods are alternatives on one host (both bind 80/443).
   `curl -s http://localhost:5000/health` returns `{"status": "ok", ...}`.
   Method 1 needs `--host 0.0.0.0`: a loopback-only listener cannot be reached
   from the pasta container.
-- Fedora 40+ host with **nginx >= 1.25.1** (the config uses `http2 on;`,
-  which older nginx rejects; RHEL 9 ships nginx 1.20-1.24 and does not
-  satisfy this unless the `nginx:1.26` module stream is enabled). IPv6 is
+- Fedora 40+ host for both methods (the container image is Fedora-based), or
+  a Rocky/RHEL 9.6+ host for Method 2 only, with **nginx >= 1.25.1** (the
+  config uses `http2 on;`, which older nginx rejects). Fedora ships nginx
+  1.28+ by default. EL9's stock nginx is 1.20 and only the `nginx:1.26`
+  module stream (available since 9.6) supports `http2 on;`; enable it before
+  installing (see [Method 2](#method-2-rpm-install)). IPv6 is
   optional: on an IPv4-only host, remove the two `listen [::]:...` lines
   from the config (see [Troubleshooting](#troubleshooting)) - nginx fails
   to start with "Address family not supported" otherwise.
@@ -170,17 +173,25 @@ Steps for RPM install:
 ### Install nginx
 
 ```bash
+# EL9 (Rocky/RHEL 9.6+) only: the stock nginx is 1.20, which rejects
+# `http2 on;`. If a different nginx stream is already enabled, run
+# `sudo dnf module reset -y nginx` first.
+sudo dnf module enable -y nginx:1.26
 sudo dnf install -y nginx openssl
 # nginx needs its temp dirs; the package does not create /var/cache/nginx.
 sudo install -d -o nginx -g nginx /var/cache/nginx
+# SELinux: label it with the packaged context (httpd_cache_t) or nginx cannot
+# create its temp dirs/files under it.
+sudo restorecon -R /var/cache/nginx
 ```
 
 ### Deploy the config
 
 Fetch the repo config (or copy it from a checkout), substitute the FQDN, and
-remove the package's stock virtual host so its `listen 80` does not collide
-with the config's port-80 redirect. The upstream stays `127.0.0.1:5000` for
-bare-metal nginx.
+drop any packaged vhosts under `conf.d/`/`default.d/` - a defensive no-op on
+Fedora and EL9, which ship none (their stock `listen 80` server lives inline
+in `/etc/nginx/nginx.conf`, which this deploy replaces wholesale). The
+upstream stays `127.0.0.1:5000` for bare-metal nginx.
 
 ```bash
 FQDN=$(hostname -f)
@@ -258,6 +269,8 @@ From a checkout, replace the `curl` line with
 
 Run it. The script is idempotent: an existing pair is never touched, so it is
 safe to re-run after the ansible playbook has pushed an internal-CA pair.
+If only one file of the pair is missing (e.g. a key deleted after a CA push),
+the script regenerates both and preserves the surviving file as `<name>.stale`.
 
 ```bash
 FQDN=$(hostname -f)
@@ -395,10 +408,11 @@ RPM method:
 
 ```bash
 sudo systemctl disable --now nginx
-# Fedora marks /etc/nginx/nginx.conf %config(noreplace): a modified file
-# survives remove/reinstall. Delete it first, then reinstall for stock files.
+# Fedora and EL9 both split nginx: the meta package owns only the unit/html,
+# nginx-core owns /etc/nginx. Delete ours first, then reinstall nginx-core
+# for the stock files (reinstalling `nginx` alone restores nothing under).
 sudo rm -f /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/default.d/*.conf
-sudo dnf reinstall -y nginx
+sudo dnf reinstall -y nginx-core
 ```
 
 ## Verify the proxy
@@ -441,6 +455,7 @@ For the container, nginx logs are host files under
 | Container exits: `mkdir() /var/lib/nginx/tmp/client_body failed (13: Permission denied)` | Read-only rootfs without the nginx temp dirs | The Quadlet ships `Tmpfs=/var/cache/nginx`; the config sets temp paths under `/var/cache/nginx`. |
 | `nginx -t`/start: `socket() [::]:443 failed (97: Address family not supported by protocol)` | Host has no IPv6; the `listen [::]:...` lines are fatal without IPv6 | Strip the `[::]` lines: `sudo sed -i '/listen \[::\]/d' <config>` (`/etc/nginx/nginx.conf` or `~/.config/qiip-nginx/nginx.conf`), then `nginx -t` and restart. |
 | `curl http://host/health` returns 308 | Intentional: port 80 redirects to HTTPS | Use `https://host/health` (with `-k` for self-signed). |
+| `*.stale` files appear in the cert dir | A half pair existed (one of `$FQDN.pem`/`$FQDN.key` was missing); the script preserved the survivor and generated a fresh self-signed pair | If the preserved file was CA-signed, re-push the matching pair via ansible-sslcerts and remove the `.stale` files; otherwise just remove them. |
 
 ## References
 

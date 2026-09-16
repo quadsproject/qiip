@@ -7,9 +7,9 @@ FROM quay.io/fedora/fedora-minimal:43@sha256:83f1e0c179bda198602a25d19aba9f83d54
 
 # nginx for the proxy; openssl for first-run self-signed cert generation
 # (fedora-minimal has no openssl CLI; the nginx package depends only on
-# openssl-libs). Drop the stock conf.d/default.d server blocks: the mounted
-# nginx.conf already defines the port 80 and port 443 servers, and the
-# packaged include globs would add a second `listen 80` and fail the start.
+# openssl-libs). Drop any stock vhosts under conf.d/default.d - a defensive
+# no-op here: Fedora's nginx ships none (its stock listen-80 server lives
+# inline in /etc/nginx/nginx.conf, which the deployed config replaces).
 RUN microdnf -y install nginx openssl \
     && rm -f /etc/nginx/conf.d/*.conf /etc/nginx/default.d/*.conf \
     && microdnf clean all
