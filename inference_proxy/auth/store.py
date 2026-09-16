@@ -439,8 +439,9 @@ class AuthStore:
             # Pre-marker databases store the generated key without a purpose
             # marker. If the derived value for a stored generation matches a
             # row, the downloader keeps the key it already has (never mint
-            # into a token_hash collision); a revoked legacy generation is
-            # skipped by minting one past it.
+            # into a token_hash collision). A revoked legacy generation is
+            # skipped by continuing the scan — a later revoke-then-re-mint
+            # row may still be live and must be reused, not revoked again.
             for index, row in enumerate(rows):
                 candidate = _derive_config_token(secret, user_id, index)
                 if _hash_token(candidate) == row["token_hash"]:
@@ -457,7 +458,7 @@ class AuthStore:
                         token = self._token_from_row(row)
                         if token is not None:
                             return CreatedToken(**token.model_dump(), token=candidate)
-                    break
+                    continue
             generation = len(rows)
             raw = _derive_config_token(secret, user_id, generation)
             try:
@@ -505,7 +506,11 @@ class AuthStore:
                         if _hash_token(candidate) == row["token_hash"]:
                             if row["revoked"] == 0:
                                 reused = row
-                            break
+                                break
+                            # Revoked generation (revoke-then-re-mint): keep
+                            # scanning so a live row at a higher index is
+                            # reused instead of being revoked as stale.
+                            continue
                     if reused is not None:
                         generation = next(
                             i

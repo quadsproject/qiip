@@ -33,11 +33,15 @@
                 <div class="admin-add-row">
                     <form id="admin-only-server-form" class="setup-form">
                         <input type="text" id="admin-only-server-url" placeholder="Enter hostname" required>
-                        <input type="number" id="admin-only-server-port" placeholder="Port (optional)" min="1" max="65535" title="Only used for an existing OpenAI-compatible server">
+                        <input type="number" id="admin-only-server-port" placeholder="Port (optional)" min="1" max="65535" title="Only used when adopting an existing OpenAI-compatible server">
                         <input type="text" id="admin-only-server-name" placeholder="Name (optional, shown in fleet)" maxlength="100" aria-label="Operator-facing name (optional)">
+                        <label class="standalone-label" for="admin-only-server-existing">
+                            <input type="checkbox" id="admin-only-server-existing" checked>
+                            Existing OpenAI-compatible server
+                        </label>
                         <button type="submit" id="admin-only-server-btn" class="btn btn-primary">Add Admin-only Server</button>
                     </form>
-                    <p class="muted-status">Registers an already-running OpenAI-compatible server as admin-only (no provisioning); to provision a new managed node, use the dashboard's Manual setup.</p>
+                    <p class="muted-status">Checked: registers an already-running OpenAI-compatible server as admin-only (no provisioning). Unchecked: adds the host to the pool so qiip provisions the inference engine automatically.</p>
                 </div>
                 <div class="table-wrap">
                     <table>

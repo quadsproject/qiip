@@ -2173,3 +2173,154 @@ sandbox.fetch = async function (url) {
     )
 
     assert result == {"downloadsRequests": 2, "rows": ["newer-poll-download"]}
+
+
+_ADMIN_JS = _ROOT / "inference_proxy/static/js/admin.js"
+
+
+def test_admin_only_server_form_mimics_add_node_ux() -> None:
+    """Regression (grafuls review): the admin-only server form must offer the
+    dashboard-style choice — adopt an existing OpenAI-compatible server
+    (hostname + custom port + operator name) or add the host to the pool so
+    qiip provisions the engine automatically (default port, no name)."""
+    harness = r"""
+const fs = require("fs");
+const vm = require("vm");
+const source = fs.readFileSync(process.argv[1], "utf8");
+
+const elements = new Map();
+const docHandlers = {};
+const captures = [];
+
+function element() {
+  const el = {
+    children: [],
+    _handlers: {},
+    _attrs: {},
+    value: "",
+    textContent: "",
+    hidden: false,
+    disabled: false,
+    checked: false,
+    style: {},
+    addEventListener(name, fn) { this._handlers[name] = fn; },
+    click() {},
+    focus() {},
+    select() {},
+  };
+  return el;
+}
+
+function byId(id) {
+  if (!elements.has(id)) elements.set(id, element());
+  return elements.get(id);
+}
+
+const sandbox = {
+  console,
+  POLL_INTERVAL_MS: 10000,
+  document: {
+    readyState: "complete",
+    getElementById: byId,
+    addEventListener(name, fn) { docHandlers[name] = fn; },
+    querySelectorAll() { return []; },
+    querySelector() { return element(); },
+    createElement() { return element(); },
+    createTextNode(text) { return { textContent: text }; },
+    execCommand() { return true; },
+    body: element(),
+  },
+  window: { confirm() { return true; } },
+  requestAnimationFrame() {},
+  setInterval() { return 0; },
+  clearInterval() {},
+  fetch: async function (url, options) {
+    captures.push({ url, options });
+    return { ok: true, json: async function () { return {}; } };
+  },
+};
+
+vm.createContext(sandbox);
+vm.runInContext(source, sandbox);
+// Stub before wiring: the real refreshAdminPage would keep issuing fetches
+// from its own in-flight async chain and pollute the capture stream.
+sandbox.showToast = function () {};
+sandbox.refreshAdminPage = function () {};
+docHandlers["DOMContentLoaded"]();
+
+const toggle = byId("admin-only-server-existing");
+const portInput = byId("admin-only-server-port");
+const nameInput = byId("admin-only-server-name");
+const btn = byId("admin-only-server-btn");
+const input = byId("admin-only-server-url");
+const form = byId("admin-only-server-form");
+
+const states = [];
+function snap(label) {
+  states.push({
+    label: label,
+    btn: btn.textContent,
+    port: portInput.style.display,
+    name: nameInput.style.display,
+  });
+}
+
+(async function () {
+  // Template default: adoption mode (port + name visible).
+  toggle.checked = true;
+  toggle._handlers.change();
+  snap("adoption-default");
+
+  // Unchecked: pool registration (port + name hidden).
+  toggle.checked = false;
+  toggle._handlers.change();
+  snap("pool-mode");
+
+  // Adoption submit: port and operator name ride along.
+  toggle.checked = true;
+  toggle._handlers.change();
+  input.value = "gpu01.internal";
+  portInput.value = "8080";
+  nameInput.value = "prod-gpu";
+  await form._handlers.submit({ preventDefault() {} });
+  const adopt = JSON.parse(captures[captures.length - 1].options.body);
+
+  // Pool submit: no port/name even if stale values linger.
+  toggle.checked = false;
+  toggle._handlers.change();
+  input.value = "gpu02.internal";
+  portInput.value = "9090";
+  nameInput.value = "other";
+  await form._handlers.submit({ preventDefault() {} });
+  const pool = JSON.parse(captures[captures.length - 1].options.body);
+
+  process.stdout.write(JSON.stringify({ states: states, adopt: adopt, pool: pool }));
+})().catch(function (error) {
+  console.error(error);
+  process.exit(1);
+});
+"""
+
+    result = _run_node(_ADMIN_JS, harness)
+
+    assert result["states"] == [
+        {
+            "label": "adoption-default",
+            "btn": "Add Admin-only Server",
+            "port": "",
+            "name": "",
+        },
+        {"label": "pool-mode", "btn": "Add to Pool", "port": "none", "name": "none"},
+    ]
+    assert result["adopt"] == {
+        "hostname": "gpu01.internal",
+        "self_setup": True,
+        "admin_only": True,
+        "port": 8080,
+        "name": "prod-gpu",
+    }
+    assert result["pool"] == {
+        "hostname": "gpu02.internal",
+        "self_setup": False,
+        "admin_only": False,
+    }

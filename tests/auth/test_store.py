@@ -943,6 +943,37 @@ class TestConfigTokenRaceRecovery:
         ).fetchone()[0]
         assert active == 1
 
+    def test_race_after_revoke_reuses_live_re_minted_key(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Regression (ttlogan review): a stale worker racing a re-mint after
+        a revoke collides with the *revoked* generation. The recovery scan
+        must skip the revoked row and reuse the live re-minted key instead of
+        revoking it as stale and minting yet another generation."""
+        db = tmp_path / "race-remint.db"
+        store = AuthStore(db)
+        user = store.upsert_google_user(**_GOOGLE)
+        first = store.get_or_create_config_token(user.id, "s3cret")  # generation 0
+        assert store.revoke_token(user.id, first.id) is True
+        current = store.get_or_create_config_token(user.id, "s3cret")  # generation 1
+
+        # Second process with a pre-re-mint snapshot: it derives generation 0
+        # and collides with the (now revoked) gen-0 row.
+        stale = AuthStore(db)
+        stale._conn = _StaleSnapshotConn(stale._conn, ())  # type: ignore[assignment]
+        recovered = stale.get_or_create_config_token(user.id, "s3cret")
+
+        # The winner's just-minted key stays active and both callers agree.
+        assert recovered.token == current.token
+        assert stale.resolve_token(current.token) is not None
+        active = stale._conn.execute(
+            "SELECT COUNT(*) FROM tokens "
+            "WHERE user_id = ? AND purpose = 'agent-config' AND revoked = 0",
+            (user.id,),
+        ).fetchone()[0]
+        assert active == 1
+
     def test_concurrent_mint_never_raises_on_repeated_collisions(
         self,
         tmp_path: Path,

@@ -186,46 +186,64 @@ document.addEventListener("DOMContentLoaded", function () {
   refreshAdminPage();
   setInterval(refreshAdminPage, POLL_INTERVAL_MS);
 
-  document
-    .getElementById("admin-only-server-form")
-    .addEventListener("submit", async function (e) {
-      e.preventDefault();
-      const input = document.getElementById("admin-only-server-url");
-      const portInput = document.getElementById("admin-only-server-port");
-      const nameInput = document.getElementById("admin-only-server-name");
-      const btn = document.getElementById("admin-only-server-btn");
-      const hostname = input.value.trim();
-      if (!hostname) return;
-      btn.disabled = true;
-      try {
-        const body = {
-          hostname: hostname,
-          self_setup: true,
-          admin_only: true,
-        };
-        const port = portInput.value.trim();
-        if (port) body.port = Number(port);
-        const name = nameInput.value.trim();
-        if (name) body.name = name;
-        const resp = await fetch("/admin/nodes/pool", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (resp.ok) {
-          showToast(`admin-only server ${hostname} registered`, "success");
-          input.value = "";
-          portInput.value = "";
-          nameInput.value = "";
-          refreshAdminPage();
-        } else {
-          showToast(data.detail || `HTTP ${resp.status}`, "error");
-        }
-      } catch (err) {
-        showToast(`Registration failed: ${err.message}`, "error");
-      } finally {
-        btn.disabled = false;
+  const adminForm = document.getElementById("admin-only-server-form");
+  const existingToggle = document.getElementById("admin-only-server-existing");
+  const portInput = document.getElementById("admin-only-server-port");
+  const nameInput = document.getElementById("admin-only-server-name");
+  const adminBtn = document.getElementById("admin-only-server-btn");
+  function syncAdminForm() {
+    const adopt = existingToggle.checked;
+    adminBtn.textContent = adopt ? "Add Admin-only Server" : "Add to Pool";
+    // A custom port and operator-facing name only apply to adopting an
+    // already-running server; pool registration provisions on the default.
+    portInput.style.display = adopt ? "" : "none";
+    nameInput.style.display = adopt ? "" : "none";
+  }
+  existingToggle.addEventListener("change", syncAdminForm);
+  syncAdminForm();
+  adminForm.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    const input = document.getElementById("admin-only-server-url");
+    const hostname = input.value.trim();
+    if (!hostname) return;
+    adminBtn.disabled = true;
+    try {
+      const adopt = existingToggle.checked;
+      const body = {
+        hostname: hostname,
+        self_setup: adopt,
+        admin_only: adopt,
+      };
+      const port = portInput.value.trim();
+      if (adopt && port) body.port = Number(port);
+      const name = nameInput.value.trim();
+      if (adopt && name) body.name = name;
+      const resp = await fetch("/admin/nodes/pool", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (resp.ok) {
+        showToast(
+          adopt
+            ? `admin-only server ${hostname} registered`
+            : `${hostname} added to pool (qiip will provision it)`,
+          "success"
+        );
+        input.value = "";
+        portInput.value = "";
+        nameInput.value = "";
+        existingToggle.checked = true;
+        syncAdminForm();
+        refreshAdminPage();
+      } else {
+        showToast(data.detail || `HTTP ${resp.status}`, "error");
       }
-    });
+    } catch (err) {
+      showToast(`Registration failed: ${err.message}`, "error");
+    } finally {
+      adminBtn.disabled = false;
+    }
+  });
 });

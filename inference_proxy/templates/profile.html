@@ -64,14 +64,16 @@
                     </p>
                     <form id="token-form" class="setup-form" hidden>
                         <input type="text" id="token-name" placeholder="Token name (e.g. ci-job, laptop)" maxlength="100" required aria-label="Token name">
-                        <label id="token-endpoints-label">Pin to endpoints (optional)</label>
-                        <div class="endpoint-picker" id="endpoint-picker">
-                            <button type="button" id="endpoint-toggle" class="btn btn-neutral endpoint-toggle" aria-expanded="false" aria-controls="endpoint-list">
-                                <span id="endpoint-summary">All Endpoints (0 selected)</span>
-                                <span class="endpoint-caret" aria-hidden="true">▾</span>
-                            </button>
-                            <div class="endpoint-list" id="endpoint-list" hidden>
-                                <p class="muted-status endpoint-empty" id="endpoint-empty">No endpoints available to pin</p>
+                        <div class="token-pin-group" id="token-pin-group">
+                            <label id="token-endpoints-label">Pin to endpoints (optional)</label>
+                            <div class="endpoint-picker" id="endpoint-picker">
+                                <button type="button" id="endpoint-toggle" class="btn btn-neutral endpoint-toggle" aria-expanded="false" aria-controls="endpoint-list">
+                                    <span id="endpoint-summary">All Endpoints (0 selected)</span>
+                                    <span class="endpoint-caret" aria-hidden="true">▾</span>
+                                </button>
+                                <div class="endpoint-list" id="endpoint-list" hidden>
+                                    <p class="muted-status endpoint-empty" id="endpoint-empty">No endpoints available to pin</p>
+                                </div>
                             </div>
                         </div>
                         <select id="token-endpoints" multiple aria-label="Pin to endpoints" hidden></select>
