@@ -41,9 +41,12 @@ fleet_router = APIRouter(
 
 # Credential-shaped substrings that must never reach a non-admin viewer:
 # provisioning failures are surfaced verbatim (task error fields, log
-# entries), and engine-start commands can embed HF_TOKEN or similar.
+# entries), and engine-start commands can embed HF_TOKEN or similar. The
+# provisioner shell-quotes a value that carries a trailing newline
+# (e.g. ``HF_TOKEN='token\n'``), so the value may be single- or
+# double-quoted; the unquoted branch keeps the older (bare) assignments.
 _SECRET_ASSIGN_RE = re.compile(
-    r"(?P<key>[A-Za-z0-9_]*(?:TOKEN|PASSWORD|SECRET|CREDENTIAL|APIKEY)[A-Za-z0-9_]*)\s*[=:]\s*(?P<value>[^\s,;\"']+)",
+    r"(?P<key>[A-Za-z0-9_]*(?:TOKEN|PASSWORD|SECRET|CREDENTIAL|APIKEY)[A-Za-z0-9_]*)\s*[=:]\s*(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;\"']+)",
     re.IGNORECASE,
 )
 _BEARER_RE = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")

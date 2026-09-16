@@ -396,7 +396,21 @@ class AuthStore:
                 _CONFIG_ROWS_SQL,
                 (user_id, _CONFIG_TOKEN_PURPOSE, _CONFIG_TOKEN_NAME),
             ).fetchall()
-            active = next((r for r in reversed(rows) if not r["revoked"]), None)
+            # Only purpose-marked rows are governed by the one-active config
+            # key invariant. A same-name row created by an older worker
+            # (``create_token`` with name 'agent-config' but no purpose) is a
+            # plain user token and must stay inert: it must never be treated
+            # as the active config key, minted into, or revoked by the
+            # generated-key path. Purpose-NULL generated keys from pre-marker
+            # databases are still recovered below by hash match.
+            active = next(
+                (
+                    r
+                    for r in reversed(rows)
+                    if not r["revoked"] and r["purpose"] == _CONFIG_TOKEN_PURPOSE
+                ),
+                None,
+            )
             if active is not None:
                 generation = next(
                     i for i, r in enumerate(rows) if r["id"] == active["id"]

@@ -101,6 +101,11 @@ vm.createContext(sandbox);
 vm.runInContext(source, sandbox);
 
 (async function () {
+  // Mirror the template: #endpoint-empty is the first child of
+  // #endpoint-list. renderEndpointList keeps it and only prunes generated
+  // rows, so a reopen test reproduces the structure that made the old
+  // clearing loop stop and leave stale checked rows behind.
+  byId("endpoint-list").appendChild(byId("endpoint-empty"));
   // init() runs on load; wait for its fetches to settle.
   await new Promise(function (r) { setTimeout(r, 20); });
   // The template renders the create form hidden; mirror that so the
@@ -111,7 +116,10 @@ vm.runInContext(source, sandbox);
   await new Promise(function (r) { setTimeout(r, 20); });
 
   if (CHECK_INDEX >= 0) {
-    const rows = byId("endpoint-list").children;
+    const empty = byId("endpoint-empty");
+    const rows = byId("endpoint-list").children.filter(function (child) {
+      return child !== empty;
+    });
     const checkbox = rows[CHECK_INDEX] && rows[CHECK_INDEX].children[0];
     if (checkbox) {
       checkbox.checked = true;
@@ -139,12 +147,16 @@ vm.runInContext(source, sandbox);
     rowScopes: body.children.map(function (row) {
       return row.children[5] ? row.children[5].textContent : "";
     }),
-    listValues: list.children.map(function (label) {
-      return label.children[0] ? label.children[0].value : "";
-    }),
-    checkedValues: list.children.map(function (label) {
-      return label.children[0] ? !!label.children[0].checked : false;
-    }),
+    listValues: list.children
+      .filter(function (child) { return child !== byId("endpoint-empty"); })
+      .map(function (label) {
+        return label.children[0] ? label.children[0].value : "";
+      }),
+    checkedValues: list.children
+      .filter(function (child) { return child !== byId("endpoint-empty"); })
+      .map(function (label) {
+        return label.children[0] ? !!label.children[0].checked : false;
+      }),
     selectValues: select.children.map(function (option) {
       return { value: option.value, selected: !!option.selected };
     }),

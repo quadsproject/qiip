@@ -809,6 +809,37 @@ class TestConfigToken:
         ).fetchone()[0]
         assert active == 1
 
+    def test_older_worker_ordinary_token_is_inert_for_generated_key(
+        self,
+        auth_store: AuthStore,
+    ) -> None:
+        """Regression (sjug review): during a rolling upgrade an older
+        worker can create an ordinary 'agent-config' token (random value, no
+        purpose marker) AFTER the generated key. That same-name row must be
+        inert: it must not be selected as the active config key, must not
+        trigger a revoke of the live generated key, and a config download
+        must keep returning the generated key."""
+        user = self._user(auth_store)
+        generated = auth_store.get_or_create_config_token(user.id, "session-secret")
+        ordinary = auth_store.create_token(user.id, "agent-config")
+
+        again = auth_store.get_or_create_config_token(user.id, "session-secret")
+
+        assert again.token == generated.token
+        assert again.id == generated.id
+        assert again.revoked is False
+        # The ordinary same-name row stays active and resolvable (never
+        # revoked, never treated as the config key).
+        assert ordinary.revoked is False
+        assert auth_store.resolve_token(ordinary.token) is not None
+        # The generated key is still the sole active purpose-marked key.
+        active = auth_store._conn.execute(
+            "SELECT COUNT(*) FROM tokens "
+            "WHERE user_id = ? AND purpose = 'agent-config' AND revoked = 0",
+            (user.id,),
+        ).fetchone()[0]
+        assert active == 1
+
 
 class _StaleRows:
     """Result stand-in with a sqlite3.Row-compatible fetchall/fetchone."""

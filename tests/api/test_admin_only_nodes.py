@@ -742,9 +742,17 @@ class TestFleetReadOnlySurface:
     ) -> None:
         """Regression (sjug review): failed engine-start commands embed
         HF_TOKEN in error/log text; the read-only surface must redact it for
-        non-admin viewers, including retained buffered entries."""
+        non-admin viewers. The provisioner shell-quotes a token carrying a
+        trailing newline, so the secret can appear single- or double-quoted
+        and must be redacted too — in tasks and retained buffered log
+        entries."""
         test_registry.add(_make_node("pub1", model="public"))
         secret = "hf_0123456789abcdef"
+        quoted_secret = "hf_fedcba9876543210\n"
+        task_error = (
+            f"command failed: export HF_TOKEN={secret}\n"
+            f"export HF_TOKEN='{quoted_secret}' launch failed"
+        )
         mock_provisioner.list_tasks_raw.return_value = [
             (
                 json.dumps(
@@ -752,7 +760,7 @@ class TestFleetReadOnlySurface:
                         "hostname": "pub1",
                         "current_step": "engine-start",
                         "failed_step": "engine-start",
-                        "error": f"command failed: export HF_TOKEN={secret}",
+                        "error": task_error,
                         "started_at": "2026-09-15T12:00:00Z",
                         "updated_at": "2026-09-15T12:00:01Z",
                     }
@@ -763,19 +771,22 @@ class TestFleetReadOnlySurface:
         buffer = ProvisioningLogBuffer()
         buffer.create("pub1")
         buffer.append("pub1", "error", f"HF_TOKEN={secret} launch failed")
+        buffer.append("pub1", "error", f'HF_TOKEN="{quoted_secret}" launch failed')
         buffer.mark_complete("pub1")
         mock_provisioner.log_buffer = buffer
         client, _user = _signed_in_client(app, auth_store)
 
         tasks = client.get("/fleet/nodes/pub1/tasks")
         assert tasks.status_code == 200
-        assert secret not in tasks.text
+        assert "hf_0123456789abcdef" not in tasks.text
+        assert "hf_fedcba9876543210" not in tasks.text
         assert "HF_TOKEN=[REDACTED]" in tasks.text
 
         logs = client.get("/fleet/nodes/pub1/logs")
         assert logs.status_code == 200
         log_text = logs.text
-        assert secret not in log_text
+        assert "hf_0123456789abcdef" not in log_text
+        assert "hf_fedcba9876543210" not in log_text
         assert "HF_TOKEN=[REDACTED]" in log_text
 
 
@@ -804,6 +815,21 @@ class TestLocalAdminLoginJSONOnly:
                 headers={"Content-Type": "application/json"},
             )
             assert response.status_code == 422
+
+    def test_invalid_utf8_body_returns_422(self, app: FastAPI) -> None:
+        """Regression (sjug review): an ``application/json`` body containing
+        invalid UTF-8 raises ``UnicodeDecodeError`` before JSON decoding
+        completes, so the handler returned 500. It must return a controlled,
+        client-facing 422."""
+        client = TestClient(app)
+        response = client.post(
+            "/auth/local-admin",
+            content=b'\xff\xfe{"username": "a"}',
+            headers={"Content-Type": "application/json"},
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "Login body must be valid JSON"
 
 
 class TestNodeDetailReadOnly:

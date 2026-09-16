@@ -98,6 +98,37 @@ class TestOAuthLogin:
             == "https://inference-proxy.scalelab.redhat.com/auth/callback"
         )
 
+    def test_login_preserves_port_and_configured_path_for_allowlisted_host(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+    ) -> None:
+        """Regression (sjug review): rebuilding the callback from
+        ``.hostname`` alone dropped the request port and any configured path
+        prefix, so ``http://localhost:5000/auth/callback`` became
+        ``http://localhost/auth/callback`` and broke previously valid OAuth
+        redirects. An allowlisted host must keep the request port and the
+        configured callback path."""
+        oauth = OAuthSettings(
+            client_id="123.apps.googleusercontent.com",
+            client_secret=SecretStr("s3cret"),
+            redirect_uri="http://localhost:5000/prefix/auth/callback",
+            allowed_redirect_hosts=["localhost"],
+        )
+        settings = test_settings.model_copy(update={"oauth": oauth})
+        plugin = _RecordingPlugin()
+        client = _client_with_auth(
+            app,
+            plugin,
+            settings,
+            base_url="http://localhost:5000",
+        )
+
+        response = client.get("/auth/login", follow_redirects=False)
+
+        assert response.status_code == 302
+        assert plugin.last_redirect_uri == "http://localhost:5000/prefix/auth/callback"
+
     def test_login_falls_back_to_configured_uri_for_unlisted_host(
         self,
         app: FastAPI,

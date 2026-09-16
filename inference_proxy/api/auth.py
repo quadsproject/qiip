@@ -93,7 +93,14 @@ def _oauth_redirect_uri(request: Request, settings: Settings) -> str | None:
         allowed.add(configured_host.lower())
     host = request.url.hostname
     if host and host.lower() in allowed:
-        return f"{request.url.scheme}://{host}/auth/callback"
+        # Preserve the request port and the configured callback path. A bare
+        # ``{scheme}://{host}/auth/callback`` rebuild dropped the port
+        # (``.hostname`` omits it) and any configured path prefix, breaking
+        # previously valid OAuth redirects (e.g. ``http://localhost:5000``
+        # became ``http://localhost``). Use base_url semantics —
+        # ``scheme://host[:port]`` + the configured path.
+        path = urlsplit(configured).path or "/auth/callback"
+        return f"{str(request.base_url).rstrip('/')}{path}"
     return configured
 
 
@@ -130,7 +137,7 @@ async def local_admin_login(
         )
     try:
         payload = await request.json()
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise HTTPException(
             status_code=422, detail="Login body must be valid JSON"
         ) from exc
