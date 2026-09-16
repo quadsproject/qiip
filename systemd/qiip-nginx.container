@@ -1,0 +1,82 @@
+# QIIP nginx reverse proxy - Podman systemd USER Quadlet unit.
+#
+# Deployed unit: ~/.config/containers/systemd/qiip-nginx.container
+# (rootless user search path; see podman-systemd.unit(5)).
+#
+# Rootless, pasta networking, first-run self-signed cert generation.
+# See nginx/nginx.md for the full deploy, certificate and rotation guide.
+#
+# Install:
+#   mkdir -p ~/.config/containers/systemd
+#   cp systemd/qiip-nginx.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now qiip-nginx
+#   loginctl enable-linger qiip     # start at boot without a login session
+
+[Unit]
+Description=QIIP nginx reverse proxy (TLS termination for inference gateway)
+Documentation=https://github.com/quadsproject/qiip
+
+[Container]
+ContainerName=qiip-nginx
+# Local build, digest-pinned. Replace with the digest from
+# `podman images --digests` after building nginx/Containerfile.
+# Pull=never keeps systemd from ever fetching the tag.
+Image=localhost/qiip/nginx:latest@sha256:REPLACE_WITH_BUILT_IMAGE_DIGEST
+Pull=never
+
+# Rootless pasta: dual-stack, forwards published ports, no host netns.
+Network=pasta
+
+# Publish the config's listeners. Under pasta a single PublishPort line
+# covers both IPv4 and IPv6 (pasta forwards both families); do NOT add
+# [::] variants, pasta rejects the overlapping rule ("Forwarding
+# configuration conflict"). A rootless host cannot bind <1024 by default
+# (net.ipv4.ip_unprivileged_port_start=1024): set it to 0 once (deploy
+# transcript in nginx/nginx.md), or use the 8080/8443 fallback.
+PublishPort=80:80
+PublishPort=443:443
+
+# FQDN used by gen-cert.sh for the cert CN/SAN and by the config's {FQDN}.
+# Must match the value substituted into the planted nginx.conf.
+Environment=QIIP_FQDN=REPLACE_WITH_HOST_FQDN
+
+# Read-only rootfs (hardening). Podman 5 mounts /run, /tmp and /var/tmp as
+# read-write tmpfs under --read-only, so the nginx pid file works; nginx
+# spills request bodies over client_body_buffer_size (1m) to
+# /var/cache/nginx, so that is an explicit writable tmpfs.
+ReadOnly=true
+Tmpfs=/var/cache/nginx
+# nginx worker_rlimit_nofile 65535 must not be clamped by the container fd
+# limit.
+Ulimit=nofile=65535:65535
+
+# Hardening: no new privileges; drop all caps, re-add only what nginx needs
+# (bind 80/443 inside its own netns; setuid/setgid to the nginx worker).
+NoNewPrivileges=true
+DropCapability=ALL
+AddCapability=NET_BIND_SERVICE SETUID SETGID
+
+# Read-only bind mounts. Sources live under the deploying user's home
+# (dependable for a rootless deploy; no writes to /etc). %h expands to the
+# user home. :Z relabels for SELinux enforcing on Fedora.
+#   config: planted copy of nginx/nginx.conf with {FQDN} and the upstream set
+#   certs:  writable so gen-cert.sh can create the first-run self-signed pair
+#   logs:   persistent container storage; access/error logs land on the host
+Volume=%h/.config/qiip-nginx/nginx.conf:/etc/nginx/nginx.conf:ro,Z
+Volume=%h/.config/qiip-nginx/certs:/etc/pki/tls/certs:Z
+Volume=%h/.config/qiip-nginx/logs:/var/log/nginx:Z
+
+# OCI labels.
+Label=name=qiip-nginx
+Label=org.opencontainers.image.source=https://github.com/quadsproject/qiip
+
+# Graceful stop: nginx finishes in-flight requests on SIGTERM before exit.
+StopTimeout=20
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

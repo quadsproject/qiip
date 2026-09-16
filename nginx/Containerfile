@@ -1,0 +1,22 @@
+# QIIP nginx reverse proxy container image.
+#
+# Base: Fedora Minimal 43 - the smallest functional Fedora base that ships a
+# package manager (microdnf) and matches the fc43 host. No Docker Hub (quay.io
+# only); digest-pinned for reproducible builds. See nginx/nginx.md.
+FROM quay.io/fedora/fedora-minimal:43@sha256:83f1e0c179bda198602a25d19aba9f83d54536fa4d7971a983143aa933504ffe
+
+# nginx for the proxy; openssl for first-run self-signed cert generation
+# (fedora-minimal has no openssl CLI; the nginx package depends only on
+# openssl-libs). Drop the stock conf.d/default.d server blocks: the mounted
+# nginx.conf already defines the port 80 and port 443 servers, and the
+# packaged include globs would add a second `listen 80` and fail the start.
+RUN microdnf -y install nginx openssl \
+    && rm -f /etc/nginx/conf.d/*.conf /etc/nginx/default.d/*.conf \
+    && microdnf clean all
+
+# Entrypoint: generate a self-signed cert iff missing, then exec the CMD.
+COPY nginx/gen-cert.sh /gen-cert.sh
+RUN chmod 0555 /gen-cert.sh
+
+ENTRYPOINT ["/gen-cert.sh"]
+CMD ["/usr/sbin/nginx", "-g", "daemon off;"]
