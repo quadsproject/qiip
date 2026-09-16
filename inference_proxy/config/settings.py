@@ -3,9 +3,16 @@
 Sub-models inherit from BaseModel (not BaseSettings) to ensure
 nested env var resolution works correctly through the root Settings class.
 Only the root Settings class inherits from BaseSettings.
+
+Configuration sources (highest precedence first): init arguments,
+``INFERENCE_PROXY_*`` environment variables, the modular YAML conf directory
+(``INFERENCE_PROXY_CONF_DIR``, default ``conf/`` relative to the working
+directory, mirroring the CWD-relative ``.env``), ``.env``, and the secrets
+directory. YAML files are merged in sorted filename order.
 """
 
 import ipaddress
+import os
 import re
 from pathlib import Path
 from string import Formatter
@@ -14,13 +21,69 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    YamlConfigSettingsSource,
+)
 
 from inference_proxy.models.endpoint import (
     EndpointPolicy,
     EndpointValidationError,
     parse_endpoint,
 )
+
+DEFAULT_CONF_DIR = "conf"
+
+
+class _MappingYamlConfigSettingsSource(YamlConfigSettingsSource):
+    """YAML source that names a bad file and treats ``null`` as unset.
+
+    ``null`` is deliberately not a value: dropping it lets the environment,
+    ``.env``, or the built-in default still apply (YAML sits above ``.env``,
+    so an explicit null would otherwise silently clobber a secret a host
+    keeps in ``.env``). Applied recursively, so nested per-plugin config
+    mappings and section values left as ``null`` behave as unset too.
+    """
+
+    def _strip_nulls(self, value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                key: self._strip_nulls(item)
+                for key, item in value.items()
+                if item is not None
+            }
+        return value
+
+    def _read_file(self, file_path: Path) -> dict[str, object]:
+        data = super()._read_file(file_path)
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"{file_path} must contain a YAML mapping at the top level"
+            )
+        stripped = self._strip_nulls(data)
+        assert isinstance(stripped, dict)
+        return stripped
+
+
+def yaml_conf_files() -> list[Path]:
+    """Return the sorted YAML files of the configured config directory.
+
+    The directory comes from ``INFERENCE_PROXY_CONF_DIR`` (default ``conf/``
+    relative to the working directory, mirroring QUADS' ``QUADS_CONF_DIR``).
+    A missing directory is not an error: settings fall back to
+    environment/defaults.
+    """
+    conf_dir = Path(os.environ.get("INFERENCE_PROXY_CONF_DIR") or DEFAULT_CONF_DIR)
+    if not conf_dir.is_dir():
+        return []
+    return sorted(
+        path
+        for path in conf_dir.iterdir()
+        if path.is_file() and path.suffix in {".yml", ".yaml"}
+    )
+
 
 DEFAULT_NVIDIA_DRIVER_VERSION = "580.126.09"
 DEFAULT_NVIDIA_DRIVER_SHA256 = (
@@ -416,7 +479,7 @@ class LLMFitSettings(BaseModel):
     @field_validator("install_url")
     @classmethod
     def install_url_is_safe_template(cls, value: str) -> str:
-        """Allow one safely-rendered HTTP(S) release URL template."""
+        """Allow a safely-rendered HTTP(S) release URL template."""
         if any(ord(character) < 32 for character in value):
             raise ValueError("llmfit.install_url must not contain control characters")
         try:
@@ -428,9 +491,12 @@ class LLMFitSettings(BaseModel):
             for _literal, field_name, format_spec, conversion in parsed_fields
             if field_name is not None
         ]
-        if fields != [("version", "", None)]:
+        if not fields or any(
+            field_name != "version" or format_spec or conversion
+            for field_name, format_spec, conversion in fields
+        ):
             raise ValueError(
-                "llmfit.install_url must contain exactly one plain {version} field"
+                "llmfit.install_url must contain only plain {version} fields"
             )
 
         parsed = urlsplit(value.format(version="1.2.3"))
@@ -828,6 +894,37 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Load modular YAML conf while keeping environment on top.
+
+        Precedence (highest first): init arguments, environment variables,
+        YAML conf directory, ``.env``, secrets directory. Environment wins so
+        secrets can stay out of files and existing deployments keep working;
+        YAML wins over ``.env`` so a migrated host is driven by the conf
+        files, not a stale dotfile.
+        """
+        conf_files = yaml_conf_files()
+        yaml_source = _MappingYamlConfigSettingsSource(
+            settings_cls,
+            yaml_file=conf_files,
+            deep_merge=True,
+        )
+        return (
+            init_settings,
+            env_settings,
+            yaml_source,
+            dotenv_settings,
+            file_secret_settings,
+        )
 
     etcd: EtcdSettings = EtcdSettings()
     routing: RoutingSettings = RoutingSettings()

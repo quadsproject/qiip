@@ -470,7 +470,6 @@ class TestArtifactDigestSettings:
             "ftp://downloads.example/llmfit-{version}.tar.gz",
             "https://user:secret@downloads.example/llmfit-{version}.tar.gz",
             "https://downloads.example/llmfit.tar.gz",
-            "https://downloads.example/{version}/{version}/llmfit.tar.gz",
             "https://downloads.example/llmfit-{version!r}.tar.gz",
             "https://downloads.example/llmfit-{other}.tar.gz",
             "https://downloads.example/llmfit-{version}.tar.gz#fragment",
@@ -480,6 +479,18 @@ class TestArtifactDigestSettings:
     def test_llmfit_install_url_rejects_unsafe_templates(self, url: str) -> None:
         with pytest.raises(ValidationError, match="llmfit.install_url"):
             LLMFitSettings(install_url=url)
+
+    def test_llmfit_install_url_accepts_repeated_version_fields(self) -> None:
+        """The shipped default repeats {version} (release path + asset name)."""
+        url = (
+            "https://downloads.example/releases/v{version}/"
+            "llmfit-v{version}-x86_64.tar.gz"
+        )
+        settings = LLMFitSettings(install_url=url)
+
+        assert settings.install_url.format(version=settings.version) == (
+            "https://downloads.example/releases/v1.1.6/llmfit-v1.1.6-x86_64.tar.gz"
+        )
 
     @pytest.mark.parametrize("scheme", ["https", "http"])
     def test_llmfit_install_url_accepts_verified_mirrors(self, scheme: str) -> None:

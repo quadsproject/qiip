@@ -17,6 +17,11 @@ _TEST_ADMIN_USERNAME = "test-admin"
 _TEST_ADMIN_PASSWORD = "test-password"
 os.environ.setdefault("INFERENCE_PROXY_ADMIN__USERNAME", _TEST_ADMIN_USERNAME)
 os.environ.setdefault("INFERENCE_PROXY_ADMIN__PASSWORD", _TEST_ADMIN_PASSWORD)
+# Keep the suite hermetic: without this, a checkout with live conf/*.yml
+# (or an exported INFERENCE_PROXY_CONF_DIR on the runner) would leak into
+# every Settings(_env_file=None) construction. YAML tests override it via
+# monkeypatch before construction.
+os.environ["INFERENCE_PROXY_CONF_DIR"] = "/nonexistent-qiip-conf"
 
 from collections.abc import AsyncIterator, Generator
 from unittest.mock import AsyncMock, MagicMock

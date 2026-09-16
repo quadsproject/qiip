@@ -10,6 +10,10 @@ __pycache__/
 # Environment variables
 .env
 
+# Live YAML config (tracked examples use the .example suffix)
+conf/*.yml
+conf/*.yaml
+
 # Distribution
 dist/
 build/

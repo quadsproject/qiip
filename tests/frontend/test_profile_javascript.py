@@ -185,7 +185,7 @@ def _run(
         .replace(
             "USER",
             json.dumps(
-                {"id": 1, "email": "kambiz@redhat.com", "name": "K", "picture": None}
+                {"id": 1, "email": "kambiz@example.com", "name": "K", "picture": None}
             ),
         )
     )

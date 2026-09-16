@@ -145,10 +145,17 @@ git clone https://github.com/quadsproject/qiip.git && cd qiip
 # Install dependencies
 uv sync
 
-# Copy and edit configuration
-cp .env.example .env
-# Set the required INFERENCE_PROXY_ADMIN__USERNAME and
-# INFERENCE_PROXY_ADMIN__PASSWORD values in .env
+# Copy and edit configuration. YAML is the primary configuration format;
+# create a conf/ directory in the gateway's working directory (or set
+# INFERENCE_PROXY_CONF_DIR to a directory such as /etc/qiip/conf).
+mkdir -p conf
+cp conf/qiip.yml.example conf/qiip.yml
+cp conf/auth.yml.example conf/auth.yml
+cp conf/plugins.yml.example conf/plugins.yml
+# Set the required admin.username and admin.password values in
+# conf/qiip.yml, and huggingface.cache_dir (required).
+# Environment variables with the INFERENCE_PROXY_ prefix override any
+# value in the YAML files, so secrets can stay in the environment or .env.
 
 # Run the gateway
 uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 5000
@@ -532,11 +539,46 @@ before upgrading inference clients.
 
 ## Configuration
 
-All settings are loaded from environment variables with the prefix
-`INFERENCE_PROXY_` and double-underscore nesting for nested groups. A `.env`
-file is also supported. The checked-in [.env.example](.env.example) is the
-exhaustive environment-variable reference; this section explains the settings
-whose interactions or security properties need more context.
+Configuration is loaded from modular YAML files in a `conf/` directory
+(`conf/qiip.yml`, `conf/auth.yml`, `conf/plugins.yml`), mirroring the
+[QUADS conf/ layout](https://github.com/quadsproject/quads/tree/development/conf).
+The directory is taken from `INFERENCE_PROXY_CONF_DIR` and defaults to `conf/`
+relative to the working directory. Copy the checked-in examples
+(`conf/*.yml.example`) and edit them. Load precedence, highest first:
+
+1. Settings passed to the app constructor
+2. `INFERENCE_PROXY_*` environment variables
+3. YAML files in `INFERENCE_PROXY_CONF_DIR` (merged in filename order)
+4. `.env` file
+5. Built-in defaults
+
+This keeps existing deployments working unchanged: a host that only sets
+environment variables is unaffected, secrets can stay in exported environment
+variables or `.env`, and YAML always wins over a stale `.env` for values it
+actually sets. A `null` in YAML means unset, so the environment, `.env`, or
+the built-in default still applies (the shipped examples use `null` for
+secrets, so copying them cannot clobber a secret a host keeps in `.env`; the
+admin password is an empty string on purpose and must be set in
+`conf/qiip.yml`). Unrecognized section names fail startup, while unrecognized
+keys inside a section are ignored (matching today's handling of unknown
+environment variables). The checked-in
+[.env.example](.env.example) remains the exhaustive environment-variable
+reference. The rest of this section explains the settings whose interactions
+or security properties need more context.
+
+Existing `.env`-based hosts can migrate in one shot with a tested one-time
+script shipped with this feature (see the pull request for
+`qiip-env-to-conf.py`): it converts every well-formed
+`INFERENCE_PROXY_GROUP__FIELD` value into the matching YAML file(s), skips
+retired groups with a warning, writes the conf directory `0700` and files
+`0600`, and leaves the `.env` untouched. Environment variables still win after
+the migration, so exported or unit-managed values continue to apply; remove
+migrated keys from `.env` once the YAML files are trusted, but keep the file
+present: the packaged `systemd/inference-proxy.service` reads
+`EnvironmentFile=/opt/inference-proxy/.env`, so an empty or comment-only
+`.env` is the safe end state. Restart the gateway afterwards
+(`sudo systemctl restart inference-proxy` with the packaged unit, otherwise
+restart whatever supervises the process).
 
 ### Upgrade requirements
 
@@ -592,7 +634,7 @@ the signed user id and expiry.
 | `INFERENCE_PROXY_OAUTH__CLIENT_SECRET` | required (to enable) | Google OAuth 2.0 client secret, stored as a masked secret |
 | `INFERENCE_PROXY_OAUTH__REDIRECT_URI` | required (to enable) | Absolute `http(s)://` callback URI, e.g. `https://gateway.example.com/auth/callback` |
 | `INFERENCE_PROXY_OAUTH__ALLOWED_DOMAINS` | `[]` | JSON array of hosted domains allowed to sign in; empty allows any Google account |
-| `INFERENCE_PROXY_OAUTH__ALLOWED_REDIRECT_HOSTS` | `[]` | JSON array of extra hostnames that may start an OAuth flow (multi-name deployments behind one wildcard cert, e.g. `["inference-proxy.scalelab.redhat.com"]`); the callback returns to the hostname used to sign in. Hosts outside the list fall back to `REDIRECT_URI`, so single-name deployments are unchanged |
+| `INFERENCE_PROXY_OAUTH__ALLOWED_REDIRECT_HOSTS` | `[]` | JSON array of extra hostnames that may start an OAuth flow (multi-name deployments behind one wildcard cert, e.g. `["inference-proxy.scalelab.example.com"]`); the callback returns to the hostname used to sign in. Hosts outside the list fall back to `REDIRECT_URI`, so single-name deployments are unchanged |
 | `INFERENCE_PROXY_AUTH__DB_PATH` | `data/qiip.db` | SQLite file holding users, token digests, and usage |
 | `INFERENCE_PROXY_AUTH__SESSION_SECRET` | required for browser sign-in | Long random secret signing the session cookie (local-admin form and Google OAuth) |
 | `INFERENCE_PROXY_AUTH__SESSION_COOKIE` | `qiip_session` | Session cookie name (alphanumeric plus `_` and `-`) |
@@ -794,8 +836,9 @@ power, SSH, or installation work and name the allowlist setting to update.
 
 QIIP uses a QUADS-style plugin architecture: category interfaces (currently
 `auth`), built-in implementations, and an optional external plugin directory.
-Plugins are configured through environment variables only (a YAML config may
-follow later).
+Plugins are configured in `conf/plugins.yml` (see the checked-in example); the
+`plugins:` section maps 1:1 onto the settings model, and environment variables
+with the `INFERENCE_PROXY_` prefix still override it for legacy setups.
 
 | Variable | Default | Description |
 |----------|---------|-------------|

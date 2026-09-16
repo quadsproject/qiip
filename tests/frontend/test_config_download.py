@@ -235,7 +235,7 @@ def _harness_opts(base_url: str, model_id: str, func: str, opts_json: str) -> st
 class TestAdminOnlyServerConfigs:
     """Admin-only server configs declare token auth with a placeholder."""
 
-    _BASE = "https://inference-proxy-dev.rdu2.scalelab.redhat.com"
+    _BASE = "https://inference-proxy-dev.rdu2.scalelab.example.com"
     _MODEL = "DeepSeek-V4-Flash-Vision-Exp"
     _OPTS = '{"name": "DeepSeek-V4-Flash-Vision-Exp (qiip)", "admin_only": true}'
 

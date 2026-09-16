@@ -1,0 +1,57 @@
+# QIIP user identity configuration: auth store, sessions, SSO whitelist, and
+# Google OAuth. Copy to conf/auth.yml in the working directory (or the
+# directory named by INFERENCE_PROXY_CONF_DIR) and adjust values. A null value
+# means unset, so the environment, .env, or the built-in default still
+# applies; keep secrets (session_secret, OAuth client_secret) in the
+# environment or .env: environment variables with the INFERENCE_PROXY_ prefix
+# override these values.
+
+auth:
+  # SQLite database backing the user/token/usage store.
+  db_path: data/qiip.db
+  # Secret that signs the browser session cookie; REQUIRED before Google
+  # OAuth can be enabled (OAuth stores transient state in the signed cookie).
+  session_secret: null
+  session_cookie: qiip_session
+  # Session lifetime in seconds (300 to 7 days).
+  session_ttl_seconds: 43200
+  # Require /v1 inference requests to carry a valid bearer token. Defaults to
+  # false so existing public deployments keep working; requires OAuth enabled.
+  enforce_api_tokens: false
+  # Reject Google accounts that have not verified their email address.
+  require_email_verification: true
+  # SSO whitelist: gate who can mint/use inference tokens. The URL and the
+  # enforcement flag must be set together (fail-fast); fetch timeout 5/10s,
+  # no redirects, 1 MiB cap. Must be HTTPS and non-localhost.
+  sso_whitelist_url: null
+  # Optional plain domain that resolves bare usernames in a flat JSON list.
+  sso_whitelist_default_domain: null
+  enforce_sso_whitelist: false
+  # Refresh cadence: hourly (top of the hour) or daily at an HH:MM wall-clock
+  # time in the server's local timezone. Daily requires sso_whitelist_poll_time.
+  sso_whitelist_poll_interval: hourly
+  sso_whitelist_poll_time: null
+  # Optional flat-file cache: persists the last successful document for warm
+  # start and operator inspection; atomically replaced on each refresh.
+  sso_whitelist_cache_file: null
+  # Local overrides merged on top of the fetched document.
+  sso_whitelist_extra_users: []
+  sso_whitelist_extra_domains: []
+  # Emails whose tokens are exempt from endpoint scoping and owner isolation
+  # (and from the SSO whitelist gate); they may pin tokens to any endpoint.
+  admin_only_tokens_full_access: []
+
+oauth:
+  # Google OAuth (set all three credentials to enable; any partial set fails
+  # startup). Redirect URI must be registered at Google's console and match
+  # this value exactly.
+  client_id: null
+  client_secret: null
+  redirect_uri: null
+  # Optional allowlist of Google Workspace hosted domains; empty allows any
+  # Google account.
+  allowed_domains: []
+  # Extra hosts whose Host header is trusted for the OAuth callback redirect
+  # (multi-name deployments); the configured host is always trusted. Empty
+  # uses the configured redirect_uri unchanged.
+  allowed_redirect_hosts: []

@@ -1,0 +1,160 @@
+# QIIP gateway configuration (core services).
+# Copy to conf/qiip.yml in the working directory (or the directory named by
+# INFERENCE_PROXY_CONF_DIR, e.g. /etc/qiip/conf) and adjust values for your
+# environment. Copying activates these values; the empty admin password below
+# makes startup fail until you set it. A null value means unset, so the
+# environment, .env, or the built-in default still applies. Keep secrets in
+# the environment or .env instead of this file: environment variables with
+# the INFERENCE_PROXY_ prefix override these values. Comments on documented
+# constraints come from .env.example.
+
+etcd:
+  # etcd cluster endpoints; must include an HTTP(S) scheme.
+  endpoints:
+    - http://localhost:2379
+  # etcd key prefix for node registration.
+  node_prefix: /nodes/
+  # Proxy-managed healthy node keys expire without successful health evidence.
+  # Keep this above 300 seconds and above three complete health-check intervals.
+  node_lease_ttl: 600
+
+routing:
+  # Total attempts including the first request.
+  max_attempts: 3
+  # Total pre-response streaming handshake budget across all attempts (seconds).
+  timeout: 30
+  # Secure defaults allow only localhost/loopback on port 8000. Existing
+  # deployments must set the GPU host suffixes and/or IP networks before upgrade.
+  allowed_endpoint_hosts:
+    - "*.inference.example.com"
+  allowed_endpoint_networks:
+    - 10.0.1.0/24
+  allowed_endpoint_ports:
+    - 8000
+
+proxy:
+  # httpx client timeouts, tuned for LLM inference.
+  connect_timeout: 5.0
+  read_timeout: 120.0
+  write_timeout: 10.0
+  pool_timeout: 10.0
+  max_connections: 100
+  max_keepalive_connections: 20
+  keepalive_expiry: 30
+
+resilience:
+  # Consecutive failures before a circuit breaker trips to OPEN.
+  circuit_breaker_threshold: 3
+  # Consecutive probe failures before marking a node UNHEALTHY.
+  health_check_failure_threshold: 3
+  # Seconds between health check probe cycles.
+  health_check_interval: 30
+
+logging:
+  json_output: false
+  # One of DEBUG, INFO, WARNING, ERROR, or CRITICAL. Invalid values fail startup.
+  level: INFO
+
+admin:
+  # Shared credentials for /admin/* and /dashboard* (HTTP Basic). Both values
+  # are required at startup; the empty password makes startup fail so an
+  # unedited copy cannot enable a known credential.
+  username: operator
+  password: ""
+
+dashboard:
+  poll_interval: 10
+
+pricing:
+  # Premium-equivalent rates for token budget estimates; USD per million
+  # tokens. The estimate is what the recorded usage would have cost at this
+  # rate, not a cash ledger.
+  input_rate_per_mtok: 5.0
+  output_rate_per_mtok: 25.0
+  model_label: claude-opus-4.8
+
+ssh:
+  # Node provisioning access; all hosts use the same key and username.
+  key_path: ~/.ssh/id_rsa
+  username: root
+  connect_timeout: 10
+  streaming_command_timeout: 3600.0
+  streaming_inactivity_timeout: 900.0
+
+provisioning:
+  # Health polling after vLLM startup and cold-boot waits.
+  health_poll_timeout: 600
+  health_poll_interval: 10
+  vllm_port: 8000
+  min_disk_gb: 20
+  drain_timeout: 30
+  scripts_dir: auto-vllm
+  boot_wait_timeout: 300
+  boot_wait_interval: 10
+  max_concurrent_provisions: 32
+  log_max_entries_per_host: 1000
+  log_max_bytes_per_host: 1048576
+  log_max_entry_bytes: 16384
+  log_max_completed_hosts: 64
+  nfs_mount_point: /srv/hf-cache
+  # The default NVIDIA driver and llama.cpp versions ship with a verified
+  # SHA-256; changing a version requires configuring its matching digest.
+  nvidia_driver_version: 580.126.09
+  nvidia_driver_sha256: 4cac53e48f8adff661d47c8788ed24059a248c9fd8098ceafd088a498986ec26
+  llamacpp_version: b10242
+  llamacpp_sha256: b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3
+  llamacpp_source_url: https://github.com/ggml-org/llama.cpp/archive/refs/tags/{version}.tar.gz
+  llamacpp_setup_timeout: 7200.0
+  llamacpp_fit_target_mib: 512
+
+quads:
+  # Set base_url to enable the QUADS integration; server_timezone is then
+  # required (IANA timezone used by the QUADS server's local clock).
+  base_url: null
+  server_timezone: null
+  timeout: 10.0
+  poll_interval: 300
+  verify_ssl: true
+  schedule_check_interval: 300
+  schedule_lookahead_hours: 24
+
+redfish:
+  # Set both credentials to enable BMC power management. Node DNS names must
+  # also match routing.allowed_endpoint_hosts; IP literals are not accepted
+  # for BMC template expansion.
+  bmc_username: null
+  bmc_password: null
+  bmc_host_template: mgmt-{hostname}
+  system_id: "1"
+  connect_timeout: 10.0
+  read_timeout: 60.0
+  power_poll_timeout: 60.0
+  power_poll_interval: 5.0
+  # Always False for self-signed BMC certs.
+  verify_ssl: false
+
+llmfit:
+  # Model recommendation via SSH; version and sha256 are one upgrade unit.
+  binary_path: /usr/local/bin/llmfit
+  timeout: 60.0
+  allowed_providers:
+    - Meta
+    - Mistral
+    - DeepSeek
+    - Google
+    - Microsoft
+    - MiniMax
+    - Moonshot
+    - Nomic
+    - OpenAI
+  version: 1.1.6
+  sha256: 1e09232a128455596a2d348ab5893741d04b94aa6d924f1253462dc13304f7c6
+  install_url: https://github.com/AlexsJones/llmfit/releases/download/v{version}/llmfit-v{version}-x86_64-unknown-linux-musl.tar.gz
+
+huggingface:
+  # cache_dir is required; export paths are required only for node setup.
+  cache_dir: /data/huggingface
+  nfs_export: storage.example.com:/exports/huggingface
+  shared_root: /data
+  # Optional token for gated repositories; prefer the environment.
+  api_token: null

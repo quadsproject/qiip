@@ -260,7 +260,7 @@ def test_grant_admin_sends_json_content_type() -> None:
     result = _run_node(
         _ADMIN_TOKENS_JS,
         _role_harness(
-            {"id": 1, "email": "kambiz@redhat.com", "name": "K", "is_admin": False}
+            {"id": 1, "email": "kambiz@example.com", "name": "K", "is_admin": False}
         ),
     )
     assert result["calls"][0] == {
@@ -274,7 +274,7 @@ def test_revoke_admin_sends_json_content_type() -> None:
     result = _run_node(
         _ADMIN_TOKENS_JS,
         _role_harness(
-            {"id": 1, "email": "kambiz@redhat.com", "name": "K", "is_admin": True}
+            {"id": 1, "email": "kambiz@example.com", "name": "K", "is_admin": True}
         ),
     )
     assert result["calls"][0] == {

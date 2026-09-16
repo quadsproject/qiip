@@ -1,0 +1,24 @@
+# QIIP plugin loading configuration. Copy to conf/plugins.yml in the working
+# directory (or the directory named by INFERENCE_PROXY_CONF_DIR).
+# This maps 1:1 onto the settings.plugins model used by PluginManager:
+# external_dir (where external plugins are scanned), disabled (names never
+# imported), and config (per-plugin config dicts). Per-plugin `enabled` is
+# read by BasePlugin from the plugin's own config entry; omit it to default
+# to enabled. Do not use ${ENV_VAR} placeholders here: the loader does not
+# expand them, and environment variables override these values anyway.
+
+plugins:
+  # Optional directory scanned for external (downstream/third-party) plugins.
+  # Module code executes at startup as the service user; point at a
+  # root/user-owned directory that is not group/world-writable. Only
+  # `disabled` below prevents a module from being imported at all.
+  external_dir: null
+  # Fully-qualified plugin names that are never loaded (never imported).
+  # Add e.g. auth.google here only when replacing the built-in with an
+  # external plugin registered under a distinct name.
+  disabled: []
+  # Per-plugin configuration keyed by plugin name, passed to the plugin
+  # constructor.
+  config:
+    auth.google:
+      enabled: true

@@ -79,7 +79,7 @@ class TestOAuthLogin:
             client_id="123.apps.googleusercontent.com",
             client_secret=SecretStr("s3cret"),
             redirect_uri="https://proxy.example.com/auth/callback",
-            allowed_redirect_hosts=["inference-proxy.scalelab.redhat.com"],
+            allowed_redirect_hosts=["inference-proxy.scalelab.example.com"],
         )
         settings = test_settings.model_copy(update={"oauth": oauth})
         plugin = _RecordingPlugin()
@@ -87,7 +87,7 @@ class TestOAuthLogin:
             app,
             plugin,
             settings,
-            base_url="https://inference-proxy.scalelab.redhat.com",
+            base_url="https://inference-proxy.scalelab.example.com",
         )
 
         response = client.get("/auth/login", follow_redirects=False)
@@ -95,7 +95,7 @@ class TestOAuthLogin:
         assert response.status_code == 302
         assert (
             plugin.last_redirect_uri
-            == "https://inference-proxy.scalelab.redhat.com/auth/callback"
+            == "https://inference-proxy.scalelab.example.com/auth/callback"
         )
 
     def test_login_preserves_port_and_configured_path_for_allowlisted_host(
