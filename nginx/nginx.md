@@ -40,8 +40,12 @@ methods are alternatives on one host (both bind 80/443).
 
 ## Prerequisites
 
-- Gateway running and healthy on port 5000
-  (`curl -s http://localhost:5000/health` returns `{"status": "ok", ...}`).
+- Gateway running and healthy on port 5000. Start it with exactly
+  `uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 5000`
+  (the README Quick Start now uses this port), then check
+  `curl -s http://localhost:5000/health` returns `{"status": "ok", ...}`.
+  Method 1 needs `--host 0.0.0.0`: a loopback-only listener cannot be reached
+  from the pasta container.
 - Fedora 40+ host with **nginx >= 1.25.1** (the config uses `http2 on;`,
   which older nginx rejects; RHEL 9 ships nginx 1.20-1.24 and does not
   satisfy this unless the `nginx:1.26` module stream is enabled). IPv6 is
@@ -104,6 +108,14 @@ sudo loginctl enable-linger "$USER"     # start at boot without a login session
 
 systemctl --user status qiip-nginx --no-pager
 podman exec qiip-nginx nginx -t         # configuration file test is successful
+```
+
+The container reaches the gateway through the host interface, so keep port
+5000 closed externally (the `/v1/*` inference endpoints are unauthenticated):
+
+```bash
+sudo firewall-cmd --permanent --remove-port=5000/tcp
+sudo firewall-cmd --reload
 ```
 
 High-port fallback (no sysctl): change the two `PublishPort=` lines in the
@@ -193,10 +205,15 @@ network-connect boolean. Open 80/443 and keep 5000 closed externally (the
 sudo setsebool -P httpd_can_network_connect on
 sudo firewall-cmd --permanent --add-service=http
 sudo firewall-cmd --permanent --add-service=https
+sudo firewall-cmd --permanent --remove-port=5000/tcp
 sudo firewall-cmd --reload
 ```
 
 ### Install and start
+
+The cert pair must already exist (generate it first, see
+[Certificates](#certificates)); otherwise `nginx -t` fails with
+`cannot load certificate ... BIO_new_file() failed`.
 
 ```bash
 sudo nginx -t
@@ -221,55 +238,23 @@ Note: `/etc/pki/tls/certs` is also the system CA trust-store directory on
 Fedora. These cert/key files are a web-server pair placed there for
 (ansible-sslcerts-compatible) convenience only; `update-ca-trust` does not
 add them to the bundle and they are not part of the system trust store.
+For a real CA, the `.pem` file must contain the leaf plus any intermediates
+(concatenate them) and the same applies to playbook-pushed files.
 
 ### Generate a self-signed pair
 
 One shared script does both methods: it is the container entrypoint and a
-host one-shot. Install it on an RPM host with `cat` (visible) or `curl`
-(the block below is a copy of `nginx/gen-cert.sh`; keep it in sync):
+host one-shot. Install it on an RPM host (single source is
+`nginx/gen-cert.sh`; fetch it or copy it from a checkout):
 
 ```bash
-sudo tee /usr/local/sbin/gen-cert.sh >/dev/null <<'EOF'
-#!/bin/sh
-# QIIP self-signed certificate generator and container entrypoint.
-#
-# Container: ENTRYPOINT ["/gen-cert.sh"], CMD ["/usr/sbin/nginx","-g","daemon off;"]
-#            generates the cert iff missing, then execs the command.
-# Host one-shot: QIIP_FQDN=<fqdn> CERTS_DIR=<dir> /usr/local/sbin/gen-cert.sh
-#            generates the cert iff missing, then exits 0.
-#
-# Idempotent: an existing non-empty pair is never touched, so certs pushed by
-# an internal CA (or the ansible-sslcerts playbook) survive container restarts.
-set -eu
-FQDN="${QIIP_FQDN:?set QIIP_FQDN (<fqdn>)}"
-CERTS_DIR="${CERTS_DIR:-/etc/pki/tls/certs}"
-CERT="$CERTS_DIR/$FQDN.pem"
-KEY="$CERTS_DIR/$FQDN.key"
-if [ ! -s "$CERT" ] || [ ! -s "$KEY" ]; then
-    export TMPDIR="${TMPDIR:-/var/cache/nginx}"
-    openssl req -x509 -newkey rsa:4096 -quiet \
-        -keyout "$KEY" -out "$CERT" \
-        -days 3650 -nodes \
-        -subj "/CN=$FQDN" -addext "subjectAltName=DNS:$FQDN"
-    chmod 600 "$KEY"
-    chmod 644 "$CERT"
-fi
-if [ "$#" -gt 0 ]; then
-    # Container mode: the /var/cache/nginx tmpfs starts empty and root-owned;
-    # nginx master (uid 0) creates the temp dirs, workers (nginx user) must be
-    # able to write into them. Matches the RPM package ownership.
-    mkdir -p /var/cache/nginx/client_temp /var/cache/nginx/proxy_temp \
-             /var/cache/nginx/fastcgi_temp /var/cache/nginx/uwsgi_temp \
-             /var/cache/nginx/scgi_temp
-    chown -R nginx:nginx /var/cache/nginx
-    exec "$@"
-fi
-exit 0
-EOF
+sudo curl -fsSL -o /usr/local/sbin/gen-cert.sh \
+  https://raw.githubusercontent.com/quadsproject/qiip/main/nginx/gen-cert.sh
 sudo chmod 0555 /usr/local/sbin/gen-cert.sh
 ```
 
-(Or once: `sudo curl -fsSL -o /usr/local/sbin/gen-cert.sh https://raw.githubusercontent.com/quadsproject/qiip/main/nginx/gen-cert.sh`.)
+From a checkout, replace the `curl` line with
+`sudo cp nginx/gen-cert.sh /usr/local/sbin/gen-cert.sh`.
 
 Run it. The script is idempotent: an existing pair is never touched, so it is
 safe to re-run after the ansible playbook has pushed an internal-CA pair.
@@ -303,11 +288,12 @@ For distribution nginx the upstream playbook works as shipped: drop
 `<hostname>.pem`/`.key` into `install/roles/sslcerts/files/`, run the
 playbook, and its `Reload Nginx` handler restarts the system `nginx` service.
 Host must be in an inventory group named `nginx` and files must be named
-after `ansible_nodename`.
+after `ansible_nodename`. On the target host that is `uname -n` (run these
+on the target, not a separate controller; `hostname -f` may differ).
 
 ```bash
-cp new.pem install/roles/sslcerts/files/$(hostname -f).pem
-cp new.key install/roles/sslcerts/files/$(hostname -f).key
+cp new.pem install/roles/sslcerts/files/$(uname -n).pem
+cp new.key install/roles/sslcerts/files/$(uname -n).key
 ansible-playbook -i hosts install/sslcerts.yml
 ```
 
@@ -326,7 +312,7 @@ plus `host_vars` overrides.
    `hosts` inventory, exactly like a normal nginx host (the shipped
    inventory has a commented `#host04` placeholder).
 
-2. Create `install/host_vars/<inventory-hostname>.yml` in the playbook
+2. Create `install/host_vars/<inventory-hostname>.yaml` in the playbook
    checkout, named after the host as written in the inventory (the shipped
    example is `install/host_vars/host04.yaml`):
 
@@ -409,9 +395,10 @@ RPM method:
 
 ```bash
 sudo systemctl disable --now nginx
-sudo dnf remove -y nginx                 # or: sudo dnf reinstall nginx
-# reinstall restores the stock /etc/nginx/nginx.conf and the conf.d/default.d
-# files that this setup replaced/removed
+# Fedora marks /etc/nginx/nginx.conf %config(noreplace): a modified file
+# survives remove/reinstall. Delete it first, then reinstall for stock files.
+sudo rm -f /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/default.d/*.conf
+sudo dnf reinstall -y nginx
 ```
 
 ## Verify the proxy
@@ -446,9 +433,9 @@ For the container, nginx logs are host files under
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | `413 Request Entity Too Large` | Body over the deliberate 50 MiB cap (OMP archived image frames fit under it) | Raise `client_max_body_size` in the config (bounded step, e.g. 64m), `nginx -t`, restart. |
-| `502 Bad Gateway` | Gateway down, or wrong upstream | Confirm the gateway is up: `curl -s http://localhost:5000/health`, and restart how you run it (README Quick Start). Container: confirm the planted config has `host.containers.internal:5000`. |
+| `502 Bad Gateway` | Gateway down, or wrong upstream | Confirm the gateway is up: `curl -s http://localhost:5000/health`; start it with `uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 5000`. Container: confirm the planted config has `host.containers.internal:5000`. |
 | `504 Gateway Timeout` | `proxy_read_timeout 3600` exceeded or upstream wedged | Fix/hold the node; only raise the timeout for legitimately very long generations. |
-| SSE arrives in bursts | `proxy_buffering` on or `gzip` on | Confirm `proxy_buffering off`, `X-Accel-Buffering no always`, `gzip off`. |
+| SSE arrives in bursts | `proxy_buffering` on or `gzip` on | Confirm `proxy_buffering off` and `gzip off`. |
 | `Permission denied` on the cert | SELinux label missing | Ensure `:Z` on the `Volume=`/mount; `sudo chcon -R -t container_file_t ~/.config/qiip-nginx/certs`, then restart. |
 | `bind: address already in use` on 80/443 | Bare-metal nginx still runs | This proxy replaces it: `sudo systemctl stop nginx && sudo systemctl disable nginx`, then restart the new unit. |
 | Container exits: `mkdir() /var/lib/nginx/tmp/client_body failed (13: Permission denied)` | Read-only rootfs without the nginx temp dirs | The Quadlet ships `Tmpfs=/var/cache/nginx`; the config sets temp paths under `/var/cache/nginx`. |

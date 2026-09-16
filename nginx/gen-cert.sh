@@ -11,10 +11,14 @@
 # an internal CA (or the ansible-sslcerts playbook) survive container restarts.
 set -eu
 FQDN="${QIIP_FQDN:?set QIIP_FQDN (<fqdn>)}"
+case "$FQDN" in
+    *REPLACE_*) echo "QIIP_FQDN is still the placeholder '$FQDN' - set it to the real hostname" >&2; exit 1 ;;
+esac
 CERTS_DIR="${CERTS_DIR:-/etc/pki/tls/certs}"
 CERT="$CERTS_DIR/$FQDN.pem"
 KEY="$CERTS_DIR/$FQDN.key"
 if [ ! -s "$CERT" ] || [ ! -s "$KEY" ]; then
+    echo "generating self-signed pair for $FQDN into $CERTS_DIR" >&2
     export TMPDIR="${TMPDIR:-/var/cache/nginx}"   # writable tmpfs under ReadOnly=true
     openssl req -x509 -newkey rsa:4096 -quiet \
         -keyout "$KEY" -out "$CERT" \

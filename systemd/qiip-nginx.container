@@ -11,7 +11,7 @@
 #   cp systemd/qiip-nginx.container ~/.config/containers/systemd/
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now qiip-nginx
-#   loginctl enable-linger qiip     # start at boot without a login session
+#   sudo loginctl enable-linger "$USER"   # start at boot without a login session
 
 [Unit]
 Description=QIIP nginx reverse proxy (TLS termination for inference gateway)
@@ -52,10 +52,12 @@ Tmpfs=/var/cache/nginx
 Ulimit=nofile=65535:65535
 
 # Hardening: no new privileges; drop all caps, re-add only what nginx needs
-# (bind 80/443 inside its own netns; setuid/setgid to the nginx worker).
+# (bind 80/443 inside its own netns; setuid/setgid to the nginx worker;
+# chown so gen-cert.sh can hand the /var/cache/nginx temp dirs to the nginx
+# user - nginx itself needs CHOWN to chown dirs it creates at startup).
 NoNewPrivileges=true
 DropCapability=ALL
-AddCapability=NET_BIND_SERVICE SETUID SETGID
+AddCapability=NET_BIND_SERVICE SETUID SETGID CHOWN
 
 # Read-only bind mounts. Sources live under the deploying user's home
 # (dependable for a rootless deploy; no writes to /etc). %h expands to the

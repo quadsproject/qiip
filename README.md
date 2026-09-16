@@ -165,6 +165,9 @@ sends base64-encoded credentials --not encryption --on every request. A trusted
 work LAN may use HTTP; use a TLS terminator whenever that network path is not
 trusted.
 
+Optional TLS termination (rootless Podman container or RPM nginx, self-signed
+certificate bootstrap): see [nginx/nginx.md](nginx/nginx.md).
+
 ### Verify it's running
 
 ```bash
