@@ -54,6 +54,7 @@ from inference_proxy.config.settings import (
     AuthSettings,
     EtcdSettings,
     HuggingFaceSettings,
+    ProvisioningSettings,
     RoutingSettings,
     Settings,
 )
@@ -82,6 +83,9 @@ def test_settings(tmp_path: Path) -> Settings:
             password=SecretStr(_TEST_ADMIN_PASSWORD),
         ),
         huggingface=HuggingFaceSettings(cache_dir=str(_TEST_HF_CACHE)),
+        provisioning=ProvisioningSettings(
+            log_db_path=tmp_path / "provisioning-logs.sqlite3"
+        ),
         auth=AuthSettings(
             db_path=tmp_path / "qiip-test-auth.db",
             session_secret=SecretStr("test-session-secret"),

@@ -414,6 +414,13 @@ EOF
             "${dtype_args[@]+"${dtype_args[@]}"}"
     fi
 
+    local engine_log_fd
+    if [ -n "${QIIP_LOG_CONFIG:-}" ]; then
+        exec {engine_log_fd}> >(python3 "${SCRIPT_DIR}/../common/provision-logs.py" engine >/dev/null 2>&1)
+    else
+        exec {engine_log_fd}> "$VLLM_LOG_FILE"
+    fi
+
     # EXTRA_ARGS is an intentional word-split shell override.
     # shellcheck disable=SC2086
     "$VLLM_BIN" serve "$MODEL" \
@@ -428,9 +435,10 @@ EOF
         "${reasoning_args[@]+"${reasoning_args[@]}"}" \
         ${EXTRA_ARGS:-} \
         "${dtype_args[@]+"${dtype_args[@]}"}" \
-        > "$VLLM_LOG_FILE" 2>&1 &
+        >&"$engine_log_fd" 2>&1 &
 
     local pid=$!
+    exec {engine_log_fd}>&-
     echo "$pid" > "$PID_FILE"
     verify_vllm_started "$pid"
     echo "vLLM started (PID ${pid})"

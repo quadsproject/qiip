@@ -64,6 +64,7 @@ from inference_proxy.models.openai import ErrorDetail, ErrorResponse
 from inference_proxy.plugins.interfaces.auth import AuthPlugin
 from inference_proxy.plugins.manager import PluginManager
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
+from inference_proxy.provisioning.log_store import AttemptLogStore
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.provisioning.ssh_client import SSHClient
 from inference_proxy.proxy.client import ProxyClient
@@ -428,7 +429,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.redfish_client = None
                 logger.info("redfish disabled (BMC credentials not configured)")
 
+            log_store = AttemptLogStore(
+                resolved_settings.provisioning.log_db_path,
+                max_bytes=resolved_settings.provisioning.log_storage_max_bytes,
+                attempt_max_bytes=resolved_settings.provisioning.log_attempt_max_bytes,
+                max_attempts=resolved_settings.provisioning.log_max_attempts,
+                retention_days=resolved_settings.provisioning.log_retention_days,
+                max_record_bytes=resolved_settings.provisioning.log_max_entry_bytes,
+            )
+            log_store.interrupt_running()
             log_buffer = ProvisioningLogBuffer(
+                store=log_store,
                 max_entries_per_host=(
                     resolved_settings.provisioning.log_max_entries_per_host
                 ),

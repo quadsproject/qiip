@@ -99,6 +99,9 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Run tests](#run-tests)
   - [Lint and format](#lint-and-format)
   - [Type check](#type-check)
+- [Durable provisioning evidence](#durable-provisioning-evidence)
+- [Troubleshooting](#troubleshooting)
+  - [Reading provisioning logs offline](#reading-provisioning-logs-offline)
 - [Technology Stack](#technology-stack)
 - [License](#license)
 
@@ -872,6 +875,18 @@ Provisioning resource and retention controls:
 | `INFERENCE_PROXY_PROVISIONING__LOG_MAX_BYTES_PER_HOST` | `1048576` | Retained message bytes per host operation |
 | `INFERENCE_PROXY_PROVISIONING__LOG_MAX_ENTRY_BYTES` | `16384` | Maximum bytes in one retained log message |
 | `INFERENCE_PROXY_PROVISIONING__LOG_MAX_COMPLETED_HOSTS` | `64` | Completed host-operation buffers retained, oldest first |
+| `INFERENCE_PROXY_PROVISIONING__LOG_DB_PATH` | `data/provisioning-logs.sqlite3` | Durable gateway attempt database; use persistent local storage |
+| `INFERENCE_PROXY_PROVISIONING__LOG_RETENTION_DAYS` | `30` | Retention of gateway attempt history |
+| `INFERENCE_PROXY_PROVISIONING__LOG_STORAGE_MAX_BYTES` | `268435456` | Gateway retained record payload budget |
+| `INFERENCE_PROXY_PROVISIONING__LOG_ATTEMPT_MAX_BYTES` | `33554432` | Gateway record payload budget per attempt |
+| `INFERENCE_PROXY_PROVISIONING__LOG_MAX_ATTEMPTS` | `1000` | Gateway attempt manifests retained |
+| `INFERENCE_PROXY_PROVISIONING__LOG_REMOTE_ROOT` | `/var/lib/qiip/provisioning-logs` | Node database and bounded engine tails |
+| `INFERENCE_PROXY_PROVISIONING__LOG_REMOTE_RETENTION_DAYS` | `7` | Node attempt retention |
+| `INFERENCE_PROXY_PROVISIONING__LOG_REMOTE_MAX_BYTES` | `134217728` | Node payload budget, half for records and half for raw tails |
+| `INFERENCE_PROXY_PROVISIONING__LOG_REMOTE_ATTEMPT_MAX_BYTES` | `16777216` | Node record and raw-tail limit per attempt, subject to total budgets |
+| `INFERENCE_PROXY_PROVISIONING__LOG_REMOTE_MAX_ATTEMPTS` | `32` | Node attempt manifests and raw tails retained |
+| `INFERENCE_PROXY_PROVISIONING__LOG_RECONNECT_ATTEMPTS` | `3` | Consecutive automatic retrieval retries after SSH errors |
+| `INFERENCE_PROXY_PROVISIONING__LOG_POLL_INTERVAL` | `1` | Seconds between node log retrieval requests |
 
 Managed llama.cpp provisioning builds a verified source tag with CUDA enabled
 for the NVIDIA GPU attached to the node. It has five gateway settings:
@@ -1201,6 +1216,142 @@ uv run --frozen ruff format .
 ```bash
 uv run --frozen mypy inference_proxy tests
 ```
+
+## Durable provisioning evidence
+
+Each setup, relaunch, and teardown receives a UUID and a SHA-256 identity of its
+setup bundle. Setup stdout/stderr, launch stdout/stderr, engine startup output,
+and available `vllm`, `llamacpp`, and NVIDIA Fabric Manager journal records are
+stored on the node and retrieved into the gateway database. Every record carries
+the hostname, attempt, engine, model selection (null until known for automatic
+selection), bundle version, stage, source, timestamp, and sequence. Node timestamps
+represent capture time; journal JSON also contains the original journal timestamp
+and cursor. Gateway messages use gateway time.
+
+Configure the durable-log settings under `provisioning:` in `conf/qiip.yml`
+(see `conf/qiip.yml.example`). The gateway requires a writable persistent
+`log_db_path`; startup fails if this database cannot be opened, rather than
+silently losing durable history. The gateway payload budget must cover one
+attempt. Half the node budget is reserved for SQLite records, so the node total
+must be at least twice its per-attempt record budget.
+
+The node recorder requires Python 3.9+ with SQLite and write access to the remote
+log root. It is uploaded with the setup bundle. Recording survives loss of the
+SSH connection; reconnects retrieve by sequence and commit the retrieval cursor
+with each record. A lost launch acknowledgement never causes a second setup or
+engine launch. Explicit teardown cancellation signals the detached command group
+and retains its final output. Gateway shutdown stops retrieval and leaves the
+node command and recorder running; the attempt is marked interrupted locally.
+If completion cannot be established within the deadline, the
+attempt fails with an explicit collection warning. Recorded commands retain the
+configured SSH total and inactivity deadlines; llama.cpp setup retains its longer
+setup timeout. This feature retrieves evidence;
+it does not reconcile or resume a provisioning process after a gateway restart.
+
+On the node detail page, **Provisioning history** lists attempts independently of
+the current node state. Select an attempt to search all retained messages, filter
+by source, retrieve missed node output, or download a gzip-compressed JSONL bundle
+containing its manifest, records, and an export summary that reports concurrent
+rotation during download. Failed stages and their output appear in the
+summary; unavailable sources, sequence gaps, and retention losses remain visible.
+The live stream also resumes by attempt and sequence. The engine pipe consumer
+batches output for up to 100 ms or 64 KiB before committing. Catchable recorder
+failures and SIGINT/SIGTERM stop recording and drain the pipe. SIGKILL, an OOM
+kill, or node loss cannot run that drain; those events can interrupt the engine
+and require operator recovery.
+
+Administrative API (existing admin authentication and JSON request requirements):
+
+- `GET /admin/provisioning/{hostname}/attempts?limit=100&offset=0`
+- `GET /admin/provisioning/{hostname}/attempts/{id}/logs?q=error&source=setup.stderr&after=0&limit=500`
+- `POST /admin/provisioning/{hostname}/attempts/{id}/collect` with JSON `{}`
+- `GET /admin/provisioning/{hostname}/attempts/{id}/bundle`
+- `GET /admin/provisioning/{hostname}/logs?attempt_id={id}&after=0` (SSE; supports `Last-Event-ID: {id}:{seq}`)
+
+Offsets are inclusive sequence positions; use `next_offset` for the next page.
+Search is a case-insensitive literal substring match, including `%` and `_`.
+Retrieval reports unavailable sources in the returned manifest while preserving
+previously collected data. Restarted gateway attempts are marked `interrupted`;
+retrieving their evidence does not claim that provisioning succeeded.
+
+Byte limits bound UTF-8 JSON record payloads, plus bounded raw tails on nodes;
+allow extra filesystem space for SQLite pages, indexes, manifests, and the
+SQLite WAL (long-lived readers may delay checkpointing). New stores use full
+auto-vacuum. A pre-existing SQLite file with auto-vacuum disabled requires an
+explicit rebuild to enable page reclamation; this upgrade does not rebuild it
+during startup. Prefix rotation retains monotonic sequence numbers
+and dropped-record counts. Age/count retention runs at store initialization,
+attempt creation, and before history snapshots when expired/excess rows exist.
+History snapshots use read transactions; WAL allows writers to proceed while
+readers inspect a snapshot. Active attempts are protected from manifest
+eviction and do not consume the completed-attempt count budget; their record
+payloads still rotate. Expired manifests are counted in
+`evicted_attempts` (gateway-wide), and requesting an evicted attempt returns 404.
+Raw-tail capacity is divided across the configured node attempt count, keeping
+runtime output bounded after startup collection ends. Existing pre-upgrade logs
+are not imported. Keep the gateway database on one persistent local volume for
+its owning gateway process; separate gateway replicas do not share this history.
+
+Controlled verification lives in `tests/provisioning/test_attempt_logs.py`: it
+runs the uploaded recorder and shipped setup/launch boundaries with fixture
+installers and a fake engine. It exercises lost acknowledgements, stream
+interruption, restart, concurrent readers, retries, record/raw-file rotation, and
+missing remote/journal sources. These checks do not establish success rates or
+failure causes on real fleet hardware.
+
+## Troubleshooting
+
+### Reading provisioning logs offline
+
+When the gateway is down, use the SQLite CLI to read its persistent database.
+The default path is `data/provisioning-logs.sqlite3`; substitute your configured
+`INFERENCE_PROXY_PROVISIONING__LOG_DB_PATH` if different. Open it read-only to
+avoid accidentally creating or modifying a database. First list attempts:
+
+```bash
+sqlite3 -readonly -header -column data/provisioning-logs.sqlite3 \
+  "SELECT id, hostname, json_extract(metadata,'$.started_at') AS started_at,
+          json_extract(metadata,'$.status') AS status,
+          json_extract(metadata,'$.failure_summary') AS failure_summary,
+          dropped AS dropped_records
+   FROM attempts ORDER BY created DESC;"
+```
+
+Replace `ATTEMPT_ID` below with an ID from that list to read one attempt in
+sequence order. Sequence numbers are local to each attempt:
+
+```bash
+sqlite3 -readonly data/provisioning-logs.sqlite3 \
+  "SELECT json_extract(payload,'$.ts') || ' [' ||
+          json_extract(payload,'$.source') || '] ' || json_extract(payload,'$.msg')
+   FROM records WHERE attempt='ATTEMPT_ID' ORDER BY seq;"
+```
+
+For a JSONL export preserving all record metadata, use `SELECT payload` (each
+row is already JSON). The companion manifest includes source availability,
+issues, and retention counters, which distinguish missing evidence from an
+empty log:
+
+```bash
+sqlite3 -readonly data/provisioning-logs.sqlite3 \
+  "SELECT payload FROM records WHERE attempt='ATTEMPT_ID' ORDER BY seq;" \
+  | jq -c . > provisioning-attempt.jsonl
+sqlite3 -readonly data/provisioning-logs.sqlite3 \
+  "SELECT json_object('metadata',json(metadata),'next_seq',next_seq,
+                      'remote_cursor',remote_cursor,'dropped_records',dropped,
+                      'retained_bytes',bytes)
+   FROM attempts WHERE id='ATTEMPT_ID';" \
+  | jq . > provisioning-attempt-manifest.json
+```
+
+`sqlite3 -readonly data/provisioning-logs.sqlite3 .dump` produces a SQL backup,
+not JSONL. These reads do not require the gateway or network access. If only a
+node's evidence is available, run the same queries on
+`/var/lib/qiip/provisioning-logs/attempts.sqlite3` (or the configured
+`INFERENCE_PROXY_PROVISIONING__LOG_REMOTE_ROOT` plus `/attempts.sqlite3`). The
+node also keeps bounded `<attempt-id>.engine.log` raw tails alongside that
+database. Copy the database while its writers are stopped, or use SQLite's
+`.backup` command for a consistent snapshot of a live database.
 
 ## Technology Stack
 

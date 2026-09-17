@@ -208,6 +208,31 @@
                 </div>
             </section>
 
+            {% if not read_only | default(false) %}
+            <section class="card" id="attempt-history-panel">
+                <h2 class="card-title">Provisioning history</h2>
+                <div class="attempt-toolbar">
+                    <label for="attempt-select">Attempt</label>
+                    <select id="attempt-select"><option value="">Loading attempts…</option></select>
+                    <button type="button" id="attempt-older" class="btn btn-secondary" hidden>Older attempts</button>
+                    <button type="button" id="attempt-refresh" class="btn btn-secondary">Refresh history</button>
+                </div>
+                <p id="attempt-summary" role="status" aria-live="polite"></p>
+                <p id="attempt-issues" class="attempt-issues"></p>
+                <form id="attempt-search" class="attempt-toolbar">
+                    <label for="attempt-query">Search full logs</label>
+                    <input type="search" id="attempt-query" maxlength="500" placeholder="Search retained messages">
+                    <label for="attempt-source">Source</label>
+                    <select id="attempt-source"><option value="">All sources</option></select>
+                    <button class="btn btn-secondary" type="submit">Search</button>
+                    <button class="btn btn-secondary" type="button" id="attempt-collect">Retrieve from node</button>
+                    <a id="attempt-download" class="btn btn-secondary" hidden>Download log bundle</a>
+                </form>
+                <div id="attempt-output" class="log-viewer" aria-label="Attempt log records"></div>
+                <button type="button" id="attempt-more" class="btn btn-secondary" hidden>Load more records</button>
+            </section>
+            {% endif %}
+
             <section class="card" id="logs-panel">
                 <h2 class="card-title">
                     Live Logs
@@ -237,5 +262,8 @@
     <script src="{{ static_asset_url(request, 'js/setup_selection.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/llamacpp_relaunch.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/node_detail.js') }}"></script>
+    {% if not read_only | default(false) %}
+    <script src="{{ static_asset_url(request, 'js/provisioning_history.js') }}"></script>
+    {% endif %}
 </body>
 </html>

@@ -12,8 +12,12 @@ The guide separates three kinds of change:
 
 - [Recommended upgrade sequence](#recommended-upgrade-sequence)
 - [Required operator migrations](#required-operator-migrations)
+- [Durable provisioning attempt logs](#26-durable-provisioning-attempt-logs)
+- [Self-service onboarding](#27-self-service-onboarding-moves-normal-users-to-start)
+- [Catalog profiles and automatic placement](#28-catalog-profiles-and-automatic-model-placement)
 - [Artifact sources and mirror policy](#artifact-sources-and-mirror-policy)
 - [Client-visible compatibility changes](#client-visible-compatibility-changes)
+- [RPM install migration](#rpm-install-migration)
 - [Operational runbooks](#operational-runbooks)
 - [Verification checklist](#verification-checklist)
 
@@ -200,7 +204,7 @@ The current node bundle installs:
 
 - vLLM 0.26.0
 - FlashInfer Python and AOT cubins 0.6.14
-- uv 0.12.1
+- uv 0.12.17
 - CPython 3.12 on Linux x86_64, targeting `manylinux_2_34`
 
 The upgrade therefore changes the node runtime versions as well as the package tool. Review vLLM release compatibility and model behavior before rolling the bundle across the fleet.
@@ -263,10 +267,17 @@ SHA-256 before extraction, and builds CUDA-enabled `llama-server` and
 is two hours:
 
 ```dotenv
-INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION=b10242
-INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256=b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION=v0.4.1
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256=ef3d5b1907a391500ae11b5e61a8e2022e0deaac9790899cad9c4e02f03bfb9a
 INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT=7200
 ```
+
+Upstream now publishes `v<major>.<minor>.<patch>` release tags and marks the
+older `b<number>` build tags as nightly prereleases. The version setting accepts
+both formats; the default follows the release tags. Deployments that pin a
+`b<number>` tag with its own digest keep working unchanged, while deployments on
+the previous default rebuild llama.cpp at the next managed setup because the
+version is part of the immutable build identity.
 
 Changing the version requires an explicitly configured matching digest. A
 custom source mirror is selected through the validated
@@ -413,7 +424,7 @@ a property of the selected model, quantization, GPU topology, and free-memory
 target. `context_per_slot` is QIIP's simultaneous-capacity guarantee;
 `slot_context_limit` is llama.cpp's maximum for one request; and
 `aggregate_context` is the total unified KV pool. When the aggregate exceeds
-the model training context, b10242's `possible training context overflow` and
+the model training context, llama.cpp's `possible training context overflow` and
 slot-capping warnings are expected and validated. A fitter-failure warning is
 still fatal.
 
@@ -503,6 +514,151 @@ repeated `{version}` placeholders, matching the shipped default release URL
 option to the default value previously failed validation; mirrors and custom
 URLs with a single `{version}` keep working.
 
+### 26. Durable provisioning attempt logs
+
+Provisioning now stores evidence in `data/provisioning-logs.sqlite3` by default.
+Place this file on a persistent local volume writable by the gateway service;
+include it in backups. The existing in-memory log settings still bound live
+buffers. The `provisioning.log_*` keys in `conf/qiip.yml.example` configure durable
+retention, node/gateway byte budgets, and retrieval intervals; matching
+`INFERENCE_PROXY_PROVISIONING__LOG_*` environment variables remain supported.
+The gateway fails startup if the database is not writable. Its payload budget
+must cover one attempt; the node total must cover twice its per-attempt record
+budget because half is reserved for raw tails. The node log root must be a
+dedicated absolute directory, not `/`.
+
+New setup attempts upload the node recorder and require node Python 3.9+ with
+SQLite. The SSH account needs access to `/var/lib/qiip/provisioning-logs` and the
+relevant service journals. Missing journals are reported in the attempt manifest.
+Pre-upgrade logs are not imported and no backfill is performed.
+Gateway shutdown leaves detached node commands running; only explicit teardown
+cancellation sends the node a cancel request. After restart, use
+**Provisioning history → Retrieve from node** to recover missed evidence; the
+operation remains marked interrupted until an operator assesses its outcome.
+
+Managed engine starts now retain a bounded, attempt-specific raw engine tail in
+the node log directory. Startup validation reads that same file. Direct script
+invocations retain their usual `/var/log/*-serve.log` destinations. Downloaded
+bundles contain a JSONL manifest followed by records and may include sensitive
+model/tool output; they remain behind the existing administrative authorization.
+
+### 27. Self-service onboarding moves normal users to `/start`
+
+This changes what signed-in non-admin users see and how they get tokens. No
+configuration is required; read it before upgrading a gateway that already has
+Google users.
+
+- **One page for normal users.** After sign-in they land on `/start`, and
+  `/dashboard`, node detail pages, `/models`, `/chat`, `/profile`, and the
+  token and admin pages all redirect them there. The read-only fleet and node
+  views they had before are gone. Admin-role users and the local admin keep
+  every page and are redirected away from `/start`.
+- **`POST /profile/tokens` is admin-only.** Normal users get `403`, including
+  for `name: agent-config`. Scripts that minted tokens as a normal user must
+  move to `/start`, or the user needs the admin role.
+- **Existing tokens keep working until the user mints a new one.** A user who
+  already has tokens sees the newest one on `/start`, labelled as able to use
+  every model and read-only. Creating a token there revokes **all** of that
+  user's older tokens at once (pinned tokens and the agent-config key
+  included), so tools configured with them must be set up again. Tell users
+  before they click through.
+- **New tokens are model-scoped.** Requests for a model outside the token's
+  list are refused with `403 model_not_permitted`, and `/v1/models` narrows to
+  the token's models when a scoped token is presented. Anonymous listing and
+  unscoped tokens behave as before.
+- **Scope needs token enforcement to mean anything.** With
+  `auth.enforce_api_tokens=false` (the default) a client can drop the bearer
+  token and use any public model anonymously. Set it to `true` if model scope
+  is meant as a restriction rather than a convenience.
+- **Database migration is automatic.** On first start the auth database
+  (`auth.db_path`) gains `tokens.model_scope`, `tokens.derive_nonce`, a
+  `setup_links` table, and a unique index allowing one active onboarding token
+  per user. Existing rows are untouched. Back the file up first; a downgraded
+  build ignores the new columns.
+- **Set `oauth.redirect_uri` to the public https origin.** The setup command
+  and the configs it writes take their origin from it. This matters most
+  behind a reverse proxy uvicorn does not trust for forwarded headers (for
+  example the rootless Podman nginx), where the request scheme alone would
+  read as `http`.
+- **Treat proxy access logs as sensitive.** `/s/{id}` links are credentials
+  for 15 minutes. The gateway redacts them in its own request log; nginx
+  still records them in `access.log` unless its `log_format` is changed.
+- **`auth.session_secret` now protects tokens too.** Onboarding tokens are
+  derived from it, so the secret plus the auth database is enough to recover
+  them. Rotating it keeps existing tokens valid on `/v1` but blocks
+  re-exporting them; users are then asked to create a new token.
+
+### 28. Catalog profiles and automatic model placement
+
+`placement.enabled` now defaults to `true`. With QUADS configured and the
+approved artifacts present, eligible free hosts are provisioned automatically
+using only the catalog models and their pinned configurations. Set
+`placement.enabled: false` before upgrading to opt out. Existing explicit
+`false` settings remain effective.
+
+- **Node records gain two fields.** `/nodes/<host>` values now carry `gpus`
+  (the node's own `nvidia-smi` inventory) and `placement` (set only on nodes
+  automatic placement provisioned). Existing records load unchanged. A
+  gateway without profile support cannot read profile node records; see
+  [Rollback](#rollback).
+- **Manual teardown suspends automatic placement for the host.** Teardown,
+  force teardown, and cancellation through `DELETE /admin/nodes/{host}` now
+  persist an opt-out before starting teardown. It survives node deletion and
+  gateway restarts, including when placement is disabled or QUADS is absent.
+  If suspension cannot be saved, teardown returns `503` without cancelling an
+  active provisioning task. The handler inspects the operation first, saves
+  suspension, then cancels only that inspected operation; if it was replaced,
+  the request returns `409` without cancelling its replacement.
+  If cancellation or subsequent lease acquisition fails, the response explains
+  that automatic placement remains suspended: retry teardown or resume it.
+  A `503` can therefore leave a visible suspension even when teardown did not
+  run. If another admin resumes placement during cancellation, the handler
+  checks suspension under the teardown lease and returns `409` without stopping
+  the node or recreating the suspension. Failed teardown also keeps suspension.
+  Scheduled teardown and automatic recovery do not create suspensions.
+- **Resume from Admin > Automatic Model Placement > Suspended hosts**, or use
+  `DELETE /admin/placement/suspensions/{host}`. The host becomes eligible on a
+  subsequent placement pass; GPU qualification, availability, ownership,
+  exclusions, and retry limits still apply. Resume returns `409` during a host
+  lifecycle operation. Manual setup and claim reset do not implicitly resume
+  automation. `GET /admin/placement` includes `suspended_hosts` even with
+  placement disabled or QUADS absent.
+- **Back up `/placement/suspensions/` alongside `/placement/claims/` and `/nodes/`.**
+  Suspension keys are persistent and unleased. Their presence blocks placement
+  even if the stored value cannot be parsed.
+- **A new etcd prefix, `/placement/claims/`.** Claims are persistent, unleased
+  keys. Back them up with `/nodes/`. Deleting a claim by hand releases its host
+  to the next placement pass; prefer `DELETE /admin/placement/claims/{host}`.
+- **Managed llama.cpp nodes need a rebuild-free setup pass.** `setup.sh` now
+  also checks that `llama-server` accepts the profile options (`q4_0` KV,
+  `--spec-type`, draft cache types). The pinned v0.4.1 build passes; a custom
+  older pin fails at setup with "does not accept the catalog profile CLI".
+- **New llama.cpp sizing policy `profile`.** `auto` and `custom` behave as
+  before, still restricted to f16 and q8_0 KV. To override a profile on one
+  node, assign it an owner first, then use
+  `POST /admin/nodes/{host}/llamacpp/relaunch`. Taking ownership removes it
+  from automatic placement. A successful relaunch replaces the profile with
+  the requested policy; a failed relaunch restores the verified profile.
+  Nodes still controlled by automatic placement refuse custom relaunch with `409`.
+- **`PATCH /admin/nodes/{host}/owner` can now answer `409`.** It reserves the
+  host like every other lifecycle operation, on all nodes and not only on
+  automatic placements. While setup, relaunch, teardown or an automatic
+  placement holds the host, the request is refused at once with a message
+  naming the cause, and nothing is written. Repeat it when the operation
+  finishes. Scripts that assumed this call always succeeds on a registered
+  node need to handle `409`.
+- **`placement.max_attempts` counts attempts since the last success.** An
+  attempt interrupted by a gateway restart is counted, a limit lowered between
+  restarts applies to existing claims, and a successful provision resets the
+  count. Every launch, including the first on a host and the first after a
+  claim reset, asks the host for running setup or start commands first.
+- **Before upgrading with placement enabled:** configure QUADS, download each profile's files
+  with `POST /admin/models/download` at the revisions the catalog pins, check
+  `GET /admin/placement` shows every profile's files as present, list any host
+  that must stay out in `placement.exclude_hosts`, and leave
+  `placement.require_qualified_gpu` on so a profile only lands on GPU products
+  it has been validated on.
+
 ## Artifact Sources and Mirror Policy
 
 There is no single global mirror switch. Each source has a different trust and configuration boundary.
@@ -535,6 +691,11 @@ The node-only `NVIDIA_DRIVER_URL` and `LLMFIT_URL` variables are intentionally d
 | **Correctness fix** | Chat messages preserve tool calls, `content: null`, multimodal content parts, and additional OpenAI-compatible fields. Completion prompts preserve string, string-array, token-ID, and nested token-ID forms. | Remove client-side transformations that existed only to prevent the proxy from stripping these fields; retaining them can cause duplicate handling. |
 | **Behavioral break** | `/v1/models[].owned_by` now reports the registered node's engine (`vllm` or `llama_cpp`) instead of always reporting `vllm`. | Treat `owned_by` as backend metadata rather than a constant. Do not filter otherwise valid models solely because the value is not `vllm`. |
 | **Defined boundary** | After a streaming response has started, an upstream failure is not retried. The proxy emits an OpenAI-format error event followed by `[DONE]`. | Treat a mid-stream error as terminal and do not concatenate a second backend's output onto the partial response. |
+| **New surface** | `POST /v1/messages` and `POST /v1/messages/count_tokens` (Anthropic Messages API, used by Claude Code) and `POST /v1/responses` (OpenAI Responses API, used by Codex) are forwarded to nodes serving the requested model, with the same token authentication, routing, failover, and usage tracking as chat completions. `/v1/messages` also accepts the token as `x-api-key`, which still authenticates when a bearer token sent with it does not resolve. | Point Claude Code at the gateway root and Codex at `/v1` with `wire_api = "responses"`. An adopted server that does not implement these APIs returns its own 404. |
+| **New surface** | On `/v1/messages`, qiip's own errors (401, 403, 404, 503, failover exhaustion) use Anthropic's `{"type": "error", "error": {...}}` envelope, with the qiip code in `error.code`. A mid-stream failure is an `event: error` frame on `/v1/messages` and an `event: response.failed` frame on `/v1/responses`; neither format ends with `[DONE]`. | Anthropic and OpenAI SDKs read these natively. Custom clients should not wait for `[DONE]` on these routes. |
+| **New surface** | Streamed SSE events keep their `event:` names. Chat and text completion streams carry none, so their bytes are unchanged. | None for OpenAI-compatible clients. |
+| **Defined boundary** | On `/v1/messages` and `/v1/responses`, system and developer messages that come before the conversation join the system prompt (`instructions` for Responses). Later ones reach the model as user messages at the same position, wrapped in `<system-reminder>` tags, so strict chat templates accept them without defeating the backend's prompt cache. | Send instructions that must stay system-level before the first user message. |
+| **Defined boundary** | The Responses API is served statelessly. `previous_response_id` and stored-response retrieval are not supported. | Send the whole conversation each turn, as Codex does with `store: false`. |
 
 No failover marker is added when no backend attempt occurred, such as when no node serves the requested model. A non-retryable error returned after one attempt is also not marked as exhausted.
 
@@ -592,6 +753,39 @@ until every gateway that may provision or display the node understands it.
 | **Correctness fix** | Generated agent-config keys are now identified by an internal `purpose` marker instead of their display name. Tokens that users themselves created with the name `agent-config` (an allowed name in earlier builds) are preserved untouched — including their endpoint pins — and are no longer revoked or replaced by a config download. Only purpose-marked keys are governed by the one-active-per-user invariant. | Legacy `agent-config`-named rows keep working exactly as before (they appear in the profile token list and can be revoked like any other token). Keys generated before this build remain valid: with the same session secret the next config download reuses and marks the recognizable generated key. If the session secret changed before that migration, the old unmarked key can no longer be recognized and stays valid — revoke it explicitly, since secret rotation alone does not invalidate it. |
 | **New surface** | `POST /admin/nodes/pool` accepts `"admin_only": true` (implies `"self_setup": true`) to register an admin-only inference server from an existing OpenAI-compatible URL, plus an optional operator-facing `"name"` shown in the admin fleet view. Admin-only nodes are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never appear in `/fleet/nodes` or public `/v1/models`, render bold with an `admin_only` badge on the admin fleet page, and are removed with the normal pool deletion endpoint. `/admin/nodes[]` gains `admin_only` and `name`. | No action unless you adopt admin-only servers; the admin-only flag and name are additive and default to false/empty for all existing records. |
 | **New surface** | `GET /fleet/nodes` returns the registered-node view for signed-in non-admins: admin-only servers removed, operational actions stripped, and nodes owned by another user excluded (endpoint/model/engine/artifact/GPU identity stays private per RFE-107, matching `/v1/models` and the endpoint picker). The dashboard JS uses it for non-admin viewers while admins keep `/admin/nodes`. | Signed-in non-admin users now see the fleet (unowned nodes plus their own); treat `/fleet/nodes` as org-internal inventory that never enumerates another user's private nodes. |
+
+## RPM install migration
+
+The qiip RPM uses a different layout from the git-checkout convention
+(`/opt/inference-proxy` + uv venv):
+
+- service unit: `/usr/lib/systemd/system/inference-proxy.service` (system
+  `python3`, `WorkingDirectory=/usr/share/qiip`, `EnvironmentFile=-/etc/qiip/qiip.env`)
+- node engine bundles: `/usr/share/qiip/{auto-vllm,auto-llamacpp,common}`
+- config examples: `/etc/qiip/conf/*.yml.example`
+- writable data: `/var/lib/qiip` (`provisioning-logs.sqlite3`, `qiip.db`)
+- nginx bundle: `/usr/share/qiip/nginx/{nginx.conf,gen-cert.sh}`
+
+To move an existing gateway to the RPM install:
+
+1. Remove any stale unit copy so the RPM unit wins:
+   `sudo rm -f /etc/systemd/system/inference-proxy.service && sudo systemctl daemon-reload`.
+2. Stop the checkout service: `sudo systemctl stop inference-proxy`.
+3. Copy writable data: `sudo mv /opt/inference-proxy/data/qiip.db /var/lib/qiip/`
+   and `.../data/provisioning-logs.sqlite3` (new location defaults).
+4. Move settings: copy `INFERENCE_PROXY_*` values from
+   `/opt/inference-proxy/.env` into `/etc/qiip/qiip.env`.
+5. `sudo dnf install qiip` (after `dnf copr enable quadsdev/qiip`), copy
+   the config examples, then
+   `sudo systemctl enable --now inference-proxy`. The package now also
+   requires and starts nginx (deploys the bundled config when the stock
+   file is unmodified per the nginx-core rpmdb, so an operator-edited
+   `/etc/nginx/nginx.conf` is left untouched) and
+   serves the gateway as a tuned uvicorn process farm; tune worker counts
+   via the `server:` YAML block or `INFERENCE_PROXY_SERVER__WORKERS`.
+
+The old `/opt/inference-proxy` checkout is no longer needed by the service;
+keep it only for development.
 
 ## Operational Runbooks
 
@@ -689,6 +883,7 @@ reprovisioning.
 There is no database migration to reverse, but rollback does not restore every previous behavior:
 
 - Node environments synchronized from the new frozen bundle remain on the new vLLM and FlashInfer versions until another reviewed bundle converges them.
+- Older gateways reject `sizing: profile` records, so their managed leases expire. Before rollback, disable placement and tear down profile nodes or take ownership and successfully relaunch them with a compatible `auto` or `custom` policy. Ownership alone is insufficient.
 - A managed key already deleted by lease expiry is not recreated by installing an older gateway.
 - Node records written without `managed: true` remain externally owned.
 - Clients changed to understand pre-stream non-200 responses and exhaustion markers should keep that handling; it is backward-compatible with older responses.

@@ -540,6 +540,47 @@ def test_node_detail_managed_node_shows_power_and_recommendations() -> None:
     }
 
 
+def test_durable_log_replay_uses_monotonic_cursor_without_retaining_entries() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+sandbox.connectLogStream();
+const stream = eventSources[0];
+for (let seq = 0; seq < 1500; seq++) {
+  stream.emit("message", { data: JSON.stringify({ attempt_id: "attempt", seq, msg: "line " + seq }) });
+}
+stream.emit("message", { data: JSON.stringify({ attempt_id: "attempt", seq: 0, msg: "replayed with changed metadata" }) });
+stream.emit("error");
+runNextTimer();
+console.log(JSON.stringify({
+  lines: byId("logs-output").children.length,
+  retained: sandbox.logSeenEntries.size,
+  cursor: sandbox.logResumeCursor,
+  url: eventSources[1].url,
+}));
+"""
+    )
+    assert result["lines"] == 1500
+    assert result["retained"] == 0
+    assert result["cursor"] == {"attempt": "attempt", "after": 1500}
+    assert result["url"].endswith("?attempt_id=attempt&after=1500")
+
+
+def test_legacy_log_deduplication_has_a_bounded_window() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+sandbox.connectLogStream();
+const stream = eventSources[0];
+for (let i = 0; i < 1500; i++) {
+  stream.emit("message", { data: JSON.stringify({ msg: "line " + i }) });
+}
+stream.emit("message", { data: JSON.stringify({ msg: "line 1499" }) });
+console.log(JSON.stringify({ lines: byId("logs-output").children.length, retained: sandbox.logSeenEntries.size }));
+"""
+    )
+    assert result["lines"] == 1500
+    assert result["retained"] <= 1000
+
+
 def test_log_stream_reconnects_after_transient_drop() -> None:
     result = _run_node_detail_scenario(
         r"""

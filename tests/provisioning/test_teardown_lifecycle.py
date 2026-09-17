@@ -55,7 +55,7 @@ def _provisioner(
         endpoint_policy=_ENDPOINT_POLICY,
         registry=registry,
         connection_tracker=MagicMock(get=MagicMock(return_value=0)),
-        log_buffer=MagicMock(),
+        log_buffer=MagicMock(store=None),
         nfs_export="nfs.example:/exports/huggingface",
     )
 

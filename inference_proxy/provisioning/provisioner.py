@@ -9,10 +9,11 @@ Per D-15: Concrete class, no protocol/interface.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import shlex
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -56,6 +57,7 @@ from inference_proxy.provisioning.host_lifecycle import (
     HostLifecycleLease,
 )
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
+from inference_proxy.provisioning.remote_logs import RemoteLogCollector
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
     SSHClient,
@@ -407,16 +409,117 @@ class NodeProvisioner:
             max_entry_bytes=settings.log_max_entry_bytes,
             max_completed_hosts=settings.log_max_completed_hosts,
         )
+        self._remote_logs = (
+            RemoteLogCollector(
+                ssh_client, self._log_buffer.store, self._log_buffer, settings
+            )
+            if self._log_buffer.store is not None
+            else None
+        )
         self._lifecycle = lifecycle_coordinator or HostLifecycleCoordinator()
         self._hf_token = hf_token
         self._nfs_export = nfs_export
         self._artifact_index = artifact_index
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._provisioning_tasks: dict[str, _ProvisioningTask] = {}
+        self._explicit_cancel_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def log_buffer(self) -> ProvisioningLogBuffer:
         return self._log_buffer
+
+    def _begin_log(
+        self,
+        hostname: str,
+        engine: InferenceEngine,
+        *,
+        model: str | None = None,
+        operation: str = "provision",
+    ) -> None:
+        digest = hashlib.sha256()
+        files = [
+            *self._engine_scripts_dir(engine).glob("*"),
+            *self._common_scripts_dir().glob("*"),
+            Path(__file__).with_name("log_store.py"),
+        ]
+        for path in sorted(files):
+            if path.is_file():
+                digest.update(path.name.encode())
+                digest.update(path.read_bytes())
+        self._log_buffer.create(
+            hostname,
+            engine=engine.value,
+            model=model,
+            operation=operation,
+            bundle_version="sha256:" + digest.hexdigest(),
+        )
+
+    async def collect_logs(self, hostname: str, attempt_id: str) -> dict[str, object]:
+        store = self._log_buffer.store
+        if (
+            store is None
+            or self._remote_logs is None
+            or store.get(attempt_id)["hostname"] != hostname
+        ):
+            raise KeyError(attempt_id)
+        # The durable manifest describes any unavailable source.
+        with suppress(SSHConnectionError, TimeoutError):
+            await self._remote_logs.collect(attempt_id)
+        return store.get(attempt_id)
+
+    async def _finish_remote_logs(self, hostname: str, *, cancel: bool = False) -> None:
+        try:
+            attempt_id = self._log_buffer.attempts.get(hostname)
+            if self._remote_logs is None or attempt_id is None:
+                return
+            manifest = await asyncio.to_thread(self._remote_logs.store.get, attempt_id)
+            if not manifest.get("phases"):
+                return
+            task = asyncio.current_task()
+            # A gateway shutdown stops retrieval, not the detached node worker.
+            interrupted = bool(task and task.cancelling()) and not cancel
+            await self._remote_logs.collect(
+                attempt_id, finish=not interrupted, cancel=cancel
+            )
+        except Exception:
+            logger.warning(
+                "remote_logs_finish_failed", hostname=hostname, exc_info=True
+            )
+
+    def _mark_log_complete(self, hostname: str) -> None:
+        try:
+            task = asyncio.current_task()
+            attempt_id = self._log_buffer.attempts.get(hostname)
+            store = self._log_buffer.store
+            if (
+                task
+                and task.cancelling()
+                and task not in self._explicit_cancel_tasks
+                and store
+                and attempt_id
+            ):
+                store.update(
+                    attempt_id,
+                    status="interrupted",
+                    failure_summary="Gateway collection interrupted; remote command left running",
+                )
+        except Exception:
+            logger.warning(
+                "log_interrupt_status_failed", hostname=hostname, exc_info=True
+            )
+        try:
+            self._log_buffer.mark_complete(hostname)
+        except Exception:
+            logger.warning("log_completion_failed", hostname=hostname, exc_info=True)
+
+    def _engine_log_path(self, hostname: str, engine: InferenceEngine) -> str:
+        if self._remote_logs is not None:
+            return f"{self._settings.log_remote_root}/{self._log_buffer.attempts[hostname]}.engine.log"
+        return (
+            "/var/log/llamacpp-serve.log"
+            if engine == InferenceEngine.LLAMA_CPP
+            else "/var/log/vllm-serve.log"
+        )
 
     def validate_endpoint(self, hostname: str, port: int | None = None) -> str:
         """Return the canonical provisioned endpoint or fail with a config hint."""
@@ -514,6 +617,8 @@ class NodeProvisioner:
             *(engine_dir / name for name in _ENGINE_BUNDLE_FILES[engine]),
             common_dir / "setup-base.sh",
         }
+        if self._remote_logs is not None:
+            required.add(common_dir / "provision-logs.py")
         missing = sorted(str(path) for path in required if not path.is_file())
         if missing:
             raise ProvisioningError(
@@ -650,6 +755,8 @@ class NodeProvisioner:
         *,
         stream: str | None = None,
     ) -> None:
+        if self._remote_logs is not None and stream is not None:
+            return  # Remote raw output was already committed by its sequence.
         self._log_buffer.append(hostname, level, msg, stream=stream)
 
     async def list_tasks_raw(self) -> list[tuple[bytes, KeyValue]]:
@@ -667,6 +774,16 @@ class NodeProvisioner:
     ) -> None:
         """Write provisioning state to etcd (D-05). Best-effort (Pitfall 3)."""
         now = datetime.now(UTC)
+        store = self._log_buffer.store
+        attempt_id = self._log_buffer.attempts.get(hostname)
+        if store is not None and attempt_id is not None:
+            fields: dict[str, object] = {"stage": failed_step or step.value}
+            if error:
+                fields.update(
+                    status="failed",
+                    failure_summary=f"{failed_step or step.value}: {error}",
+                )
+            store.update(attempt_id, **fields)
         state = ProvisioningState(
             hostname=hostname,
             current_step=step,
@@ -995,7 +1112,7 @@ class NodeProvisioner:
         request: LlamaCppRuntimeRequest,
     ) -> None:
         started_at = datetime.now(UTC)
-        self._log_buffer.create(hostname)
+        self._begin_log(hostname, InferenceEngine.LLAMA_CPP, operation="relaunch")
         self._log(hostname, "info", "llama.cpp relaunch started")
         await self._update_state(
             hostname,
@@ -1598,14 +1715,20 @@ class NodeProvisioner:
                     owner=owner,
                 )
         except asyncio.CancelledError:
-            self._log(hostname, "error", "Provisioning cancelled by teardown")
+            explicit = asyncio.current_task() in self._explicit_cancel_tasks
+            message = (
+                "Provisioning cancelled by teardown"
+                if explicit
+                else "Gateway collection interrupted; remote command left running"
+            )
+            self._log(hostname, "error", message)
             await self._update_state(
                 hostname,
                 ProvisioningStep.FAILED,
-                failed_step="cancelled",
-                error="Provisioning cancelled by teardown",
+                failed_step="cancelled" if explicit else "interrupted",
+                error=message,
             )
-            self._log_buffer.mark_complete(hostname)
+            self._mark_log_complete(hostname)
             raise
         finally:
             lease.release()
@@ -1635,7 +1758,9 @@ class NodeProvisioner:
             engine=engine,
             vllm_params=vllm_params.model_dump() if vllm_params else None,
         )
-        self._log_buffer.create(hostname)
+        self._begin_log(
+            hostname, engine, model=artifact.model_alias if artifact else model
+        )
         self._log(hostname, "info", "Provisioning started")
 
         await self._update_state(
@@ -1794,7 +1919,10 @@ class NodeProvisioner:
                 logger.warning("failed_node_update_failed", hostname=hostname)
             raise
         finally:
-            self._log_buffer.mark_complete(hostname)
+            await self._finish_remote_logs(
+                hostname, cancel=asyncio.current_task() in self._explicit_cancel_tasks
+            )
+            self._mark_log_complete(hostname)
 
         logger.info("provisioning_complete", hostname=hostname)
 
@@ -1805,6 +1933,12 @@ class NodeProvisioner:
         scripts_dir, common_dir = self._required_script_bundles(engine)
         await self._ssh_client.upload(hostname, scripts_dir)
         await self._ssh_client.upload(hostname, common_dir)
+        if self._remote_logs is not None:
+            await self._ssh_client.upload(
+                hostname,
+                Path(__file__).with_name("log_store.py"),
+                "common/log_store.py",
+            )
 
     async def _run_setup(
         self,
@@ -1820,7 +1954,17 @@ class NodeProvisioner:
             env=self._setup_script_env(engine),
             scripts_dir=self._engine_scripts_dir(engine).name,
         )
-        if engine == InferenceEngine.LLAMA_CPP:
+        output: AsyncIterator[tuple[str, str]]
+        if self._remote_logs is not None:
+            output = self._remote_logs.run(
+                hostname,
+                command,
+                stage="setup",
+                timeout=self._settings.llamacpp_setup_timeout
+                if engine == InferenceEngine.LLAMA_CPP
+                else None,
+            )
+        elif engine == InferenceEngine.LLAMA_CPP:
             output = self._ssh_client.run_streaming(
                 hostname,
                 command,
@@ -1905,7 +2049,11 @@ class NodeProvisioner:
         """Fail closed unless the healthy server proves the managed fit contract."""
         try:
             log_text = await self._ssh_run_command(
-                hostname, "cat -- /var/log/llamacpp-serve.log"
+                hostname,
+                "cat -- "
+                + shlex.quote(
+                    self._engine_log_path(hostname, InferenceEngine.LLAMA_CPP)
+                ),
             )
             fit = _parse_llamacpp_runtime_fit(log_text)
             memory_text = await self._ssh_run_command(
@@ -2042,8 +2190,22 @@ class NodeProvisioner:
             ),
             scripts_dir=self._engine_scripts_dir(engine).name,
         )
+        output: AsyncIterator[tuple[str, str]]
+        if self._remote_logs is not None:
+            log_path = self._engine_log_path(hostname, engine)
+            variable = (
+                "AUTOLLAMACPP_LOG_FILE"
+                if engine == InferenceEngine.LLAMA_CPP
+                else "AUTOVLLM_LOG_FILE"
+            )
+            command = f"{variable}={shlex.quote(log_path)} " + command
+            output = self._remote_logs.run(
+                hostname, command, stage="start", engine_log=log_path
+            )
+        else:
+            output = self._ssh_client.run_streaming(hostname, command)
         model_name: str | None = None
-        async for stream, line in self._ssh_client.run_streaming(hostname, command):
+        async for stream, line in output:
             logger.debug(
                 "start_vllm_output", stream=stream, line=line, hostname=hostname
             )
@@ -2052,6 +2214,10 @@ class NodeProvisioner:
                 match = MODEL_PATTERN.search(line)
                 if match:
                     model_name = match.group(1).strip()
+                    if self._log_buffer.store is not None:
+                        self._log_buffer.store.update(
+                            self._log_buffer.attempts[hostname], model=model_name
+                        )
                     self._log(hostname, "info", f"Detected model: {model_name}")
 
         if model_name is None:
@@ -2069,10 +2235,10 @@ class NodeProvisioner:
         self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
     ) -> None:
         """Tail engine log and feed lines into the provisioning log buffer."""
-        if engine == InferenceEngine.LLAMA_CPP:
-            log_path = "/var/log/llamacpp-serve.log"
-        else:
-            log_path = "/var/log/vllm-serve.log"
+        if self._remote_logs is not None:
+            await self._remote_logs.follow(self._log_buffer.attempts[hostname])
+            return
+        log_path = self._engine_log_path(hostname, engine)
         try:
             async for _stream, line in self._ssh_client.run_streaming(
                 hostname, f"tail -n +1 -f {log_path}"
@@ -2318,9 +2484,13 @@ class NodeProvisioner:
             return None
 
         task = record.task
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        self._explicit_cancel_tasks.add(task)
+        try:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        finally:
+            self._explicit_cancel_tasks.discard(task)
 
         if not task.cancelled():
             raise RuntimeError(
@@ -2435,7 +2605,7 @@ class NodeProvisioner:
         """
         teardown_started_at = datetime.now(UTC)
         logger.info("teardown_start", hostname=hostname, force=force, engine=engine)
-        self._log_buffer.create(hostname)
+        self._begin_log(hostname, engine, operation="teardown")
         self._log(hostname, "info", f"Teardown started (force={force})")
 
         try:
@@ -2545,6 +2715,7 @@ class NodeProvisioner:
                 )
             raise
         finally:
-            self._log_buffer.mark_complete(hostname)
+            await self._finish_remote_logs(hostname)
+            self._mark_log_complete(hostname)
 
         logger.info("teardown_complete", hostname=hostname)

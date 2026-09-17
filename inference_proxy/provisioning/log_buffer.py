@@ -14,7 +14,9 @@ from collections import deque
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TypedDict
+from typing import Any, TypedDict
+
+from inference_proxy.provisioning.log_store import AttemptLogStore
 
 _TRUNCATION_MARKER = b" ... [truncated]"
 
@@ -58,6 +60,7 @@ class ProvisioningLogBuffer:
     def __init__(
         self,
         *,
+        store: AttemptLogStore | None = None,
         max_entries_per_host: int = 1_000,
         max_bytes_per_host: int = 1_048_576,
         max_entry_bytes: int = 16_384,
@@ -78,6 +81,8 @@ class ProvisioningLogBuffer:
         if max_completed_hosts < 1:
             raise ValueError("max_completed_hosts must be at least 1")
 
+        self.store = store
+        self.attempts: dict[str, str] = {}
         self._max_entries_per_host = max_entries_per_host
         self._max_bytes_per_host = max_bytes_per_host
         self._max_entry_bytes = max_entry_bytes
@@ -85,7 +90,7 @@ class ProvisioningLogBuffer:
         self._hosts: dict[str, _HostLog] = {}
         self._completion_sequence = 0
 
-    def create(self, hostname: str) -> None:
+    def create(self, hostname: str, **metadata: Any) -> None:
         """Start a fresh operation generation for *hostname*.
 
         Host lifecycle leases serialize production operations. Closing an
@@ -94,8 +99,16 @@ class ProvisioningLogBuffer:
         """
         previous = self._hosts.pop(hostname, None)
         if previous is not None:
+            if not previous.complete and self.store is not None:
+                self.store.update(
+                    self.attempts[hostname],
+                    status="interrupted",
+                    failure_summary="Replaced by a later operation before completion",
+                )
             self._close(previous)
         self._hosts[hostname] = _HostLog()
+        if self.store is not None:
+            self.attempts[hostname] = self.store.create(hostname, **metadata)
 
     def append(
         self,
@@ -104,11 +117,14 @@ class ProvisioningLogBuffer:
         msg: str,
         *,
         stream: str | None = None,
+        persist: bool = True,
     ) -> None:
         host_log = self._hosts.get(hostname)
         if host_log is None:
             return
 
+        if persist and self.store is not None:
+            self.store.append(self.attempts[hostname], msg, level=level, stream=stream)
         bounded_msg = self._truncate_message(msg)
         message_bytes = len(bounded_msg.encode("utf-8"))
         entry: LogEntry = {
@@ -173,6 +189,16 @@ class ProvisioningLogBuffer:
         if host_log is None:
             return
         self._close(host_log)
+        if self.store is not None:
+            attempt_id = self.attempts[hostname]
+            current = self.store.get(attempt_id)
+            self.store.update(
+                attempt_id,
+                finished_at=datetime.now(UTC).isoformat(),
+                status="complete"
+                if current["status"] == "running"
+                else current["status"],
+            )
         self._evict_completed()
 
     def _evict_completed(self) -> None:
@@ -188,6 +214,7 @@ class ProvisioningLogBuffer:
             self._close(host_log)
             if self._hosts.get(hostname) is host_log:
                 self._hosts.pop(hostname)
+                self.attempts.pop(hostname, None)
 
     def has(self, hostname: str) -> bool:
         return hostname in self._hosts

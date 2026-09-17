@@ -641,6 +641,13 @@ EOF
 EOF
     fi
 
+    local engine_log_fd
+    if [ -n "${QIIP_LOG_CONFIG:-}" ]; then
+        exec {engine_log_fd}> >(python3 "${SCRIPT_DIR}/../common/provision-logs.py" engine >/dev/null 2>&1)
+    else
+        exec {engine_log_fd}> "$LLAMACPP_LOG_FILE"
+    fi
+
     if [ "$MANAGED" = "1" ]; then
         printf 'qiip_fit_plan: sizing=%s train_context=%s context_per_slot=%s slots=%s aggregate_context=%s fit_target_mib=%s cache_type_k=%s cache_type_v=%s flash_attn=%s estimator_overrun_used=%s\n' \
             "$MANAGED_SIZING" \
@@ -652,7 +659,7 @@ EOF
             "$MANAGED_CACHE_TYPE_K" \
             "$MANAGED_CACHE_TYPE_V" \
             "$MANAGED_FLASH_ATTN" \
-            "$MANAGED_ESTIMATOR_OVERRUN_USED" > "$LLAMACPP_LOG_FILE"
+            "$MANAGED_ESTIMATOR_OVERRUN_USED" >&"$engine_log_fd"
         # llama.cpp's auto parallel value is a fixed four, not a VRAM fit. The
         # planner uses llama-fit-params to select the largest full-context slot
         # count that preserves the requested free-memory margin. A unified KV
@@ -674,7 +681,7 @@ EOF
             --fit off \
             --verbosity 4 \
             --metrics \
-            >> "$LLAMACPP_LOG_FILE" 2>&1 &
+            >&"$engine_log_fd" 2>&1 &
     else
         set -f
         # shellcheck disable=SC2086
@@ -689,10 +696,11 @@ EOF
             -b "$BATCH_SIZE" \
             --metrics \
             ${EXTRA_ARGS:-} \
-            > "$LLAMACPP_LOG_FILE" 2>&1 &
+            >&"$engine_log_fd" 2>&1 &
     fi
 
     local pid=$!
+    exec {engine_log_fd}>&-
     echo "$pid" > "$PID_FILE"
     verify_llamacpp_started "$pid"
     echo "llama-server started (PID ${pid})"
