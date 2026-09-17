@@ -528,8 +528,8 @@ class TestDashboardRoles:
         response = TestClient(app).get("/dashboard")
 
         assert response.status_code == 200
-        assert "Sign in with Local Admin" in response.text
-        assert "Sign in with Google Auth" in response.text
+        assert "Local Admin" in response.text
+        assert "Google Auth" in response.text
 
     def test_user_sees_fleet_but_not_admin_pages(
         self,
@@ -545,7 +545,7 @@ class TestDashboardRoles:
 
         tokens = client.get("/dashboard/tokens")
         assert tokens.status_code == 200
-        assert "Sign in with Local Admin" in tokens.text
+        assert "Local Admin" in tokens.text
         assert "Administrator access required" in tokens.text
 
     def test_admin_role_sees_admin_pages(
@@ -610,7 +610,7 @@ class TestDashboardRoles:
         assert response.headers["location"] == "/dashboard"
 
         dashboard = client.get("/dashboard")
-        assert "Sign in with Local Admin" in dashboard.text
+        assert "Local Admin" in dashboard.text
         assert ">Logout</button>" not in dashboard.text
 
     def test_local_admin_form_login(self, app: FastAPI) -> None:
@@ -845,7 +845,7 @@ class TestNodeDetailReadOnly:
         assert response.status_code == 200
         assert "READ_ONLY = true" in response.text
         # In-page sign-in must never be shown for a still-signed-in user.
-        assert "Sign in with Local Admin" not in response.text
+        assert "Local Admin" not in response.text
 
     def test_admin_gets_operational_detail_page(
         self,
@@ -867,7 +867,7 @@ class TestNodeDetailReadOnly:
         response = TestClient(app).get("/dashboard/nodes/gpu01")
 
         assert response.status_code == 200
-        assert "Sign in with Local Admin" in response.text
+        assert "Local Admin" in response.text
 
 
 class TestSelfRevocation:
@@ -893,7 +893,7 @@ class TestSelfRevocation:
         assert client.get("/dashboard").status_code == 200
         tokens_page = client.get("/dashboard/tokens")
         assert tokens_page.status_code == 200
-        assert "Sign in with Local Admin" in tokens_page.text
+        assert "Local Admin" in tokens_page.text
         assert "www-authenticate" not in tokens_page.headers
 
     def test_revoking_other_user_does_not_mark_self(

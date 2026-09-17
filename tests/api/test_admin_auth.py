@@ -109,8 +109,8 @@ class TestBasicOnlyDeployment:
         assert response.status_code == 200
         # Neither browser option can work here (no session_secret, OAuth off):
         # both must be gated off and the HTTP-Basic hint shown instead.
-        assert "Sign in with Local Admin" not in response.text
-        assert "Sign in with Google Auth" not in response.text
+        assert "Local Admin" not in response.text
+        assert "Google Auth" not in response.text
         assert 'class="signin-form"' not in response.text
         assert "Browser sign-in is not configured" in response.text
 
@@ -328,9 +328,38 @@ class TestAdminBasicAuthentication:
         )
 
         assert unauthenticated.status_code == 200
-        assert "Sign in with Local Admin" in unauthenticated.text
-        assert "Sign in with Google Auth" in unauthenticated.text
+        assert "Local Admin" in unauthenticated.text
+        assert "Google Auth" in unauthenticated.text
         assert authenticated.status_code == 200
+
+    async def test_signin_local_admin_is_folded_by_default(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+    ) -> None:
+        """The local-admin form is always folded, even when it is the sole
+        configured option (no naked credential fields on first load)."""
+        both = test_settings.model_copy(
+            deep=True,
+            update={
+                "oauth": test_settings.oauth.model_copy(
+                    update={
+                        "client_id": "test-client",
+                        "client_secret": SecretStr("test-secret"),
+                        "redirect_uri": "https://gateway.example.com/auth/callback",
+                    }
+                )
+            },
+        )
+        app.dependency_overrides[get_settings] = lambda: both
+        response = await _request(app, "GET", "/dashboard")
+        assert '<details class="signin-admin">' in response.text
+        assert 'class="signin-admin" open' not in response.text
+
+        app.dependency_overrides[get_settings] = lambda: test_settings
+        response = await _request(app, "GET", "/dashboard")
+        assert '<details class="signin-admin">' in response.text
+        assert 'class="signin-admin" open' not in response.text
 
     @pytest.mark.parametrize("path", ["/health", "/v1/models", "/chat"])
     async def test_non_admin_routes_remain_public(

@@ -22,17 +22,20 @@
             {% endif %}
             <div class="signin-options">
                 {% if sessions_available %}
-                <form method="post" action="/auth/local-admin" class="signin-form">
-                    <label class="signin-label" for="signin-username">Local Admin</label>
-                    <input class="signin-input" type="text" id="signin-username" name="username"
-                           placeholder="Admin username" required autocomplete="username">
-                    <input class="signin-input" type="password" name="password"
-                           placeholder="Password" required autocomplete="current-password">
-                    <button type="submit" class="btn btn-primary">Sign in with Local Admin</button>
-                </form>
+                <details class="signin-admin">
+                    <summary class="btn signin-option">Local Admin</summary>
+                    <form method="post" action="/auth/local-admin" class="signin-form">
+                        <label class="signin-label" for="signin-username">Local Admin</label>
+                        <input class="signin-input" type="text" id="signin-username" name="username"
+                               placeholder="Admin username" required autocomplete="username">
+                        <input class="signin-input" type="password" name="password"
+                               placeholder="Password" required autocomplete="current-password">
+                        <button type="submit" class="btn btn-primary">Sign in</button>
+                    </form>
+                </details>
                 {% endif %}
                 {% if oauth_enabled %}
-                <a class="btn" href="/auth/login">Sign in with Google Auth</a>
+                <a class="btn signin-option" href="/auth/login">Google Auth</a>
                 {% endif %}
                 {% if not sessions_available and not oauth_enabled %}
                 <p class="muted-status">Browser sign-in is not configured on this gateway. Use the

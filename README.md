@@ -51,7 +51,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Hardware-aware model recommendations** -- runs llmfit via SSH on a target host to produce ranked, runtime-normalized recommendations with fit levels, throughput, memory estimates, and typed GGUF sources; auto-installs the binary on first use
 - **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
 - **Admin authentication** -- HTTP Basic credentials or a signed-in admin-role session (local-admin form or Google OAuth) on all `/admin/*` endpoints; browser pages gate with a sign-in page instead of 401ing
-- **Fleet sign-in gate** -- anonymous visitors to the fleet dashboard get a sign-in page with two options: **Sign in with Local Admin** (in-page username/password form that establishes a signed session cookie — no browser Basic challenge popup; HTTP Basic still works for scripts and SSE) and **Sign in with Google Auth** (same flow as the profile page)
+- **Fleet sign-in gate** -- anonymous visitors to the fleet dashboard get a sign-in page with two choices: **Local Admin** (a collapsible option that expands to an in-page username/password form establishing a signed session cookie — no browser Basic challenge popup; HTTP Basic still works for scripts and SSE) and **Google Auth** (same flow as the profile page)
 - **Admin roles** -- the HTTP Basic admin user (bootstrap authority) can grant or revoke the admin role to Google-authenticated users on the token dashboard (`/dashboard/tokens`); role admins then reach the admin surface through their session and see admin-only servers
 - **Admin-only inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). At `/v1` they are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with an `admin_only` badge in the admin fleet view. Token usage from admin-only servers is tracked on the token summary pages exactly like any other node
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
@@ -329,11 +329,11 @@ curl -u "$INFERENCE_PROXY_ADMIN__USERNAME:$INFERENCE_PROXY_ADMIN__PASSWORD" \
 ```
 
 The fleet page (`/dashboard`) is available to every authenticated viewer:
-anonymous visitors receive a sign-in page with **Sign in with Local Admin**
-(an in-page username/password form that creates a signed admin session; the
-browser native Basic prompt is no longer used, though HTTP Basic requests and
-SSE still pass through unchanged) and **Sign in with Google Auth** (the same
-flow as the profile page).
+anonymous visitors receive a sign-in page with **Local Admin**
+(a collapsible choice that expands to an in-page username/password form
+creating a signed admin session; the browser native Basic prompt is no longer
+used, though HTTP Basic requests and SSE still pass through unchanged) and
+**Google Auth** (the same flow as the profile page).
 Signed-in non-admin users see the fleet with admin-only servers removed, no
 operational actions, and nodes owned by another user excluded (ownership is
 private: `/v1/models` and the endpoint picker treat it the same way); node

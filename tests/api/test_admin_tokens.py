@@ -178,14 +178,14 @@ class TestAdminTokenPages:
         response = TestClient(app).get("/dashboard/tokens")
 
         assert response.status_code == 200
-        assert "Sign in with Local Admin" in response.text
+        assert "Local Admin" in response.text
         assert "QIIP - Token Management" not in response.text
 
     def test_user_detail_page_requires_admin(self, app: FastAPI) -> None:
         response = TestClient(app).get("/dashboard/users/1")
 
         assert response.status_code == 200
-        assert "Sign in with Local Admin" in response.text
+        assert "Local Admin" in response.text
         assert "QIIP - User Tokens" not in response.text
 
     def test_tokens_page_renders(self, client: TestClient) -> None:

@@ -988,6 +988,41 @@ tbody tr:last-child td { border-bottom: none; }
   box-shadow: 0 0 0 2px var(--primary-soft);
 }
 
+.btn.signin-option {
+  width: 100%;
+  justify-content: center;
+  padding: 0.75rem 1rem;
+  background: var(--surface);
+  border-color: var(--border-strong);
+  color: var(--text);
+  font-size: 0.875rem;
+}
+
+.signin-option:hover:not(:disabled),
+.signin-option:focus-visible {
+  background: var(--primary-soft);
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.signin-admin summary {
+  list-style: none;
+}
+
+.signin-admin summary::-webkit-details-marker {
+  display: none;
+}
+
+.signin-admin[open] > summary {
+  background: var(--primary-soft);
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.signin-admin[open] .signin-form {
+  margin-top: 0.875rem;
+}
+
 .admin-add-row {
   margin-bottom: 1rem;
 }
