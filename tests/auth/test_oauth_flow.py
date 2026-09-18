@@ -200,7 +200,7 @@ class TestOAuthCallback:
         )
 
         assert response.status_code == 302
-        assert response.headers["location"] == "/profile"
+        assert response.headers["location"] == "/start"
 
         me = client.get("/auth/me")
         assert me.status_code == 200
@@ -307,7 +307,7 @@ class TestOAuthCallback:
         allowed = allowed_client.get(
             "/auth/callback?code=code&state=state", follow_redirects=False
         )
-        assert allowed.headers["location"] == "/profile"
+        assert allowed.headers["location"] == "/start"
 
 
 class TestOAuthCallbackWhitelist:
@@ -374,7 +374,7 @@ class TestOAuthCallbackWhitelist:
             "/auth/callback?code=code&state=state", follow_redirects=False
         )
 
-        assert response.headers["location"] == "/profile"
+        assert response.headers["location"] == "/start"
         assert client.get("/auth/me").status_code == 200
 
     def test_unavailable_allowlist_fails_closed(

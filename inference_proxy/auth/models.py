@@ -59,6 +59,19 @@ class ApiToken(BaseModel):
     last_used_at: datetime | None
     revoked: bool
     endpoint_scope: list[str] | None = None
+    # Model ids the token may request on /v1 (None = unrestricted).
+    model_scope: list[str] | None = None
+    purpose: str | None = None
+
+
+class SetupLink(BaseModel):
+    """A live short-lived link to a rendered harness setup script."""
+
+    user_id: int
+    token_id: int
+    harness: str
+    models: list[str]
+    expires_at: datetime
 
 
 class CreatedToken(ApiToken):
@@ -84,6 +97,7 @@ class PublicToken(BaseModel):
     last_used_at: datetime | None
     revoked: bool
     endpoint_scope: list[str] | None = None
+    model_scope: list[str] | None = None
 
     @classmethod
     def from_token(cls, token: ApiToken) -> PublicToken:
@@ -96,6 +110,7 @@ class PublicToken(BaseModel):
             last_used_at=token.last_used_at,
             revoked=token.revoked,
             endpoint_scope=token.endpoint_scope,
+            model_scope=token.model_scope,
         )
 
 

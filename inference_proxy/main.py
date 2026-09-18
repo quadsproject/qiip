@@ -42,6 +42,7 @@ from inference_proxy.api.middleware import (
     NoStoreMiddleware,
     RequestLoggingMiddleware,
 )
+from inference_proxy.api.onboarding import onboarding_router
 from inference_proxy.api.profile import profile_router
 from inference_proxy.api.routes import router
 from inference_proxy.auth.allowlist import SSOAllowlist
@@ -616,6 +617,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(chat_router)
     application.include_router(auth_router)
     application.include_router(profile_router)
+    application.include_router(onboarding_router)
 
     static_dir = Path(__file__).resolve().parent / "static"
     application.mount("/static", StaticFiles(directory=str(static_dir)), name="static")

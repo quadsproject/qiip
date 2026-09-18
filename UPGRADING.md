@@ -13,6 +13,7 @@ The guide separates three kinds of change:
 - [Recommended upgrade sequence](#recommended-upgrade-sequence)
 - [Required operator migrations](#required-operator-migrations)
 - [Durable provisioning attempt logs](#26-durable-provisioning-attempt-logs)
+- [Self-service onboarding](#27-self-service-onboarding-moves-normal-users-to-start)
 - [Artifact sources and mirror policy](#artifact-sources-and-mirror-policy)
 - [Client-visible compatibility changes](#client-visible-compatibility-changes)
 - [Operational runbooks](#operational-runbooks)
@@ -504,7 +505,6 @@ repeated `{version}` placeholders, matching the shipped default release URL
 option to the default value previously failed validation; mirrors and custom
 URLs with a single `{version}` keep working.
 
-<<<<<<< HEAD
 ### 26. Durable provisioning attempt logs
 
 Provisioning now stores evidence in `data/provisioning-logs.sqlite3` by default.
@@ -533,8 +533,52 @@ invocations retain their usual `/var/log/*-serve.log` destinations. Downloaded
 bundles contain a JSONL manifest followed by records and may include sensitive
 model/tool output; they remain behind the existing administrative authorization.
 
-=======
->>>>>>> upstream/main
+### 27. Self-service onboarding moves normal users to `/start`
+
+This changes what signed-in non-admin users see and how they get tokens. No
+configuration is required; read it before upgrading a gateway that already has
+Google users.
+
+- **One page for normal users.** After sign-in they land on `/start`, and
+  `/dashboard`, node detail pages, `/models`, `/chat`, `/profile`, and the
+  token and admin pages all redirect them there. The read-only fleet and node
+  views they had before are gone. Admin-role users and the local admin keep
+  every page and are redirected away from `/start`.
+- **`POST /profile/tokens` is admin-only.** Normal users get `403`, including
+  for `name: agent-config`. Scripts that minted tokens as a normal user must
+  move to `/start`, or the user needs the admin role.
+- **Existing tokens keep working until the user mints a new one.** A user who
+  already has tokens sees the newest one on `/start`, labelled as able to use
+  every model and read-only. Creating a token there revokes **all** of that
+  user's older tokens at once (pinned tokens and the agent-config key
+  included), so tools configured with them must be set up again. Tell users
+  before they click through.
+- **New tokens are model-scoped.** Requests for a model outside the token's
+  list are refused with `403 model_not_permitted`, and `/v1/models` narrows to
+  the token's models when a scoped token is presented. Anonymous listing and
+  unscoped tokens behave as before.
+- **Scope needs token enforcement to mean anything.** With
+  `auth.enforce_api_tokens=false` (the default) a client can drop the bearer
+  token and use any public model anonymously. Set it to `true` if model scope
+  is meant as a restriction rather than a convenience.
+- **Database migration is automatic.** On first start the auth database
+  (`auth.db_path`) gains `tokens.model_scope`, `tokens.derive_nonce`, a
+  `setup_links` table, and a unique index allowing one active onboarding token
+  per user. Existing rows are untouched. Back the file up first; a downgraded
+  build ignores the new columns.
+- **Set `oauth.redirect_uri` to the public https origin.** The setup command
+  and the configs it writes take their origin from it. This matters most
+  behind a reverse proxy uvicorn does not trust for forwarded headers (for
+  example the rootless Podman nginx), where the request scheme alone would
+  read as `http`.
+- **Treat proxy access logs as sensitive.** `/s/{id}` links are credentials
+  for 15 minutes. The gateway redacts them in its own request log; nginx
+  still records them in `access.log` unless its `log_format` is changed.
+- **`auth.session_secret` now protects tokens too.** Onboarding tokens are
+  derived from it, so the secret plus the auth database is enough to recover
+  them. Rotating it keeps existing tokens valid on `/v1` but blocks
+  re-exporting them; users are then asked to create a new token.
+
 ## Artifact Sources and Mirror Policy
 
 There is no single global mirror switch. Each source has a different trust and configuration boundary.

@@ -20,9 +20,13 @@ Viewer contract (RFE admin-only servers + admin roles):
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
-from inference_proxy.api.templating import signin_response, templates
+from inference_proxy.api.templating import (
+    signin_response,
+    templates,
+    user_home_redirect,
+)
 from inference_proxy.config.dependencies import get_settings, viewer_role
 from inference_proxy.config.settings import Settings
 
@@ -30,17 +34,16 @@ dashboard_router = APIRouter(
     tags=["dashboard"],
 )
 
-_ADMIN_REQUIRED_NOTICE = "Administrator access required to view this page."
-
 
 def _admin_or_signin(
     request: Request,
     settings: Settings,
-) -> tuple[bool, HTMLResponse | None]:
+) -> tuple[bool, HTMLResponse | RedirectResponse | None]:
     """Return (allowed, response) for admin-only pages.
 
-    Anonymous and non-admin signed-in callers receive the sign-in page;
-    only the response is returned when access is denied.
+    Anonymous callers receive the sign-in page and signed-in non-admins are
+    redirected to their own page (``/start``); only the response is returned
+    when access is denied.
     """
     role = viewer_role(request, settings)
     if role is None:
@@ -50,20 +53,15 @@ def _admin_or_signin(
             sessions_available=settings.auth.session_secret is not None,
         )
     if role != "admin":
-        return False, signin_response(
-            request,
-            notice=_ADMIN_REQUIRED_NOTICE,
-            oauth_enabled=settings.oauth.enabled,
-            sessions_available=settings.auth.session_secret is not None,
-        )
+        return False, user_home_redirect()
     return True, None
 
 
-@dashboard_router.get("/dashboard", response_class=HTMLResponse)
+@dashboard_router.get("/dashboard", response_class=HTMLResponse, response_model=None)
 async def dashboard(
     request: Request,
     settings: Settings = Depends(get_settings),
-) -> HTMLResponse:
+) -> HTMLResponse | RedirectResponse:
     """Render the operations dashboard HTML shell."""
     role = viewer_role(request, settings)
     if role is None:
@@ -72,6 +70,8 @@ async def dashboard(
             oauth_enabled=settings.oauth.enabled,
             sessions_available=settings.auth.session_secret is not None,
         )
+    if role != "admin":
+        return user_home_redirect()
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
@@ -83,19 +83,18 @@ async def dashboard(
     )
 
 
-@dashboard_router.get("/dashboard/nodes/{node_id:path}", response_class=HTMLResponse)
+@dashboard_router.get(
+    "/dashboard/nodes/{node_id:path}", response_class=HTMLResponse, response_model=None
+)
 async def node_detail(
     request: Request,
     node_id: str,
     settings: Settings = Depends(get_settings),
-) -> HTMLResponse:
-    """Render per-node detail page with provisioning tasks.
+) -> HTMLResponse | RedirectResponse:
+    """Render per-node detail page with provisioning tasks (admins only).
 
-    Admins get the full operational page; signed-in non-admins get the
-    read-only equivalent (node info, provisioning tasks, installation log)
-    for nodes their fleet view is allowed to see — the interactive panels
-    (setup, power, relaunch, recommendations, config download) are rendered
-    but hidden client-side, and their backing /admin APIs never load.
+    Anonymous visitors get the sign-in page; signed-in non-admins are sent
+    to their own page (``/start``).
     """
     role = viewer_role(request, settings)
     if role is None:
@@ -104,6 +103,8 @@ async def node_detail(
             oauth_enabled=settings.oauth.enabled,
             sessions_available=settings.auth.session_secret is not None,
         )
+    if role != "admin":
+        return user_home_redirect()
     return templates.TemplateResponse(
         request=request,
         name="node_detail.html",
@@ -116,11 +117,11 @@ async def node_detail(
     )
 
 
-@dashboard_router.get("/models", response_class=HTMLResponse)
+@dashboard_router.get("/models", response_class=HTMLResponse, response_model=None)
 async def models_page(
     request: Request,
     settings: Settings = Depends(get_settings),
-) -> HTMLResponse:
+) -> HTMLResponse | RedirectResponse:
     """Render the model catalog page."""
     _, denied = _admin_or_signin(request, settings)
     if denied is not None:
@@ -135,11 +136,13 @@ async def models_page(
     )
 
 
-@dashboard_router.get("/dashboard/tokens", response_class=HTMLResponse)
+@dashboard_router.get(
+    "/dashboard/tokens", response_class=HTMLResponse, response_model=None
+)
 async def tokens_page(
     request: Request,
     settings: Settings = Depends(get_settings),
-) -> HTMLResponse:
+) -> HTMLResponse | RedirectResponse:
     """Render the admin token-management dashboard shell."""
     _, denied = _admin_or_signin(request, settings)
     if denied is not None:
@@ -154,12 +157,14 @@ async def tokens_page(
     )
 
 
-@dashboard_router.get("/dashboard/users/{user_id}", response_class=HTMLResponse)
+@dashboard_router.get(
+    "/dashboard/users/{user_id}", response_class=HTMLResponse, response_model=None
+)
 async def user_detail_page(
     request: Request,
     user_id: int,
     settings: Settings = Depends(get_settings),
-) -> HTMLResponse:
+) -> HTMLResponse | RedirectResponse:
     """Render the admin per-user token and usage detail shell."""
     _, denied = _admin_or_signin(request, settings)
     if denied is not None:
@@ -175,11 +180,13 @@ async def user_detail_page(
     )
 
 
-@dashboard_router.get("/dashboard/admin", response_class=HTMLResponse)
+@dashboard_router.get(
+    "/dashboard/admin", response_class=HTMLResponse, response_model=None
+)
 async def admin_page(
     request: Request,
     settings: Settings = Depends(get_settings),
-) -> HTMLResponse:
+) -> HTMLResponse | RedirectResponse:
     """Render the admin page: admin-only inference servers and admin-role
     management (users table with grant/revoke actions)."""
     _, denied = _admin_or_signin(request, settings)

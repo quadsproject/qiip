@@ -116,6 +116,20 @@ def model_not_found_error(model: str) -> tuple[int, ErrorResponse]:
     )
 
 
+def model_not_permitted_error(model: str) -> tuple[int, ErrorResponse]:
+    """Return a 403 error when the token's model scope excludes *model*."""
+    return 403, ErrorResponse(
+        error=ErrorDetail(
+            message=(
+                f"This API token is not allowed to use the model '{model}'. "
+                "Add it to the token's models in qiip and try again."
+            ),
+            type="invalid_request_error",
+            code="model_not_permitted",
+        )
+    )
+
+
 def model_unavailable_error(model: str) -> tuple[int, ErrorResponse]:
     """Return a 503 error when the model exists but all nodes are unavailable.
 

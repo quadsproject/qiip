@@ -33,6 +33,7 @@ from starlette.background import BackgroundTask
 from inference_proxy.api.errors import (
     map_proxy_error,
     model_not_found_error,
+    model_not_permitted_error,
     model_unavailable_error,
     no_nodes_error,
 )
@@ -91,6 +92,25 @@ def _select_error(
             return model_not_found_error(model)
         return model_unavailable_error(model)
     return no_nodes_error()
+
+
+def _model_scope_denied(
+    auth: TokenAuth | None,
+    model: str | None,
+) -> JSONResponse | None:
+    """Return a 403 response when the token's model scope excludes *model*.
+
+    ``model_scope`` is None for unrestricted tokens. Every inference POST
+    must call this before selecting a node: a route that skips it serves a
+    scoped token any model. ``model`` is a required request field today, so
+    the empty case is purely defensive.
+    """
+    if auth is None or auth.token.model_scope is None:
+        return None
+    if model and model in auth.token.model_scope:
+        return None
+    status, error = model_not_permitted_error(model or "")
+    return JSONResponse(content=error.model_dump(), status_code=status)
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -485,6 +505,9 @@ async def chat_completions(
     body["messages"] = [
         message.model_dump(exclude_unset=True) for message in request.messages
     ]
+    denied = _model_scope_denied(usage_auth, body.get("model"))
+    if denied is not None:
+        return denied
     allowed, owner = auth_scope(usage_auth, settings)
     if request.stream:
         return await _stream_completion(
@@ -541,6 +564,9 @@ async def text_completions(
     the request for usage tracking; enforcement is config-gated.
     """
     body = request.model_dump(exclude_none=True)
+    denied = _model_scope_denied(usage_auth, body.get("model"))
+    if denied is not None:
+        return denied
     allowed, owner = auth_scope(usage_auth, settings)
     if request.stream:
         return await _stream_completion(
@@ -574,9 +600,27 @@ async def text_completions(
     )
 
 
+async def _presented_model_scope(
+    request: StarletteRequest,
+    store: AuthStore,
+) -> list[str] | None:
+    """Return the model scope of a presented bearer token, if any.
+
+    Listing never rejects (it stays open exactly as before); a valid scoped
+    token simply narrows the list so harnesses only offer usable models.
+    """
+    scheme, _, raw = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not raw.strip():
+        return None
+    auth = await asyncio.to_thread(store.resolve_token, raw.strip())
+    return auth.token.model_scope if auth is not None else None
+
+
 @router.get("/v1/models")
 async def list_models(
+    starlette_request: StarletteRequest,
     node_selector: NodeSelector = Depends(get_node_selector),
+    usage_store: AuthStore = Depends(get_auth_store),
 ) -> JSONResponse:
     """Return an OpenAI-compatible list of available models.
 
@@ -587,8 +631,11 @@ async def list_models(
     """
     nodes = node_selector._registry.get_all()
     models_seen: dict[str, dict[str, str | int]] = {}
+    model_scope = await _presented_model_scope(starlette_request, usage_store)
 
     for node in nodes:
+        if model_scope is not None and node.model not in model_scope:
+            continue
         if node.status != NodeStatus.HEALTHY:
             continue
         if node.admin_only:

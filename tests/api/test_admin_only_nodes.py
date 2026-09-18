@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
@@ -429,11 +430,15 @@ class TestSessionIsolation:
         client, _user = _signed_in_client(app, auth_store)
         basic = base64.b64encode(b"test-admin:test-password").decode()
 
-        response = client.get("/dashboard", headers={"Authorization": f"Basic {basic}"})
+        response = client.get(
+            "/dashboard",
+            headers={"Authorization": f"Basic {basic}"},
+            follow_redirects=False,
+        )
 
-        assert response.status_code == 200
-        assert 'href="/dashboard/admin"' not in response.text
-        assert ">Logout</button>" in response.text
+        # Still a normal user: sent to their own page, never the admin view.
+        assert response.status_code == 302
+        assert response.headers["location"] == "/start"
 
     def test_admin_api_not_elevated_by_cached_basic(
         self,
@@ -456,6 +461,8 @@ class TestSessionIsolation:
         import base64
 
         client, user = _signed_in_client(app, auth_store)
+        # Normal users never see the navbar (they live on /start).
+        auth_store.set_user_admin(user.id, True)
 
         signed_in = client.get("/dashboard")
         assert user.email in signed_in.text
@@ -497,9 +504,9 @@ class TestSessionIsolation:
         assert response.status_code == 302
 
         assert client.get("/admin/metrics").status_code == 401
-        dashboard = client.get("/dashboard")
-        assert 'href="/dashboard/admin"' not in dashboard.text
-        assert ">Logout</button>" in dashboard.text
+        dashboard = client.get("/dashboard", follow_redirects=False)
+        assert dashboard.status_code == 302
+        assert dashboard.headers["location"] == "/start"
 
 
 class TestDashboardRoles:
@@ -531,22 +538,31 @@ class TestDashboardRoles:
         assert "Local Admin" in response.text
         assert "Google Auth" in response.text
 
-    def test_user_sees_fleet_but_not_admin_pages(
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/dashboard",
+            "/dashboard/nodes/gpu01",
+            "/dashboard/tokens",
+            "/dashboard/admin",
+            "/dashboard/users/1",
+            "/models",
+            "/chat",
+            "/profile",
+        ],
+    )
+    def test_normal_user_is_sent_to_start_from_every_page(
         self,
         app: FastAPI,
         auth_store: AuthStore,
+        path: str,
     ) -> None:
         client, _user = _signed_in_client(app, auth_store)
 
-        dashboard = client.get("/dashboard")
-        assert dashboard.status_code == 200
-        assert "Node Fleet" in dashboard.text
-        assert 'href="/dashboard/admin"' not in dashboard.text
+        response = client.get(path, follow_redirects=False)
 
-        tokens = client.get("/dashboard/tokens")
-        assert tokens.status_code == 200
-        assert "Local Admin" in tokens.text
-        assert "Administrator access required" in tokens.text
+        assert response.status_code == 302
+        assert response.headers["location"] == "/start"
 
     def test_admin_role_sees_admin_pages(
         self,
@@ -589,10 +605,10 @@ class TestDashboardRoles:
         auth_store: AuthStore,
     ) -> None:
         client, _user = _signed_in_client(app, auth_store)
-        # Non-admin Google user (role does not matter for the Logout control).
-        response = client.get("/dashboard")
+        # A normal user's only page still offers a way out.
+        response = client.get("/start")
         assert response.status_code == 200
-        assert ">Logout</button>" in response.text
+        assert 'action="/auth/logout"' in response.text
 
     def test_logout_clears_local_admin_and_returns_to_signin(
         self,
@@ -833,19 +849,17 @@ class TestLocalAdminLoginJSONOnly:
 
 
 class TestNodeDetailReadOnly:
-    def test_non_admin_gets_read_only_detail_page(
+    def test_non_admin_is_sent_to_start(
         self,
         app: FastAPI,
         auth_store: AuthStore,
     ) -> None:
         client, _user = _signed_in_client(app, auth_store)
 
-        response = client.get("/dashboard/nodes/gpu01")
+        response = client.get("/dashboard/nodes/gpu01", follow_redirects=False)
 
-        assert response.status_code == 200
-        assert "READ_ONLY = true" in response.text
-        # In-page sign-in must never be shown for a still-signed-in user.
-        assert "Local Admin" not in response.text
+        assert response.status_code == 302
+        assert response.headers["location"] == "/start"
 
     def test_admin_gets_operational_detail_page(
         self,
@@ -877,8 +891,8 @@ class TestSelfRevocation:
         auth_store: AuthStore,
     ) -> None:
         """Revoking your own admin role must never pop the native Basic
-        dialog: the session stays valid, the dashboard keeps serving the
-        trimmed fleet view, and admin pages fall back to the in-page sign-in.
+        dialog: the session stays valid and every operations page sends the
+        now-normal user to their own page.
         """
         client, user = _signed_in_client(app, auth_store)
         auth_store.set_user_admin(user.id, True)
@@ -889,12 +903,12 @@ class TestSelfRevocation:
         assert response.status_code == 204
         assert response.headers["x-qiip-self-revoked"] == "true"
         assert "www-authenticate" not in response.headers
-        # Session survives; admin pages now render the in-page sign-in.
-        assert client.get("/dashboard").status_code == 200
-        tokens_page = client.get("/dashboard/tokens")
-        assert tokens_page.status_code == 200
-        assert "Local Admin" in tokens_page.text
+        # Session survives; operations pages now redirect to the user page.
+        tokens_page = client.get("/dashboard/tokens", follow_redirects=False)
+        assert tokens_page.status_code == 302
+        assert tokens_page.headers["location"] == "/start"
         assert "www-authenticate" not in tokens_page.headers
+        assert client.get("/start").status_code == 200
 
     def test_revoking_other_user_does_not_mark_self(
         self,

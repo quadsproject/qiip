@@ -96,7 +96,6 @@ provisioning:
   log_max_bytes_per_host: 1048576
   log_max_entry_bytes: 16384
   log_max_completed_hosts: 64
-<<<<<<< HEAD
   # Persistent gateway history. The service must be able to write this path.
   log_db_path: data/provisioning-logs.sqlite3
   log_retention_days: 30
@@ -116,8 +115,6 @@ provisioning:
   # Reconnect attempts: 0..20. Poll interval and retention days must be positive.
   log_reconnect_attempts: 3
   log_poll_interval: 1
-=======
->>>>>>> upstream/main
   nfs_mount_point: /srv/hf-cache
   # The default NVIDIA driver and llama.cpp versions ship with a verified
   # SHA-256; changing a version requires configuring its matching digest.
