@@ -102,10 +102,21 @@ Start vLLM (auto-detects GPU and selects a model):
 
 vLLM runs as a background process. PID is written to `/var/run/vllm.pid`, logs to `/var/log/vllm-serve.log`.
 
+Before launch, when `AUTOVLLM_NFS_EXPORT` is set, the script verifies the NFS
+mount source, filesystem type (NFSv3), and required options
+(`vers=3,hard,proto=tcp,timeo=600,retrans=3`), checks the model snapshot
+completeness through a local-only Hugging Face verification, and confirms free
+space on the FlashInfer cache and on the cache filesystem when a download is
+needed. A complete shared snapshot starts offline (`HF_HUB_OFFLINE=1`) without
+re-downloading; a partial snapshot fails with an actionable message.
+
 Script-specific launch overrides use the `AUTOVLLM_*` namespace, including
 `AUTOVLLM_MODEL`, `AUTOVLLM_API_PORT`, `AUTOVLLM_TENSOR_PARALLEL`,
 `AUTOVLLM_GPU_MEM_UTIL`, `AUTOVLLM_MAX_MODEL_LEN`,
-`AUTOVLLM_MAX_BATCHED_TOKENS`, and `AUTOVLLM_EXTRA_ARGS`. Do not use
+`AUTOVLLM_MAX_BATCHED_TOKENS`, and `AUTOVLLM_EXTRA_ARGS`. Storage checks are
+tuned with `AUTOVLLM_NFS_EXPORT`, `AUTOVLLM_NFS_MOUNT_POINT`,
+`AUTOVLLM_PROBE_TIMEOUT` (probe bound, default 10s), and
+`AUTOVLLM_MIN_FREE_GB` (per-filesystem floor, default 20). Do not use
 `VLLM_PORT` for the API port; vLLM reserves that name for internal
 communication.
 

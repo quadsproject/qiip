@@ -3,6 +3,8 @@ set -euo pipefail
 
 API_PORT="${AUTOLLAMACPP_PORT:-8000}"
 NFS_MOUNT_POINT="${AUTOLLAMACPP_NFS_MOUNT_POINT:-/srv/hf-cache}"
+# Shared name (setup.sh and the gateway use AUTOVLLM_NFS_EXPORT for both engines).
+NFS_EXPORT="${AUTOVLLM_NFS_EXPORT:-}"
 GGUF_RELATIVE_PATH="${AUTOLLAMACPP_GGUF_PATH:-}"
 MODEL_ALIAS="${AUTOLLAMACPP_MODEL_ALIAS:-}"
 GPU_LAYERS_OVERRIDE="${AUTOLLAMACPP_GPU_LAYERS:-}"
@@ -45,6 +47,9 @@ MANAGED_GPU_FREE_MIB=()
 
 # shellcheck source=auto-llamacpp/llamacpp-process.sh
 source "${SCRIPT_DIR}/llamacpp-process.sh"
+# Shared storage primitives (source/fstype/option verification).
+# shellcheck disable=SC1091 source=../common/setup-base.sh
+source "${SCRIPT_DIR}/../common/setup-base.sh"
 
 detect_gpu_info() {
     GPU_COUNT=0
@@ -115,6 +120,33 @@ resolve_gguf_artifact() {
     # llama.cpp derives sibling split paths from the entrypoint filename. Keep
     # the validated symlink path so the -00001-of-0000N.gguf suffix survives.
     GGUF_PATH="$candidate"
+    # Verify every declared shard of a split-family GGUF: llama.cpp derives
+    # sibling paths from the entrypoint filename, so a missing shard surfaces
+    # later only as a failed load. The gateway owns the exact file set/sizes
+    # (artifacts.py); the node verifies count + readability of the family.
+    local base
+    base=$(basename -- "$GGUF_PATH")
+    if [[ "$base" =~ ^(.*)-([0-9]{5})-of-([0-9]{5})\.gguf$ ]]; then
+        local prefix family_total dir missing
+        prefix="${BASH_REMATCH[1]}"
+        family_total="${BASH_REMATCH[3]}"
+        dir=$(dirname -- "$GGUF_PATH")
+        missing=0
+        local i shard_path
+        for (( i = 1; i <= family_total; i++ )); do
+            shard_path="$(printf '%s/%s-%05d-of-%s.gguf' "$dir" "$prefix" "$i" "$family_total")"
+            if [ ! -f "$shard_path" ] || [ ! -r "$shard_path" ] || [ ! -s "$shard_path" ]; then
+                echo "FATAL: split GGUF shard missing, unreadable, or empty: ${shard_path}" >&2
+                missing=1
+            fi
+        done
+        if [ "$missing" -ne 0 ]; then
+            return 1
+        fi
+    elif [ ! -r "$resolved" ]; then
+        echo "FATAL: selected GGUF artifact is not readable: ${GGUF_RELATIVE_PATH}" >&2
+        return 1
+    fi
 }
 
 configure_llamacpp_params() {
@@ -260,6 +292,7 @@ clear_script_environment() {
     unset AUTOLLAMACPP_MANAGED_SIZING AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT
     unset AUTOLLAMACPP_MANAGED_PARALLEL AUTOLLAMACPP_MANAGED_CACHE_TYPE
     unset AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN
+    unset AUTOVLLM_NFS_EXPORT
     unset AUTOLLAMACPP_SCRIPT_DIR AUTOLLAMACPP_BIN AUTOLLAMACPP_FIT_BIN
     unset AUTOLLAMACPP_INSTALL_ROOT
     unset AUTOLLAMACPP_PID_FILE
@@ -706,9 +739,26 @@ EOF
     echo "llama-server started (PID ${pid})"
 }
 
+run_storage_preflight() {
+    # Before engine load the mount must be the intended NFSv3 export with the
+    # exact required options; a wrong-export mount would silently serve a
+    # different cache. Artifact completeness is verified in run_llamacpp
+    # (resolve_gguf_artifact) right before the server loads it.
+    if [ -n "$NFS_EXPORT" ]; then
+        if ! verify_nfs_storage; then
+            echo "FATAL: NFS storage verification failed at ${NFS_MOUNT_POINT}; refusing to start" >&2
+            return 1
+        fi
+        echo "NFS storage verified: source=${NFS_EXPORT}, NFSv3, required options"
+    else
+        echo "WARNING: AUTOVLLM_NFS_EXPORT not provided; storage source not verified" >&2
+    fi
+}
+
 main() {
     detect_gpu_info
     configure_llamacpp_params
+    run_storage_preflight
     run_llamacpp
 }
 
