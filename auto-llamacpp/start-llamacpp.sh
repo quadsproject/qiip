@@ -414,7 +414,7 @@ select_managed_cache_policy() {
         "$LLAMACPP_FALLBACK_CACHE_TYPE")
             MANAGED_CACHE_TYPE_K="$LLAMACPP_FALLBACK_CACHE_TYPE"
             MANAGED_CACHE_TYPE_V="$LLAMACPP_FALLBACK_CACHE_TYPE"
-            # b10242 requires Flash Attention for a quantized V cache. Make
+            # llama.cpp requires Flash Attention for a quantized V cache. Make
             # that dependency explicit so estimation and serving cannot
             # resolve AUTO differently.
             MANAGED_FLASH_ATTN=on

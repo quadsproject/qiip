@@ -381,12 +381,12 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_API_PORT": "8123",
         "AUTOVLLM_LLMFIT_VERSION": "8.7.6",
         "AUTOVLLM_LLMFIT_SHA256": "c" * 64,
-        "AUTOLLAMACPP_VERSION": "b10242",
+        "AUTOLLAMACPP_VERSION": "v0.4.1",
         "AUTOLLAMACPP_SHA256": (
-            "b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3"
+            "ef3d5b1907a391500ae11b5e61a8e2022e0deaac9790899cad9c4e02f03bfb9a"
         ),
         "AUTOLLAMACPP_SOURCE_URL": (
-            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b10242.tar.gz"
+            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v0.4.1.tar.gz"
         ),
     }
     artifact = _artifact()

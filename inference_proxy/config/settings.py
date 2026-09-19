@@ -93,9 +93,9 @@ DEFAULT_LLMFIT_VERSION = "1.1.6"
 DEFAULT_LLMFIT_SHA256 = (
     "1e09232a128455596a2d348ab5893741d04b94aa6d924f1253462dc13304f7c6"
 )
-DEFAULT_LLAMACPP_VERSION = "b10242"
+DEFAULT_LLAMACPP_VERSION = "v0.4.1"
 DEFAULT_LLAMACPP_SHA256 = (
-    "b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3"
+    "ef3d5b1907a391500ae11b5e61a8e2022e0deaac9790899cad9c4e02f03bfb9a"
 )
 DEFAULT_LLAMACPP_SOURCE_URL = (
     "https://github.com/ggml-org/llama.cpp/archive/refs/tags/{version}.tar.gz"
@@ -369,11 +369,12 @@ class ProvisioningSettings(BaseModel):
 
     @field_validator("llamacpp_version")
     @classmethod
-    def llamacpp_version_is_build_tag(cls, value: str) -> str:
-        """Accept the upstream ``b<number>`` build-tag format only."""
-        if re.fullmatch(r"b[1-9][0-9]*", value) is None:
+    def llamacpp_version_is_upstream_tag(cls, value: str) -> str:
+        """Accept upstream ``v<major>.<minor>.<patch>`` and ``b<number>`` tags only."""
+        if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+|b[1-9][0-9]*", value) is None:
             raise ValueError(
-                "provisioning.llamacpp_version must use the b<number> build-tag format"
+                "provisioning.llamacpp_version must use the v<major>.<minor>.<patch> "
+                "release-tag or b<number> build-tag format"
             )
         return value
 
@@ -422,7 +423,7 @@ class ProvisioningSettings(BaseModel):
         return value
 
     def llamacpp_source_download_url(self) -> str:
-        """Render the validated source URL for the selected build tag."""
+        """Render the validated source URL for the selected upstream tag."""
         return self.llamacpp_source_url.format(version=self.llamacpp_version)
 
     @model_validator(mode="after")
