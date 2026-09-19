@@ -100,6 +100,11 @@ AUTOLLAMACPP_MODEL_ALIAS=org/model \
   ./start-llamacpp.sh
 ```
 
+Before launch the script verifies the NFS mount source, filesystem type
+(NFSv3), and required options when `AUTOVLLM_NFS_EXPORT` is set, and verifies
+every shard of a split-family GGUF (presence, readability, non-empty) so a
+missing shard fails before llama-server loads it.
+
 llama-server runs as a background process. PID is written to
 `/var/run/llamacpp.pid`, logs to `/var/log/llamacpp-serve.log`.
 

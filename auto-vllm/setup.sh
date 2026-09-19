@@ -126,6 +126,7 @@ install_vllm() {
 install_vllm_unit() {
     sudo install -m 755 "${SCRIPT_DIR}/wait-fabric.sh" /usr/local/bin/wait-nvswitch-fabric
     sudo install -m 755 "${SCRIPT_DIR}/preflight.sh" /usr/local/bin/vllm-preflight
+    sudo install -m 755 "${SCRIPT_DIR}/../common/setup-base.sh" /usr/local/bin/qiip-setup-base.sh
     cat <<UNIT | sudo tee /etc/systemd/system/vllm.service > /dev/null
 [Unit]
 Description=vLLM inference server
@@ -134,6 +135,8 @@ Wants=network-online.target
 
 [Service]
 Type=exec
+Environment="AUTOVLLM_NFS_EXPORT=${NFS_EXPORT}"
+Environment="AUTOVLLM_NFS_MOUNT_POINT=${NFS_MOUNT_POINT}"
 ExecStartPre=/usr/local/bin/wait-nvswitch-fabric
 ExecStartPre=/usr/local/bin/vllm-preflight --check-only
 ExecStart=${SCRIPT_DIR}/start-vllm.sh

@@ -415,75 +415,354 @@ mount_nfs_cache() {
     # ponytail: hard mount blocks processes in D-state when the NFS server is
     # unreachable — df/ls on the path will hang. That is correct for bulk model
     # I/O (retries instead of EIO/corruption), but changes the failure mode
-    # from "job dies with IOError" to "job stalls silently". Any external
-    # monitoring or startup timeout around vLLM must account for this.
+    # from "job dies with IOError" to "job stalls silently". The control-plane
+    # probe below fails fast when the server is down before the mount and every
+    # data-plane probe is bounded by AUTOVLLM_PROBE_TIMEOUT with --kill-after,
+    # but a D-state process cannot be killed at all: a server that drops
+    # mid-I/O can still hang one probe until the kernel retransmission timeout.
+    # External startup timeouts around vLLM must account for that. NFSv3 is a
+    # fleet constraint; soft/intr escapes stay rejected (soft turns a blip into
+    # EIO, intr is a no-op on modern kernels).
     local nfs_opts="vers=3,hard,proto=tcp,timeo=600,retrans=3"
 
     if mountpoint -q "${NFS_MOUNT_POINT}"; then
-        local current_opts
-        current_opts=$(awk -v mp="${NFS_MOUNT_POINT}" '$2 == mp {print $4}' /proc/mounts)
-        if [[ "$current_opts" == *",hard,"* || "$current_opts" == "hard,"* ]] \
-            && [[ "$current_opts" == *"timeo=600"* ]]; then
-            echo "NFS already mounted at ${NFS_MOUNT_POINT} with correct options"
+        local verify_rc=0
+        verify_nfs_storage || verify_rc=$?
+        if [ "$verify_rc" -eq 0 ]; then
+            echo "NFS already mounted at ${NFS_MOUNT_POINT} with the expected source and options"
             ensure_nfs_persistence "$nfs_opts"
+            check_install_capacity || [ "$?" -eq 2 ] || return 1
             return 0
         fi
-        echo "NFS at ${NFS_MOUNT_POINT} has stale options: ${current_opts}"
-        echo "hard/soft cannot be changed via remount; performing umount/mount cycle"
-        if fuser -m "${NFS_MOUNT_POINT}" &>/dev/null; then
+        if [ "$verify_rc" -eq 2 ]; then
+            echo "FATAL: refusing to remount ${NFS_MOUNT_POINT}; its source is not ${NFS_EXPORT}" >&2
+            echo "Unmount the stale mount manually once it is safe, then re-run setup" >&2
+            return 1
+        fi
+        # Probe the server BEFORE any umount/fuser: on a hard NFS mount with a
+        # dropped server those can block in D-state with no bound at all.
+        nfs_server_reachable
+        echo "NFS at ${NFS_MOUNT_POINT} failed verification; performing umount/mount cycle"
+        local probe_timeout
+        probe_timeout="${AUTOVLLM_PROBE_TIMEOUT:-10}"
+        if timeout --kill-after=2 "$probe_timeout" fuser -m "${NFS_MOUNT_POINT}" &>/dev/null; then
             echo "FATAL: ${NFS_MOUNT_POINT} is busy; processes holding it open:" >&2
-            fuser -vm "${NFS_MOUNT_POINT}" >&2 || true
+            timeout --kill-after=2 "$probe_timeout" fuser -vm "${NFS_MOUNT_POINT}" >&2 || true
             echo "Stop the above processes, then re-run setup" >&2
             return 1
         fi
         sudo umount "${NFS_MOUNT_POINT}"
     fi
 
+    nfs_server_reachable
+
     sudo mkdir -p "${NFS_MOUNT_POINT}"
     sudo timeout --kill-after=5 60 \
         mount -t nfs -o "$nfs_opts" "${NFS_EXPORT}" "${NFS_MOUNT_POINT}"
 
-    verify_nfs_mount_opts
+    verify_nfs_storage
     ensure_nfs_persistence "$nfs_opts"
+    check_install_capacity || [ "$?" -eq 2 ] || return 1
 }
 
-verify_nfs_mount_opts() {
-    local actual_opts
-    actual_opts=$(awk -v mp="${NFS_MOUNT_POINT}" '$2 == mp {print $4}' /proc/mounts)
-    if [ -z "$actual_opts" ]; then
-        echo "FATAL: ${NFS_MOUNT_POINT} not in /proc/mounts after mount returned success" >&2
+nfs_server_reachable() {
+    # Control-plane probe: connecting needs no data-plane RPC, so a dead server
+    # fails here in seconds with an actionable message instead of a D-state
+    # hang inside df/stat/ls.
+    local probe_timeout server probe_bash
+    probe_timeout="${AUTOVLLM_PROBE_TIMEOUT:-10}"
+    probe_bash="${AUTOVLLM_NFS_PROBE_BASH:-bash}"
+    server="${NFS_EXPORT%:*}"
+    server="${server#\[}"
+    server="${server%\]}"
+    if [[ "$server" == *:* ]]; then
+        server="[$server]"
+    fi
+    if timeout --kill-after=2 "$probe_timeout" "$probe_bash" -c "exec 3<>/dev/tcp/${server}/2049" 2>/dev/null; then
+        echo "NFS server reachable at ${server}:2049"
+        return 0
+    fi
+    echo "FATAL: NFS server ${server} not reachable on tcp/2049" >&2
+    echo "Verify the server, export, and network path, then re-run setup" >&2
+    return 1
+}
+
+_normalize_nfs_source() {
+    # Split on the LAST colon: bracketed IPv6 ([addr]:/path) and the plain
+    # host:path form both carry exactly one separator into the path.
+    local src="$1" host path
+    host="${src%:*}"
+    path="${src#"${host}":}"
+    host="${host#\[}"
+    host="${host%\]}"
+    host=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')
+    if [[ "$host" == *:* ]]; then
+        host="[$host]"
+    fi
+    if [[ "$path" != "/" ]]; then
+        path="${path%/}"
+    fi
+    printf '%s:%s' "$host" "$path"
+}
+
+_mount_opt() {
+    case ",$1," in
+        *",$2,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+verify_nfs_storage() {
+    # Control-plane verification of the NFSv3 mount: source export, filesystem
+    # type, and the exact option set QIIP requires. Return codes: 0 verified;
+    # 2 wrong source (caller must not touch the mount); 3 wrong fstype/options.
+    local mounts_file line real_mp
+    mounts_file="${AUTOVLLM_MOUNTS_FILE:-/proc/mounts}"
+    # /proc/mounts is ordered by mount ID; a mount stacked over this path
+    # appears later, so the LAST match is the visible filesystem.
+    real_mp="$(readlink -f -- "${NFS_MOUNT_POINT}" 2>/dev/null)" || real_mp=""
+    line=$(awk -v mp="${NFS_MOUNT_POINT}" -v rmp="$real_mp" '
+        function d(s){ gsub(/\\040/," ",s); gsub(/\\011/,"\t",s); gsub(/\\134/,"\\",s); return s }
+        d($2) == mp || (rmp != "" && d($2) == rmp) {got = $0}
+        END {if (got != "") print got}
+    ' "$mounts_file")
+    if [ -z "$line" ]; then
+        echo "FATAL: ${NFS_MOUNT_POINT} not found in ${mounts_file}; NFS storage is not mounted" >&2
         return 1
     fi
-    local opt
-    for opt in hard timeo=600 retrans=3; do
-        if [[ "$actual_opts" != *"$opt"* ]]; then
-            echo "FATAL: /proc/mounts shows '${actual_opts}' — missing '${opt}'" >&2
+    local actual_source actual_fstype actual_opts
+    actual_source=$(printf '%s\n' "$line" | awk '
+        function d(s){ gsub(/\\040/," ",s); gsub(/\\011/,"\t",s); gsub(/\\134/,"\\",s); return s }
+        {print d($1)}
+    ')
+    actual_fstype=$(printf '%s\n' "$line" | awk '{print $3}')
+    actual_opts=$(printf '%s\n' "$line" | awk '{print $4}')
+
+    local expected
+    expected=$(_normalize_nfs_source "$NFS_EXPORT")
+    if [ "$(_normalize_nfs_source "$actual_source")" != "$expected" ]; then
+        echo "FATAL: mount source '${actual_source}' is not the expected export '${NFS_EXPORT}'" >&2
+        return 2
+    fi
+    if [ "$actual_fstype" != "nfs" ]; then
+        echo "FATAL: ${NFS_MOUNT_POINT} filesystem type is '${actual_fstype}'; QIIP requires NFSv3 ('nfs')" >&2
+        return 3
+    fi
+
+    local missing=""
+    if ! _mount_opt "$actual_opts" "vers=3" && ! _mount_opt "$actual_opts" "nfsvers=3"; then
+        missing+="vers=3 "
+    fi
+    if ! _mount_opt "$actual_opts" "hard"; then
+        missing+="hard "
+    fi
+    if ! _mount_opt "$actual_opts" "proto=tcp"; then
+        missing+="proto=tcp "
+    fi
+    if ! _mount_opt "$actual_opts" "retrans=3"; then
+        missing+="retrans=3 "
+    fi
+    local timeo
+    timeo=$(printf '%s\n' "$actual_opts" | tr ',' '\n' | sed -n 's/^timeo=//p')
+    if [ "$timeo" != "600" ]; then
+        missing+="timeo=${timeo:-unset} (required timeo=600) "
+    fi
+    local opt sec
+    for opt in soft noac; do
+        if _mount_opt "$actual_opts" "$opt"; then
+            missing+="${opt} (rejected) "
+        fi
+    done
+    sec=$(printf '%s\n' "$actual_opts" | tr ',' '\n' | sed -n 's/^sec=//p')
+    if [ -n "$sec" ] && [ "$sec" != "sys" ]; then
+        missing+="sec=${sec} (QIIP requires sec=sys) "
+    fi
+
+    if [ -n "$missing" ]; then
+        echo "FATAL: ${NFS_MOUNT_POINT} mount options are not the required set:" >&2
+        echo "  ${mounts_file}: ${actual_opts}" >&2
+        echo "  problems: ${missing}" >&2
+        return 3
+    fi
+    echo "NFS mount verified via ${mounts_file}: source=${actual_source} fstype=${actual_fstype}"
+}
+
+check_storage_capacity() {
+    # Probe each filesystem once (df target dedupe). NFSv3 hard mounts make df
+    # a data-plane round trip; the probe is bounded by PROBE_TIMEOUT with
+    # --kill-after, but a D-state process cannot be killed and waits for the
+    # hard-mount reconnect cycle.
+    local min_gb probe_timeout min_bytes need_gb
+    min_gb="${AUTOVLLM_MIN_FREE_GB:-20}"
+    probe_timeout="${AUTOVLLM_PROBE_TIMEOUT:-10}"
+    min_bytes=$((min_gb * 1024 * 1024 * 1024))
+    need_gb=$(((min_bytes + 1073741823) / 1073741824))
+    local -a seen=()
+    local path avail_bytes target
+    for path in "$@"; do
+        if ! timeout --kill-after=2 "$probe_timeout" test -e "$path"; then
+            continue
+        fi
+        avail_bytes=$(timeout --kill-after=2 "$probe_timeout" df --output=avail -B1 "$path" 2>/dev/null | tail -1 | xargs) || {
+            echo "WARNING: cannot determine free space on ${path} (probe failed or timed out)" >&2
+            return 2
+        }
+        target=$(timeout --kill-after=2 "$probe_timeout" df --output=target "$path" 2>/dev/null | tail -1 | xargs) || true
+        if printf '%s\n' "${seen[@]}" 2>/dev/null | grep -qxF "$target"; then
+            continue
+        fi
+        seen+=("$target")
+        if [ -z "$avail_bytes" ] || [ "$avail_bytes" -lt "$min_bytes" ]; then
+            local avail_gb
+            avail_gb=$(( (${avail_bytes:-0} + 1073741823) / 1073741824 ))
+            echo "FATAL: ${path} (${target}) has ${avail_gb}GB free but ${need_gb}GB is required" >&2
             return 1
         fi
     done
-    echo "NFS mount verified via /proc/mounts: ${actual_opts}"
+    echo "Storage capacity verified (at least ${need_gb}GB free per filesystem)"
+}
+
+check_install_capacity() {
+    # The engine setup.sh defines INSTALL_TMP_DIR, VLLM_VENV or
+    # LLAMACPP_INSTALL_ROOT, and LLMFIT_BIN before sourcing this file; the
+    # defaults mirror both engines.
+    local vllm_root llmfit_root
+    vllm_root="$(dirname "${VLLM_VENV:-/opt/vllm-venv}")"
+    llmfit_root="$(dirname "${LLMFIT_BIN:-/usr/local/bin/llmfit}")"
+    check_storage_capacity \
+        "$NFS_MOUNT_POINT" \
+        "${INSTALL_TMP_DIR:-/tmp}" \
+        "$vllm_root" \
+        "${LLAMACPP_INSTALL_ROOT:-/opt/llama.cpp}" \
+        "$llmfit_root"
 }
 
 ensure_nfs_persistence() {
     local nfs_opts="$1"
 
-    local autofs_map=""
-    autofs_map=$(grep -rl "${NFS_EXPORT}" /etc/auto.* 2>/dev/null | head -1) || true
-
+    # One persistence mechanism only: when autofs manages this export, its map
+    # entry is updated (on-demand behavior preserved) and fstab is left alone;
+    # otherwise the marked fstab entry is written.
+    local autofs_map
+    autofs_map=$(find_autofs_map) || true
     if [ -n "$autofs_map" ]; then
-        echo "Mount managed by autofs (${autofs_map}); updating options in map"
-        sudo sed -i "s|-fstype=nfs,[^[:space:]]*|-fstype=nfs,${nfs_opts}|" "$autofs_map"
+        ensure_autofs_entry "$nfs_opts" "$autofs_map"
         sudo systemctl reload autofs 2>/dev/null || true
         return 0
     fi
 
-    local fstab_opts="${nfs_opts},_netdev,nofail"
-    if grep -q "${NFS_MOUNT_POINT}" /etc/fstab; then
-        sudo sed -i "\|${NFS_MOUNT_POINT}|d" /etc/fstab
+    ensure_fstab_entry "$nfs_opts" "${nfs_opts},_netdev,nofail"
+}
+
+find_autofs_map() {
+    # Locate the single map file whose last field references our exact export;
+    # never the first file that merely contains the export string (comments,
+    # master includes, unrelated entries would be edited). RHEL/Fedora keep
+    # map fragments in /etc/auto.master.d, so those are scanned too.
+    local dir f base
+    dir="${AUTOVLLM_AUTO_MAP_DIR:-/etc}"
+    for f in "$dir"/auto.* "$dir"/auto.master.d/*; do
+        [ -f "$f" ] || continue
+        base=$(basename "$f")
+        [ "$base" = "auto.master" ] && continue
+        if awk -v expval="${NFS_EXPORT}" '
+            function d(s){ gsub(/\\040/," ",s); gsub(/\\011/,"\t",s); gsub(/\\134/,"\\",s); return s }
+            d($NF) == expval {found=1} END {exit found ? 0 : 1}' "$f"; then
+            printf '%s\n' "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_escape_fstab_field() {
+    # fstab/autofs maps are whitespace-delimited; spaces, tabs, and backslashes
+    # must be octal-escaped (\\040/\\011/\\134) exactly as /proc/mounts and the
+    # read side decode them.
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s// /\\040}
+    s=${s//$'\t'/\\011}
+    printf '%s' "$s"
+}
+
+ensure_fstab_entry() {
+    local nfs_opts="$1" fstab_opts="$2"
+    local fstab marker managed_entry line line_source
+    fstab="${AUTOVLLM_FSTAB_FILE:-/etc/fstab}"
+    marker="# qiip-managed"
+    managed_entry="$(_escape_fstab_field "$NFS_EXPORT") $(_escape_fstab_field "$NFS_MOUNT_POINT") nfs ${fstab_opts} 0 0 ${marker}"
+    line=$(awk -v mp="${NFS_MOUNT_POINT}" '
+        function d(s){ gsub(/\\040/," ",s); gsub(/\\011/,"\t",s); gsub(/\\134/,"\\",s); return s }
+        d($2) == mp {print; exit}
+    ' "$fstab") || true
+
+    if [ -n "$line" ]; then
+        line_source=$(printf '%s\n' "$line" | awk '
+            function d(s){ gsub(/\\040/," ",s); gsub(/\\011/,"\t",s); gsub(/\\134/,"\\",s); return s }
+            {print d($1)}
+        ')
+        if [[ "$line" == *"${marker}"* ]]; then
+            :
+        elif [ "$line_source" = "$NFS_EXPORT" ]; then
+            echo "QIIP fstab entry for ${NFS_MOUNT_POINT} exists without marker; adopting it"
+        else
+            echo "FATAL: ${fstab} already has an entry for ${NFS_MOUNT_POINT} from source '${line_source}':" >&2
+            echo "  ${line}" >&2
+            echo "QIIP will not overwrite it; remove or correct the entry first" >&2
+            return 1
+        fi
+        if ! {
+            sudo awk -v entry="$managed_entry" -v mp="${NFS_MOUNT_POINT}" '
+                function d(s){ gsub(/\\040/," ",s); gsub(/\\011/,"\t",s); gsub(/\\134/,"\\",s); return s }
+                d($2) == mp {print entry; next} {print}' \
+                "$fstab" | sudo tee "${fstab}.qiip.tmp" > /dev/null \
+                && sudo mv "${fstab}.qiip.tmp" "$fstab"
+        }; then
+            echo "FATAL: could not update ${fstab} (write failed); entries unchanged" >&2
+            return 1
+        fi
+        echo "Updated QIIP fstab entry for ${NFS_MOUNT_POINT}"
+        return 0
     fi
-    echo "${NFS_EXPORT} ${NFS_MOUNT_POINT} nfs ${fstab_opts} 0 0" \
-        | sudo tee -a /etc/fstab > /dev/null
-    echo "fstab entry for ${NFS_MOUNT_POINT} (nofail — storage outage will not block boot)"
+
+    printf '%s\n' "$managed_entry" | sudo tee -a "$fstab" > /dev/null \
+        || { echo "FATAL: could not append to ${fstab} (write failed)" >&2; return 1; }
+    echo "fstab entry for ${NFS_MOUNT_POINT} (${marker}, nofail — storage outage will not block boot)"
+}
+
+ensure_autofs_entry() {
+    local nfs_opts="$1" map="$2"
+    local line key entry marker_line
+    line=$(awk -v expval="${NFS_EXPORT}" '
+        function d(s){ gsub(/\\040/," ",s); gsub(/\\011/,"\t",s); gsub(/\\134/,"\\",s); return s }
+        d($NF) == expval {got = $0; exit}
+        END {if (got != "") print got}
+    ' "$map")
+    if [ -z "$line" ]; then
+        echo "FATAL: ${map} has no entry for export ${NFS_EXPORT}; cannot manage autofs" >&2
+        return 1
+    fi
+    key=$(printf '%s\n' "$line" | awk '
+        function d(s){ gsub(/\\040/," ",s); gsub(/\\011/,"\t",s); gsub(/\\134/,"\\",s); return s }
+        {print d($1)}
+    ')
+    marker_line="# qiip-managed ${key}"
+    if ! grep -qF "$marker_line" "$map"; then
+        echo "QIIP autofs entry for ${key} exists without marker; adopting it"
+    fi
+    entry="$(_escape_fstab_field "$key") -fstype=nfs,${nfs_opts} $(_escape_fstab_field "$NFS_EXPORT")"
+    if ! {
+        sudo awk -v ml="$marker_line" -v entry="$entry" -v expval="${NFS_EXPORT}" '
+            function d(s){ gsub(/\\040/," ",s); gsub(/\\011/,"\t",s); gsub(/\\134/,"\\",s); return s }
+            $0 == ml {next} d($NF) == expval {print ml; print entry; next} {print}' \
+            "$map" | sudo tee "${map}.qiip.tmp" > /dev/null \
+            && sudo mv "${map}.qiip.tmp" "$map"
+    }; then
+        echo "FATAL: could not update ${map} (write failed); entries unchanged" >&2
+        return 1
+    fi
+    echo "Updated QIIP autofs entry for ${key} in ${map}"
 }
 
 configure_firewall() {

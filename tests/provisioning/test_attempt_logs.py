@@ -115,6 +115,16 @@ def harness(tmp_path: Path) -> tuple[NodeProvisioner, LocalNodeSSH, AttemptLogSt
         tmp_path, vllm_bin=fake_engine, process_log=tmp_path / "engine-events"
     )
     environment["AUTOVLLM_SCRIPT_DIR"] = str(node / "auto-vllm")
+    # The node bundle runs without a real NFS mount; a mounts-file fixture gives
+    # the strict source/options verification the same evidence a mounted host
+    # provides without touching the host's /proc/mounts.
+    mounts_file = tmp_path / "mounts"
+    mount_point = environment["AUTOVLLM_NFS_MOUNT_POINT"]
+    mounts_file.write_text(
+        f"fixture:/cache {mount_point} nfs "
+        "rw,vers=3,hard,proto=tcp,timeo=600,retrans=3,sec=sys 0 0\n"
+    )
+    environment["AUTOVLLM_MOUNTS_FILE"] = str(mounts_file)
     # A deterministic relevant service-journal source, independent of systemd.
     _write_executable(
         Path(environment["PATH"].split(":")[0]) / "journalctl",
