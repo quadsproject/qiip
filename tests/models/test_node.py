@@ -320,3 +320,30 @@ class TestVllmParams:
             VllmParams(dtype="float8_e4m3fn")
         with pytest.raises(ValidationError):
             VllmParams(dtype="float8_e5m2")
+
+    def test_gpu_devices_defaults_to_none_and_accepts_subset(self) -> None:
+        from inference_proxy.models.node import VllmParams
+
+        assert VllmParams().gpu_devices is None
+        assert VllmParams(gpu_devices=(0, 2)).gpu_devices == (0, 2)
+        assert VllmParams(gpu_devices=[1, 3]).gpu_devices == (1, 3)
+
+    def test_rejects_invalid_gpu_devices(self) -> None:
+        from inference_proxy.models.node import VllmParams
+
+        with pytest.raises(ValidationError):
+            VllmParams(gpu_devices=(-1,))
+        with pytest.raises(ValidationError):
+            VllmParams(gpu_devices=(1, 1))
+        with pytest.raises(ValidationError):
+            VllmParams(gpu_devices=())
+
+    def test_rejects_tensor_parallel_larger_than_selected_devices(self) -> None:
+        from inference_proxy.models.node import VllmParams
+
+        with pytest.raises(ValidationError):
+            VllmParams(tensor_parallel_size=3, gpu_devices=(0, 1))
+        assert (
+            VllmParams(tensor_parallel_size=2, gpu_devices=(0, 1)).tensor_parallel_size
+            == 2
+        )

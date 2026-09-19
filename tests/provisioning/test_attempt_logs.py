@@ -152,7 +152,10 @@ def harness(tmp_path: Path) -> tuple[NodeProvisioner, LocalNodeSSH, AttemptLogSt
         nfs_mount_point=environment["AUTOVLLM_NFS_MOUNT_POINT"],
         log_remote_root=str(node / "logs"),
         log_poll_interval=0.02,
-        health_poll_timeout=1,
+        # The engine sink flush (~100ms) plus the fake engine's 0.5s lifetime
+        # must land inside the recorder's post-launch collection window; a
+        # loaded runner makes 1s marginal (recorder deadlines are wall-clock).
+        health_poll_timeout=2,
         min_disk_gb=1,
     )
     provisioner = NodeProvisioner(

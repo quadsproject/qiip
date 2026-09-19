@@ -127,6 +127,9 @@ install_vllm_unit() {
     sudo install -m 755 "${SCRIPT_DIR}/wait-fabric.sh" /usr/local/bin/wait-nvswitch-fabric
     sudo install -m 755 "${SCRIPT_DIR}/preflight.sh" /usr/local/bin/vllm-preflight
     sudo install -m 755 "${SCRIPT_DIR}/../common/setup-base.sh" /usr/local/bin/qiip-setup-base.sh
+    # A previous provisioning may have left a selection here; re-setup starts
+    # from defaults and start-vllm.sh rewrites the file on first success.
+    sudo rm -f /etc/vllm/vllm.env
     cat <<UNIT | sudo tee /etc/systemd/system/vllm.service > /dev/null
 [Unit]
 Description=vLLM inference server
@@ -138,6 +141,7 @@ Type=exec
 Environment="AUTOVLLM_NFS_EXPORT=${NFS_EXPORT}"
 Environment="AUTOVLLM_NFS_MOUNT_POINT=${NFS_MOUNT_POINT}"
 Environment="AUTOVLLM_MIN_FREE_GB=${AUTOVLLM_MIN_FREE_GB:-20}"
+EnvironmentFile=-/etc/vllm/vllm.env
 ExecStartPre=/usr/local/bin/wait-nvswitch-fabric
 ExecStartPre=/usr/local/bin/vllm-preflight --check-only
 ExecStart=${SCRIPT_DIR}/start-vllm.sh

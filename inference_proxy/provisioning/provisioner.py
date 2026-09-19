@@ -723,6 +723,10 @@ class NodeProvisioner:
                     env["AUTOVLLM_REASONING_PARSER"] = vllm_params.reasoning_parser
                 if vllm_params.dtype is not None:
                     env["AUTOVLLM_DTYPE"] = vllm_params.dtype
+                if vllm_params.gpu_devices is not None:
+                    env["AUTOVLLM_GPU_DEVICES"] = ",".join(
+                        str(device) for device in vllm_params.gpu_devices
+                    )
         if self._hf_token:
             env["HF_TOKEN"] = self._hf_token
         return env

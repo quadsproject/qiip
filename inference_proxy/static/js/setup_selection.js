@@ -36,6 +36,7 @@ function createSetupSelectionController(options) {
   var preferred = null;
   var preferredApplied = false;
   var operatorChanged = false;
+  var vllmParamsInvalid = false;
   var errorMessage = "Model catalog is still loading.";
 
   function appendOption(select, value, label, disabled) {
@@ -224,6 +225,7 @@ function createSetupSelectionController(options) {
     var fields = vllmParamsContainer.querySelectorAll("[data-vllm-param]");
     var params = {};
     var hasAny = false;
+    vllmParamsInvalid = false;
     for (var i = 0; i < fields.length; i++) {
       var field = fields[i];
       var name = field.dataset.vllmParam;
@@ -232,6 +234,18 @@ function createSetupSelectionController(options) {
       hasAny = true;
       if (name === "gpu_memory_utilization") {
         params[name] = parseFloat(raw);
+      } else if (name === "gpu_devices") {
+        // ponytail: same format rule as preflight.sh, reject instead of
+        // parseInt-silencing "0 2" to [0] or sending [0,null] to the API
+        if (!/^\d+(?:\s*,\s*\d+)*$/.test(raw)) {
+          vllmParamsInvalid = true;
+          errorMessage =
+            "GPU devices must be a comma-separated list of indices, e.g. 0,2";
+          return null;
+        }
+        params[name] = raw.split(",").map(function (value) {
+          return parseInt(value.trim(), 10);
+        });
       } else if (
         name === "tool_call_parser" ||
         name === "reasoning_parser" ||
@@ -254,6 +268,7 @@ function createSetupSelectionController(options) {
     if (!hasModel(modelSelect.value)) return null;
     var selection = { engine: "vllm", model: modelSelect.value };
     var vp = getVllmParams();
+    if (vllmParamsInvalid) return null;
     if (vp) selection.vllm_params = vp;
     return selection;
   }
@@ -294,6 +309,7 @@ function createSetupSelectionController(options) {
     selectEngine: selectEngine,
     getSelection: getSelection,
     getVllmParams: getVllmParams,
+    paramsInvalid: function () { return vllmParamsInvalid; },
     buildBody: buildBody,
     isValid: function () { return getSelection() !== null; },
     errorMessage: function () { return errorMessage; },

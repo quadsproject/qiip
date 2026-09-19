@@ -379,6 +379,19 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_MODEL": "org/model",
         "HF_TOKEN": "hf secret",
     }
+    assert provisioner._start_script_env(
+        "org/model",
+        vllm_params=VllmParams(tensor_parallel_size=2, gpu_devices=(0, 2)),
+    ) == {
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
+        "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MIN_FREE_GB": "20",
+        "AUTOVLLM_MODEL": "org/model",
+        "AUTOVLLM_TENSOR_PARALLEL": "2",
+        "AUTOVLLM_GPU_DEVICES": "0,2",
+        "HF_TOKEN": "hf secret",
+    }
     llama_setup = provisioner._setup_script_env(InferenceEngine.LLAMA_CPP)
     assert llama_setup == {
         "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",

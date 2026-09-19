@@ -76,6 +76,10 @@
                         <span>Tensor parallel size</span>
                         <input id="vllm-tensor-parallel" type="number" min="1" step="1" inputmode="numeric" data-vllm-param="tensor_parallel_size" placeholder="auto">
                     </label>
+                    <label class="runtime-control" for="vllm-gpu-devices">
+                        <span>GPU devices (indices)</span>
+                        <input id="vllm-gpu-devices" type="text" inputmode="numeric" data-vllm-param="gpu_devices" placeholder="auto, e.g. 0,2">
+                    </label>
                     <label class="runtime-control" for="vllm-max-model-len">
                         <span>Max model length</span>
                         <span class="runtime-input-unit"><input id="vllm-max-model-len" type="number" min="1" step="1" inputmode="numeric" data-vllm-param="max_model_len" placeholder="auto"> <span>tokens</span></span>
