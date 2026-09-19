@@ -419,3 +419,67 @@ process.stdout.write(JSON.stringify({
 
     assert result["vllmParams"] == {"dtype": "bfloat16"}
     assert result["body"]["vllm_params"] == {"dtype": "bfloat16"}
+
+
+def test_vllm_gpu_devices_serialized_as_int_list() -> None:
+    result = _run_scenario(
+        r"""
+const container = byId("vllm-params-container");
+const fields = [
+  { param: "gpu_devices", value: "0, 2" },
+  { param: "tensor_parallel_size", value: "" },
+];
+fields.forEach(function (f) {
+  const input = new Element("input");
+  input.setAttribute("data-vllm-param", f.param);
+  input.value = f.value;
+  container.appendChild(input);
+});
+
+controller.setCatalog({
+  models: [{ repo_id: "org/vllm-model" }],
+  gguf_artifacts: [],
+});
+const body = controller.buildBody({ hostname: "gpu01" });
+process.stdout.write(JSON.stringify({
+  body: body,
+  gpuDevices: body && body.vllm_params ? body.vllm_params.gpu_devices : null,
+}));
+"""
+    )
+
+    assert result["gpuDevices"] == [0, 2]
+
+
+def test_vllm_gpu_devices_rejects_malformed_input() -> None:
+    result = _run_scenario(
+        r"""
+const container = byId("vllm-params-container");
+const fields = [
+  { param: "gpu_devices", value: "0 2" },
+];
+fields.forEach(function (f) {
+  const input = new Element("input");
+  input.setAttribute("data-vllm-param", f.param);
+  input.value = f.value;
+  container.appendChild(input);
+});
+
+controller.setCatalog({
+  models: [{ repo_id: "org/vllm-model" }],
+  gguf_artifacts: [],
+});
+const body = controller.buildBody({ hostname: "gpu01" });
+process.stdout.write(JSON.stringify({
+  body: body,
+  isValid: controller.isValid(),
+  errorMessage: controller.errorMessage(),
+}));
+"""
+    )
+
+    assert result["body"] is None
+    assert result["isValid"] is False
+    assert result["errorMessage"] == (
+        "GPU devices must be a comma-separated list of indices, e.g. 0,2"
+    )

@@ -69,6 +69,7 @@ class VllmParams(BaseModel):
     tool_call_parser: str | None = Field(default=None, min_length=1, max_length=256)
     reasoning_parser: str | None = Field(default=None, min_length=1, max_length=256)
     dtype: str | None = Field(default=None, min_length=1, max_length=256)
+    gpu_devices: tuple[int, ...] | None = Field(default=None, min_length=1)
 
     @field_validator("dtype")
     @classmethod
@@ -79,6 +80,31 @@ class VllmParams(BaseModel):
             allowed = ", ".join(sorted(SUPPORTED_VLLM_DTYPES))
             raise ValueError(f"unsupported vLLM dtype {value!r}; allowed: {allowed}")
         return value
+
+    @field_validator("gpu_devices")
+    @classmethod
+    def validate_gpu_devices(
+        cls, value: tuple[int, ...] | None
+    ) -> tuple[int, ...] | None:
+        if value is None:
+            return value
+        if any(device < 0 for device in value):
+            raise ValueError("GPU device indices must be non-negative")
+        if len(set(value)) != len(value):
+            raise ValueError("GPU device indices must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def validate_tensor_parallel_fits_devices(self) -> VllmParams:
+        if (
+            self.gpu_devices is not None
+            and self.tensor_parallel_size is not None
+            and self.tensor_parallel_size > len(self.gpu_devices)
+        ):
+            raise ValueError(
+                "tensor_parallel_size exceeds the selected GPU device count"
+            )
+        return self
 
 
 class NodeStatus(StrEnum):

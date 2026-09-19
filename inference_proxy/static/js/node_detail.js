@@ -19,6 +19,7 @@ function setupActionBody(id, node) {
   };
   if (node && node.state !== "available") {
     var vp = setupSelection.getVllmParams();
+    if (setupSelection.paramsInvalid()) return null;
     if (vp) base.vllm_params = vp;
     return base;
   }

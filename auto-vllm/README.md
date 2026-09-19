@@ -114,12 +114,27 @@ re-downloading; a partial snapshot fails with an actionable message.
 Script-specific launch overrides use the `AUTOVLLM_*` namespace, including
 `AUTOVLLM_MODEL`, `AUTOVLLM_API_PORT`, `AUTOVLLM_TENSOR_PARALLEL`,
 `AUTOVLLM_GPU_MEM_UTIL`, `AUTOVLLM_MAX_MODEL_LEN`,
-`AUTOVLLM_MAX_BATCHED_TOKENS`, and `AUTOVLLM_EXTRA_ARGS`. Storage checks are
+`AUTOVLLM_MAX_BATCHED_TOKENS`, `AUTOVLLM_EXTRA_ARGS`, and
+`AUTOVLLM_GPU_DEVICES`. Storage checks are
 tuned with `AUTOVLLM_NFS_EXPORT`, `AUTOVLLM_NFS_MOUNT_POINT`,
 `AUTOVLLM_PROBE_TIMEOUT` (probe bound, default 10s), and
 `AUTOVLLM_MIN_FREE_GB` (per-filesystem floor, default 20). Do not use
 `VLLM_PORT` for the API port; vLLM reserves that name for internal
 communication.
+
+`AUTOVLLM_GPU_DEVICES` selects an explicit subset of physical GPUs
+(nvidia-smi indices, comma-separated, e.g. `0,2`). The subset is exported as
+`CUDA_VISIBLE_DEVICES`, so preflight and the engine see the same devices.
+Preflight distinguishes physical inventory (nvidia-smi), CUDA-visible
+(torch), and allocated (tensor-parallel) device counts; it allows a
+tensor-parallel size up to the CUDA-visible count, derives the same default
+tensor-parallel size the launcher would pick when none is set explicitly, and
+rejects device indices that are not present, duplicate, or non-numeric. The
+effective device set, tensor-parallel size, and model are written to
+`/etc/vllm/vllm.env` only after a verified engine start; a failed launch
+leaves the previous file in place, so `vllm.service` keeps the last working
+allocation on a restart. Profiles assume a homogeneous GPU family: with a
+subset, model, VRAM, and compute-cap detection use the first selected card.
 
 ## Health check
 

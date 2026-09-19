@@ -39,6 +39,15 @@ fi
 EXPECTED_GPU_COUNT="${AUTOVLLM_EXPECTED_GPU_COUNT:-}"
 EXPECTED_TENSOR_PARALLEL="${AUTOVLLM_TENSOR_PARALLEL:-}"
 MODEL_PATH="${AUTOVLLM_MODEL:-}"
+GPU_DEVICES_OVERRIDE="${AUTOVLLM_GPU_DEVICES:-}"
+
+# The selected subset must be visible to torch for both the sourced path and
+# the systemd ExecStartPre `vllm-preflight --check-only` path, so export here
+# rather than only in start-vllm.sh main(). nvidia-smi ignores this variable,
+# so physical inventory below stays the full list.
+if [ -n "$GPU_DEVICES_OVERRIDE" ]; then
+    export CUDA_VISIBLE_DEVICES="$GPU_DEVICES_OVERRIDE"
+fi
 
 _pass=0
 _fail=0
@@ -67,6 +76,34 @@ _summary() {
 
 # ── 1. Driver & GPU count ───────────────────────────────────────────────
 
+# Validates an explicit device list: format, physical range, duplicates.
+# Shared with start-vllm.sh detect_gpu_info so an invalid first token cannot
+# reach an nvidia-smi -i probe before this actionable message can fire.
+validate_gpu_devices_list() {
+    local count="$1"
+    if [ -z "$GPU_DEVICES_OVERRIDE" ]; then
+        return 0
+    fi
+    if ! [[ "$GPU_DEVICES_OVERRIDE" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+        _bail "GPU device list '${GPU_DEVICES_OVERRIDE}' is not a comma-separated list of numeric indices (e.g. 0,2)"
+    fi
+    local -a devices=()
+    local token
+    IFS=',' read -r -a devices <<< "$GPU_DEVICES_OVERRIDE"
+    for token in "${devices[@]}"; do
+        if [ "$token" -ge "$count" ]; then
+            _bail "GPU device ${token} not present; physical devices are 0..$((count - 1)) (nvidia-smi --list-gpus)"
+        fi
+    done
+    local -a seen=()
+    for token in "${devices[@]}"; do
+        if printf '%s\n' "${seen[@]}" | grep -qxF "$token"; then
+            _bail "GPU device ${token} listed more than once in AUTOVLLM_GPU_DEVICES"
+        fi
+        seen+=("$token")
+    done
+}
+
 check_driver() {
     if ! command -v nvidia-smi &>/dev/null; then
         _bail "nvidia-smi not found — install NVIDIA drivers or run setup.sh"
@@ -83,7 +120,19 @@ check_driver() {
     _mark PASS "Driver loaded, ${count} GPU(s) visible"
 
     GPU_COUNT="$count"
-    GPU_COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0 | xargs)
+    validate_gpu_devices_list "$count"
+
+    # Capability probes follow the same first-selected-device rule as
+    # detect_gpu_info so backend selection describes the card the engine runs.
+    local probe_index=0
+    if [ -n "$GPU_DEVICES_OVERRIDE" ]; then
+        probe_index="${GPU_DEVICES_OVERRIDE%%,*}"
+    fi
+    GPU_COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i "$probe_index" | xargs)
+    # Profile sizing needs the card name; detect_gpu_info already set it for
+    # the sourced path (same first-selected-device rule), so only query here
+    # when running standalone.
+    GPU_MODEL="${GPU_MODEL:-$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$probe_index" | xargs)}"
 }
 
 # ── 2. NVSwitch / Fabric Manager ────────────────────────────────────────
@@ -133,20 +182,64 @@ check_fabric() {
     fi
 }
 
-# ── 3. CUDA device count vs tensor-parallel ─────────────────────────────
+# ── 3. Tensor-parallel default & CUDA device count ──────────────────────
+
+# Mirrors configure_vllm_params in start-vllm.sh: datacenter cards spread
+# across the selected devices; consumer/unknown cards use a single GPU.
+profile_tensor_parallel() {
+    local device_count="${GPU_DEVICE_COUNT:-}"
+    if [ -z "$device_count" ]; then
+        if [ -n "$GPU_DEVICES_OVERRIDE" ]; then
+            device_count=$(awk -F, '{print NF}' <<< "$GPU_DEVICES_OVERRIDE") || true
+        else
+            device_count="$GPU_COUNT"
+        fi
+    fi
+    case "$GPU_MODEL" in
+        *"H100"*|*"A100"*|*"A30"*|*"A40"*|*"V100"*) echo "$device_count" ;;
+        *) echo 1 ;;
+    esac
+}
+
+# The tensor-parallel size the launch will use: start-vllm.sh sets
+# EXPECTED_TENSOR_PARALLEL to its resolved value; the standalone --check-only
+# path must reproduce the default so a device subset is validated against the
+# allocation, not against the physical inventory.
+effective_tensor_parallel() {
+    if [ -n "$EXPECTED_TENSOR_PARALLEL" ]; then
+        echo "$EXPECTED_TENSOR_PARALLEL"
+    else
+        profile_tensor_parallel
+    fi
+}
+
+# ── CUDA device count vs tensor-parallel ────────────────────────────────
 
 check_cuda_devices() {
-    local tp="${EXPECTED_TENSOR_PARALLEL:-$GPU_COUNT}"
+    local tp
+    tp="$(effective_tensor_parallel)"
     local cuda_count
     cuda_count=$("$VLLM_PYTHON" -c 'import torch; print(torch.cuda.device_count())' 2>/dev/null) || true
 
     if [ -z "$cuda_count" ]; then
         _bail "torch.cuda.device_count() failed — check PyTorch/CUDA install in ${VLLM_PYTHON}"
     fi
-    if [ "$cuda_count" -ne "$tp" ]; then
-        _bail "torch sees ${cuda_count} CUDA device(s) but tensor-parallel needs ${tp} — check CUDA_VISIBLE_DEVICES or driver"
+    if [ -z "$tp" ]; then
+        tp="$GPU_COUNT"
     fi
-    _mark PASS "torch.cuda.device_count() = ${cuda_count} (matches TP=${tp})"
+    if [ "$tp" -lt 1 ]; then
+        _bail "tensor-parallel-size must be >= 1 (got ${tp})"
+    fi
+    if [ "$tp" -gt "$cuda_count" ]; then
+        _bail "tensor-parallel-size ${tp} exceeds ${cuda_count} CUDA-visible device(s) of ${GPU_COUNT} physical — check AUTOVLLM_GPU_DEVICES / CUDA_VISIBLE_DEVICES or add GPUs"
+    fi
+    if [ "$tp" -lt "$cuda_count" ]; then
+        _mark WARN "using ${tp} of ${cuda_count} CUDA-visible device(s); the engine allocates the first ${tp}"
+    fi
+    if [ "$cuda_count" -lt "$GPU_COUNT" ] && [ -z "$GPU_DEVICES_OVERRIDE" ]; then
+        _mark WARN "CUDA-visible ${cuda_count} < physical ${GPU_COUNT} without AUTOVLLM_GPU_DEVICES; the model was sized from the physical inventory"
+    fi
+    _mark PASS "physical=${GPU_COUNT} (nvidia-smi), CUDA-visible=${cuda_count}, allocated=${tp} for tensor-parallel"
 }
 
 # ── 4. Model path / space ───────────────────────────────────────────────
@@ -276,6 +369,114 @@ print(sum(s.size or 0 for s in model_info(sys.argv[1]).siblings))
     else
         _mark WARN "Cannot verify model size or free space — download may fail"
     fi
+}
+
+# Mirrors vLLM's shardability rule so an unsupported tensor-parallel size
+# fails with an actionable message instead of a mid-start error. KV heads
+# replicate when fewer than TP (vLLM allows tp % kv == 0 in that case).
+# rc: 0 pass, 1 reject (message printed), 2 not verifiable (no config.json).
+verify_model_topology() {
+    local model="$1" tp="$2"
+    local config_file=""
+
+    if [ "$tp" -le 1 ]; then
+        return 0
+    fi
+    if [ -d "$model" ]; then
+        config_file="${model}/config.json"
+    else
+        local slug="${model//\//'--'}"
+        local cache_dir="${NFS_MOUNT_POINT}"
+        if [ -L "$HF_CACHE_LINK" ]; then
+            cache_dir=$(timeout --kill-after=2 "${AUTOVLLM_PROBE_TIMEOUT:-10}" readlink -f "$HF_CACHE_LINK") || true
+        fi
+        local model_root="${cache_dir}/hub/models--${slug}"
+        local rev=""
+        if [ -f "${model_root}/refs/main" ]; then
+            rev=$(xargs < "${model_root}/refs/main") || true
+        fi
+        # Only the requested revision is authoritative; falling back to an
+        # arbitrary cached snapshot would judge this model by another branch
+        # or an older layout, and can reject a valid pending revision.
+        if [ -n "$rev" ] && [ -f "${model_root}/snapshots/${rev}/config.json" ]; then
+            config_file="${model_root}/snapshots/${rev}/config.json"
+        fi
+    fi
+    if [ -z "$config_file" ] || [ ! -r "$config_file" ]; then
+        return 2
+    fi
+
+    # All parsing, validation, and arithmetic stay in Python: config.json is
+    # untrusted model metadata, and shell arithmetic recursively evaluates
+    # embedded command substitutions before the divisibility checks run.
+    # rc: 0 pass, 1 reject (FATAL on stderr), 2 not verifiable.
+    local rc=0
+    "$VLLM_PYTHON" - "$config_file" "$tp" "$model" <<'PY' || rc=$?
+import json
+import sys
+
+try:
+    with open(sys.argv[1]) as fh:
+        cfg = json.load(fh)
+    tp = int(sys.argv[2])
+    model = sys.argv[3]
+except Exception:
+    sys.exit(2)
+
+heads = cfg.get("num_attention_heads")
+kv = cfg.get("num_key_value_heads")
+
+
+def pos_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+if not pos_int(heads):
+    sys.exit(2)
+if not pos_int(kv) or kv > heads:
+    kv = heads
+if heads % tp:
+    print(
+        f"FATAL: model {model} has {heads} attention head(s), "
+        f"not divisible by tensor-parallel-size {tp}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+if kv >= tp:
+    if kv % tp:
+        print(
+            f"FATAL: model {model} has {kv} KV head(s), "
+            f"not divisible by tensor-parallel-size {tp}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+elif tp % kv:
+    print(
+        f"FATAL: model {model} has {kv} KV head(s); "
+        f"tensor-parallel-size {tp} is not a multiple of it",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+    case "$rc" in
+        0|1|2) return "$rc" ;;
+        *) return 2 ;;
+    esac
+}
+
+check_model_topology() {
+    local tp
+    tp="$(effective_tensor_parallel)"
+    if [ -z "$MODEL_PATH" ]; then
+        return 0
+    fi
+    local rc=0
+    verify_model_topology "$MODEL_PATH" "$tp" || rc=$?
+    case "$rc" in
+        0) _mark PASS "Model topology verified for TP=${tp}" ;;
+        1) _bail "Unsupported model/topology parallelism (see message above)" ;;
+        2) _mark WARN "Model topology not verifiable pre-launch; engine will validate" ;;
+    esac
 }
 
 # ── 5. NFS mount health ────────────────────────────────────────────────
@@ -437,8 +638,12 @@ check_attention_backend() {
 # ── 7. Persistence mode ────────────────────────────────────────────────
 
 check_persistence_mode() {
+    local probe_index=0
+    if [ -n "$GPU_DEVICES_OVERRIDE" ]; then
+        probe_index="${GPU_DEVICES_OVERRIDE%%,*}"
+    fi
     local pm
-    pm=$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader -i 0 | xargs)
+    pm=$(nvidia-smi --query-gpu=persistence_mode --format=csv,noheader -i "$probe_index" | xargs)
     if [ "$pm" = "Enabled" ]; then
         _mark PASS "Persistence mode enabled"
     else
@@ -455,6 +660,7 @@ run_preflight() {
     check_fabric
     check_cuda_devices
     check_model
+    check_model_topology
     check_nfs_mounts
     # Model-cache space is verified in check_model only when a download is
     # needed; JIT kernel cache space is the only write at start time. The
