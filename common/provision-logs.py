@@ -7,6 +7,8 @@ Commands are sent to the worker's stdin and are never written into the log DB.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import os
 import re
@@ -50,6 +52,68 @@ def prune_raw_logs(config, store):
             path.unlink(missing_ok=True)
 
 
+def _acquire_host_lock(root: str | Path | None) -> tuple[int | None, bool]:
+    """Take the host-scoped mutation lock.
+
+    Returns ``(fd, True)`` on success, ``(None, True)`` when another worker
+    holds the lock, and ``(None, False)`` when locking is unavailable (no
+    root, read-only root, or recorder running without a writable filesystem).
+    One lock path is shared by both engine setup paths: workers with a live
+    mutating command must never run concurrently on one node. The kernel
+    releases the lock when the holder exits, so a crashed worker cannot wedge
+    the host forever; a surviving orphan is still caught by the phase probe
+    and blocks a retry. Unavailable locking disables fencing but never fails
+    the recorder, preserving behavior for configs without a remote log root.
+    """
+    try:
+        if root is None:
+            return None, False
+        lock_path = Path(root) / "host.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except Exception:
+        return None, False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
+            return None, True
+        print(
+            f"provision-logs: host lock unavailable ({exc}); "
+            "continuing without fencing",
+            file=sys.stderr,
+        )
+        return None, False
+    return fd, True
+
+
+def _release_host_lock(fd: int | None) -> None:
+    """Close the supervisor's lock copy without unlocking.
+
+    The flock is per open-file-description: when the lock fd is inherited by
+    the command process (pass_fds), closing the supervisor copy keeps the
+    lock held until the command exits, so a crashed supervisor cannot free
+    the fence while the mutation is still running. This file must never be
+    deleted while a worker could hold it (see _acquire_host_lock).
+    """
+    if fd is None:
+        return
+    with suppress(OSError):
+        os.close(fd)
+
+
+def _group_dead(pgid: int) -> bool:
+    """Return whether no process remains in the group *pgid*."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def worker(config):
     store = open_store(config)
     attempt, phase = config["attempt_id"], config["phase"]
@@ -65,6 +129,8 @@ def worker(config):
     deadline = time.monotonic() + config["timeout"]
     collection_deadline = deadline + config["health_timeout"]
     records = []
+    lock_fd = None
+    launched = False
 
     def record(msg, source, level="info"):
         records.append(
@@ -110,15 +176,34 @@ def worker(config):
     try:
         if engine_path:
             engine_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_fd, lock_available = _acquire_host_lock(config.get("root"))
+        if lock_available and lock_fd is None:
+            holder = store.latest_running(attempt, exclude=attempt)
+            message = "Host busy with another provisioning operation"
+            if holder:
+                message += f" (attempt {holder})"
+            store.issue(attempt, message)
+            store.update_phase(
+                attempt, phase, status="complete", exit_status=126, recording=False
+            )
+            store.update(attempt, status="failed", failure_summary=message)
+            return
         command = config.pop("command")
         environment = dict(os.environ, QIIP_LOG_CONFIG=json.dumps(config))
+        if lock_fd is not None:
+            os.set_inheritable(lock_fd, True)
+            # The start scripts close this fd at the serving-process handoff so
+            # the long-lived engine cannot hold the fence past the launch step.
+            environment["QIIP_LOCK_FD"] = str(lock_fd)
         proc = subprocess.Popen(
             ["bash", "-c", command],
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            pass_fds=[lock_fd] if lock_fd is not None else [],
         )
+        launched = True
         processes.append(proc)
         for source, pipe in (
             (stage + ".stdout", proc.stdout),
@@ -191,8 +276,31 @@ def worker(config):
                 cancelled = True
                 with suppress(ProcessLookupError):
                     os.killpg(proc.pid, signal.SIGTERM)
-                store.update_phase(attempt, phase, status="complete", exit_status=130)
-                store.issue(attempt, "Remote command cancelled by gateway")
+                with suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=2)
+                with suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                with suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5)
+                _release_host_lock(lock_fd)
+                if _group_dead(proc.pid):
+                    store.update_phase(
+                        attempt, phase, status="complete", exit_status=130
+                    )
+                    store.issue(attempt, "Remote command cancelled by gateway")
+                else:
+                    store.update_phase(
+                        attempt,
+                        phase,
+                        status="survivor",
+                        exit_status=130,
+                        recording=False,
+                    )
+                    store.issue(
+                        attempt,
+                        f"Remote process group {proc.pid} survived cancellation; "
+                        "conflicting retries blocked",
+                    )
                 break
             pipes_open = any(
                 key.data[0].startswith(stage + ".")
@@ -200,6 +308,7 @@ def worker(config):
             )
             if not command_done and proc.poll() is not None and not pipes_open:
                 command_done = True
+                _release_host_lock(lock_fd)
                 collection_deadline = now + config["health_timeout"]
                 store.update_phase(
                     attempt,
@@ -216,7 +325,30 @@ def worker(config):
                 timed_out = True
                 with suppress(ProcessLookupError):
                     os.killpg(proc.pid, signal.SIGTERM)
-                store.update_phase(attempt, phase, status="complete", exit_status=124)
+                with suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=2)
+                with suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                with suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5)
+                _release_host_lock(lock_fd)
+                if _group_dead(proc.pid):
+                    store.update_phase(
+                        attempt, phase, status="complete", exit_status=124
+                    )
+                else:
+                    store.update_phase(
+                        attempt,
+                        phase,
+                        status="survivor",
+                        exit_status=124,
+                        recording=False,
+                    )
+                    store.issue(
+                        attempt,
+                        f"Remote process group {proc.pid} survived timeout; "
+                        "conflicting retries blocked",
+                    )
                 store.issue(
                     attempt, "Remote command exceeded its total or inactivity deadline"
                 )
@@ -231,8 +363,30 @@ def worker(config):
             store.issue(attempt, "Engine startup log unavailable", source="engine")
     except Exception as exc:
         store.issue(attempt, "Node recorder failed: " + str(exc), source="recorder")
-        store.update_phase(attempt, phase, status="complete", exit_status=125)
+        if launched:
+            with suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
+            if _group_dead(proc.pid):
+                store.update_phase(attempt, phase, status="complete", exit_status=125)
+            else:
+                store.update_phase(
+                    attempt,
+                    phase,
+                    status="survivor",
+                    exit_status=125,
+                    recording=False,
+                )
+                store.issue(
+                    attempt,
+                    f"Remote process group {proc.pid} survived recorder failure; "
+                    "conflicting retries blocked",
+                )
+        else:
+            store.update_phase(attempt, phase, status="complete", exit_status=125)
     finally:
+        _release_host_lock(lock_fd)
         for process in processes:
             if process.poll() is None:
                 process.terminate()
@@ -289,12 +443,13 @@ def worker(config):
                 attempt, "Service journal unavailable (nonzero exit)", source="journal"
             )
         store.update_phase(attempt, phase, recording=False)
-        store.update(
-            attempt,
-            status="complete"
-            if store.get(attempt).get("stop_collection")
-            else "recorded",
-        )
+        if launched:
+            store.update(
+                attempt,
+                status="complete"
+                if store.get(attempt).get("stop_collection")
+                else "recorded",
+            )
 
 
 def engine_sink():
@@ -431,6 +586,56 @@ def main():
         worker(config)
         return
     store = open_store(config)
+    if action == "active":
+        # Host-level authority: report whether any attempt on this host still
+        # has a live phase. A stale row (recorder died, group gone) is
+        # re-probed and closed so an orphan can never wedge the host forever.
+        live: dict[str, object] = {}
+        for attempt_id, metadata in store.attempts_metadata_by_host(config["hostname"]):
+            for phase, info in (metadata.get("phases") or {}).items():
+                if info.get("status") not in {"running", "launching", "survivor"}:
+                    continue
+                pid = info.get("pid")
+                if pid and _group_dead(pid):
+                    store.update_phase(
+                        attempt_id,
+                        phase,
+                        status="complete",
+                        exit_status=137,
+                        recording=False,
+                    )
+                    continue
+                if not pid:
+                    launcher = info.get("launcher_pid")
+                    if launcher and not _group_dead(launcher):
+                        # Worker is still starting; keep the intent live.
+                        live = {
+                            "holder": attempt_id,
+                            "phase": phase,
+                            "status": info["status"],
+                            "pid": None,
+                        }
+                        continue
+                    # No command pid and no live launcher: an abandoned launch
+                    # intent (worker died or the node rebooted before it could
+                    # record the command pid).
+                    store.update_phase(
+                        attempt_id,
+                        phase,
+                        status="complete",
+                        exit_status=137,
+                        recording=False,
+                    )
+                    continue
+                if not live:
+                    live = {
+                        "holder": attempt_id,
+                        "phase": phase,
+                        "status": info["status"],
+                        "pid": pid,
+                    }
+        print(json.dumps({"active": bool(live), **live}))
+        return
     attempt = config["attempt_id"]
     if action == "launch":
         try:
@@ -458,6 +663,9 @@ def main():
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+            # The launcher pid lets the active probe tell an in-flight start
+            # from an intent abandoned before the command pid was recorded.
+            store.update_phase(attempt, phase, launcher_pid=proc.pid)
             # communicate() waits for the worker; only send and close stdin.
             proc.stdin.write(json.dumps(config).encode())
             proc.stdin.close()

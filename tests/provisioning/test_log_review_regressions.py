@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import json
 import runpy
+import signal
 import subprocess
 import sys
 import time
@@ -308,7 +309,9 @@ def test_timeout_remains_124_when_process_group_already_exited(
     assert manifest["phases"]["setup"]["recording"] is False
     assert any("deadline" in issue for issue in manifest["issues"])
     assert not any("Node recorder failed" in issue for issue in manifest["issues"])
-    assert killpg.call_count == 2  # SIGTERM deadline, then final group SIGKILL.
+    sigs = [c.args[1] for c in killpg.call_args_list]
+    assert signal.SIGTERM in sigs
+    assert signal.SIGKILL in sigs  # deadline SIGTERM, then final group SIGKILL.
 
 
 def test_phase_updates_and_appends_preserve_concurrent_metadata(tmp_path: Path) -> None:

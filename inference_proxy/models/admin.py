@@ -216,6 +216,7 @@ class TaskStatusResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     hostname: str
+    attempt_id: str | None = None
     current_step: str
     started_at: datetime
     updated_at: datetime
