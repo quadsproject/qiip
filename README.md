@@ -1403,8 +1403,42 @@ node command and recorder running; the attempt is marked interrupted locally.
 If completion cannot be established within the deadline, the
 attempt fails with an explicit collection warning. Recorded commands retain the
 configured SSH total and inactivity deadlines; llama.cpp setup retains its longer
-setup timeout. This feature retrieves evidence;
-it does not reconcile or resume a provisioning process after a gateway restart.
+setup timeout.
+
+At startup the gateway reconciles every host with an unfinished attempt in the
+background (`reconcile_pending_operations`). Before each provision or relaunch
+on a host, and during teardown, it rechecks that host. Both paths ask the node
+recorder whether any remote process group is still alive on that host.
+
+The node is the authority on its own process groups, and the check is
+host-scoped rather than attempt-scoped. A newer local attempt or a second
+gateway cannot hide a survivor. Reconcile mirrors remaining retained evidence
+into the gateway database, then blocks the host while an operation is running,
+survived cancellation, or the host is unreachable. An interrupted attempt whose
+node-side record is gone or complete is not blocked.
+
+> [!IMPORTANT]
+> Reconcile recovers state; it does not resume an interrupted command or
+> roll back partial setup.
+>
+> A blocked host requires operator teardown and provision or relaunches stay
+> refused until the node reports no live phase.
+
+The recorder holds one host-scoped lock (shared by the vLLM and llama.cpp
+paths) on the node, which rejects concurrent setup from a second controller
+with a "host busy" outcome. A phase that cannot prove its process group
+terminated is marked `survivor`; both markers surface in the attempt history
+and block the next attempt.
+
+> [!WARNING]
+> The lock file at the remote log root must never be deleted while a worker
+> could hold it; a deleted lock lets a second controller bypass the fence.
+
+> [!CAUTION]
+> On NFS exports without lock support the fence degrades to best-effort (the
+> recorder logs a warning and continues).
+>
+> Keep the remote log root on local storage when multiple controllers may reach a node.
 
 On the node detail page, **Provisioning history** lists attempts independently of
 the current node state. Select an attempt to search all retained messages, filter

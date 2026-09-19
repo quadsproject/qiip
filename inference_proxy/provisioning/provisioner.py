@@ -776,6 +776,8 @@ class NodeProvisioner:
         now = datetime.now(UTC)
         store = self._log_buffer.store
         attempt_id = self._log_buffer.attempts.get(hostname)
+        if not isinstance(attempt_id, str):
+            attempt_id = None
         if store is not None and attempt_id is not None:
             fields: dict[str, object] = {"stage": failed_step or step.value}
             if error:
@@ -786,6 +788,7 @@ class NodeProvisioner:
             store.update(attempt_id, **fields)
         state = ProvisioningState(
             hostname=hostname,
+            attempt_id=attempt_id,
             current_step=step,
             started_at=started_at or now,
             updated_at=now,
@@ -806,6 +809,94 @@ class NodeProvisioner:
             if stream == "stdout":
                 lines.append(line)
         return "\n".join(lines)
+
+    async def _reconcile_host(self, hostname: str, *, block: bool = True) -> bool:
+        """Recover evidence and detect live remote work on the node.
+
+        Runs under the host lifecycle lease before any new remote mutation.
+        The node is the authority on its own process groups: a read-only
+        ``active`` probe reports whether any attempt on this host still has a
+        live or surviving phase, so a newer local attempt cannot shadow an
+        older survivor and a second gateway cannot fence-bypass. Returns True
+        when a live remote operation blocks a new mutation (block=True) or a
+        live survivor was recorded (block=False). Never re-runs remote setup
+        or engine launch.
+        """
+        store = self._log_buffer.store
+        if store is None or self._remote_logs is None:
+            return False
+        probe = await self._remote_logs.host_active(hostname)
+        if probe.get("unreachable"):
+            history = await asyncio.to_thread(store.history, hostname, limit=1)
+            if history["attempts"]:
+                store.issue(
+                    history["attempts"][0]["attempt_id"],
+                    f"Host unreachable during reconcile: {probe.get('error', '')}",
+                )
+            return block
+        if not probe.get("active"):
+            return False
+
+        status = probe.get("status")
+        reason = (
+            "Remote operation is still running on the node; "
+            "wait for it to finish or tear the host down before retrying"
+            if status in {"running", "launching"}
+            else (
+                "Remote process survived cancellation; it must be torn down "
+                "before retrying this host"
+            )
+        )
+        holder = probe.get("holder")
+        match = None
+        if isinstance(holder, str):
+            history = await asyncio.to_thread(store.history, hostname)
+            match = next(
+                (a for a in history["attempts"] if a["attempt_id"] == holder), None
+            )
+        if match is not None:
+            # Mirror remaining evidence for the holder before writing, and
+            # re-check: a phase that completed during the probe is not a block.
+            with suppress(Exception):
+                await self._remote_logs.collect(match["attempt_id"])
+            phases = store.get(match["attempt_id"]).get("remote_phases") or {}
+            if phases and list(phases.values())[-1].get("status") == "complete":
+                return False
+        else:
+            history = await asyncio.to_thread(store.history, hostname, limit=1)
+            match = history["attempts"][0] if history["attempts"] else None
+        if match is None:
+            return block
+        survivor = status == "survivor"
+        existing = match.get("failure_summary") or ""
+        summary = (
+            existing
+            if reason in existing
+            else (f"{existing} (reconcile: {reason})" if existing else reason)
+        )
+        store.update(
+            match["attempt_id"],
+            status="interrupted",
+            survivor=survivor,
+            failure_summary=summary,
+        )
+        store.issue(match["attempt_id"], reason + "; conflicting retries blocked")
+        return block
+
+    async def reconcile_pending_operations(self) -> None:
+        """Best-effort startup recovery for hosts with unfinished remote work.
+
+        Runs in the background so a slow or unreachable host cannot block
+        startup; the per-mutation ``_reconcile_host`` hook is the safety gate.
+        """
+        store = self._log_buffer.store
+        if store is None or self._remote_logs is None:
+            return
+        hostnames = await asyncio.to_thread(store.pending_hosts)
+        for hostname in hostnames:
+            with suppress(Exception):
+                await self._reconcile_host(hostname)
+            logger.info("startup_reconcile_finished", hostname=hostname)
 
     async def _power_on_if_needed(self, hostname: str) -> None:
         """Power on the host via Redfish if configured (D-01, D-06, D-07).
@@ -1074,6 +1165,11 @@ class NodeProvisioner:
             raise ValueError("lifecycle lease does not own this host")
 
         try:
+            if await self._reconcile_host(hostname):
+                raise RelaunchPreconditionError(
+                    "A prior provisioning operation is still active on the node; "
+                    "wait for it to finish or tear the host down before retrying"
+                )
             await self._relaunch_llamacpp(hostname, request)
         finally:
             lease.release()
@@ -1758,6 +1854,11 @@ class NodeProvisioner:
             engine=engine,
             vllm_params=vllm_params.model_dump() if vllm_params else None,
         )
+        if await self._reconcile_host(hostname):
+            raise ProvisioningError(
+                "A prior provisioning operation is still active on the node; "
+                "wait for it to finish or tear the host down before retrying"
+            )
         self._begin_log(
             hostname, engine, model=artifact.model_alias if artifact else model
         )
@@ -2540,6 +2641,12 @@ class NodeProvisioner:
             raise ValueError("lifecycle lease does not own this host")
 
         try:
+            if await self._reconcile_host(hostname, block=False):
+                logger.warning(
+                    "teardown_reconcile_survivor",
+                    hostname=hostname,
+                    reason="a prior remote operation is still active on the node",
+                )
             engine = self._resolve_teardown_engine(
                 hostname,
                 force=force,
