@@ -95,9 +95,9 @@ def test_uv_pin_records_official_checksum_provenance() -> None:
     )
     documentation = (NODE_PROJECT / "README.md").read_text()
 
-    assert version == "0.12.1"
+    assert version == "0.12.17"
     assert checksum_line == (
-        "90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb  "
+        "fa82fd8dde8e8eefdecada6aa0889666556cfceb690d06e0c3bca49eb3070a63  "
         "uv-x86_64-unknown-linux-gnu.tar.gz"
     )
     assert (
@@ -137,7 +137,7 @@ def test_pinned_uv_reads_and_resolves_node_lock(tmp_path: Path) -> None:
         timeout=5,
         check=True,
     )
-    assert version.stdout.startswith("uv 0.12.1 ")
+    assert version.stdout.startswith("uv 0.12.17 ")
 
     subprocess.run(
         [uv_binary, "lock", "--check", "--project", str(NODE_PROJECT)],

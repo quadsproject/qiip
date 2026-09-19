@@ -75,7 +75,7 @@ def _uv_bootstrap_fixture(
     digest = hashlib.sha256(archive_content.encode()).hexdigest()
     if not valid_checksum:
         digest = "0" * 64
-    (bundle / ".uv-version").write_text("0.12.1\n")
+    (bundle / ".uv-version").write_text("0.12.17\n")
     (bundle / "uv-x86_64-unknown-linux-gnu.tar.gz.sha256").write_text(
         f"{digest}  uv-x86_64-unknown-linux-gnu.tar.gz\n"
     )
@@ -115,7 +115,7 @@ while [[ "$#" -gt 0 ]]; do
         mkdir -p "$2/uv-x86_64-unknown-linux-gnu"
         cat > "$2/uv-x86_64-unknown-linux-gnu/uv" <<'EOF'
 #!/bin/bash
-echo 'uv 0.12.1 (fixture)'
+echo 'uv 0.12.17 (fixture)'
 EOF
         chmod +x "$2/uv-x86_64-unknown-linux-gnu/uv"
         exit 0
@@ -218,7 +218,7 @@ def test_uv_bootstrap_verifies_digest_before_install(tmp_path: Path) -> None:
         timeout=5,
         check=True,
     )
-    assert installed.stdout.startswith("uv 0.12.1")
+    assert installed.stdout.startswith("uv 0.12.17")
 
 
 def test_uv_bootstrap_checksum_mismatch_never_installs(tmp_path: Path) -> None:
@@ -237,7 +237,7 @@ def test_uv_bootstrap_checksum_mismatch_never_installs(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     ("installed_version", "expected_bootstrap"),
-    [("0.12.1", False), ("0.11.0", True)],
+    [("0.12.17", False), ("0.11.0", True)],
 )
 def test_uv_bootstrap_version_matrix(
     tmp_path: Path,
@@ -265,7 +265,7 @@ def test_uv_bootstrap_version_matrix(
         timeout=5,
         check=True,
     )
-    assert installed.stdout.startswith("uv 0.12.1")
+    assert installed.stdout.startswith("uv 0.12.17")
 
 
 def test_hard_step_stops_at_first_failed_command(tmp_path: Path) -> None:
@@ -333,7 +333,7 @@ def test_vllm_environment_syncs_with_frozen_uv_lock(tmp_path: Path) -> None:
         uv_bin,
         """#!/bin/bash
 if [[ "$1" == '--version' ]]; then
-    echo 'uv 0.12.1 (test)'
+    echo 'uv 0.12.17 (test)'
     exit 0
 fi
 echo "env:$UV_PROJECT_ENVIRONMENT" >> "$AUTOVLLM_TEST_LOG"

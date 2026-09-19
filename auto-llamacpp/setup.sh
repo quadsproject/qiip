@@ -34,8 +34,8 @@ INSTALL_TMP_DIR="${AUTOVLLM_TMP_DIR:-/tmp}"
 
 # llama.cpp-specific. GitHub does not publish a Linux CUDA archive for this
 # release, so managed nodes compile the verified source for their attached GPU.
-DEFAULT_LLAMACPP_VERSION="b10242"
-DEFAULT_LLAMACPP_SHA256="b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3"
+DEFAULT_LLAMACPP_VERSION="v0.4.1"
+DEFAULT_LLAMACPP_SHA256="ef3d5b1907a391500ae11b5e61a8e2022e0deaac9790899cad9c4e02f03bfb9a"
 LLAMACPP_VERSION="${AUTOLLAMACPP_VERSION-$DEFAULT_LLAMACPP_VERSION}"
 if [[ -v AUTOLLAMACPP_SHA256 ]]; then
     LLAMACPP_SHA256="$AUTOLLAMACPP_SHA256"
@@ -68,10 +68,16 @@ source "$(cd -- "${SCRIPT_DIR}/.." && pwd)/common/setup-base.sh"
 
 # --- llama.cpp-specific functions ---
 
+# Release tags (v<major>.<minor>.<patch>) report "version: 0.4.1 (build N, commit
+# C)". Nightly b<number> tags report "version: 0.4.1-dev (build 11052, commit C)",
+# or "version: 10242 (C)" before upstream adopted release versions.
 installed_llamacpp_version() {
     local binary="$1"
     "$binary" --version 2>&1 \
-        | sed -nE 's/^version:[[:space:]]*([0-9]+).*/b\1/p' \
+        | sed -nE \
+            -e 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]+\(build .*/v\1/p' \
+            -e 's/^version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+-dev[[:space:]]+\(build[[:space:]]+([1-9][0-9]*),.*/b\1/p' \
+            -e 's/^version:[[:space:]]*([1-9][0-9]*)[[:space:]].*/b\1/p' \
         | head -n 1
 }
 
@@ -173,8 +179,8 @@ verify_managed_server_cli() {
 install_llamacpp() {
     require_sha256 "llama.cpp ${LLAMACPP_VERSION}" "$LLAMACPP_SHA256" \
         "AUTOLLAMACPP_SHA256"
-    if [[ ! "$LLAMACPP_VERSION" =~ ^b[1-9][0-9]*$ ]]; then
-        echo "FATAL: AUTOLLAMACPP_VERSION must use the b<number> build-tag format" >&2
+    if [[ ! "$LLAMACPP_VERSION" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|b[1-9][0-9]*)$ ]]; then
+        echo "FATAL: AUTOLLAMACPP_VERSION must use the v<major>.<minor>.<patch> release-tag or b<number> build-tag format" >&2
         return 2
     fi
     if [[ ! "$LLAMACPP_SOURCE_URL" =~ ^https?:// ]]; then
@@ -241,15 +247,22 @@ install_llamacpp() {
         verify_sha256 "$archive" "$LLAMACPP_SHA256" \
             "llama.cpp ${LLAMACPP_VERSION} source"
         tar xzf "$archive" -C "$source_dir" --strip-components=1
-        # b10242's memory estimator supports unified KV internally, but its CLI
+        # The pinned memory estimator supports unified KV internally, but its CLI
         # allowlist omits llama-fit-params. Expose the existing option so the
         # planner estimates the exact KV mode used by llama-server.
         enable_fit_params_unified_kv "$source_dir"
 
         # Source tarballs have no .git, so cmake/build-info.cmake logs two harmless
         # "fatal: not a git repository" lines and falls back to BUILD_NUMBER=0.
-        # LLAMA_BUILD_NUMBER/COMMIT below override that fallback and are what
-        # installed_llamacpp_version() matches against -- they are not decorative.
+        # The version flags below are what installed_llamacpp_version() matches
+        # against -- they are not decorative. A release tag must clear the
+        # default "-dev" suffix; a build tag must override the fallback number.
+        local -a version_flags
+        if [[ "$LLAMACPP_VERSION" == v* ]]; then
+            version_flags=(-DLLAMA_BUILD_IS_DEV=OFF)
+        else
+            version_flags=(-DLLAMA_BUILD_NUMBER="${LLAMACPP_VERSION#b}")
+        fi
         cmake -S "$source_dir" -B "$build_dir" -G "Unix Makefiles" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_COMPILER="$CUDA_NVCC" \
@@ -265,7 +278,7 @@ install_llamacpp() {
             -DLLAMA_BUILD_UI=OFF \
             -DLLAMA_BUILD_MTMD=OFF \
             -DLLAMA_OPENSSL=OFF \
-            -DLLAMA_BUILD_NUMBER="${LLAMACPP_VERSION#b}" \
+            "${version_flags[@]}" \
             -DLLAMA_BUILD_COMMIT="$LLAMACPP_VERSION"
         cmake --build "$build_dir" --target llama-server llama-fit-params llama-quantize \
             --parallel "$(nproc)"

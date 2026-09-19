@@ -120,8 +120,8 @@ provisioning:
   # SHA-256; changing a version requires configuring its matching digest.
   nvidia_driver_version: 580.126.09
   nvidia_driver_sha256: 4cac53e48f8adff661d47c8788ed24059a248c9fd8098ceafd088a498986ec26
-  llamacpp_version: b10242
-  llamacpp_sha256: b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3
+  llamacpp_version: v0.4.1
+  llamacpp_sha256: ef3d5b1907a391500ae11b5e61a8e2022e0deaac9790899cad9c4e02f03bfb9a
   llamacpp_source_url: https://github.com/ggml-org/llama.cpp/archive/refs/tags/{version}.tar.gz
   llamacpp_setup_timeout: 7200.0
   llamacpp_fit_target_mib: 512

@@ -202,7 +202,7 @@ The current node bundle installs:
 
 - vLLM 0.26.0
 - FlashInfer Python and AOT cubins 0.6.14
-- uv 0.12.1
+- uv 0.12.17
 - CPython 3.12 on Linux x86_64, targeting `manylinux_2_34`
 
 The upgrade therefore changes the node runtime versions as well as the package tool. Review vLLM release compatibility and model behavior before rolling the bundle across the fleet.
@@ -265,10 +265,17 @@ SHA-256 before extraction, and builds CUDA-enabled `llama-server` and
 is two hours:
 
 ```dotenv
-INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION=b10242
-INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256=b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION=v0.4.1
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256=ef3d5b1907a391500ae11b5e61a8e2022e0deaac9790899cad9c4e02f03bfb9a
 INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT=7200
 ```
+
+Upstream now publishes `v<major>.<minor>.<patch>` release tags and marks the
+older `b<number>` build tags as nightly prereleases. The version setting accepts
+both formats; the default follows the release tags. Deployments that pin a
+`b<number>` tag with its own digest keep working unchanged, while deployments on
+the previous default rebuild llama.cpp at the next managed setup because the
+version is part of the immutable build identity.
 
 Changing the version requires an explicitly configured matching digest. A
 custom source mirror is selected through the validated
@@ -415,7 +422,7 @@ a property of the selected model, quantization, GPU topology, and free-memory
 target. `context_per_slot` is QIIP's simultaneous-capacity guarantee;
 `slot_context_limit` is llama.cpp's maximum for one request; and
 `aggregate_context` is the total unified KV pool. When the aggregate exceeds
-the model training context, b10242's `possible training context overflow` and
+the model training context, llama.cpp's `possible training context overflow` and
 slot-capping warnings are expected and validated. A fitter-failure warning is
 still fatal.
 

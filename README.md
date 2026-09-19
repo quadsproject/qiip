@@ -979,7 +979,7 @@ for the NVIDIA GPU attached to the node. It has five gateway settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION` | `b10242` | Pinned llama.cpp build tag |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION` | `v0.4.1` | Pinned llama.cpp release tag (`v<major>.<minor>.<patch>`, or a nightly `b<number>` build tag) |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256` | committed digest | SHA-256 of the source archive selected by the version |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` | GitHub tag archive | Validated HTTP(S) URL template containing exactly one `{version}` placeholder |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT` | `7200` | Total wall-clock deadline for the llama.cpp setup command, including the CUDA source build (seconds) |

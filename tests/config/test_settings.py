@@ -381,7 +381,7 @@ class TestArtifactDigestSettings:
         assert provisioning.llamacpp_source_url == DEFAULT_LLAMACPP_SOURCE_URL
         assert provisioning.llamacpp_fit_target_mib == 512
         assert provisioning.llamacpp_source_download_url() == (
-            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b10242.tar.gz"
+            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v0.4.1.tar.gz"
         )
         assert llmfit.version == "1.1.6"
         assert llmfit.sha256 == (
@@ -428,13 +428,25 @@ class TestArtifactDigestSettings:
         )
         assert configured.llamacpp_sha256 == "b" * 64
 
-    @pytest.mark.parametrize("version", ["10242", "v10242", "b0", "b1.2", "latest"])
-    def test_llamacpp_version_requires_build_tag(self, version: str) -> None:
+    @pytest.mark.parametrize(
+        "version",
+        ["10242", "v10242", "v0.4", "0.4.1", "v0.4.1-dev", "b0", "b1.2", "latest"],
+    )
+    def test_llamacpp_version_requires_upstream_tag(self, version: str) -> None:
         with pytest.raises(ValidationError, match=r"b<number>"):
             ProvisioningSettings(
                 llamacpp_version=version,
                 llamacpp_sha256="b" * 64,
             )
+
+    @pytest.mark.parametrize("version", ["v0.5.0", "v1.10.2", "b11052"])
+    def test_llamacpp_version_accepts_release_and_build_tags(
+        self, version: str
+    ) -> None:
+        configured = ProvisioningSettings(
+            llamacpp_version=version, llamacpp_sha256="b" * 64
+        )
+        assert configured.llamacpp_version == version
 
     @pytest.mark.parametrize(
         "url",
@@ -461,7 +473,7 @@ class TestArtifactDigestSettings:
             )
         )
         assert settings.llamacpp_source_download_url() == (
-            f"{scheme}://mirror.example/llama/b10242/source.tar.gz"
+            f"{scheme}://mirror.example/llama/v0.4.1/source.tar.gz"
         )
 
     @pytest.mark.parametrize(

@@ -935,7 +935,7 @@ if [ "$*" != '--version' ]; then
     expected='--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --version'
     [ "$*" = "$expected" ] || exit 46
 fi
-echo 'version: 10242 (b10242)' >&2
+echo 'version: 0.4.1 (build 0, commit v0.4.1)' >&2
 EOF
     cat > "$build_dir/bin/llama-fit-params" <<'EOF'
 #!/bin/bash
@@ -948,7 +948,7 @@ case "$*" in
     "$metadata"|"$estimate") ;;
     *) exit 45 ;;
 esac
-echo 'version: 10242 (b10242)' >&2
+echo 'version: 0.4.1 (build 0, commit v0.4.1)' >&2
 EOF
     cat > "$build_dir/bin/llama-quantize" <<'EOF'
 #!/bin/bash
@@ -985,10 +985,10 @@ exec "$@"
         **os.environ,
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "AUTOVLLM_TMP_DIR": str(tmp_path),
-        "AUTOLLAMACPP_VERSION": "b10242",
+        "AUTOLLAMACPP_VERSION": "v0.4.1",
         "AUTOLLAMACPP_SHA256": digest,
         "AUTOLLAMACPP_SOURCE_URL": (
-            "https://mirror.example/llama.cpp/b10242/source.tar.gz"
+            "https://mirror.example/llama.cpp/v0.4.1/source.tar.gz"
         ),
         "AUTOLLAMACPP_INSTALL_ROOT": str(install_root),
         "AUTOLLAMACPP_LINK_DIR": str(link_dir),
@@ -1011,7 +1011,7 @@ def test_setup_defaults_match_gateway_source_pair() -> None:
     assert result.stdout.splitlines() == [
         DEFAULT_LLAMACPP_VERSION,
         DEFAULT_LLAMACPP_SHA256,
-        ("https://github.com/ggml-org/llama.cpp/archive/refs/tags/b10242.tar.gz"),
+        ("https://github.com/ggml-org/llama.cpp/archive/refs/tags/v0.4.1.tar.gz"),
     ]
 
 
@@ -1036,8 +1036,9 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     assert "<-DLLAMA_BUILD_EXAMPLES=OFF>" in configure
     assert "<-DLLAMA_BUILD_SERVER=ON>" in configure
     assert "<-DLLAMA_BUILD_UI=OFF>" in configure
-    assert "<-DLLAMA_BUILD_NUMBER=10242>" in configure
-    assert "<-DLLAMA_BUILD_COMMIT=b10242>" in configure
+    assert "<-DLLAMA_BUILD_IS_DEV=OFF>" in configure
+    assert "-DLLAMA_BUILD_NUMBER" not in configure
+    assert "<-DLLAMA_BUILD_COMMIT=v0.4.1>" in configure
     build = next(line for line in operations if line.startswith("cmake <--build>"))
     assert "<llama-server> <llama-fit-params> <llama-quantize>" in build
     assert (
@@ -1157,11 +1158,29 @@ def test_install_is_idempotent_for_source_and_gpu_identity(tmp_path: Path) -> No
     )
 
 
+def test_build_tag_pins_build_number_and_rejects_other_version(
+    tmp_path: Path,
+) -> None:
+    env, operation_log, link_dir = _build_fixture(tmp_path)
+    env["AUTOLLAMACPP_VERSION"] = "b11052"
+
+    result = _run_shell(_source_setup("install_llamacpp"), env=env)
+
+    assert result.returncode != 0
+    assert "built llama-server did not report b11052" in result.stderr
+    operations = operation_log.read_text().splitlines()
+    configure = next(line for line in operations if line.startswith("cmake <-S>"))
+    assert "<-DLLAMA_BUILD_NUMBER=11052>" in configure
+    assert "<-DLLAMA_BUILD_COMMIT=b11052>" in configure
+    assert "-DLLAMA_BUILD_IS_DEV" not in configure
+    assert not link_dir.exists()
+
+
 def test_fit_concurrency_profile_invalidates_v1_build(tmp_path: Path) -> None:
     env, operation_log, link_dir = _build_fixture(tmp_path)
     old_marker = "\n".join(
         (
-            "version=b10242",
+            "version=v0.4.1",
             f"source_sha256={env['AUTOLLAMACPP_SHA256']}",
             "build_profile=cuda-portable-cpu-v1",
             "compute_capabilities=8.0,9.0",
@@ -1169,12 +1188,12 @@ def test_fit_concurrency_profile_invalidates_v1_build(tmp_path: Path) -> None:
         )
     )
     old_identity = hashlib.sha256(old_marker.encode()).hexdigest()[:16]
-    old_install = Path(env["AUTOLLAMACPP_INSTALL_ROOT"]) / f"b10242-{old_identity}"
+    old_install = Path(env["AUTOLLAMACPP_INSTALL_ROOT"]) / f"v0.4.1-{old_identity}"
     old_bin = old_install / "bin"
     old_bin.mkdir(parents=True)
     _write_executable(
         old_bin / "llama-server",
-        "#!/bin/bash\necho 'version: 10242 (b10242)' >&2\n",
+        "#!/bin/bash\necho 'version: 0.4.1 (build 0, commit v0.4.1)' >&2\n",
     )
     _write_executable(old_bin / "llama-quantize", "#!/bin/bash\nexit 0\n")
     (old_install / "BUILD-INFO").write_text(f"{old_marker}\n", encoding="utf-8")
@@ -1229,11 +1248,23 @@ def test_empty_digest_fails_before_download(tmp_path: Path) -> None:
     assert not operation_log.exists()
 
 
-def test_version_parser_reads_real_stderr_shape(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("version: 0.4.1 (build 0, commit v0.4.1)", "v0.4.1\n"),
+        ("version: 0.4.1 (build 10964, commit b29c606)", "v0.4.1\n"),
+        ("version: 0.4.1-dev (build 11052, commit b11052)", "b11052\n"),
+        ("version: 0.4.1-dev (build 0, commit unknown)", ""),
+        ("version: 10242 (fixture)", "b10242\n"),
+    ],
+)
+def test_version_parser_reads_real_stderr_shape(
+    tmp_path: Path, output: str, expected: str
+) -> None:
     binary = tmp_path / "llama-server"
     _write_executable(
         binary,
-        "#!/bin/bash\necho 'version: 10242 (fixture)' >&2\n",
+        f"#!/bin/bash\necho {shlex.quote(output)} >&2\n",
     )
 
     result = _run_shell(
@@ -1241,7 +1272,7 @@ def test_version_parser_reads_real_stderr_shape(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "b10242\n"
+    assert result.stdout == expected
 
 
 def test_managed_start_refuses_missing_nvidia_driver(tmp_path: Path) -> None:

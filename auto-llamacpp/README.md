@@ -18,7 +18,7 @@ deployment target.
 
 ## Verified source build
 
-Linux CUDA archives are not published for the pinned `b10242` release.
+Linux CUDA archives are not published for the pinned `v0.4.1` release.
 `setup.sh` therefore downloads the pinned GitHub tag source archive, verifies
 its committed SHA-256 before extraction, applies one digest-pinned CLI
 allowlist transformation, and compiles `llama-server`, `llama-fit-params`, and
@@ -44,19 +44,21 @@ still applies, so build output remains a liveness signal.
 
 ### Bumping the llama.cpp version
 
-1. Pick a `b<number>` tag from <https://github.com/ggml-org/llama.cpp/releases>.
+1. Pick a `v<major>.<minor>.<patch>` release tag from
+   <https://github.com/ggml-org/llama.cpp/releases>. Nightly `b<number>` build
+   tags (published as prereleases) are also accepted.
 2. Download the tag source archive and compute its SHA-256:
 
    ```bash
-   curl -fSL -o llama.cpp-b12345.tar.gz \
-     "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b12345.tar.gz"
-   sha256sum llama.cpp-b12345.tar.gz
+   curl -fSL -o llama.cpp-v1.2.3.tar.gz \
+     "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v1.2.3.tar.gz"
+   sha256sum llama.cpp-v1.2.3.tar.gz
    ```
 
 3. Configure the matching version and digest:
 
    ```dotenv
-   INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION=b12345
+   INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION=v1.2.3
    INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256=<hash-from-step-2>
    ```
 
@@ -154,7 +156,7 @@ a configuration that was previously verified on the real node.
 The managed planner first estimates F16 for both K and V. If that policy cannot
 fully offload one request at the 4,096-token floor while preserving the reserve,
 it retries the complete plan with Q8_0 for both K and V. Q8_0 V requires Flash
-Attention in b10242, so the fallback passes `--flash-attn on` to both the
+Attention in llama.cpp, so the fallback passes `--flash-attn on` to both the
 estimator and server; the F16 policy retains `auto`. QIIP does not automatically
 select Q4 or mixed cache types. If Q8_0 cannot meet the minimum plan, setup fails
 instead of accepting lower KV precision or CPU layer spill. Q8_0 can change
@@ -205,7 +207,7 @@ teardown-only `relaunch_failed` state. A gateway restart converts any orphaned
 health recovery to bless an unverified server.
 
 With unified KV, llama.cpp internally reports `n_ctx_seq` as the aggregate
-pool. When that exceeds the model training context, b10242 emits its expected
+pool. When that exceeds the model training context, llama.cpp emits its expected
 `possible training context overflow` and slot-capping warnings, then caps each
 request to the training context. QIIP validates those exact records as benign;
 it still rejects `failed to fit params to free device memory`. The provisioning
@@ -213,7 +215,7 @@ record distinguishes `context_per_slot` (capacity guaranteed simultaneously to
 every selected slot), `slot_context_limit` (llama.cpp's maximum for one
 request), and `aggregate_context` (the unified pool).
 
-The pinned b10242 estimator already implements unified-KV memory accounting but
+The pinned estimator already implements unified-KV memory accounting but
 does not expose that option in the `llama-fit-params` CLI allowlist. The
 versioned `cuda-portable-cpu-v2-fit-concurrency` build profile exposes the
 existing option so estimation and serving use the same KV mode. Its exact

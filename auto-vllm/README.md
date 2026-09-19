@@ -21,7 +21,7 @@ The `uv` version is recorded in `.uv-version`. Its checksum comes from Astral's
 published release asset:
 
 ```text
-https://github.com/astral-sh/uv/releases/download/0.12.1/uv-x86_64-unknown-linux-gnu.tar.gz.sha256
+https://github.com/astral-sh/uv/releases/download/0.12.17/uv-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 Regenerate the node lock from the repository root with that exact `uv` binary:
