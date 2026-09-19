@@ -335,12 +335,15 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_NVIDIA_DRIVER_VERSION": "999.1",
         "AUTOVLLM_NVIDIA_DRIVER_SHA256": "b" * 64,
         "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MIN_FREE_GB": "20",
         "AUTOVLLM_LLMFIT_VERSION": "8.7.6",
         "AUTOVLLM_LLMFIT_SHA256": "c" * 64,
     }
     assert provisioner._start_script_env("org/model") == {
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MIN_FREE_GB": "20",
         "AUTOVLLM_MODEL": "org/model",
         "HF_TOKEN": "hf secret",
     }
@@ -355,7 +358,9 @@ def test_script_env_prefix_exact() -> None:
     )
     assert provisioner._start_script_env("org/model", vllm_params=vllm_params) == {
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MIN_FREE_GB": "20",
         "AUTOVLLM_MODEL": "org/model",
         "AUTOVLLM_TENSOR_PARALLEL": "4",
         "AUTOVLLM_MAX_MODEL_LEN": "8192",
@@ -368,7 +373,9 @@ def test_script_env_prefix_exact() -> None:
     }
     assert provisioner._start_script_env("org/model", vllm_params=VllmParams()) == {
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MIN_FREE_GB": "20",
         "AUTOVLLM_MODEL": "org/model",
         "HF_TOKEN": "hf secret",
     }
@@ -379,6 +386,7 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_NVIDIA_DRIVER_VERSION": "999.1",
         "AUTOVLLM_NVIDIA_DRIVER_SHA256": "b" * 64,
         "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MIN_FREE_GB": "20",
         "AUTOVLLM_LLMFIT_VERSION": "8.7.6",
         "AUTOVLLM_LLMFIT_SHA256": "c" * 64,
         "AUTOLLAMACPP_VERSION": "v0.4.1",
@@ -392,6 +400,7 @@ def test_script_env_prefix_exact() -> None:
     artifact = _artifact()
     assert provisioner._start_script_env(None, InferenceEngine.LLAMA_CPP, artifact) == {
         "AUTOLLAMACPP_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOLLAMACPP_PORT": "8123",
         "AUTOLLAMACPP_REQUIRE_CUDA": "1",
         "AUTOLLAMACPP_MANAGED": "1",
@@ -418,6 +427,7 @@ def test_script_env_prefix_exact() -> None:
         ),
     ) == {
         "AUTOLLAMACPP_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOLLAMACPP_PORT": "8123",
         "AUTOLLAMACPP_REQUIRE_CUDA": "1",
         "AUTOLLAMACPP_MANAGED": "1",
@@ -439,6 +449,7 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_NVIDIA_DRIVER_VERSION=999.1",
         f"AUTOVLLM_NVIDIA_DRIVER_SHA256={'b' * 64}",
         "AUTOVLLM_API_PORT=8123",
+        "AUTOVLLM_MIN_FREE_GB=20",
         "AUTOVLLM_LLMFIT_VERSION=8.7.6",
         f"AUTOVLLM_LLMFIT_SHA256={'c' * 64}",
         "bash",
@@ -585,6 +596,8 @@ def test_env_prefix_quoting() -> None:
     assert words == [
         "AUTOVLLM_NFS_MOUNT_POINT=/srv/hf-cache",
         "AUTOVLLM_API_PORT=8000",
+        "AUTOVLLM_MIN_FREE_GB=20",
+        "AUTOVLLM_NFS_EXPORT=nfs.example:/exports/huggingface",
         f"AUTOVLLM_MODEL={model}",
         "HF_TOKEN=token '$(touch nope)'",
         "bash",
@@ -3713,3 +3726,14 @@ class TestWaitForSsh:
         ):
             # Should not raise -- just returns after timeout
             await provisioner._wait_for_ssh("host1")
+
+
+def test_start_env_omits_export_when_gateway_has_none() -> None:
+    """Proxy-only deployments keep the start contract without an export."""
+    provisioner = _make_provisioner(nfs_export=None)
+    vllm_env = provisioner._start_script_env("org/model")
+    assert "AUTOVLLM_NFS_EXPORT" not in vllm_env
+    llama_env = provisioner._start_script_env(
+        None, InferenceEngine.LLAMA_CPP, _artifact()
+    )
+    assert "AUTOVLLM_NFS_EXPORT" not in llama_env

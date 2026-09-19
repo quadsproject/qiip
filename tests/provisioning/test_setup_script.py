@@ -805,3 +805,553 @@ exit 0
     else:
         assert operations == []
         assert "no firewall rule required" in result.stdout
+
+
+NFS_OPTS = "rw,vers=3,hard,proto=tcp,timeo=600,retrans=3,sec=sys"
+
+
+def _nfs_env(
+    tmp_path: Path,
+    *,
+    export: str = "storage.example:/exports/huggingface",
+    mounts_line: str | None = None,
+) -> tuple[dict[str, str], Path]:
+    """Env for storage-logic tests: permissive sudo + injectable fixtures.
+
+    fstab and autofs fixtures live under tmp_path so no test can touch the
+    host's /etc/fstab or /etc/auto.* files.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    operation_log = tmp_path / "operations.log"
+    _write_executable(
+        bin_dir / "sudo",
+        """#!/bin/bash
+echo "sudo:$*" >> "$AUTOVLLM_TEST_LOG"
+case "$1" in
+    umount|mount|systemctl) exit 0 ;;
+esac
+exec "$@"
+""",
+    )
+    _write_executable(
+        bin_dir / "mountpoint",
+        """#!/bin/bash
+if grep -qF "$2 " "$AUTOVLLM_MOUNTS_FILE"; then
+    exit 0
+fi
+exit 1
+""",
+    )
+    _write_executable(bin_dir / "fuser", "#!/bin/bash\nexit 1\n")
+    mounts_file = tmp_path / "mounts"
+    mount_point = str(tmp_path / "srv" / "hf-cache")
+    if mounts_line is None:
+        mounts_line = f"{export} {mount_point} nfs {NFS_OPTS} 0 0"
+    mounts_file.write_text(mounts_line + "\n")
+    env = os.environ.copy()
+    env.pop("BASH_ENV", None)
+    env.update(
+        {
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "AUTOVLLM_TEST_LOG": str(operation_log),
+            "AUTOVLLM_NFS_EXPORT": export,
+            "AUTOVLLM_NFS_MOUNT_POINT": mount_point,
+            "AUTOVLLM_MOUNTS_FILE": str(mounts_file),
+            "AUTOVLLM_FSTAB_FILE": str(tmp_path / "fstab"),
+            "AUTOVLLM_AUTO_MAP_DIR": str(tmp_path / "auto"),
+            "AUTOVLLM_MIN_FREE_GB": "1",
+        }
+    )
+    (tmp_path / "auto").mkdir(exist_ok=True)
+    (tmp_path / "fstab").touch()
+    (tmp_path / "srv" / "hf-cache").mkdir(parents=True, exist_ok=True)
+    return env, operation_log
+
+
+def _storage_output(result: subprocess.CompletedProcess[str]) -> tuple[str, int]:
+    return result.stdout + result.stderr, result.returncode
+
+
+def test_verify_nfs_storage_accepts_exact_export_and_options(tmp_path: Path) -> None:
+    env, _log = _nfs_env(tmp_path)
+    result = _run_shell(_source_and("verify_nfs_storage"), env=env)
+    assert result.returncode == 0, result.stderr
+    assert "verified" in result.stdout
+
+
+def test_verify_nfs_storage_rejects_wrong_export_without_touch(
+    tmp_path: Path,
+) -> None:
+    env, log = _nfs_env(tmp_path)
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    Path(env["AUTOVLLM_MOUNTS_FILE"]).write_text(
+        f"other.example:/exports/other {mp} nfs rw,vers=3,hard,proto=tcp,timeo=600,retrans=3 0 0\n"
+    )
+    result = _run_shell(_source_and("verify_nfs_storage"), env=env)
+    assert result.returncode == 2
+    assert "is not the expected export" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("fstype", "opts", "needle"),
+    [
+        ("nfs4", NFS_OPTS, "unsupported"),
+        ("nfs", "rw,vers=3,hard,proto=tcp,timeo=600,sec=sys", "retrans=3"),
+        ("nfs", "rw,hard,proto=tcp,timeo=600,retrans=3,sec=sys", "vers=3"),
+        ("nfs", "rw,vers=3,soft,proto=tcp,timeo=600,retrans=3,sec=sys", "soft"),
+        ("nfs", "rw,vers=3,hard,proto=tcp,timeo=300,retrans=3,sec=sys", "timeo=300"),
+    ],
+)
+def test_verify_nfs_storage_rejects_wrong_fstype_or_options(
+    tmp_path: Path,
+    fstype: str,
+    opts: str,
+    needle: str,
+) -> None:
+    env, _log = _nfs_env(tmp_path)
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    mounts_line = f"storage.example:/exports/huggingface {mp} {fstype} {opts} 0 0"
+    Path(env["AUTOVLLM_MOUNTS_FILE"]).write_text(mounts_line + "\n")
+    result = _run_shell(_source_and("verify_nfs_storage"), env=env)
+    assert result.returncode == 3
+    assert needle in result.stderr
+
+
+def test_verify_nfs_storage_decodes_octal_escapes(tmp_path: Path) -> None:
+    env, _log = _nfs_env(
+        tmp_path,
+        export="storage.example:/exports/with space",
+        mounts_line=(
+            r"storage.example:/exports/with\040space /srv/hf\040cache nfs "
+            + NFS_OPTS
+            + " 0 0"
+        ),
+    )
+    env["AUTOVLLM_NFS_EXPORT"] = "storage.example:/exports/with space"
+    env["AUTOVLLM_NFS_MOUNT_POINT"] = "/srv/hf cache"
+    result = _run_shell(_source_and("verify_nfs_storage"), env=env)
+    assert result.returncode == 0, result.stderr
+
+
+def test_check_storage_capacity_fails_on_proven_shortage(tmp_path: Path) -> None:
+    env, _log = _nfs_env(tmp_path)
+    bin_dir = Path(env["PATH"].split(":")[0])
+    _write_executable(
+        bin_dir / "df",
+        """#!/bin/bash
+if [[ "$1" == "--output=target" ]]; then
+    echo 'Mounted on'
+    echo '/fixture'
+    exit 0
+fi
+if [[ "$1" == "--output=avail" ]]; then
+    echo 'Avail'
+    echo '1073741824'
+    exit 0
+fi
+exit 1
+""",
+    )
+    env["AUTOVLLM_MIN_FREE_GB"] = "20"
+    result = _run_shell(
+        _source_and('check_storage_capacity "$NFS_MOUNT_POINT"'), env=env
+    )
+    assert result.returncode == 1
+    assert "1GB free but 20GB is required" in result.stderr
+
+
+def test_check_storage_capacity_warns_on_probe_failure(tmp_path: Path) -> None:
+    env, _log = _nfs_env(tmp_path)
+    bin_dir = Path(env["PATH"].split(":")[0])
+    _write_executable(bin_dir / "df", "#!/bin/bash\nexit 1\n")
+    result = _run_shell(
+        _source_and('check_storage_capacity "$NFS_MOUNT_POINT"'), env=env
+    )
+    assert result.returncode == 2
+    assert "cannot determine free space" in result.stderr
+
+
+def test_mount_nfs_cache_accepts_matching_mount_without_churn(
+    tmp_path: Path,
+) -> None:
+    env, log = _nfs_env(tmp_path)
+    result = _run_shell(_source_and("mount_nfs_cache"), env=env)
+    assert result.returncode == 0, result.stderr
+    operations = log.read_text().splitlines()
+    assert not [op for op in operations if "umount" in op or " mount " in op]
+
+
+def test_mount_nfs_cache_refuses_wrong_export_without_umount(
+    tmp_path: Path,
+) -> None:
+    env, log = _nfs_env(tmp_path)
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    Path(env["AUTOVLLM_MOUNTS_FILE"]).write_text(
+        f"other.example:/exports/other {mp} nfs rw,vers=3,hard,proto=tcp,timeo=600,retrans=3 0 0\n"
+    )
+    result = _run_shell(_source_and("mount_nfs_cache"), env=env)
+    assert result.returncode != 0
+    assert "refusing to remount" in result.stderr
+    operations = log.read_text().splitlines() if log.exists() else []
+    assert "umount" not in operations
+
+
+def test_mount_nfs_cache_busy_mount_fails_before_umount(tmp_path: Path) -> None:
+    env, log = _nfs_env(tmp_path)
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    Path(env["AUTOVLLM_MOUNTS_FILE"]).write_text(
+        f"storage.example:/exports/huggingface {mp} nfs rw,vers=3,hard,proto=tcp,timeo=300,retrans=3 0 0\n"
+    )
+    bin_dir = Path(env["PATH"].split(":")[0])
+    probe = tmp_path / "probe-bash"
+    _write_executable(probe, "#!/bin/bash\nexit 0\n")
+    env["AUTOVLLM_NFS_PROBE_BASH"] = str(probe)
+    _write_executable(
+        bin_dir / "fuser",
+        """#!/bin/bash
+if [[ "$1" == "-vm" ]]; then
+    echo '1234 holder'
+    exit 1
+fi
+exit 0
+""",
+    )
+    result = _run_shell(_source_and("mount_nfs_cache"), env=env)
+    assert result.returncode != 0
+    assert "is busy" in result.stderr
+    operations = log.read_text().splitlines() if log.exists() else []
+    assert "umount" not in operations
+
+
+def test_ensure_persistence_appends_marked_fstab_entry(tmp_path: Path) -> None:
+    env, _log = _nfs_env(tmp_path)
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    fstab = Path(env["AUTOVLLM_FSTAB_FILE"])
+    fstab.write_text("# existing comment\n")
+    result = _run_shell(
+        _source_and(
+            'ensure_nfs_persistence "vers=3,hard,proto=tcp,timeo=600,retrans=3"'
+        ),
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = fstab.read_text().splitlines()
+    assert any("# qiip-managed" in line and mp in line for line in lines)
+
+
+def test_ensure_persistence_is_idempotent(tmp_path: Path) -> None:
+    env, _log = _nfs_env(tmp_path)
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    fstab = Path(env["AUTOVLLM_FSTAB_FILE"])
+    fstab.write_text("# existing comment\n")
+    cmd = 'ensure_nfs_persistence "vers=3,hard,proto=tcp,timeo=600,retrans=3"'
+    assert _run_shell(_source_and(cmd), env=env).returncode == 0
+    assert _run_shell(_source_and(cmd), env=env).returncode == 0
+    assert sum(1 for line in fstab.read_text().splitlines() if mp in line) == 1
+
+
+def test_ensure_persistence_adopts_matching_unmarked_entry(tmp_path: Path) -> None:
+    env, _log = _nfs_env(tmp_path)
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    fstab = Path(env["AUTOVLLM_FSTAB_FILE"])
+    fstab.write_text(
+        f"storage.example:/exports/huggingface {mp} nfs "
+        "vers=3,hard,proto=tcp,timeo=600,retrans=3,_netdev,nofail 0 0\n"
+    )
+    result = _run_shell(
+        _source_and(
+            'ensure_nfs_persistence "vers=3,hard,proto=tcp,timeo=600,retrans=3"'
+        ),
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "# qiip-managed" in fstab.read_text()
+
+
+def test_ensure_persistence_refuses_conflicting_unmarked_entry(
+    tmp_path: Path,
+) -> None:
+    env, _log = _nfs_env(tmp_path)
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    fstab = Path(env["AUTOVLLM_FSTAB_FILE"])
+    fstab.write_text(
+        f"other.example:/exports/other {mp} nfs "
+        "vers=3,hard,proto=tcp,timeo=600,retrans=3 0 0\n"
+    )
+    result = _run_shell(
+        _source_and(
+            'ensure_nfs_persistence "vers=3,hard,proto=tcp,timeo=600,retrans=3"'
+        ),
+        env=env,
+    )
+    assert result.returncode != 0
+    assert "will not overwrite" in result.stderr
+    assert "other.example:/exports/other" in fstab.read_text()
+
+
+def test_ensure_persistence_updates_autofs_map_with_marker(tmp_path: Path) -> None:
+    env, log = _nfs_env(tmp_path)
+    auto_dir = Path(env["AUTOVLLM_AUTO_MAP_DIR"])
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    (auto_dir / "auto.srv").write_text(
+        "# managed by ops\n"
+        f"{mp} -fstype=nfs,vers=3,hard,proto=tcp,timeo=600,retrans=3 "
+        "storage.example:/exports/huggingface\n"
+    )
+    env["AUTOVLLM_AUTO_MAP_DIR"] = str(auto_dir)
+    result = _run_shell(
+        _source_and(
+            'ensure_nfs_persistence "vers=3,hard,proto=tcp,timeo=600,retrans=3"'
+        ),
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    text = (auto_dir / "auto.srv").read_text()
+    assert f"# qiip-managed {mp}" in text
+    assert "systemctl reload autofs" in log.read_text()
+
+
+def test_ensure_persistence_leaves_foreign_autofs_map_untouched(
+    tmp_path: Path,
+) -> None:
+    """QIIP manages only map entries for its own export; foreign maps stay put."""
+    env, _log = _nfs_env(tmp_path)
+    auto_dir = Path(env["AUTOVLLM_AUTO_MAP_DIR"])
+    foreign = auto_dir / "auto.srv"
+    original = (
+        "/srv/hf-cache -fstype=nfs,vers=3,hard,proto=tcp,timeo=600,retrans=3 "
+        "other.example:/exports/other\n"
+    )
+    foreign.write_text(original)
+    result = _run_shell(
+        _source_and(
+            'ensure_nfs_persistence "vers=3,hard,proto=tcp,timeo=600,retrans=3"'
+        ),
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert foreign.read_text() == original
+
+
+def test_verify_nfs_storage_absent_mount_reports_not_found(tmp_path: Path) -> None:
+    env, _log = _nfs_env(tmp_path)
+    Path(env["AUTOVLLM_MOUNTS_FILE"]).write_text("proc /proc proc rw 0 0\n")
+    result = _run_shell(_source_and("verify_nfs_storage"), env=env)
+    assert result.returncode == 1
+    assert "not found" in result.stderr
+
+
+def test_verify_nfs_storage_accepts_ipv6_bracketed_export(tmp_path: Path) -> None:
+    env, _log = _nfs_env(
+        tmp_path,
+        export="[2001:db8::1]:/exports/huggingface",
+        mounts_line="[2001:db8::1]:/exports/huggingface /srv/hf-cache nfs "
+        + NFS_OPTS
+        + " 0 0",
+    )
+    env["AUTOVLLM_NFS_MOUNT_POINT"] = "/srv/hf-cache"
+    Path(env["AUTOVLLM_MOUNTS_FILE"]).write_text(
+        f"[2001:db8::1]:/exports/huggingface /srv/hf-cache nfs {NFS_OPTS} 0 0\n"
+    )
+    result = _run_shell(_source_and("verify_nfs_storage"), env=env)
+    assert result.returncode == 0, result.stderr
+
+
+def test_ensure_persistence_write_failure_is_fatal(tmp_path: Path) -> None:
+    env, log = _nfs_env(tmp_path)
+    bin_dir = Path(env["PATH"].split(":")[0])
+    _write_executable(
+        bin_dir / "sudo",
+        """#!/bin/bash
+echo "sudo:$*" >> "$AUTOVLLM_TEST_LOG"
+if [[ "$1" == "tee" && "${AUTOVLLM_FAIL_TEE:-0}" == "1" ]]; then
+    exit 1
+fi
+case "$1" in
+    umount|mount|systemctl) exit 0 ;;
+esac
+exec "$@"
+""",
+    )
+    env["AUTOVLLM_FAIL_TEE"] = "1"
+    result = _run_shell(
+        _source_and(
+            'ensure_nfs_persistence "vers=3,hard,proto=tcp,timeo=600,retrans=3"'
+        ),
+        env=env,
+    )
+    assert result.returncode != 0
+    assert "write failed" in result.stderr
+    assert "Updated QIIP" not in result.stdout
+
+
+def test_mount_nfs_cache_remounts_stale_options_when_server_up(
+    tmp_path: Path,
+) -> None:
+    env, log = _nfs_env(tmp_path)
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    Path(env["AUTOVLLM_MOUNTS_FILE"]).write_text(
+        f"storage.example:/exports/huggingface {mp} nfs rw,vers=3,hard,proto=tcp,timeo=300,retrans=3 0 0\n"
+    )
+    bin_dir = Path(env["PATH"].split(":")[0])
+    probe = tmp_path / "probe-bash"
+    _write_executable(probe, "#!/bin/bash\nexit 0\n")
+    env["AUTOVLLM_NFS_PROBE_BASH"] = str(probe)
+    _write_executable(
+        bin_dir / "mount",
+        f"""#!/bin/bash
+echo "mount:$*" >> "$AUTOVLLM_TEST_LOG"
+cat > "$AUTOVLLM_MOUNTS_FILE" <<EOF
+storage.example:/exports/huggingface {mp} nfs rw,vers=3,hard,proto=tcp,timeo=600,retrans=3 0 0
+EOF
+exit 0
+""",
+    )
+    result = _run_shell(_source_and("mount_nfs_cache"), env=env)
+    assert result.returncode == 0, result.stderr
+    assert "umount" in log.read_text()
+    assert "capacity" in result.stdout.lower()
+
+
+def test_mount_nfs_cache_fails_fast_when_server_unreachable(tmp_path: Path) -> None:
+    env, _log = _nfs_env(tmp_path)
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    Path(env["AUTOVLLM_MOUNTS_FILE"]).write_text(
+        f"storage.example:/exports/huggingface {mp} nfs rw,vers=3,hard,proto=tcp,timeo=300,retrans=3 0 0\n"
+    )
+    probe = tmp_path / "probe-bash"
+    _write_executable(probe, "#!/bin/bash\nexit 1\n")
+    env["AUTOVLLM_NFS_PROBE_BASH"] = str(probe)
+    result = _run_shell(_source_and("mount_nfs_cache"), env=env)
+    assert result.returncode != 0
+    assert "not reachable" in result.stderr
+
+
+def test_ensure_autofs_update_is_idempotent(tmp_path: Path) -> None:
+    env, _log = _nfs_env(tmp_path)
+    auto_dir = Path(env["AUTOVLLM_AUTO_MAP_DIR"])
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    (auto_dir / "auto.srv").write_text(
+        f"{mp} -fstype=nfs,vers=3,hard,proto=tcp,timeo=600,retrans=3 "
+        "storage.example:/exports/huggingface\n"
+    )
+    cmd = 'ensure_nfs_persistence "vers=3,hard,proto=tcp,timeo=600,retrans=3"'
+    assert _run_shell(_source_and(cmd), env=env).returncode == 0
+    assert _run_shell(_source_and(cmd), env=env).returncode == 0
+    text = (auto_dir / "auto.srv").read_text()
+    assert text.count(f"# qiip-managed {mp}") == 1
+    assert text.count("storage.example:/exports/huggingface") == 1
+
+
+def test_ensure_persistence_updates_only_matching_autofs_key(
+    tmp_path: Path,
+) -> None:
+    """A second entry mounting the same export under another key stays intact."""
+    env, _log = _nfs_env(tmp_path)
+    auto_dir = Path(env["AUTOVLLM_AUTO_MAP_DIR"])
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    other = str(tmp_path / "mnt" / "other-cache")
+    entry = (
+        "-fstype=nfs,vers=3,hard,proto=tcp,timeo=600,retrans=3 "
+        "storage.example:/exports/huggingface"
+    )
+    (auto_dir / "auto.srv").write_text(f"{mp} {entry}\n{other} {entry}\n")
+    result = _run_shell(
+        _source_and(
+            'ensure_nfs_persistence "vers=3,hard,proto=tcp,timeo=600,retrans=3"'
+        ),
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    text = (auto_dir / "auto.srv").read_text()
+    assert f"# qiip-managed {mp}" in text
+    assert f"{other} {entry}" in text
+    assert text.count("storage.example:/exports/huggingface") == 2
+
+
+def test_ensure_persistence_selects_autofs_map_by_key_not_export(
+    tmp_path: Path,
+) -> None:
+    """An unrelated map sharing the export is never the one QIIP edits."""
+    env, _log = _nfs_env(tmp_path)
+    auto_dir = Path(env["AUTOVLLM_AUTO_MAP_DIR"])
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    other = str(tmp_path / "mnt" / "other-cache")
+    entry = (
+        "-fstype=nfs,vers=3,hard,proto=tcp,timeo=600,retrans=3 "
+        "storage.example:/exports/huggingface"
+    )
+    (auto_dir / "auto.other").write_text(f"{other} {entry}\n")
+    (auto_dir / "auto.srv").write_text(f"{mp} {entry}\n")
+    result = _run_shell(
+        _source_and(
+            'ensure_nfs_persistence "vers=3,hard,proto=tcp,timeo=600,retrans=3"'
+        ),
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert f"# qiip-managed {mp}" in (auto_dir / "auto.srv").read_text()
+    assert (auto_dir / "auto.other").read_text() == f"{other} {entry}\n"
+
+
+def test_ensure_persistence_preserves_escaped_fields_on_reupdate(
+    tmp_path: Path,
+) -> None:
+    """Repeated updates keep \\040/\\011 escapes instead of literal whitespace."""
+    env, _log = _nfs_env(
+        tmp_path,
+        export="storage.example:/exports/with space",
+    )
+    env["AUTOVLLM_NFS_MOUNT_POINT"] = "/srv/hf cache"
+    cmd = 'ensure_nfs_persistence "vers=3,hard,proto=tcp,timeo=600,retrans=3"'
+    assert _run_shell(_source_and(cmd), env=env).returncode == 0
+    assert _run_shell(_source_and(cmd), env=env).returncode == 0
+    text = Path(env["AUTOVLLM_FSTAB_FILE"]).read_text()
+    assert r"storage.example:/exports/with\040space /srv/hf\040cache nfs" in text
+    assert text.count(r"storage.example:/exports/with\040space") == 1
+
+
+def test_ensure_persistence_preserves_escaped_autofs_fields_on_reupdate(
+    tmp_path: Path,
+) -> None:
+    """Repeated autofs updates keep \\040 escapes in key and export."""
+    env, _log = _nfs_env(tmp_path, export="storage.example:/exports/with space")
+    env["AUTOVLLM_NFS_MOUNT_POINT"] = "/srv/hf cache"
+    auto_dir = Path(env["AUTOVLLM_AUTO_MAP_DIR"])
+    (auto_dir / "auto.srv").write_text(
+        "/srv/hf\\040cache -fstype=nfs,vers=3,hard,proto=tcp,timeo=600,retrans=3 "
+        "storage.example:/exports/with\\040space\n"
+    )
+    cmd = 'ensure_nfs_persistence "vers=3,hard,proto=tcp,timeo=600,retrans=3"'
+    assert _run_shell(_source_and(cmd), env=env).returncode == 0
+    assert _run_shell(_source_and(cmd), env=env).returncode == 0
+    text = (auto_dir / "auto.srv").read_text()
+    assert (
+        r"-fstype=nfs,vers=3,hard,proto=tcp,timeo=600,retrans=3 "
+        r"storage.example:/exports/with\040space"
+    ) in text
+    assert text.count(r"storage.example:/exports/with\040space") == 1
+
+
+def test_nfs_server_reachable_probes_bare_ipv6_address(tmp_path: Path) -> None:
+    """The TCP probe gets the unbracketed address; display keeps the brackets."""
+    env, _log = _nfs_env(
+        tmp_path,
+        export="[2001:db8::1]:/exports/huggingface",
+    )
+    probe = tmp_path / "probe-bash"
+    _write_executable(
+        probe,
+        """#!/bin/bash
+if [[ "$2" == *"/dev/tcp/2001:db8::1/2049"* ]] \\
+    && [[ "$2" != *"[2001:db8::1]"* ]]; then
+    exit 0
+fi
+exit 1
+""",
+    )
+    env["AUTOVLLM_NFS_PROBE_BASH"] = str(probe)
+    result = _run_shell(_source_and("nfs_server_reachable"), env=env)
+    assert result.returncode == 0, result.stderr
+    assert "reachable at [2001:db8::1]:2049" in result.stdout

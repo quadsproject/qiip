@@ -204,6 +204,7 @@ clear_script_environment() {
     unset AUTOVLLM_STARTUP_GRACE_PERIOD AUTOVLLM_STARTUP_LOG_LINES
     unset AUTOVLLM_STOP_TIMEOUT AUTOVLLM_STOP_INTERVAL
     unset AUTOVLLM_ATTENTION_BACKEND AUTOVLLM_FLASHINFER_CACHE_DIR
+    unset AUTOVLLM_NFS_EXPORT
 }
 
 configure_attention_backend() {
@@ -302,12 +303,36 @@ prepare_hf_cache() {
 prestage_model_weights() {
     local model="$1"
 
+    # Local directory — already on the node
     if [ -d "$model" ]; then
         return 0
     fi
 
+    # Verify-first: the gateway pre-downloads into the shared export, so a
+    # complete snapshot needs no network and no repeated download. The
+    # local-only verification is idempotent, which is the reusable
+    # verified-completion check. Hub resolves repos under cache_dir, so the
+    # cache root is <mount>/hub, NOT the mount root (HF_HOME=<mount> used for
+    # downloads resolves to the same <mount>/hub).
+    local cache_dir="${NFS_MOUNT_POINT}/hub"
+    local verify_rc=0
+    verify_hf_snapshot "$model" "$cache_dir" || verify_rc=$?
+    if [ "$verify_rc" -eq 0 ]; then
+        echo "Model weights verified complete in shared cache: ${model}"
+        export HF_HUB_OFFLINE=1
+        return 0
+    fi
+    if [ "$verify_rc" -eq 2 ]; then
+        echo "FATAL: cached model ${model} is incomplete; remove ${NFS_MOUNT_POINT}/hub/models--${model//\//'--'} and re-run" >&2
+        return 1
+    fi
+    if [ "$verify_rc" -ne 3 ]; then
+        echo "FATAL: cannot verify cached model ${model} (rc=${verify_rc})" >&2
+        return 1
+    fi
+
     local avail_bytes model_bytes
-    avail_bytes=$(df --output=avail -B1 "$NFS_MOUNT_POINT" 2>/dev/null | tail -1 | xargs) || true
+    avail_bytes=$(timeout --kill-after=2 "${AUTOVLLM_PROBE_TIMEOUT:-10}" df --output=avail -B1 "$NFS_MOUNT_POINT" 2>/dev/null | tail -1 | xargs) || true
     model_bytes=$("$VLLM_PYTHON" -c "
 import sys; from huggingface_hub import model_info
 print(sum(s.size or 0 for s in model_info(sys.argv[1]).siblings))
@@ -321,12 +346,20 @@ print(sum(s.size or 0 for s in model_info(sys.argv[1]).siblings))
         return 1
     fi
 
-    echo "Pre-staging model weights in single process: ${model}"
-    HF_HOME="$NFS_MOUNT_POINT" "$VLLM_PYTHON" -c "
+    echo "Preparing model weights (download to shared cache; progress below): ${model}"
+    if ! HF_HOME="$NFS_MOUNT_POINT" "$VLLM_PYTHON" -c "
 import sys; from huggingface_hub import snapshot_download
 snapshot_download(sys.argv[1])
-" "$model"
-    echo "Model weights staged; vLLM will launch with HF_HUB_OFFLINE=1"
+" "$model"; then
+        echo "FATAL: model ${model} download failed; check network access, cache free space, and that the export is not root_squashed for this node" >&2
+        return 1
+    fi
+
+    if ! verify_hf_snapshot "$model" "$cache_dir"; then
+        echo "FATAL: model ${model} download did not produce a verifiable snapshot" >&2
+        return 1
+    fi
+    echo "Model weights staged and verified; vLLM will launch with HF_HUB_OFFLINE=1"
     export HF_HUB_OFFLINE=1
 }
 

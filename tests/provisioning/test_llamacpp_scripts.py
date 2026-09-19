@@ -1437,3 +1437,118 @@ def test_process_identity_survives_managed_binary_relink(tmp_path: Path) -> None
 
     assert before_relink.returncode == 0
     assert after_relink.returncode == 0
+
+
+def _split_artifact(
+    tmp_path: Path, *, shards: int, empty: bool = False
+) -> tuple[Path, Path]:
+    snapshot = tmp_path / "hub" / "models--org--split-model" / "snapshots" / ("a" * 40)
+    blobs = tmp_path / "hub" / "models--org--split-model" / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir(parents=True)
+    paths: list[Path] = []
+    for index in range(1, shards + 1):
+        blob = blobs / hashlib.sha256(str(index).encode()).hexdigest()
+        blob.write_bytes(b"" if empty else f"shard {index}".encode())
+        shard = snapshot / f"model-{index:05d}-of-{shards:05d}.gguf"
+        shard.symlink_to(Path(os.path.relpath(blob, snapshot)))
+        paths.append(shard)
+    return paths[0], paths[-1]
+
+
+def test_split_family_missing_shard_fails(tmp_path: Path) -> None:
+    first, last = _split_artifact(tmp_path, shards=2)
+    last.unlink()
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
+        "AUTOLLAMACPP_GGUF_PATH": str(first.relative_to(tmp_path)),
+        "AUTOLLAMACPP_MODEL_ALIAS": "org/split-model",
+    }
+    result = _run_shell(
+        _source_start("resolve_gguf_artifact"),
+        env=env,
+    )
+    assert result.returncode != 0
+    assert last.as_posix() in result.stderr
+
+
+def test_split_family_empty_shard_fails(tmp_path: Path) -> None:
+    first, _last = _split_artifact(tmp_path, shards=2, empty=True)
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
+        "AUTOLLAMACPP_GGUF_PATH": str(first.relative_to(tmp_path)),
+        "AUTOLLAMACPP_MODEL_ALIAS": "org/split-model",
+    }
+    result = _run_shell(
+        _source_start("resolve_gguf_artifact"),
+        env=env,
+    )
+    assert result.returncode != 0
+    assert "empty" in result.stderr
+
+
+def test_split_family_high_shard_missing_fails(tmp_path: Path) -> None:
+    """A 10-shard family missing shard 10: the padded count must read decimal.
+    Bash would take 00010 as octal eight and never check shards 9 and 10."""
+    first, last = _split_artifact(tmp_path, shards=10)
+    last.unlink()
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
+        "AUTOLLAMACPP_GGUF_PATH": str(first.relative_to(tmp_path)),
+        "AUTOLLAMACPP_MODEL_ALIAS": "org/split-model",
+    }
+    result = _run_shell(
+        _source_start("resolve_gguf_artifact"),
+        env=env,
+    )
+    assert result.returncode != 0
+    assert last.as_posix() in result.stderr
+
+
+def test_split_family_octal_looking_count_is_not_truncated(tmp_path: Path) -> None:
+    """An 8-shard family missing shard 8 must fail, not skip the shard loop."""
+    first, last = _split_artifact(tmp_path, shards=8)
+    last.unlink()
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
+        "AUTOLLAMACPP_GGUF_PATH": str(first.relative_to(tmp_path)),
+        "AUTOLLAMACPP_MODEL_ALIAS": "org/split-model",
+    }
+    result = _run_shell(
+        _source_start("resolve_gguf_artifact"),
+        env=env,
+    )
+    assert result.returncode != 0
+    assert last.as_posix() in result.stderr
+
+
+def test_storage_preflight_verifies_match_or_fails_on_wrong_export(
+    tmp_path: Path,
+) -> None:
+    mounts = tmp_path / "mounts"
+    mount_point = str(tmp_path / "cache")
+    mounts.write_text(
+        f"storage.example:/exports/huggingface {mount_point} nfs "
+        "rw,vers=3,hard,proto=tcp,timeo=600,retrans=3,sec=sys 0 0\n"
+    )
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": mount_point,
+        "AUTOVLLM_NFS_EXPORT": "storage.example:/exports/huggingface",
+        "AUTOVLLM_MOUNTS_FILE": str(mounts),
+    }
+    good = _run_shell(_source_start("run_storage_preflight"), env=env)
+    assert good.returncode == 0, good.stderr
+    assert "NFS storage verified" in good.stdout
+
+    mounts.write_text(
+        f"other.example:/exports/other {mount_point} nfs "
+        "rw,vers=3,hard,proto=tcp,timeo=600,retrans=3 0 0\n"
+    )
+    bad = _run_shell(_source_start("run_storage_preflight"), env=env)
+    assert bad.returncode != 0
+    assert "not the expected export" in bad.stderr

@@ -15,6 +15,24 @@ NFS_MOUNT_POINT="${AUTOVLLM_NFS_MOUNT_POINT:-/srv/hf-cache}"
 HF_CACHE_LINK="${AUTOVLLM_HF_CACHE_LINK:-/root/.cache/huggingface}"
 FLASHINFER_CACHE="${AUTOVLLM_FLASHINFER_CACHE_DIR:-/var/cache/flashinfer}"
 ATTENTION_BACKEND_OVERRIDE="${AUTOVLLM_ATTENTION_BACKEND:-}"
+NFS_EXPORT="${AUTOVLLM_NFS_EXPORT:-}"
+
+# Shared storage primitives (source/fstype/option verification, capacity).
+# Resolved from the node bundle layout first, then the installed location used
+# by systemd's ExecStartPre (setup.sh installs qiip-setup-base.sh).
+# shellcheck disable=SC1091 source=../common/setup-base.sh
+_COMMON_SH=""
+if [ -f "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/common/setup-base.sh" ]; then
+    _COMMON_SH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/common/setup-base.sh"
+elif [ -f /usr/local/bin/qiip-setup-base.sh ]; then
+    _COMMON_SH="/usr/local/bin/qiip-setup-base.sh"
+fi
+if [ -n "$_COMMON_SH" ]; then
+    # shellcheck disable=SC1090
+    source "$_COMMON_SH"
+else
+    echo "WARNING: setup-base.sh not found; storage verification disabled" >&2
+fi
 
 # Callers can pre-set these (start-vllm.sh does after detect_gpu_info /
 # configure_vllm_params); otherwise preflight detects them itself.
@@ -133,6 +151,56 @@ check_cuda_devices() {
 
 # ── 4. Model path / space ───────────────────────────────────────────────
 
+# Mirrors the gateway's ModelCatalogService._snapshot_state (catalog.py): the
+# local-only snapshot_download call checks the cached tree manifest and rejects
+# snapshots with missing files, so a partial cache dir is never declared ready.
+# huggingface_hub 1.x only checks completeness when the tree manifest
+# (trees/<commit>.json) is cached: with the manifest absent, an existing
+# snapshot dir is returned as-is. Require the manifest here, otherwise a
+# manifest-less snapshot is reported as complete and the download that could
+# repair it is skipped.
+# Exit 0 complete, 2 incomplete (missing files), 3 not present, 4 probe timed out.
+verify_hf_snapshot() {
+    local model="$1" cache_dir="$2"
+    local out rc repo_dir commit manifest
+    rc=0
+    repo_dir="${cache_dir}/models--${model//\//'--'}"
+    if timeout --kill-after=2 "${AUTOVLLM_PROBE_TIMEOUT:-10}" test -r "${repo_dir}/refs/main"; then
+        commit=$(timeout --kill-after=2 "${AUTOVLLM_PROBE_TIMEOUT:-10}" cat "${repo_dir}/refs/main") || return 4
+        commit=$(printf '%s' "$commit" | tr -d '[:space:]')
+        [ -z "$commit" ] && return 3
+        manifest="${repo_dir}/trees/${commit}.json"
+        [ -r "$manifest" ] || return 3
+    fi
+    out=$(timeout --kill-after=2 "${AUTOVLLM_PROBE_TIMEOUT:-10}" "$VLLM_PYTHON" -c '
+import sys
+from huggingface_hub import snapshot_download
+from huggingface_hub.errors import (
+    IncompleteSnapshotError,
+    LocalEntryNotFoundError,
+    RepositoryNotFoundError,
+)
+
+model, cache_dir = sys.argv[1], sys.argv[2]
+try:
+    snapshot_download(model, repo_type="model", cache_dir=cache_dir, local_files_only=True)
+except IncompleteSnapshotError:
+    sys.exit(2)
+except (LocalEntryNotFoundError, RepositoryNotFoundError):
+    sys.exit(3)
+' "$model" "$cache_dir" 2>&1) || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        2) return 2 ;;
+        3) return 3 ;;
+        124) return 4 ;;
+        *)
+            echo "FATAL: cannot verify cached model ${model}: $(printf '%s\n' "$out" | tail -1)" >&2
+            return 1
+            ;;
+    esac
+}
+
 check_model() {
     if [ -z "$MODEL_PATH" ]; then
         _mark WARN "No model specified (AUTOVLLM_MODEL) — skipping model-path check"
@@ -140,7 +208,7 @@ check_model() {
     fi
 
     # Local directory — already downloaded
-    if [ -d "$MODEL_PATH" ]; then
+    if timeout --kill-after=2 "${AUTOVLLM_PROBE_TIMEOUT:-10}" test -d "$MODEL_PATH"; then
         if [ ! -r "$MODEL_PATH" ]; then
             _bail "Model directory ${MODEL_PATH} exists but is not readable"
         fi
@@ -148,24 +216,51 @@ check_model() {
         return 0
     fi
 
-    # HF hub model — check cache, then free space
-    local cache_dir="${NFS_MOUNT_POINT}"
+    # HF hub model — verify completeness of the local snapshot first, then
+    # capacity for a download when the snapshot is absent. Hub resolves the
+    # repo under <cache_dir>/models--<slug>: the cache root is the hub dir,
+    # not the NFS mount root (the gateway stages under <mount>/hub, and
+    # HF_HOME=<mount> for downloads resolves to the same place).
+    local cache_dir="${NFS_MOUNT_POINT}/hub"
     if [ -L "$HF_CACHE_LINK" ]; then
-        cache_dir=$(readlink -f "$HF_CACHE_LINK")
+        local link_target
+        link_target=$(timeout --kill-after=2 "${AUTOVLLM_PROBE_TIMEOUT:-10}" readlink -f "$HF_CACHE_LINK" 2>/dev/null) || true
+        [ -n "$link_target" ] && cache_dir="${link_target}/hub"
+    fi
+
+    if verify_hf_snapshot "$MODEL_PATH" "$cache_dir"; then
+        _mark PASS "Model ${MODEL_PATH} verified complete in cache at ${cache_dir}"
+        return 0
+    else
+        local verify_rc=$?
+        if [ "$verify_rc" -eq 2 ]; then
+            _bail "Model ${MODEL_PATH} snapshot is incomplete in ${cache_dir}; remove the partial repo directory and re-run setup"
+        fi
+        if [ "$verify_rc" -eq 4 ]; then
+            _mark WARN "Model ${MODEL_PATH} cache verification timed out (storage slow or unreachable); preparation will re-check"
+        elif [ "$verify_rc" -ne 3 ]; then
+            _bail "Model ${MODEL_PATH} could not be verified (rc=${verify_rc})"
+        fi
     fi
 
     local slug="${MODEL_PATH//\//'--'}"
-    if [ -d "${cache_dir}/hub/models--${slug}" ]; then
-        _mark PASS "Model ${MODEL_PATH} cached at ${cache_dir}"
-        return 0
+    if timeout --kill-after=2 "${AUTOVLLM_PROBE_TIMEOUT:-10}" test -d "${cache_dir}/models--${slug}"; then
+        _mark WARN "Model ${MODEL_PATH} cache directory exists but could not be verified; a download will repair it"
     fi
 
-    if [ ! -d "$cache_dir" ] || [ ! -w "$cache_dir" ]; then
+    # Hub creates <cache_dir> on first write and downloads under <mount>/hub,
+    # so a missing hub subdirectory is fine as long as the mount is writable.
+    local write_root="$cache_dir"
+    if ! timeout --kill-after=2 "${AUTOVLLM_PROBE_TIMEOUT:-10}" test -d "$write_root"; then
+        write_root="${NFS_MOUNT_POINT}"
+    fi
+    if ! timeout --kill-after=2 "${AUTOVLLM_PROBE_TIMEOUT:-10}" test -d "$write_root" \
+        || ! timeout --kill-after=2 "${AUTOVLLM_PROBE_TIMEOUT:-10}" test -w "$write_root"; then
         _bail "Cache ${cache_dir} missing or not writable — model ${MODEL_PATH} needs download"
     fi
 
     local avail_bytes model_bytes
-    avail_bytes=$(df --output=avail -B1 "$cache_dir" 2>/dev/null | tail -1 | xargs) || true
+    avail_bytes=$(timeout --kill-after=2 "${AUTOVLLM_PROBE_TIMEOUT:-10}" df --output=avail -B1 "$cache_dir" 2>/dev/null | tail -1 | xargs) || true
     model_bytes=$("$VLLM_PYTHON" -c "
 import sys; from huggingface_hub import model_info
 print(sum(s.size or 0 for s in model_info(sys.argv[1]).siblings))
@@ -186,6 +281,19 @@ print(sum(s.size or 0 for s in model_info(sys.argv[1]).siblings))
 # ── 5. NFS mount health ────────────────────────────────────────────────
 
 check_nfs_mounts() {
+    # Managed runs may carry the exact export (AUTOVLLM_NFS_EXPORT); when
+    # present, verify source, filesystem type, and required options against it
+    # and fail closed. With no export (operator/direct run) the legacy
+    # warning-only path below applies.
+    if [ -n "$NFS_EXPORT" ]; then
+        if verify_nfs_storage; then
+            _mark PASS "NFS mount verified: source=${NFS_EXPORT}, NFSv3, required options"
+            return 0
+        else
+            _bail "NFS storage verification failed at ${NFS_MOUNT_POINT} (see message above)"
+        fi
+    fi
+
     local paths=("$NFS_MOUNT_POINT" "$FLASHINFER_CACHE")
     if [ -L "$HF_CACHE_LINK" ]; then
         paths+=("$(readlink -f "$HF_CACHE_LINK")")
@@ -348,6 +456,17 @@ run_preflight() {
     check_cuda_devices
     check_model
     check_nfs_mounts
+    # Model-cache space is verified in check_model only when a download is
+    # needed; JIT kernel cache space is the only write at start time. The
+    # directory is created here so the check never probes zero filesystems.
+    mkdir -p "$FLASHINFER_CACHE"
+    check_storage_capacity "$FLASHINFER_CACHE" || {
+        local cap_rc=$?
+        if [ "$cap_rc" -eq 1 ]; then
+            _bail "Insufficient free space for the FlashInfer JIT cache (see above)"
+        fi
+        _mark WARN "Could not verify storage capacity (see above)"
+    }
     check_attention_backend
     check_persistence_mode
     _summary

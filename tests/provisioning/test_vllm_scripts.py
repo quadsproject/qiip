@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import signal
 import subprocess
 import time
@@ -64,12 +65,34 @@ if [[ "$*" == *'torch.cuda.device_count()'* ]]; then
     echo 1
     exit 0
 fi
+if [[ "$*" == *'local_files_only'* ]]; then
+    case "${AUTOVLLM_TEST_SNAPSHOT_STATE:-complete}" in
+        complete) echo complete; exit 0 ;;
+        incomplete) echo "incomplete" >&2; exit 2 ;;
+        hung) echo "hung" >&2; sleep 30; exit 3 ;;
+        download_fails) echo "missing" >&2; exit 3 ;;
+        missing)
+            if [[ -f "${AUTOVLLM_TEST_SNAPSHOT_FLAG:-/nonexistent}" ]]; then
+                echo complete; exit 0
+            fi
+            echo "missing" >&2; exit 3
+            ;;
+    esac
+fi
+if [[ "$*" == *'snapshot_download'* ]]; then
+    if [[ "${AUTOVLLM_TEST_SNAPSHOT_STATE:-complete}" != "download_fails" ]]; then
+        touch "${AUTOVLLM_TEST_SNAPSHOT_FLAG:-/nonexistent}" 2>/dev/null || true
+    fi
+    exit 0
+fi
 [[ "${AUTOVLLM_FLASHINFER_AVAILABLE:-1}" == "1" ]]
 """,
     )
 
     cache_dir = tmp_path / "nfs-cache"
     cache_dir.mkdir(exist_ok=True)
+    flashinfer_dir = tmp_path / "flashinfer-cache"
+    flashinfer_dir.mkdir(exist_ok=True)
     env = os.environ.copy()
     env.pop("INVOCATION_ID", None)
     env.pop("AUTOVLLM_DTYPE", None)
@@ -83,6 +106,8 @@ fi
             "AUTOVLLM_HF_CACHE_LINK": str(tmp_path / "cache" / "huggingface"),
             "AUTOVLLM_LOG_FILE": str(tmp_path / "vllm-serve.log"),
             "AUTOVLLM_PYTHON": str(flashinfer_python),
+            "AUTOVLLM_FLASHINFER_CACHE_DIR": str(flashinfer_dir),
+            "AUTOVLLM_MIN_FREE_GB": "1",
             "AUTOVLLM_STARTUP_GRACE_PERIOD": "0.05",
             "AUTOVLLM_STOP_TIMEOUT": "2",
             "AUTOVLLM_STOP_INTERVAL": "0.01",
@@ -1007,3 +1032,503 @@ exit 7
     assert "CUDA initialization failed" in result.stderr
     assert "vLLM started" not in result.stdout
     assert not Path(env["AUTOVLLM_PID_FILE"]).exists()
+
+
+def _run_preflight_command(
+    tmp_path: Path,
+    *,
+    snapshot_state: str,
+    model: str = "org/model",
+) -> subprocess.CompletedProcess[str]:
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=tmp_path / "fake-vllm",
+        process_log=tmp_path / "process.log",
+    )
+    env["AUTOVLLM_MODEL"] = model
+    env["AUTOVLLM_TEST_SNAPSHOT_STATE"] = snapshot_state
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+MODEL_PATH={shlex.quote(model)}
+export MODEL_PATH
+run_preflight
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+
+def test_preflight_rejects_incomplete_snapshot(tmp_path: Path) -> None:
+    result = _run_preflight_command(tmp_path, snapshot_state="incomplete")
+
+    assert result.returncode != 0
+    assert "incomplete" in result.stdout + result.stderr
+
+
+def test_preflight_accepts_verified_complete_snapshot(tmp_path: Path) -> None:
+    result = _run_preflight_command(tmp_path, snapshot_state="complete")
+
+    assert result.returncode == 0, result.stderr
+    assert "verified complete" in result.stdout
+
+
+def test_prestage_skips_download_when_snapshot_verified(tmp_path: Path) -> None:
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=tmp_path / "fake-vllm",
+        process_log=tmp_path / "process.log",
+    )
+    env["AUTOVLLM_TEST_SNAPSHOT_STATE"] = "complete"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+prestage_model_weights 'org/model'
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "verified complete" in result.stdout
+    assert "Preparing model weights" not in result.stdout
+
+
+def test_prestage_downloads_then_verifies_when_missing(tmp_path: Path) -> None:
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=tmp_path / "fake-vllm",
+        process_log=tmp_path / "process.log",
+    )
+    env["AUTOVLLM_TEST_SNAPSHOT_STATE"] = "missing"
+    env["AUTOVLLM_TEST_SNAPSHOT_FLAG"] = str(tmp_path / "downloaded.flag")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+prestage_model_weights 'org/model'
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Preparing model weights" in result.stdout
+    assert "staged and verified" in result.stdout
+
+
+def test_preflight_warns_when_snapshot_probe_times_out(tmp_path: Path) -> None:
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=tmp_path / "fake-vllm",
+        process_log=tmp_path / "process.log",
+    )
+    env["AUTOVLLM_MODEL"] = "org/model"
+    env["AUTOVLLM_TEST_SNAPSHOT_STATE"] = "hung"
+    env["AUTOVLLM_PROBE_TIMEOUT"] = "1"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+MODEL_PATH='org/model'
+export MODEL_PATH
+run_preflight
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "timed out" in result.stdout + result.stderr
+
+
+def test_prestage_fails_when_verification_times_out(tmp_path: Path) -> None:
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=tmp_path / "fake-vllm",
+        process_log=tmp_path / "process.log",
+    )
+    env["AUTOVLLM_TEST_SNAPSHOT_STATE"] = "hung"
+    env["AUTOVLLM_PROBE_TIMEOUT"] = "1"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+prestage_model_weights 'org/model'
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "cannot verify cached model" in result.stderr
+
+
+def test_preflight_snapshot_probe_failure_fails_closed(tmp_path: Path) -> None:
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=tmp_path / "fake-vllm",
+        process_log=tmp_path / "process.log",
+    )
+    env["AUTOVLLM_MODEL"] = "org/model"
+    bin_dir = Path(env["PATH"].split(":")[0])
+    _write_executable(
+        bin_dir / "fake-python",
+        """#!/bin/bash
+if [[ "$*" == *'torch.cuda.device_count()'* ]]; then
+    echo 1
+    exit 0
+fi
+if [[ "$*" == *'local_files_only'* ]]; then
+    echo "import error" >&2
+    exit 1
+fi
+exit 0
+""",
+    )
+    env["AUTOVLLM_PYTHON"] = str(bin_dir / "fake-python")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+MODEL_PATH='org/model'
+export MODEL_PATH
+run_preflight
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "could not be verified" in result.stdout + result.stderr
+
+
+def test_preflight_verifies_nfs_export_match_and_rejects_mismatch(
+    tmp_path: Path,
+) -> None:
+    for expect_ok in (True, False):
+        env = _script_environment(
+            tmp_path,
+            vllm_bin=tmp_path / "fake-vllm",
+            process_log=tmp_path / "process.log",
+        )
+        env["AUTOVLLM_MODEL"] = "org/model"
+        env["AUTOVLLM_NFS_EXPORT"] = "storage.example:/exports/huggingface"
+        mounts = tmp_path / f"mounts-{expect_ok}"
+        source = (
+            "storage.example:/exports/huggingface"
+            if expect_ok
+            else "other.example:/exports/other"
+        )
+        mounts.write_text(
+            f"{source} {env['AUTOVLLM_NFS_MOUNT_POINT']} nfs "
+            "rw,vers=3,hard,proto=tcp,timeo=600,retrans=3,sec=sys 0 0\n"
+        )
+        env["AUTOVLLM_MOUNTS_FILE"] = str(mounts)
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+MODEL_PATH='org/model'
+export MODEL_PATH
+run_preflight
+""",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if expect_ok:
+            assert result.returncode == 0, result.stderr
+            assert "NFS mount verified" in result.stdout
+        else:
+            assert result.returncode != 0
+            assert "verification failed" in result.stdout + result.stderr
+
+
+def test_preflight_fails_on_proven_flashinfer_capacity_shortage(
+    tmp_path: Path,
+) -> None:
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=tmp_path / "fake-vllm",
+        process_log=tmp_path / "process.log",
+    )
+    env["AUTOVLLM_MODEL"] = "org/model"
+    bin_dir = Path(env["PATH"].split(":")[0])
+    _write_executable(
+        bin_dir / "df",
+        """#!/bin/bash
+if [[ "$1" == "--output=target" ]]; then
+    echo 'Mounted on'
+    echo '/fixture'
+    exit 0
+fi
+echo 'Avail'
+echo '0'
+exit 0
+""",
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+MODEL_PATH='org/model'
+export MODEL_PATH
+run_preflight
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Insufficient free space" in result.stdout + result.stderr
+
+
+def test_prestage_fails_when_download_is_not_verifiable(tmp_path: Path) -> None:
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=tmp_path / "fake-vllm",
+        process_log=tmp_path / "process.log",
+    )
+    env["AUTOVLLM_TEST_SNAPSHOT_STATE"] = "download_fails"
+    env["AUTOVLLM_TEST_SNAPSHOT_FLAG"] = str(tmp_path / "downloaded.flag")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+prestage_model_weights 'org/model'
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "did not produce a verifiable snapshot" in result.stderr
+
+
+def test_prestage_verifies_against_hub_cache_dir(tmp_path: Path) -> None:
+    """Verification must use the hub cache root (<mount>/hub), not the mount."""
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=tmp_path / "fake-vllm",
+        process_log=tmp_path / "process.log",
+    )
+    cache = Path(env["AUTOVLLM_NFS_MOUNT_POINT"]) / "hub"
+    repo = cache / "models--org--model"
+    commit = "a" * 40
+    (repo / "refs").mkdir(parents=True)
+    (repo / "refs" / "main").write_text(commit)
+    (repo / "snapshots" / commit).mkdir(parents=True)
+    (repo / "snapshots" / commit / "config.json").write_text("{}")
+    (repo / "trees").mkdir()
+    (repo / "trees" / f"{commit}.json").write_text("{}")
+    observer = tmp_path / "probed-cache-dir"
+    bin_dir = Path(env["PATH"].split(":")[0])
+    _write_executable(
+        bin_dir / "fake-python",
+        f"""#!/bin/bash
+if [[ "$*" == *'torch.cuda.device_count()'* ]]; then
+    echo 1
+    exit 0
+fi
+if [[ "$*" == *'local_files_only'* ]]; then
+    printf '%s\\n' "$4" >> '{observer}'
+    if [[ -d "$4/models--org--model/snapshots" ]]; then
+        echo complete
+        exit 0
+    fi
+    echo missing >&2
+    exit 3
+fi
+exit 0
+""",
+    )
+    env["AUTOVLLM_PYTHON"] = str(bin_dir / "fake-python")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+prestage_model_weights 'org/model'
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "verified complete" in result.stdout
+    assert observer.read_text().splitlines() == [str(cache)]
+
+
+def test_preflight_verifies_against_hub_cache_dir(tmp_path: Path) -> None:
+    """Preflight resolves the repo under <hub>/models--<slug> too."""
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=tmp_path / "fake-vllm",
+        process_log=tmp_path / "process.log",
+    )
+    env["AUTOVLLM_MODEL"] = "org/model"
+    cache = Path(env["AUTOVLLM_NFS_MOUNT_POINT"]) / "hub"
+    repo = cache / "models--org--model"
+    commit = "a" * 40
+    (repo / "refs").mkdir(parents=True)
+    (repo / "refs" / "main").write_text(commit)
+    (repo / "snapshots" / commit).mkdir(parents=True)
+    (repo / "snapshots" / commit / "config.json").write_text("{}")
+    (repo / "trees").mkdir()
+    (repo / "trees" / f"{commit}.json").write_text("{}")
+    bin_dir = Path(env["PATH"].split(":")[0])
+    _write_executable(
+        bin_dir / "fake-python",
+        """#!/bin/bash
+if [[ "$*" == *'torch.cuda.device_count()'* ]]; then
+    echo 1
+    exit 0
+fi
+if [[ "$*" == *'local_files_only'* ]]; then
+    if [[ -d "$4/models--org--model/snapshots" ]]; then
+        echo complete
+        exit 0
+    fi
+    echo missing >&2
+    exit 3
+fi
+exit 0
+""",
+    )
+    env["AUTOVLLM_PYTHON"] = str(bin_dir / "fake-python")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+MODEL_PATH='org/model'
+export MODEL_PATH
+run_preflight
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "verified complete" in result.stdout
+
+
+def test_prestage_repairs_snapshot_without_tree_manifest(tmp_path: Path) -> None:
+    """Without a cached tree manifest a snapshot is unverifiable: preparation
+    must run instead of selecting the offline path. huggingface_hub 1.26
+    returns an existing snapshot dir as-is when the manifest is absent."""
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=tmp_path / "fake-vllm",
+        process_log=tmp_path / "process.log",
+    )
+    cache = Path(env["AUTOVLLM_NFS_MOUNT_POINT"]) / "hub"
+    repo = cache / "models--org--model"
+    commit = "a" * 40
+    (repo / "refs").mkdir(parents=True)
+    (repo / "refs" / "main").write_text(commit)
+    (repo / "snapshots" / commit).mkdir(parents=True)
+    (repo / "snapshots" / commit / "config.json").write_text("{}")
+    # No trees/<commit>.json on purpose.
+    bin_dir = Path(env["PATH"].split(":")[0])
+    _write_executable(
+        bin_dir / "fake-python",
+        f"""#!/bin/bash
+if [[ "$*" == *'local_files_only'* ]]; then
+    echo complete
+    exit 0
+fi
+if [[ "$*" == *'snapshot_download'* ]]; then
+    mkdir -p '{repo}/trees'
+    printf '{{}}\\n' > '{repo}/trees/{commit}.json'
+    exit 0
+fi
+exit 0
+""",
+    )
+    env["AUTOVLLM_PYTHON"] = str(bin_dir / "fake-python")
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+prestage_model_weights 'org/model'
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Preparing model weights" in result.stdout
+    assert "staged and verified" in result.stdout

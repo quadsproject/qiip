@@ -637,6 +637,7 @@ class NodeProvisioner:
             "AUTOVLLM_NVIDIA_DRIVER_VERSION": self._settings.nvidia_driver_version,
             "AUTOVLLM_NVIDIA_DRIVER_SHA256": self._settings.nvidia_driver_sha256,
             "AUTOVLLM_API_PORT": str(self._settings.vllm_port),
+            "AUTOVLLM_MIN_FREE_GB": str(self._settings.min_disk_gb),
             "AUTOVLLM_LLMFIT_VERSION": self._llmfit_version,
             "AUTOVLLM_LLMFIT_SHA256": self._llmfit_sha256,
         }
@@ -685,6 +686,8 @@ class NodeProvisioner:
                 raise ProvisioningError("llama_cpp start requires a GGUF artifact")
             env["AUTOLLAMACPP_GGUF_PATH"] = artifact.node_relative_entrypoint
             env["AUTOLLAMACPP_MODEL_ALIAS"] = artifact.model_alias
+            if self._nfs_export is not None:
+                env["AUTOVLLM_NFS_EXPORT"] = self._nfs_export
         else:
             if llamacpp_request is not None:
                 raise ProvisioningError(
@@ -693,7 +696,10 @@ class NodeProvisioner:
             env = {
                 "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
                 "AUTOVLLM_API_PORT": str(self._settings.vllm_port),
+                "AUTOVLLM_MIN_FREE_GB": str(self._settings.min_disk_gb),
             }
+            if self._nfs_export is not None:
+                env["AUTOVLLM_NFS_EXPORT"] = self._nfs_export
             if model is not None:
                 env["AUTOVLLM_MODEL"] = model
             if vllm_params is not None:
