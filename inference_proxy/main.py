@@ -36,6 +36,7 @@ from inference_proxy.api.admin_tokens import admin_tokens_router
 from inference_proxy.api.auth import auth_router
 from inference_proxy.api.chat import chat_router
 from inference_proxy.api.dashboard import dashboard_router
+from inference_proxy.api.dialects import dialect_for_path
 from inference_proxy.api.errors import ApiAuthError
 from inference_proxy.api.fleet import fleet_router
 from inference_proxy.api.middleware import (
@@ -578,21 +579,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     async def _api_auth_error_handler(
-        _request: Request,
+        request: Request,
         exc: Exception,
     ) -> JSONResponse:
-        """Render token-auth failures as an OpenAI-compatible 401 body."""
+        """Render token-auth failures as a 401 in the client's API format.
+
+        OpenAI-compatible routes get the ``invalid_api_key`` body; the
+        Anthropic Messages API gets Anthropic's ``authentication_error``.
+        """
         if not isinstance(exc, ApiAuthError):
             raise exc
+        error = ErrorResponse(
+            error=ErrorDetail(
+                message=exc.message,
+                type="invalid_request_error",
+                code="invalid_api_key",
+            )
+        )
+        dialect = dialect_for_path(request.url.path)
         return JSONResponse(
             status_code=401,
-            content=ErrorResponse(
-                error=ErrorDetail(
-                    message=exc.message,
-                    type="invalid_request_error",
-                    code="invalid_api_key",
-                )
-            ).model_dump(),
+            content=dialect.error_content(error, 401),
             headers={"WWW-Authenticate": "Bearer"},
         )
 

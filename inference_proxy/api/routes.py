@@ -1,9 +1,16 @@
-"""OpenAI-compatible API route handlers for the inference proxy.
+"""Inference API route handlers for the inference proxy.
 
 Provides FastAPI route handlers for:
 - POST /v1/chat/completions (streaming + non-streaming)
 - POST /v1/completions (streaming + non-streaming)
+- POST /v1/messages (Anthropic Messages API, streaming + non-streaming)
+- POST /v1/messages/count_tokens (Anthropic token counting)
+- POST /v1/responses (OpenAI Responses API, streaming + non-streaming)
 - GET /v1/models (aggregated model listing from registry)
+
+The Messages and Responses APIs are forwarded to backends that implement
+them natively (vLLM and llama.cpp); ``dialects`` holds the few per-format
+details the proxy itself needs.
 
 Route handlers depend on abstractions (ProxyClient, NodeRegistry) via
 dependency injection, following the Dependency Inversion Principle.
@@ -26,10 +33,17 @@ import structlog
 from fastapi import APIRouter, Depends
 from fastapi import Request as StarletteRequest
 from fastapi.responses import JSONResponse
-from fastapi.sse import EventSourceResponse, format_sse_event
+from fastapi.sse import EventSourceResponse
 from httpx_sse import EventSource, aconnect_sse
 from starlette.background import BackgroundTask
 
+from inference_proxy.api.dialects import (
+    ANTHROPIC_MESSAGES,
+    OPENAI_CHAT,
+    OPENAI_RESPONSES,
+    Dialect,
+    relay_frame,
+)
 from inference_proxy.api.errors import (
     map_proxy_error,
     model_not_found_error,
@@ -37,7 +51,15 @@ from inference_proxy.api.errors import (
     model_unavailable_error,
     no_nodes_error,
 )
-from inference_proxy.auth.dependencies import get_api_auth, get_auth_store
+from inference_proxy.api.system_messages import (
+    inline_anthropic_system_messages,
+    inline_responses_system_messages,
+)
+from inference_proxy.auth.dependencies import (
+    get_api_auth,
+    get_auth_store,
+    get_messages_api_auth,
+)
 from inference_proxy.auth.models import TokenAuth
 from inference_proxy.auth.scopes import auth_scope
 from inference_proxy.auth.store import AuthStore
@@ -54,6 +76,7 @@ from inference_proxy.models.node import Node, NodeStatus
 from inference_proxy.models.openai import (
     ChatCompletionRequest,
     CompletionRequest,
+    ErrorDetail,
     ErrorResponse,
 )
 from inference_proxy.proxy.client import ProxyClient
@@ -97,6 +120,7 @@ def _select_error(
 def _model_scope_denied(
     auth: TokenAuth | None,
     model: str | None,
+    dialect: Dialect = OPENAI_CHAT,
 ) -> JSONResponse | None:
     """Return a 403 response when the token's model scope excludes *model*.
 
@@ -110,7 +134,9 @@ def _model_scope_denied(
     if model and model in auth.token.model_scope:
         return None
     status, error = model_not_permitted_error(model or "")
-    return JSONResponse(content=error.model_dump(), status_code=status)
+    return JSONResponse(
+        content=dialect.error_content(error, status), status_code=status
+    )
 
 
 def _is_retryable(exc: Exception) -> bool:
@@ -155,21 +181,41 @@ def _proxy_error_response(
     *,
     failover_exhausted: bool = False,
     attempts: int = 0,
+    dialect: Dialect = OPENAI_CHAT,
 ) -> JSONResponse:
-    """Build an OpenAI-compatible proxy error response.
+    """Build a proxy error response in the client's API format.
 
     Exhaustion is marked here, outside ``map_proxy_error``, so the shared
     streaming HTTP-status mapping remains untouched for PR 3.
     """
-    content = error.model_dump()
     headers: dict[str, str] | None = None
+    code: str | None = None
     if failover_exhausted:
-        content["error"]["code"] = "failover_exhausted"
+        code = "failover_exhausted"
         headers = {
             "X-Inference-Proxy-Failover": "exhausted",
             "X-Inference-Proxy-Attempts": str(attempts),
         }
+    content = dialect.error_content(error, status, code=code)
     return JSONResponse(content=content, status_code=status, headers=headers)
+
+
+def _invalid_request(
+    dialect: Dialect,
+    message: str,
+    *,
+    param: str | None = None,
+) -> JSONResponse:
+    """Reject a malformed request body with a 400 in the client's format."""
+    error = ErrorResponse(
+        error=ErrorDetail(
+            message=message,
+            type="invalid_request_error",
+            param=param,
+            code="invalid_request",
+        )
+    )
+    return JSONResponse(content=dialect.error_content(error, 400), status_code=400)
 
 
 def _response_content(response: httpx.Response) -> Any:
@@ -178,38 +224,6 @@ def _response_content(response: httpx.Response) -> Any:
         return response.json()
     except (json.JSONDecodeError, ValueError):
         return {"raw": response.text}
-
-
-def _extract_usage(payload: Any) -> tuple[int, int, int] | None:
-    """Extract OpenAI ``usage`` token counts from a response payload.
-
-    Returns ``(prompt, completion, total)`` or None when the payload is not
-    a dict or carries no usable usage counters.
-    """
-    if not isinstance(payload, dict):
-        return None
-    usage = payload.get("usage")
-    if not isinstance(usage, dict):
-        return None
-    prompt_tokens = usage.get("prompt_tokens")
-    completion_tokens = usage.get("completion_tokens")
-    total_tokens = usage.get("total_tokens")
-    if (
-        not isinstance(prompt_tokens, int)
-        or not isinstance(completion_tokens, int)
-        or not isinstance(total_tokens, int)
-    ):
-        return None
-    return prompt_tokens, completion_tokens, total_tokens
-
-
-def _extract_usage_from_data(data: str) -> tuple[int, int, int] | None:
-    """Extract usage from an SSE ``data`` JSON payload (AUTH-04)."""
-    try:
-        payload = json.loads(data)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    return _extract_usage(payload)
 
 
 async def _record_usage(
@@ -222,17 +236,31 @@ async def _record_usage(
     completion_tokens: int,
     total_tokens: int,
 ) -> None:
-    """Persist one token-attributed usage row off the event loop."""
-    await asyncio.to_thread(
-        store.record_usage,
-        user_id=auth.user.id,
-        token_id=auth.token.id,
-        model=model or "",
-        endpoint=endpoint,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
-    )
+    """Persist one token-attributed usage row off the event loop.
+
+    A storage failure is logged, never raised: it happens after the backend
+    already served the request, so it must not count against the node,
+    trigger a retry on another node, or turn a delivered response into an
+    error.
+    """
+    try:
+        await asyncio.to_thread(
+            store.record_usage,
+            user_id=auth.user.id,
+            token_id=auth.token.id,
+            model=model or "",
+            endpoint=endpoint,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+    except Exception:
+        logger.warning(
+            "failed to record token usage",
+            endpoint=endpoint,
+            model=model,
+            exc_info=True,
+        )
 
 
 async def _close_streaming_attempt(
@@ -294,16 +322,22 @@ async def _stream_events(
     usage_auth: TokenAuth | None = None,
     model: str = "",
     endpoint: str = "",
+    dialect: Dialect = OPENAI_CHAT,
 ) -> AsyncGenerator[bytes, None]:
     """Relay one established upstream stream without attempting failover.
 
-    When a bearer token authenticates the request, the OpenAI ``usage``
-    carried by the final streamed chunk is recorded once for usage
-    tracking (AUTH-04). The recorded usage is the last non-empty usage
-    observation, matching the OpenAI convention that the final chunk is
-    authoritative.
+    Events are re-emitted with their payloads and event names unchanged.
+    The dialect decides which event ends a successful response (``[DONE]``
+    for OpenAI chat, ``message_stop`` for Anthropic, ``response.completed``
+    for Responses) and where usage is reported. When a bearer token
+    authenticates the request, that usage is recorded once for usage
+    tracking (AUTH-04), using the latest observation.
+
+    A failure to record usage is logged and never reported as a backend
+    failure: the node served the stream, and the client may already have
+    its terminal event.
     """
-    usage: tuple[int, int, int] | None = None
+    tracker = dialect.stream_tracker()
     recorded = False
 
     async def _flush() -> None:
@@ -311,7 +345,7 @@ async def _stream_events(
         if recorded or usage_store is None or usage_auth is None:
             return
         recorded = True
-        prompt, completion, total = usage or (0, 0, 0)
+        prompt, completion, total = tracker.usage or (0, 0, 0)
         await _record_usage(
             usage_store,
             usage_auth,
@@ -324,17 +358,14 @@ async def _stream_events(
 
     try:
         async for sse in session.event_source.aiter_sse():
-            if sse.data == "[DONE]":
-                yield format_sse_event(data_str="[DONE]")
+            finished = tracker.observe(sse.event, sse.data)
+            yield relay_frame(sse.event, sse.data)
+            if finished:
                 circuit_breaker_registry.get_or_create(
                     node.node_id,
                 ).record_success()
                 await _flush()
                 return
-            found = _extract_usage_from_data(sse.data)
-            if found is not None:
-                usage = found
-            yield format_sse_event(data_str=sse.data)
         await _flush()
     except Exception as exc:
         logger.error("streaming proxy error", error=str(exc), url=url)
@@ -343,11 +374,10 @@ async def _stream_events(
             circuit_breaker_registry,
             node_selector,
         )
-        _, error_resp = map_proxy_error(exc)
-        error_json = json.dumps(error_resp.model_dump())
+        status, error_resp = map_proxy_error(exc)
         await _flush()
-        yield format_sse_event(data_str=error_json)
-        yield format_sse_event(data_str="[DONE]")
+        for frame in dialect.stream_error(error_resp, status):
+            yield frame
     finally:
         await session.close()
 
@@ -365,6 +395,7 @@ async def _proxy_non_streaming(
     usage_auth: TokenAuth | None = None,
     allowed_node_ids: frozenset[str] | None = None,
     owner: str | None = None,
+    dialect: Dialect = OPENAI_CHAT,
 ) -> JSONResponse:
     """Forward a non-streaming request with retry-on-failover.
 
@@ -375,8 +406,10 @@ async def _proxy_non_streaming(
     ``max_attempts`` includes the initial request. Each retry goes to a
     different node.
 
-    When a bearer token authenticates the request, OpenAI usage from the
-    successful backend response is recorded for usage tracking (AUTH-04).
+    When a bearer token authenticates the request, usage from the
+    successful backend response, read the way ``dialect`` reports it, is
+    recorded for usage tracking (AUTH-04). qiip's own errors are rendered
+    in the dialect's error format; backend errors pass through verbatim.
     """
     model = body.get("model")
     excluded: set[str] = set()
@@ -399,11 +432,12 @@ async def _proxy_non_streaming(
                     error,
                     failover_exhausted=True,
                     attempts=attempts,
+                    dialect=dialect,
                 )
             status, error_resp = _select_error(
                 model, node_selector, allowed_node_ids, owner
             )
-            return JSONResponse(content=error_resp.model_dump(), status_code=status)
+            return _proxy_error_response(status, error_resp, dialect=dialect)
         node = reservation.node
         attempts += 1
 
@@ -429,7 +463,7 @@ async def _proxy_non_streaming(
                 and usage_store is not None
                 and usage_auth is not None
             ):
-                usage = _extract_usage(content)
+                usage = dialect.usage_from_body(content)
                 if usage is not None:
                     prompt_tokens, completion_tokens, total_tokens = usage
                     await _record_usage(
@@ -461,7 +495,7 @@ async def _proxy_non_streaming(
                     error=str(exc),
                 )
                 continue
-            return _proxy_error_response(status, error_resp)
+            return _proxy_error_response(status, error_resp, dialect=dialect)
         finally:
             reservation.release()
 
@@ -473,6 +507,7 @@ async def _proxy_non_streaming(
         error,
         failover_exhausted=True,
         attempts=attempts,
+        dialect=dialect,
     )
 
 
@@ -616,6 +651,209 @@ async def _presented_model_scope(
     return auth.token.model_scope if auth is not None else None
 
 
+async def _read_json_body(
+    starlette_request: StarletteRequest,
+    dialect: Dialect,
+) -> dict[str, Any] | JSONResponse:
+    """Parse a pass-through request body, checking only what routing needs.
+
+    The Messages and Responses APIs are forwarded as sent, so only
+    ``model`` (used for node selection) and ``stream`` are validated here.
+    Everything else is left to the backend, which implements the API
+    natively; validating it here would reject fields newer than qiip.
+    """
+    try:
+        payload = await starlette_request.json()
+    except ValueError:
+        return _invalid_request(dialect, "Request body must be valid JSON")
+    if not isinstance(payload, dict):
+        return _invalid_request(dialect, "Request body must be a JSON object")
+    model = payload.get("model")
+    if not isinstance(model, str) or not model.strip():
+        return _invalid_request(
+            dialect,
+            "'model' must be a non-empty string",
+            param="model",
+        )
+    stream = payload.get("stream")
+    if stream is not None and not isinstance(stream, bool):
+        return _invalid_request(dialect, "'stream' must be a boolean", param="stream")
+    return payload
+
+
+async def _forward_native(
+    endpoint_path: str,
+    body: dict[str, Any],
+    *,
+    dialect: Dialect,
+    starlette_request: StarletteRequest,
+    node_selector: NodeSelector,
+    proxy: ProxyClient,
+    circuit_breaker_registry: CircuitBreakerRegistry,
+    request_metrics: RequestMetrics,
+    settings: Settings,
+    usage_store: AuthStore,
+    usage_auth: TokenAuth | None,
+    record_usage: bool = True,
+) -> JSONResponse | EventSourceResponse:
+    """Forward a natively supported API request to a node serving its model."""
+    denied = _model_scope_denied(usage_auth, body.get("model"), dialect)
+    if denied is not None:
+        return denied
+    allowed, owner = auth_scope(usage_auth, settings)
+    store = usage_store if record_usage else None
+    if body.get("stream") is True:
+        return await _stream_completion(
+            endpoint_path=endpoint_path,
+            body=body,
+            node_selector=node_selector,
+            proxy=proxy,
+            circuit_breaker_registry=circuit_breaker_registry,
+            request_metrics=request_metrics,
+            starlette_request=starlette_request,
+            max_attempts=settings.routing.max_attempts,
+            handshake_timeout=settings.routing.timeout,
+            usage_store=store,
+            usage_auth=usage_auth,
+            allowed_node_ids=allowed,
+            owner=owner,
+            dialect=dialect,
+        )
+    return await _proxy_non_streaming(
+        endpoint_path,
+        body,
+        node_selector,
+        proxy,
+        circuit_breaker_registry=circuit_breaker_registry,
+        request_metrics=request_metrics,
+        max_attempts=settings.routing.max_attempts,
+        starlette_request=starlette_request,
+        usage_store=store,
+        usage_auth=usage_auth,
+        allowed_node_ids=allowed,
+        owner=owner,
+        dialect=dialect,
+    )
+
+
+@router.post("/v1/messages", response_model=None)
+async def anthropic_messages(
+    starlette_request: StarletteRequest,
+    node_selector: NodeSelector = Depends(get_node_selector),
+    proxy: ProxyClient = Depends(get_proxy_client),
+    circuit_breaker_registry: CircuitBreakerRegistry = Depends(
+        get_circuit_breaker_registry,
+    ),
+    request_metrics: RequestMetrics = Depends(get_request_metrics),
+    settings: Settings = Depends(get_settings),
+    usage_store: AuthStore = Depends(get_auth_store),
+    usage_auth: TokenAuth | None = Depends(get_messages_api_auth),
+) -> JSONResponse | EventSourceResponse:
+    """Proxy an Anthropic Messages API request, as sent by Claude Code.
+
+    The body is forwarded as sent, except that system messages inside the
+    conversation become ``<system-reminder>`` user turns so strict chat
+    templates accept them without breaking prompt caching (see
+    ``system_messages``). The API key may arrive as ``Authorization:
+    Bearer`` or as ``x-api-key``.
+    """
+    body = await _read_json_body(starlette_request, ANTHROPIC_MESSAGES)
+    if isinstance(body, JSONResponse):
+        return body
+    return await _forward_native(
+        "/v1/messages",
+        inline_anthropic_system_messages(body),
+        dialect=ANTHROPIC_MESSAGES,
+        starlette_request=starlette_request,
+        node_selector=node_selector,
+        proxy=proxy,
+        circuit_breaker_registry=circuit_breaker_registry,
+        request_metrics=request_metrics,
+        settings=settings,
+        usage_store=usage_store,
+        usage_auth=usage_auth,
+    )
+
+
+@router.post("/v1/messages/count_tokens", response_model=None)
+async def anthropic_count_tokens(
+    starlette_request: StarletteRequest,
+    node_selector: NodeSelector = Depends(get_node_selector),
+    proxy: ProxyClient = Depends(get_proxy_client),
+    circuit_breaker_registry: CircuitBreakerRegistry = Depends(
+        get_circuit_breaker_registry,
+    ),
+    request_metrics: RequestMetrics = Depends(get_request_metrics),
+    settings: Settings = Depends(get_settings),
+    usage_store: AuthStore = Depends(get_auth_store),
+    usage_auth: TokenAuth | None = Depends(get_messages_api_auth),
+) -> JSONResponse | EventSourceResponse:
+    """Proxy Anthropic token counting to a node serving the model.
+
+    The count comes from the backend's own chat template, so the body gets
+    the same system-message rewrite as ``/v1/messages``. Counting never
+    streams (a ``stream`` flag copied from a messages body is dropped) and
+    generates nothing, so no usage is recorded.
+    """
+    body = await _read_json_body(starlette_request, ANTHROPIC_MESSAGES)
+    if isinstance(body, JSONResponse):
+        return body
+    body = {key: value for key, value in body.items() if key != "stream"}
+    return await _forward_native(
+        "/v1/messages/count_tokens",
+        inline_anthropic_system_messages(body),
+        dialect=ANTHROPIC_MESSAGES,
+        starlette_request=starlette_request,
+        node_selector=node_selector,
+        proxy=proxy,
+        circuit_breaker_registry=circuit_breaker_registry,
+        request_metrics=request_metrics,
+        settings=settings,
+        usage_store=usage_store,
+        usage_auth=usage_auth,
+        record_usage=False,
+    )
+
+
+@router.post("/v1/responses", response_model=None)
+async def openai_responses(
+    starlette_request: StarletteRequest,
+    node_selector: NodeSelector = Depends(get_node_selector),
+    proxy: ProxyClient = Depends(get_proxy_client),
+    circuit_breaker_registry: CircuitBreakerRegistry = Depends(
+        get_circuit_breaker_registry,
+    ),
+    request_metrics: RequestMetrics = Depends(get_request_metrics),
+    settings: Settings = Depends(get_settings),
+    usage_store: AuthStore = Depends(get_auth_store),
+    usage_auth: TokenAuth | None = Depends(get_api_auth),
+) -> JSONResponse | EventSourceResponse:
+    """Proxy an OpenAI Responses API request, as sent by Codex.
+
+    The body is forwarded as sent, except that system and developer items
+    after the first conversation item become ``<system-reminder>`` user
+    items, and leading ones join ``instructions`` (see
+    ``system_messages``). Requests are served statelessly: the client sends
+    the whole conversation each turn, as Codex does with ``store: false``.
+    """
+    body = await _read_json_body(starlette_request, OPENAI_RESPONSES)
+    if isinstance(body, JSONResponse):
+        return body
+    return await _forward_native(
+        "/v1/responses",
+        inline_responses_system_messages(body),
+        dialect=OPENAI_RESPONSES,
+        starlette_request=starlette_request,
+        node_selector=node_selector,
+        proxy=proxy,
+        circuit_breaker_registry=circuit_breaker_registry,
+        request_metrics=request_metrics,
+        settings=settings,
+        usage_store=usage_store,
+        usage_auth=usage_auth,
+    )
+
+
 @router.get("/v1/models")
 async def list_models(
     starlette_request: StarletteRequest,
@@ -672,6 +910,7 @@ async def _stream_completion(
     usage_auth: TokenAuth | None = None,
     allowed_node_ids: frozenset[str] | None = None,
     owner: str | None = None,
+    dialect: Dialect = OPENAI_CHAT,
 ) -> JSONResponse | EventSourceResponse:
     """Establish a backend SSE stream, then expose it to the client.
 
@@ -681,7 +920,8 @@ async def _stream_completion(
     bounded by ``handshake_timeout``.
 
     Once streaming begins, events are re-emitted with their existing JSON
-    payloads and failures are reported in-band without retrying.
+    payloads and event names, and failures are reported in-band, in the
+    dialect's format, without retrying.
     """
     model = body.get("model")
     excluded: set[str] = set()
@@ -708,11 +948,12 @@ async def _stream_completion(
                     error,
                     failover_exhausted=True,
                     attempts=attempts,
+                    dialect=dialect,
                 )
             status, error_resp = _select_error(
                 model, node_selector, allowed_node_ids, owner
             )
-            return JSONResponse(content=error_resp.model_dump(), status_code=status)
+            return _proxy_error_response(status, error_resp, dialect=dialect)
 
         node = reservation.node
         attempts += 1
@@ -788,7 +1029,7 @@ async def _stream_completion(
                     error=str(exc),
                 )
                 continue
-            return _proxy_error_response(status, error_resp)
+            return _proxy_error_response(status, error_resp, dialect=dialect)
 
         # Only the successful context crosses the handler/generator boundary.
         # Every failed context was closed before the next selection attempt.
@@ -805,6 +1046,7 @@ async def _stream_completion(
                 usage_auth=usage_auth,
                 model=body.get("model") or "",
                 endpoint=endpoint_path,
+                dialect=dialect,
             ),
             background=BackgroundTask(session.close),
         )
@@ -817,4 +1059,5 @@ async def _stream_completion(
         error,
         failover_exhausted=True,
         attempts=attempts,
+        dialect=dialect,
     )

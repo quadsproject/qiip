@@ -30,6 +30,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 ## Features
 
 - **OpenAI-compatible API** -- drop-in replacement for `/v1/chat/completions`, `/v1/completions`, and `/v1/models`
+- **Claude Code and Codex** -- the Anthropic Messages API (`/v1/messages`) and the OpenAI Responses API (`/v1/responses`) are forwarded to vLLM and llama.cpp nodes, which implement them natively, with the same token auth, routing, failover, and usage tracking as chat completions
 - **Streaming support** -- Server-Sent Events (SSE) for real-time token generation
 - **Chat playground** -- browser-based chat UI at `/chat` with markdown rendering and model selection
 - **Service discovery** -- watches etcd for node registration/deregistration in real time
@@ -57,10 +58,10 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
 - **Self-service onboarding** -- signed-in normal users land on `/start`: one question per screen (name a token, pick a coding tool, pick models) ending in a short-lived `curl ... | bash` line that writes the tool's config; returning users see their single token and its models. See [Self-service onboarding](#self-service-onboarding-start)
 - **Per-token model scope** -- a token minted by the onboarding flow may only request the models chosen for it; other models are refused on `/v1` with `403 model_not_permitted`, and `/v1/models` lists only the token's models
-- **User API tokens** -- admin-role users can mint `qiip_...` bearer tokens on their profile page to call `/v1/chat/completions` and `/v1/completions`; normal users own exactly one token, managed on `/start`. Tokens are stored as SHA-256 digests and can be revoked at any time
+- **User API tokens** -- admin-role users can mint `qiip_...` bearer tokens on their profile page to call the `/v1` inference API; normal users own exactly one token, managed on `/start`. Tokens are stored as SHA-256 digests and can be revoked at any time
 - **Stable agent-config token** -- one derived per-user key (`agent-config`) is shared by every config download across servers and browsers; its raw value is derived from `auth.session_secret` + user + generation and never stored, so revoking it rotates the key embedded in already-downloaded configs (configuration downloads for admin-only servers require the Google session that can mint it)
 - **Config-gated inference auth** -- a valid `qiip_...` bearer token is always accepted on `/v1`; requiring a token for every `/v1` request (`auth.enforce_api_tokens`) is optional and off by default, so existing public deployments keep serving anonymous requests unchanged
-- **Token usage tracking** -- token-authenticated requests record OpenAI token usage per token/model for reporting on the profile page
+- **Token usage tracking** -- token-authenticated requests record token usage per token/model for reporting on the profile page
 - **Backend endpoint allowlist** -- configurable hostname wildcard, CIDR network, and port allowlists; rejects non-matching registrations with loopback-only defaults
 - **Client config downloads** -- one-click download of OpenCode CLI and Pi coding agent configuration files from the dashboard and node detail pages; dashboard configs point at the proxy for load-balanced access, node detail configs point at individual backend endpoints
 
@@ -75,6 +76,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Use with the OpenAI Python SDK](#use-with-the-openai-python-sdk)
   - [Chat playground](#chat-playground)
 - [API Endpoints](#api-endpoints)
+  - [Claude Code and Codex](#claude-code-and-codex)
   - [Administrative access](#administrative-access)
   - [Node inventory identity](#node-inventory-identity)
   - [Relaunch managed llama.cpp sizing](#relaunch-managed-llamacpp-sizing)
@@ -264,6 +266,9 @@ Public endpoints:
 | `GET` | `/health` | Gateway health check (returns node count) |
 | `POST` | `/v1/chat/completions` | Chat completion (OpenAI-compatible) |
 | `POST` | `/v1/completions` | Text completion (OpenAI-compatible) |
+| `POST` | `/v1/messages` | Anthropic Messages API (Claude Code) |
+| `POST` | `/v1/messages/count_tokens` | Anthropic token counting |
+| `POST` | `/v1/responses` | OpenAI Responses API (Codex) |
 | `GET` | `/v1/models` | List models available across healthy nodes |
 | `GET` | `/chat` | Browser chat playground |
 | `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage (signed-in normal users are redirected to `/start`) |
@@ -329,6 +334,70 @@ Admin-authenticated endpoints (HTTP Basic or admin-role session):
 | `GET` | `/dashboard` | Authenticated operations dashboard; anonymous visitors get the sign-in page |
 | `GET` | `/dashboard/nodes/{node_id}` | Authenticated node detail page |
 | `GET` | `/dashboard/admin` | Admin page: manage admin-only inference servers (admin-role management lives on `/dashboard/tokens`) |
+
+### Claude Code and Codex
+
+Claude Code speaks the Anthropic Messages API and Codex speaks the OpenAI
+Responses API. vLLM and llama.cpp both implement these APIs natively, so qiip
+forwards requests without converting between formats. The one change it makes
+is the system-message rewrite described below. Point the tools at the gateway
+with a `qiip_...` token and a served model name:
+
+```bash
+# Claude Code (ANTHROPIC_API_KEY, sent as x-api-key, also works)
+export ANTHROPIC_BASE_URL=https://inference-proxy.example.com
+export ANTHROPIC_AUTH_TOKEN=qiip_...
+export ANTHROPIC_MODEL=Qwen/Qwen3-14B-AWQ
+export ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_MODEL
+export ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_MODEL
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_MODEL
+```
+
+```toml
+# Codex (~/.codex/config.toml), with `export QIIP_API_KEY=qiip_...`
+model = "Qwen/Qwen3-14B-AWQ"
+model_provider = "qiip"
+
+[model_providers.qiip]
+name = "qiip"
+base_url = "https://inference-proxy.example.com/v1"
+wire_api = "responses"
+env_key = "QIIP_API_KEY"
+```
+
+- **Same gateway behavior.** Requests go through the same token
+  authentication, node selection, failover, and per-token usage tracking as
+  chat completions. Anthropic reports cached prompt tokens separately; qiip
+  counts them as prompt tokens.
+- **Streams are relayed event by event** with their SSE event names, which
+  the Anthropic SDK requires. These formats do not end with `[DONE]`.
+- **System messages inside the conversation.** Claude Code sends system
+  messages between turns, and Codex sends a developer message. Some chat
+  templates (Qwen 3.x, for example) accept a system message only as the first
+  message. qiip therefore merges system and developer messages that come before
+  the conversation into the system prompt (Codex: `instructions`), and turns
+  every later one into a user message at the same position, wrapped in
+  `<system-reminder>` tags. Moving the later ones to the front instead would
+  change the start of the prompt every turn and defeat the backend's prompt
+  cache. This applies on every node. Templates that require strict
+  user/assistant alternation (Gemma-style) are still not supported, because
+  the rewrite can place two user messages in a row.
+- **Stateless Responses API.** Send the whole conversation each turn, as Codex
+  does with `store: false`. `previous_response_id` and stored-response
+  retrieval are not supported.
+- **Context size.** Neither tool knows a local model's context window. Claude
+  Code assumes 200,000 tokens for unknown models; set
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` to the
+  served model's limits. For Codex, set `model_context_window` and
+  `model_auto_compact_token_limit`.
+- **Long prompts on llama.cpp.** llama.cpp sends no response headers until
+  the first token, so processing a long uncached prompt counts against the
+  streaming handshake deadline, `routing.timeout` (default 30 seconds). If
+  agents resume large contexts on llama.cpp nodes, raise it above the longest
+  prompt processing time you expect.
+- **Backend support.** Managed nodes at the pinned vLLM and llama.cpp versions
+  serve both APIs. An adopted server that does not implement them returns its
+  own 404, which qiip passes through.
 
 ### Administrative access
 
@@ -539,8 +608,11 @@ background, with progress available from the normal provisioning log stream.
 
 ### Error responses
 
-Inference-proxy errors follow the OpenAI error format. Upstream 4xx responses
-are passed through without changing their JSON shape.
+Inference-proxy errors follow the OpenAI error format, except on
+`/v1/messages` and `/v1/messages/count_tokens`, where they use Anthropic's
+`{"type": "error", "error": {"type": ..., "message": ...}}` envelope with
+the same qiip code in `error.code`. Upstream 4xx responses are passed through
+without changing their JSON shape.
 
 | Code | Meaning |
 |------|---------|
@@ -852,9 +924,9 @@ A user who already has a token sees only that token, the models it may use
 | Codex | `~/.codex/config.toml` | one | `/v1/responses` |
 
 A tool is offered only when the gateway serves the API route it speaks, so
-Claude Code and Codex show as "Soon" until `/v1/messages` and `/v1/responses`
-exist. The models offered are the models healthy nodes are serving at that
-moment, limited to nodes the user may reach (never admin-only servers or nodes
+Claude Code and Codex are available through `/v1/messages` and
+`/v1/responses`. The models offered are the models healthy nodes are serving
+at that moment, limited to nodes the user may reach (never admin-only servers or nodes
 owned by someone else).
 
 Rules and guardrails:
