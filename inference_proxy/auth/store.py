@@ -34,6 +34,7 @@ from inference_proxy.auth.models import (
     AdminUserStats,
     ApiToken,
     CreatedToken,
+    SetupLink,
     TokenAuth,
     TokenUsage,
     UsageTimelineRow,
@@ -65,7 +66,18 @@ CREATE TABLE IF NOT EXISTS tokens (
     last_used_at    TEXT,
     revoked         INTEGER NOT NULL DEFAULT 0,
     endpoint_scope  TEXT,
-    purpose         TEXT
+    purpose         TEXT,
+    model_scope     TEXT,
+    derive_nonce    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS setup_links (
+    link_hash   TEXT    PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_id    INTEGER NOT NULL REFERENCES tokens(id) ON DELETE CASCADE,
+    harness     TEXT    NOT NULL,
+    models      TEXT    NOT NULL,
+    expires_at  TEXT    NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS usage (
@@ -151,6 +163,31 @@ def _derive_config_token(secret: str, user_id: int, generation: int) -> str:
     return f"{TOKEN_PREFIX}{base64.urlsafe_b64encode(digest).decode().rstrip('=')}"
 
 
+# Personal tokens (the single token a non-admin user owns, minted by the
+# onboarding flow) follow the same never-stored rule as agent-config keys.
+# Threat model (same as agent-config, and weaker than a random token): the
+# database alone never yields a credential, but the database PLUS the session
+# secret does. Treat a leaked session secret as a leak of every personal token:
+# the raw value is derived from the session secret, the user id, and a random
+# per-row nonce. Re-deriving it lets the user export a harness config again
+# later without the database ever holding a usable credential.
+_PERSONAL_TOKEN_PURPOSE = "personal"
+_PERSONAL_TOKEN_INFO = "qiip-personal-token-v1"
+_SETUP_LINK_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
+_SETUP_LINK_LENGTH = 12
+
+
+def _derive_personal_token(secret: str, user_id: int, nonce: str) -> str:
+    """Derive the raw value of a personal token from its stored nonce."""
+    material = f"{_PERSONAL_TOKEN_INFO}:{user_id}:{nonce}"
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        material.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return f"{TOKEN_PREFIX}{base64.urlsafe_b64encode(digest).decode().rstrip('=')}"
+
+
 def _dump_scopes(scopes: list[str] | None) -> str | None:
     """Serialize an endpoint scope to its TEXT column value.
 
@@ -228,6 +265,10 @@ class AuthStore:
             )
         if "purpose" not in token_columns:
             self._conn.execute("ALTER TABLE tokens ADD COLUMN purpose TEXT")
+        if "model_scope" not in token_columns:
+            self._conn.execute("ALTER TABLE tokens ADD COLUMN model_scope TEXT")
+        if "derive_nonce" not in token_columns:
+            self._conn.execute("ALTER TABLE tokens ADD COLUMN derive_nonce TEXT")
         # Generated agent-config keys are distinguished by the purpose marker,
         # never by their display name: earlier versions let users create their
         # own tokens named "agent-config" (possibly pinned), and those must
@@ -238,6 +279,13 @@ class AuthStore:
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_user_purpose_active_config "
             "ON tokens(user_id) WHERE revoked = 0 AND purpose = 'agent-config'"
+        )
+        # Same invariant for the onboarding flow's personal token. Minting
+        # revokes-then-inserts in one transaction, so this only ever fires if
+        # that invariant is broken by a future code path.
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_user_active_personal "
+            "ON tokens(user_id) WHERE revoked = 0 AND purpose = 'personal'"
         )
 
     def close(self) -> None:
@@ -641,6 +689,190 @@ class AuthStore:
         return TokenAuth(user=user, token=token)
 
     # ------------------------------------------------------------------
+    # Personal tokens and setup links (onboarding flow)
+    # ------------------------------------------------------------------
+
+    def create_personal_token(
+        self,
+        user_id: int,
+        name: str,
+        models: list[str],
+        secret: str,
+    ) -> CreatedToken:
+        """Mint the user's single personal token, replacing every other one.
+
+        A normal user owns exactly one token: minting revokes all of the
+        user's active tokens (and drops their pending setup links) in the
+        same transaction. *models* is the model scope enforced on /v1.
+        Raises ``KeyError`` when *user_id* does not exist.
+        """
+        nonce = secrets.token_urlsafe(16)
+        raw = _derive_personal_token(secret, user_id, nonce)
+        now = _iso(_utcnow())
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT id FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if exists is None:
+                raise KeyError(user_id)
+            try:
+                self._conn.execute(
+                    "UPDATE tokens SET revoked = 1 WHERE user_id = ? AND revoked = 0",
+                    (user_id,),
+                )
+                self._conn.execute(
+                    "DELETE FROM setup_links WHERE user_id = ?", (user_id,)
+                )
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO tokens
+                        (user_id, name, token_hash, prefix, created_at,
+                         purpose, model_scope, derive_nonce)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        name,
+                        _hash_token(raw),
+                        raw[: len(TOKEN_PREFIX) + 8],
+                        now,
+                        _PERSONAL_TOKEN_PURPOSE,
+                        _dump_scopes(models),
+                        nonce,
+                    ),
+                )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+            row = self._conn.execute(
+                "SELECT * FROM tokens WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+        token = self._token_from_row(row)
+        if token is None:  # pragma: no cover - defensive
+            raise RuntimeError("token row vanished after insert")
+        return CreatedToken(**token.model_dump(), token=raw)
+
+    def get_active_token(self, user_id: int) -> ApiToken | None:
+        """Return the user's current token: newest active row, or None.
+
+        A personal token wins over any legacy row so users who minted
+        tokens before the onboarding flow still land on the right one.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM tokens
+                 WHERE user_id = ? AND revoked = 0
+                 ORDER BY (purpose = ?) DESC, id DESC
+                 LIMIT 1
+                """,
+                (user_id, _PERSONAL_TOKEN_PURPOSE),
+            ).fetchone()
+        return self._token_from_row(row)
+
+    def set_token_models(self, user_id: int, token_id: int, models: list[str]) -> bool:
+        """Replace an active token's model scope; True when a row changed."""
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE tokens
+                   SET model_scope = ?
+                 WHERE id = ? AND user_id = ? AND revoked = 0
+                """,
+                (_dump_scopes(models), token_id, user_id),
+            )
+            self._conn.commit()
+        return cursor.rowcount > 0
+
+    def reveal_personal_token(self, token_id: int, secret: str) -> str | None:
+        """Re-derive the raw value of an active personal token.
+
+        Returns None when the row is not an active personal token or the
+        derived value no longer matches its stored hash (the session secret
+        was rotated); callers then ask the user to mint a fresh token.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT user_id, token_hash, derive_nonce FROM tokens
+                 WHERE id = ? AND revoked = 0 AND purpose = ?
+                """,
+                (token_id, _PERSONAL_TOKEN_PURPOSE),
+            ).fetchone()
+        if row is None or not row["derive_nonce"]:
+            return None
+        raw = _derive_personal_token(secret, row["user_id"], row["derive_nonce"])
+        if not hmac.compare_digest(_hash_token(raw), row["token_hash"]):
+            return None
+        return raw
+
+    def create_setup_link(
+        self,
+        user_id: int,
+        token_id: int,
+        harness: str,
+        models: list[str],
+        ttl_seconds: int,
+    ) -> tuple[str, datetime]:
+        """Create a short-lived setup-script link; returns ``(id, expiry)``.
+
+        Only the SHA-256 of the link id is stored, and the row holds no
+        credential: the script (token included) is rendered on fetch.
+        Expired rows are purged opportunistically here.
+        """
+        link_id = "".join(
+            secrets.choice(_SETUP_LINK_ALPHABET) for _ in range(_SETUP_LINK_LENGTH)
+        )
+        now = _utcnow()
+        expires = now + timedelta(seconds=ttl_seconds)
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM setup_links WHERE expires_at <= ?", (_iso(now),)
+            )
+            self._conn.execute(
+                """
+                INSERT INTO setup_links
+                    (link_hash, user_id, token_id, harness, models, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _hash_token(link_id),
+                    user_id,
+                    token_id,
+                    harness,
+                    json.dumps(models),
+                    _iso(expires),
+                ),
+            )
+            self._conn.commit()
+        return link_id, expires
+
+    def resolve_setup_link(self, link_id: str) -> SetupLink | None:
+        """Return the live setup link for *link_id*, or None.
+
+        A link is live while it is unexpired and its token is still active.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT l.* FROM setup_links l
+                  JOIN tokens t ON t.id = l.token_id
+                 WHERE l.link_hash = ? AND l.expires_at > ? AND t.revoked = 0
+                """,
+                (_hash_token(link_id), _iso(_utcnow())),
+            ).fetchone()
+        if row is None:
+            return None
+        return SetupLink(
+            user_id=row["user_id"],
+            token_id=row["token_id"],
+            harness=row["harness"],
+            models=json.loads(row["models"]),
+            expires_at=datetime.fromisoformat(row["expires_at"]),
+        )
+
+    # ------------------------------------------------------------------
     # Usage tracking (AUTH-04)
     # ------------------------------------------------------------------
 
@@ -929,4 +1161,6 @@ class AuthStore:
             last_used_at=_parse_iso(row["last_used_at"]),
             revoked=bool(row["revoked"]),
             endpoint_scope=_load_scopes(row["endpoint_scope"]),
+            model_scope=_load_scopes(row["model_scope"]),
+            purpose=row["purpose"],
         )

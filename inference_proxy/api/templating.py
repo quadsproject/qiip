@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 
 from fastapi import Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from inference_proxy.config.settings import Settings
@@ -55,6 +55,16 @@ def signin_response(
             "sessions_available": sessions_available,
         },
     )
+
+
+# Normal (non-admin) users get one page: the onboarding / token home. Every
+# operations page sends them there instead of rendering.
+USER_HOME = "/start"
+
+
+def user_home_redirect() -> RedirectResponse:
+    """Redirect a signed-in non-admin to their home page."""
+    return RedirectResponse(USER_HOME, status_code=302)
 
 
 def _request_settings(request: Request) -> Settings:

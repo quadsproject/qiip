@@ -55,7 +55,9 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Admin roles** -- the HTTP Basic admin user (bootstrap authority) can grant or revoke the admin role to Google-authenticated users on the token dashboard (`/dashboard/tokens`); role admins then reach the admin surface through their session and see admin-only servers
 - **Admin-only inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). At `/v1` they are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with an `admin_only` badge in the admin fleet view. Token usage from admin-only servers is tracked on the token summary pages exactly like any other node
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
-- **User API tokens** -- each user can mint `qiip_...` bearer tokens on their profile page to call `/v1/chat/completions` and `/v1/completions`; tokens are stored as SHA-256 digests and can be revoked at any time
+- **Self-service onboarding** -- signed-in normal users land on `/start`: one question per screen (name a token, pick a coding tool, pick models) ending in a short-lived `curl ... | bash` line that writes the tool's config; returning users see their single token and its models. See [Self-service onboarding](#self-service-onboarding-start)
+- **Per-token model scope** -- a token minted by the onboarding flow may only request the models chosen for it; other models are refused on `/v1` with `403 model_not_permitted`, and `/v1/models` lists only the token's models
+- **User API tokens** -- admin-role users can mint `qiip_...` bearer tokens on their profile page to call `/v1/chat/completions` and `/v1/completions`; normal users own exactly one token, managed on `/start`. Tokens are stored as SHA-256 digests and can be revoked at any time
 - **Stable agent-config token** -- one derived per-user key (`agent-config`) is shared by every config download across servers and browsers; its raw value is derived from `auth.session_secret` + user + generation and never stored, so revoking it rotates the key embedded in already-downloaded configs (configuration downloads for admin-only servers require the Google session that can mint it)
 - **Config-gated inference auth** -- a valid `qiip_...` bearer token is always accepted on `/v1`; requiring a token for every `/v1` request (`auth.enforce_api_tokens`) is optional and off by default, so existing public deployments keep serving anonymous requests unchanged
 - **Token usage tracking** -- token-authenticated requests record OpenAI token usage per token/model for reporting on the profile page
@@ -83,6 +85,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Server launch](#server-launch)
   - [Admin authentication](#admin-authentication)
   - [User authentication (Google OAuth)](#user-authentication-google-oauth)
+  - [Self-service onboarding (`/start`)](#self-service-onboarding-start)
   - [etcd](#etcd)
   - [Routing](#routing)
   - [SSH and provisioning commands](#ssh-and-provisioning-commands)
@@ -263,7 +266,9 @@ Public endpoints:
 | `POST` | `/v1/completions` | Text completion (OpenAI-compatible) |
 | `GET` | `/v1/models` | List models available across healthy nodes |
 | `GET` | `/chat` | Browser chat playground |
-| `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage |
+| `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage (signed-in normal users are redirected to `/start`) |
+| `GET` | `/start` | Onboarding wizard and token home for signed-in normal users; anonymous visitors get the sign-in page, admins are redirected to `/dashboard` |
+| `GET` | `/s/{id}` | Setup script for a live onboarding link. The id is the credential: 15 minute life, not logged. A dead link returns a script that explains and exits 1 |
 | `GET` | `/auth/login` | Start Google OAuth sign-in (302 to Google) |
 | `GET` | `/auth/callback` | Google redirect target; signs the session cookie |
 | `GET` | `/auth/local-admin` | Local admin login page entry (302 to `/dashboard`; the sign-in form POSTs here) |
@@ -275,7 +280,7 @@ Fleet (any signed-in user, or HTTP Basic local admin):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/fleet/nodes` | Fleet view for non-admin viewers: registered nodes without admin-only servers or operational actions |
+| `GET` | `/fleet/nodes` | Fleet JSON for non-admin viewers: registered nodes without admin-only servers or operational actions (no page renders it for them any more; normal users live on `/start`) |
 
 User-session-protected profile endpoints (require `auth.session_secret` and a
 signed-in session):
@@ -284,10 +289,19 @@ signed-in session):
 |--------|------|-------------|
 | `GET` | `/profile/me` | Public identity of the signed-in user |
 | `GET` | `/profile/tokens` | List the user's API tokens (prefix only) |
-| `POST` | `/profile/tokens` | Mint a token; accepts an optional `endpoints` pin (hostnames); returns the raw secret exactly once (except `name: agent-config`, the reusable derived config key) |
+| `POST` | `/profile/tokens` | Admin-role users only (403 for normal users, who use `/start`). Mint a token; accepts an optional `endpoints` pin (hostnames); returns the raw secret exactly once (except `name: agent-config`, the reusable derived config key) |
 | `DELETE` | `/profile/tokens/{id}` | Revoke a token |
 | `GET` | `/profile/usage` | Aggregated usage per token/model plus headline totals |
 | `GET` | `/profile/endpoints` | Registered nodes the user may pin (unowned nodes plus nodes they own) |
+
+Onboarding endpoints (signed-in normal users only; admin-role sessions get 403):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/onboarding/state` | Identity, the user's current token (never the raw secret), models online right now, and the supported coding tools |
+| `POST` | `/onboarding/token` | Mint the user's single token with a name and a model list; revokes every other token the user has |
+| `PUT` | `/onboarding/token/models` | Replace the token's model list (409 for tokens minted before this flow) |
+| `POST` | `/onboarding/setup-link` | Create a `/s/{id}` link for one coding tool; returns the ready-to-paste command and its expiry |
 
 Admin-authenticated endpoints (HTTP Basic or admin-role session):
 
@@ -337,10 +351,13 @@ anonymous visitors receive a sign-in page with **Local Admin**
 creating a signed admin session; the browser native Basic prompt is no longer
 used, though HTTP Basic requests and SSE still pass through unchanged) and
 **Google Auth** (the same flow as the profile page).
-Signed-in non-admin users see the fleet with admin-only servers removed, no
-operational actions, and nodes owned by another user excluded (ownership is
-private: `/v1/models` and the endpoint picker treat it the same way); node
-detail, model catalog, token dashboards, and the admin page remain admin-only.
+Signed-in non-admin users do not see the fleet pages at all: every operations
+page redirects them to `/start` (see
+[Self-service onboarding](#self-service-onboarding-start)). The
+`/fleet/nodes` JSON API still answers for them with admin-only servers
+removed, no operational actions, and nodes owned by another user excluded
+(ownership is private: `/v1/models` and the endpoint picker treat it the same
+way).
 
 On a trusted work LAN, the administrative surface may run over HTTP. Anyone able
 to observe that traffic can recover the reusable credential, so deploy a
@@ -797,6 +814,75 @@ Token management dashboards (admin and per-user):
 
 The defaults track published Claude Opus-class 1M-context pricing; override
 them when the reference model or your accounting changes.
+
+### Self-service onboarding (`/start`)
+
+Normal (non-admin) users get one page. After Google sign-in they land on
+`/start`, and every operations page (`/dashboard`, node detail, `/models`,
+`/chat`, `/profile`, the token and admin pages) redirects them back to it.
+Admins are unaffected and are redirected away from `/start`.
+
+A user without a token walks through one question per screen:
+
+1. a name for the token,
+2. the coding tool they use,
+3. the models they want (one model for single-model tools, any number otherwise).
+
+The last screen shows one line to paste into a terminal:
+
+```bash
+curl -sSL https://gateway.example.com/s/k7m2x9qd4tpa | bash
+```
+
+The script only writes that tool's config file, already pointed at the gateway
+with the user's token and models. It backs up an existing file first (the first
+backup is kept across reruns), merges into existing JSON and TOML configs
+instead of replacing them, and leaves the file readable only by the user. It
+needs `bash`; `python3` is used for JSON merges when present.
+
+A user who already has a token sees only that token, the models it may use
+(tap to change), and buttons to set up another tool or replace the token.
+
+| Coding tool | Config written | Models | Needs |
+|-------------|----------------|--------|-------|
+| OpenCode | `~/.config/opencode/opencode.json` | many | `/v1/chat/completions` |
+| Pi | `~/.pi/agent/models.json` | many | `/v1/chat/completions` |
+| Oh My Pi | `~/.omp/agent/models.yml` (replaced, not merged) | many | `/v1/chat/completions` |
+| Claude Code | `~/.claude/settings.json` | one | `/v1/messages` |
+| Codex | `~/.codex/config.toml` | one | `/v1/responses` |
+
+A tool is offered only when the gateway serves the API route it speaks, so
+Claude Code and Codex show as "Soon" until `/v1/messages` and `/v1/responses`
+exist. The models offered are the models healthy nodes are serving at that
+moment, limited to nodes the user may reach (never admin-only servers or nodes
+owned by someone else).
+
+Rules and guardrails:
+
+- **One token per user.** Minting on `/start` revokes every other token the
+  user has. `POST /profile/tokens` is admin-only so the rule cannot be bypassed.
+- **Model scope.** The token may only request its chosen models. Anything else
+  is refused with `403 model_not_permitted`. Asking for a setup command that
+  includes a new model adds it to the token. Scope binds tokens, so it has teeth
+  only with `auth.enforce_api_tokens=true`; with the default `false`, requests
+  without a token are anonymous and unrestricted.
+- **Setup links.** `/s/{id}` needs no session because the id is the credential.
+  It lives for 15 minutes, can be fetched again inside that window (a failed
+  first run can simply be retried), and dies when the token is replaced. Only a
+  SHA-256 of the id is stored, the gateway logs the path as `/s/[redacted]`,
+  and responses are `no-store`, `noindex`, and `no-referrer`. A reverse proxy in
+  front still logs request paths unless its log format is changed, so treat
+  proxy access logs as sensitive for 15 minutes after a link is made.
+- **No stored secret.** The token is derived from `auth.session_secret`, the
+  user id, and a random per-token value, and only its digest is stored. That is
+  what lets a user set up a second tool later. It also means the database plus
+  the session secret is enough to recover tokens: protect the secret like a
+  credential. Rotating it leaves existing tokens working on `/v1` but makes
+  them impossible to export again; the page then asks the user for a new token.
+- **Public origin.** The command and the written configs use the origin of
+  `oauth.redirect_uri` (or an `oauth.allowed_redirect_hosts` name when the
+  request came in on one), never a bare `Host` header, and never downgrade a
+  configured `https` origin to `http` behind a proxy hop uvicorn does not trust.
 
 ### etcd
 

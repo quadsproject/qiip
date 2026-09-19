@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>qiip</title>
+    <meta name="description" content="Get your coding tools connected to qiip in about a minute.">
+    <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/start.css') }}">
+    <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
+</head>
+<body class="ob-body">
+    <div class="ob-aurora" aria-hidden="true"><span></span><span></span><span></span></div>
+    <div class="ob-progress" aria-hidden="true"><div class="ob-progress-bar" id="ob-progress-bar"></div></div>
+
+    <header class="ob-top">
+        <img class="ob-logo" src="{{ static_asset_url(request, 'img/qiip.svg') }}" alt="qiip" width="40" height="33">
+        <div class="ob-top-actions">
+            <span class="ob-who" id="ob-who"></span>
+            <button class="theme-toggle" type="button" id="ob-theme" aria-label="Toggle color theme">
+                <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+                <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+            </button>
+            <form method="post" action="/auth/logout" class="ob-logout">
+                <button type="submit" class="ob-link">Sign out</button>
+            </form>
+        </div>
+    </header>
+
+    <main class="ob-stage" id="ob-stage" aria-live="polite">
+        <div class="ob-loading" id="ob-loading"><span></span><span></span><span></span></div>
+    </main>
+
+    <footer class="ob-foot">
+        <button type="button" class="ob-link ob-back" id="ob-back" hidden>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+            Back
+        </button>
+        <span class="ob-hint" id="ob-hint"></span>
+    </footer>
+
+    <div class="ob-toast" id="ob-toast" role="status"></div>
+    <script src="{{ static_asset_url(request, 'js/start.js') }}"></script>
+</body>
+</html>

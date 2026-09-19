@@ -116,7 +116,11 @@ def profile_client(
     app: FastAPI,
     make_fake_auth_plugin: FakeAuthPluginBuilder,
 ) -> TestClient:
-    """Return a TestClient already signed in through the real /auth/callback."""
+    """Return a TestClient signed in through the real /auth/callback.
+
+    The user is promoted to the admin role: the /profile token surface is
+    admin-only (normal users manage their single token on /start).
+    """
     plugin = make_fake_auth_plugin()
     app.dependency_overrides[get_auth_plugin] = lambda: plugin
     client = TestClient(app)
@@ -125,5 +129,25 @@ def profile_client(
         follow_redirects=False,
     )
     assert response.status_code == 302
-    assert response.headers["location"] == "/profile"
+    assert response.headers["location"] == "/start"
+    store = app.state.auth_store
+    for user in store.list_users_with_stats():
+        store.set_user_admin(user.id, True)
+    return client
+
+
+@pytest.fixture
+def normal_profile_client(
+    app: FastAPI,
+    make_fake_auth_plugin: FakeAuthPluginBuilder,
+) -> TestClient:
+    """Return a TestClient signed in as a normal (non-admin) user."""
+    plugin = make_fake_auth_plugin()
+    app.dependency_overrides[get_auth_plugin] = lambda: plugin
+    client = TestClient(app)
+    response = client.get(
+        "/auth/callback?code=code&state=state",
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
     return client

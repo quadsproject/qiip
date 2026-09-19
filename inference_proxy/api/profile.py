@@ -19,9 +19,9 @@ import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
-from inference_proxy.api.templating import templates
+from inference_proxy.api.templating import templates, user_home_redirect
 from inference_proxy.auth.allowlist import (
     AllowlistUnavailableError,
     SSOAllowlist,
@@ -46,16 +46,52 @@ from inference_proxy.auth.scopes import (
     pickable_endpoints,
 )
 from inference_proxy.auth.store import AuthStore
-from inference_proxy.config.dependencies import get_registry, get_settings
+from inference_proxy.config.dependencies import (
+    get_registry,
+    get_settings,
+    viewer_role,
+)
 from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.registry import NodeRegistry
 
 profile_router = APIRouter(prefix="/profile", tags=["profile"])
 
 
-@profile_router.get("", response_class=HTMLResponse)
-async def profile_page(request: Request) -> HTMLResponse:
-    """Render the profile HTML shell (client decides signed-in state)."""
+async def enforce_mint_allowlist(
+    user: User,
+    settings: Settings,
+    allowlist: SSOAllowlist | None,
+) -> None:
+    """Apply the SSO whitelist gate to a token mint (403/503 on denial).
+
+    Matches the login and use-time gates exactly: only the full-access trust
+    list bypasses it. Admin-role users must still pass, otherwise the use
+    time check (auth/dependencies.py) would 401 every call of the new token.
+    """
+    if not settings.auth.enforce_sso_whitelist or is_full_access(user.email, settings):
+        return
+    try:
+        allowed = await enforce_allowlist(user.email, allowlist)
+    except AllowlistUnavailableError:
+        raise HTTPException(
+            status_code=503, detail="SSO whitelist is unavailable"
+        ) from None
+    if not allowed:
+        raise HTTPException(status_code=403, detail="User is not in the SSO whitelist")
+
+
+@profile_router.get("", response_class=HTMLResponse, response_model=None)
+async def profile_page(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> HTMLResponse | RedirectResponse:
+    """Render the profile HTML shell (client decides signed-in state).
+
+    Signed-in normal users are sent to their own page (``/start``); the
+    profile stays for admins and for anonymous sign-in error display.
+    """
+    if viewer_role(request, settings) == "user":
+        return user_home_redirect()
     return templates.TemplateResponse(
         request=request,
         name="profile.html",
@@ -114,22 +150,15 @@ async def create_token(
     someone else is rejected (403). Admins may pin any registered node.
     """
     admin = has_admin_access(user.email, settings, is_admin=user.is_admin)
-    # The SSO whitelist gate matches the login and use-time gates exactly:
-    # only the full-access trust list bypasses it. Admin-role users must
-    # still mint through the whitelist at /v1 use time (auth/dependencies.py)
-    # would reject them, so letting them bypass at mint would create tokens
-    # that 401 on every call.
-    if settings.auth.enforce_sso_whitelist and not is_full_access(user.email, settings):
-        try:
-            allowed = await enforce_allowlist(user.email, allowlist)
-        except AllowlistUnavailableError:
-            raise HTTPException(
-                status_code=503, detail="SSO whitelist is unavailable"
-            ) from None
-        if not allowed:
-            raise HTTPException(
-                status_code=403, detail="User is not in the SSO whitelist"
-            )
+    if not admin:
+        # Normal users own exactly one model-scoped token, minted on /start.
+        # Minting here (including the agent-config key) would hand them a
+        # second, unrestricted credential the onboarding page never shows.
+        raise HTTPException(
+            status_code=403,
+            detail="Tokens are managed from the qiip start page",
+        )
+    await enforce_mint_allowlist(user, settings, allowlist)
     if body.name == "agent-config" and body.endpoints is not None:
         # The agent-config key is a single stable full-access credential
         # (get_or_create_config_token always stores a NULL scope), so a pin
