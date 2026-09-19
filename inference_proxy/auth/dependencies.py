@@ -7,7 +7,9 @@ Split responsibilities:
 * ``require_profile_user`` authenticates the browser session cookie for the
   profile surface.
 * ``get_api_auth`` authenticates bearer tokens on the /v1 inference API
-  (AUTH-03) with config-gated enforcement.
+  (AUTH-03) with config-gated enforcement. ``get_messages_api_auth``
+  applies the same rules to the Anthropic Messages API, which may also send
+  the token as ``x-api-key``.
 """
 
 from __future__ import annotations
@@ -103,21 +105,58 @@ async def get_api_auth(
     Rejections raise ``ApiAuthError`` so the /v1 error handler can emit an
     OpenAI-compatible ``invalid_api_key`` body.
     """
+    presented = _presented_tokens(request, accept_x_api_key=False)
+    return await _authenticate(presented, settings, store, allowlist)
+
+
+async def get_messages_api_auth(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    store: Annotated[AuthStore, Depends(get_auth_store)],
+    allowlist: Annotated[AllowlistProtocol | None, Depends(get_sso_allowlist)] = None,
+) -> TokenAuth | None:
+    """Authenticate an Anthropic Messages API request.
+
+    Same rules as ``get_api_auth``, but the token may also arrive in the
+    ``x-api-key`` header, which is how Anthropic clients (Claude Code with
+    ``ANTHROPIC_API_KEY``) send it. When both headers are sent, the bearer
+    token is tried first and a valid ``x-api-key`` still authenticates if
+    the bearer token does not resolve.
+    """
+    presented = _presented_tokens(request, accept_x_api_key=True)
+    return await _authenticate(presented, settings, store, allowlist)
+
+
+def _presented_tokens(request: Request, *, accept_x_api_key: bool) -> list[str]:
+    """Return the API tokens a request presents, bearer first."""
+    tokens = []
     authorization = request.headers.get("authorization", "")
     scheme, _, raw_token = authorization.partition(" ")
-    presented = scheme.lower() == "bearer" and bool(raw_token.strip())
+    if scheme.lower() == "bearer" and raw_token.strip():
+        tokens.append(raw_token.strip())
+    if accept_x_api_key:
+        api_key = request.headers.get("x-api-key", "").strip()
+        if api_key and api_key not in tokens:
+            tokens.append(api_key)
+    return tokens
 
-    if presented:
-        raw_token = raw_token.strip()
-        auth = await asyncio.to_thread(store.resolve_token, raw_token)
-        if auth is None:
-            if settings.auth.enforce_api_tokens:
-                raise ApiAuthError("Invalid API token")
-            return None
-        await _enforce_sso_whitelist(settings, allowlist, auth)
-        return auth
+
+async def _authenticate(
+    presented: list[str],
+    settings: Settings,
+    store: AuthStore,
+    allowlist: AllowlistProtocol | None,
+) -> TokenAuth | None:
+    """Resolve the first presented token that is valid, under enforcement."""
+    for token in presented:
+        auth = await asyncio.to_thread(store.resolve_token, token)
+        if auth is not None:
+            await _enforce_sso_whitelist(settings, allowlist, auth)
+            return auth
 
     if settings.auth.enforce_api_tokens:
+        if presented:
+            raise ApiAuthError("Invalid API token")
         raise ApiAuthError("Authentication required for inference requests")
     return None
 

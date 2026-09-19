@@ -372,15 +372,32 @@ class TestSetupLinks:
         assert "exactly one model" in response.json()["detail"]
 
     def test_harness_needing_an_unserved_route_is_refused(
-        self, user_client: TestClient
+        self, user_client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _mint(user_client, [MODEL_A])
+        monkeypatch.setattr(
+            "inference_proxy.api.onboarding._served_routes",
+            lambda: {"/v1/chat/completions"},
+        )
         for harness in ("claude", "codex", "nope"):
             response = user_client.post(
                 "/onboarding/setup-link",
                 json={"harness": harness, "models": [MODEL_A]},
             )
             assert response.status_code == 400
+
+    @pytest.mark.parametrize("harness", ["claude", "codex"])
+    def test_native_api_tools_are_available_and_exportable(
+        self, user_client: TestClient, harness: str
+    ) -> None:
+        _mint(user_client, [MODEL_A])
+        state = user_client.get("/onboarding/state").json()
+        tools = {tool["id"]: tool for tool in state["harnesses"]}
+        assert tools[harness]["available"] is True
+        link = _link(user_client, harness, [MODEL_A])
+        response = user_client.get(link["url"])
+        assert response.status_code == 200
+        assert MODEL_A in response.text
 
     def test_legacy_token_cannot_be_exported(
         self, user_client: TestClient, auth_store: AuthStore
