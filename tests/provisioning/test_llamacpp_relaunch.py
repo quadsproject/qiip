@@ -582,3 +582,104 @@ async def test_drain_wait_reports_complete_timeout_and_unavailable() -> None:
         await NodeProvisioner._drain_wait(provisioner, "host1")
         is DrainOutcome.UNAVAILABLE
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True])
+async def test_owned_profile_can_be_overridden_with_verified_rollback(
+    fails: bool,
+) -> None:
+    from inference_proxy.placement.catalog import BUILTIN_PROFILES
+
+    profile_request = BUILTIN_PROFILES[2].runtime_request(
+        reserve_mib=256, draft_artifact_id="c" * 64, gpu_class="l4"
+    )
+    previous = _node(runtime=_runtime(profile_request)).model_copy(
+        update={"owner": "admin@example.com"}
+    )
+    provisioner, registry, _etcd, state, _writes = _provisioner(previous)
+    requested = _request()
+    replacement = _runtime(requested)
+    provisioner._launch_llamacpp_runtime.side_effect = (  # type: ignore[attr-defined]
+        [ProvisioningError("does not fit"), (previous.model, previous.llamacpp_runtime)]
+        if fails
+        else [(previous.model, replacement)]
+    )
+
+    if fails:
+        with pytest.raises(ProvisioningError, match="does not fit"):
+            await provisioner.relaunch_llamacpp("host1", requested)
+        assert (
+            provisioner._launch_llamacpp_runtime.await_args_list[1].args[2]  # type: ignore[attr-defined]
+            == profile_request
+        )
+    else:
+        await provisioner.relaunch_llamacpp("host1", requested)
+    current = registry.get("host1")
+    assert current is not None
+    assert current.owner == previous.owner
+    assert current.placement is None
+    assert current.llamacpp_runtime == (
+        previous.llamacpp_runtime if fails else replacement
+    )
+    assert _node_from_value(state["record"].value) == current
+
+
+@pytest.mark.asyncio
+async def test_profile_rollback_launch_resolves_draft_and_checks_gpu_evidence() -> None:
+    from inference_proxy.placement.catalog import BUILTIN_PROFILES
+
+    request = BUILTIN_PROFILES[2].runtime_request(
+        reserve_mib=256, draft_artifact_id="c" * 64, gpu_class="l4"
+    )
+    provisioner, _registry, _etcd, _state, _writes = _provisioner()
+    draft = _artifact()
+    runtime = _runtime(request)
+    with (
+        patch.object(
+            provisioner, "_resolve_draft_artifact", AsyncMock(return_value=draft)
+        ) as resolve,
+        patch.object(
+            provisioner, "_read_gpu_inventory", AsyncMock(return_value=())
+        ) as inventory,
+        patch.object(
+            provisioner, "_run_start_vllm", AsyncMock(return_value="model")
+        ) as launch,
+        patch.object(provisioner, "_poll_health", AsyncMock()),
+        patch.object(
+            provisioner, "_verify_llamacpp_runtime", AsyncMock(return_value=runtime)
+        ) as verify,
+    ):
+        result = await NodeProvisioner._launch_llamacpp_runtime(
+            provisioner, "host1", _artifact(), request
+        )
+    assert result == ("model", runtime)
+    resolve.assert_awaited_once_with(request)
+    inventory.assert_awaited_once_with("host1", profile=request.profile)
+    assert launch.await_args is not None
+    assert launch.await_args.kwargs["draft_artifact"] == draft
+    verify.assert_awaited_once_with(
+        "host1", expected_request=request, draft_artifact=draft, gpus=()
+    )
+
+
+@pytest.mark.parametrize("owned", [False, True])
+def test_profile_override_requires_ownership_and_rejects_profile_requests(
+    owned: bool,
+) -> None:
+    from inference_proxy.placement.catalog import BUILTIN_PROFILES
+
+    request = BUILTIN_PROFILES[0].runtime_request(
+        reserve_mib=256, draft_artifact_id=None, gpu_class="l4"
+    )
+    node = _node(runtime=_runtime(request)).model_copy(
+        update={"owner": "admin@example.com" if owned else ""}
+    )
+    provisioner, _registry, _etcd, _state, _writes = _provisioner(node)
+    if owned:
+        assert provisioner.validate_llamacpp_relaunch(node, _request()) == node
+    else:
+        with pytest.raises(RelaunchPreconditionError, match="automatic placement"):
+            provisioner.validate_llamacpp_relaunch(node, _request())
+    with pytest.raises(RelaunchPreconditionError, match="automatic placement"):
+        provisioner.validate_llamacpp_relaunch(node, request)

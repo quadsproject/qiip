@@ -1245,3 +1245,19 @@ class TestPricingSettings:
 
     def test_is_base_model_not_base_settings(self) -> None:
         assert not issubclass(PricingSettings, BaseSettings)
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"), [(None, True), ("false", False), ("true", True)]
+)
+def test_automatic_placement_default_and_environment_opt_out(
+    monkeypatch: pytest.MonkeyPatch, override: str | None, expected: bool
+) -> None:
+    monkeypatch.delenv("INFERENCE_PROXY_PLACEMENT", raising=False)
+    monkeypatch.delenv("INFERENCE_PROXY_PLACEMENT__ENABLED", raising=False)
+    if override is not None:
+        monkeypatch.setenv("INFERENCE_PROXY_PLACEMENT__ENABLED", override)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.placement.enabled is expected

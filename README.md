@@ -529,6 +529,73 @@ A custom `port` is rejected for a plain pool registration (without
 launch. The dashboard's manual-setup form shows the port field only when the
 "Existing OpenAI-compatible server" option is enabled.
 
+### Automatic model placement
+
+Automatic placement is enabled by default. With QUADS configured, QIIP provisions prescribed
+llama.cpp profiles onto free GPU hosts by itself, in fixed, configurable ratios
+(`placement.ratios`, by default 9:2:2:2 for Qwen3.8-27B, Qwen3.6-35B-A3B, Muse
+Glimmer 30B and Gemma 4 31B: 60% Qwen3.8-27B, the rest split equally). Set `placement.enabled: false` to disable it. Automatic placement uses
+only the approved catalog models and their pinned configurations; it does not
+select arbitrary downloaded models.
+
+- **Scope.** Only hosts with exactly one GPU whose QUADS inventory names a GPU
+  product in the profile catalog (currently L4 and A30, 24 GB). Hosts with more
+  than one GPU are refused, not half-supported. There is no 16 GB policy and no
+  demand-based scaling.
+- **Ratios.** The denominator is the hosts automation already holds plus the
+  eligible free hosts. Rounding is largest remainder with catalog order breaking
+  ties, and every weighted profile gets one host once there are as many hosts as
+  profiles. A smaller fleet is served in catalog order: Qwen3.8-27B, Qwen3.6-35B-A3B,
+  Muse Glimmer 30B, then Gemma 4 31B. Eight hosts give 5/1/1/1 and fifteen give
+  9/2/2/2. Qwen3.8-27B takes A30 hosts first. A profile is placed only on GPU
+  products it has been run on for real (`placement.require_qualified_gpu`); Gemma 4
+  31B is currently validated on the L4 only.
+- **What it never touches.** Nodes a person set up, owns, adopted
+  (`self_setup`) or is operating on, hosts in `placement.exclude_hosts`, and,
+  when `placement.only_hosts` is set, every host not listed there.
+  Assigning an owner to an automatically placed node takes it out of automation.
+  `PATCH /admin/nodes/{host}/owner` takes the same per-host reservation as
+  setup, relaunch, teardown and automatic placement, on every node. While one
+  of those is in progress it answers `409` without waiting; repeat the request
+  when the operation finishes. A takeover that returned `200` is never undone
+  by automation.
+  Healthy placements are never moved to rebalance. A retry is decided by the same
+  rules as a fresh placement, as they stand at the time: a host that has since
+  been excluded, reweighted to zero, lost its GPU qualification or changed
+  inventory is released, not retried.
+- **QUADS.** A host is placed only while QUADS shows it free for the whole
+  `quads.schedule_lookahead_hours` window, the same rule manual setup applies.
+- **Durability.** Each placement is a persistent etcd claim at
+  `/placement/claims/<host>`, written with compare-and-swap and refreshed by a
+  heartbeat, so a gateway restart or an expired node lease does not hand a host
+  out twice. Before every launch, first or retry, the host itself is asked
+  whether an earlier setup or start command is still running; if it is, or the
+  host cannot be asked, the launch is blocked and reported instead of started
+  on top. Resetting a claim does not skip that check. A blocked host that has
+  no claim yet is listed under skipped hosts and left out of planning for
+  `placement.retry_backoff_seconds`, so its share goes to another free host.
+  Failures retry with backoff up to `placement.max_attempts`, then stop until
+  an operator resets the claim. The limit counts attempts since the last
+  successful provision, including one a gateway restart interrupted; a success
+  starts the count again, so a healthy node that later loses its record is
+  rebuilt rather than exhausted. QIIP is a single-gateway service: the claim's compare-and-swap is a
+  safeguard against an accidental second gateway, not support for running two.
+- **Files.** Profiles reference exact Hugging Face revisions. Download them with
+  the existing `POST /admin/models/download`. A missing file is reported and
+  only blocks its own profile; it never stops the gateway from starting.
+- **Validation gate.** With `placement.require_qualified_gpu` (the default), a
+  profile is placed only on GPU products listed in its `qualified_gpus`, which
+  is filled in as each profile is validated on real hardware.
+
+`GET /admin/placement` (and the "Automatic Model Placement" card on the admin
+page) reports, per profile, the target and the hosts serving, pending and
+failed; claims with their last error; missing files; and hosts that were skipped
+and why. Claims are read live, so they stay visible while placement is disabled.
+It also shows served requests and tokens per model. Those are a lower bound on
+demand: refused, unroutable and failed requests are not counted, the request
+counter resets on restart, and tokens are neither GPU time nor queue depth. `DELETE
+/admin/placement/claims/{hostname}` resets a failed or exhausted claim.
+
 ### Relaunch managed llama.cpp sizing
 
 The relaunch endpoint accepts the same typed automatic or custom policy stored

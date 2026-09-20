@@ -728,7 +728,7 @@ def test_managed_start_requires_positive_fit_target(value: str) -> None:
 @pytest.mark.parametrize(
     ("values", "message"),
     [
-        ({"AUTOLLAMACPP_MANAGED_SIZING": "invalid"}, "must be auto or custom"),
+        ({"AUTOLLAMACPP_MANAGED_SIZING": "invalid"}, "must be auto, custom or profile"),
         (
             {
                 "AUTOLLAMACPP_MANAGED_SIZING": "auto",
@@ -932,8 +932,13 @@ if [ "$*" != '--version' ]; then
     printf 'server' >> "$AUTOLLAMACPP_TEST_LOG"
     printf ' <%s>' "$@" >> "$AUTOLLAMACPP_TEST_LOG"
     printf '\n' >> "$AUTOLLAMACPP_TEST_LOG"
-    expected='--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --version'
-    [ "$*" = "$expected" ] || exit 46
+    q8='--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --version'
+    mtp='--cache-type-k q4_0 --cache-type-v q4_0 --flash-attn on --ubatch-size 256 --spec-type draft-mtp --spec-draft-n-max 2 --cache-type-k-draft f16 --cache-type-v-draft f16 --no-mmproj --jinja --version'
+    dflash='--spec-type draft-dflash --spec-draft-n-max 7 --version'
+    case "$*" in
+        "$q8"|"$mtp"|"$dflash") ;;
+        *) exit 46 ;;
+    esac
 fi
 echo 'version: 0.4.1 (build 0, commit v0.4.1)' >&2
 EOF

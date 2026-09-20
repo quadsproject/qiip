@@ -601,9 +601,11 @@ def test_llamacpp_setup_selects_profile_and_prepares_fabric(tmp_path: Path) -> N
 
 def test_llamacpp_cpu_only_main_skips_profile_selection(tmp_path: Path) -> None:
     # CPU-only standalone start (REQUIRE_CUDA=0) must not attempt profile
-    # selection: no nvidia-smi means a probe failure, not a rejection.
+    # selection: an unavailable GPU means a probe failure, not a rejection.
+    # Mask real workstation GPUs as well as supporting CPU-only CI runners.
+    _write_executable(tmp_path / "nvidia-smi", "#!/bin/bash\nexit 1\n")
     env = os.environ.copy()
-    env["PATH"] = "/nonexistent:/usr/bin:/bin"
+    env["PATH"] = f"{tmp_path}:/usr/bin:/bin"
     result = subprocess.run(
         [
             "bash",

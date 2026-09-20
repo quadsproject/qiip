@@ -33,6 +33,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
 from inference_proxy.api.admin import admin_router
+from inference_proxy.api.admin_placement import admin_placement_router
 from inference_proxy.api.admin_tokens import admin_tokens_router
 from inference_proxy.api.auth import auth_router
 from inference_proxy.api.chat import chat_router
@@ -64,6 +65,8 @@ from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.openai import ErrorDetail, ErrorResponse
+from inference_proxy.placement.claims import ClaimStore
+from inference_proxy.placement.reconciler import PlacementReconciler
 from inference_proxy.plugins.interfaces.auth import AuthPlugin
 from inference_proxy.plugins.manager import PluginManager
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
@@ -546,10 +549,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "schedule enforcer",
                     schedule_enforcer.stop,
                 )
+
+                # Always constructed, so the admin surfaces can report catalog
+                # files and claims; its loop only runs when placement is
+                # enabled. It never scans or raises during startup: a missing
+                # catalog file is reported by the first pass, not fatal here.
+                placement_reconciler = PlacementReconciler(
+                    settings=resolved_settings.placement,
+                    quads_client=quads_client,
+                    quads_poller=quads_poller,
+                    registry=registry,
+                    provisioner=provisioner,
+                    artifact_index=artifact_index,
+                    claims=ClaimStore(etcd_client),
+                    lookahead_hours=(resolved_settings.quads.schedule_lookahead_hours),
+                )
+                placement_reconciler.start()
+                app.state.placement_reconciler = placement_reconciler
+                resources.push_async_callback(
+                    _safe_async_cleanup,
+                    "placement reconciler",
+                    placement_reconciler.stop,
+                )
             else:
                 app.state.quads_client = None
                 app.state.quads_poller = None
                 app.state.schedule_enforcer = None
+                app.state.placement_reconciler = None
+                if resolved_settings.placement.enabled:
+                    logger.warning(
+                        "placement_disabled_without_quads",
+                        reason="placement.enabled needs quads.base_url",
+                    )
 
             http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(
@@ -641,6 +672,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(router)
     application.include_router(admin_router)
     application.include_router(admin_tokens_router)
+    application.include_router(admin_placement_router)
     application.include_router(dashboard_router)
     application.include_router(fleet_router)
     application.include_router(chat_router)

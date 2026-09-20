@@ -14,6 +14,7 @@ The guide separates three kinds of change:
 - [Required operator migrations](#required-operator-migrations)
 - [Durable provisioning attempt logs](#26-durable-provisioning-attempt-logs)
 - [Self-service onboarding](#27-self-service-onboarding-moves-normal-users-to-start)
+- [Catalog profiles and automatic placement](#28-catalog-profiles-and-automatic-model-placement)
 - [Artifact sources and mirror policy](#artifact-sources-and-mirror-policy)
 - [Client-visible compatibility changes](#client-visible-compatibility-changes)
 - [Operational runbooks](#operational-runbooks)
@@ -586,6 +587,52 @@ Google users.
   them. Rotating it keeps existing tokens valid on `/v1` but blocks
   re-exporting them; users are then asked to create a new token.
 
+### 28. Catalog profiles and automatic model placement
+
+`placement.enabled` now defaults to `true`. With QUADS configured and the
+approved artifacts present, eligible free hosts are provisioned automatically
+using only the catalog models and their pinned configurations. Set
+`placement.enabled: false` before upgrading to opt out. Existing explicit
+`false` settings remain effective.
+
+- **Node records gain two fields.** `/nodes/<host>` values now carry `gpus`
+  (the node's own `nvidia-smi` inventory) and `placement` (set only on nodes
+  automatic placement provisioned). Existing records load unchanged. A
+  gateway without profile support cannot read profile node records; see
+  [Rollback](#rollback).
+- **A new etcd prefix, `/placement/claims/`.** Claims are persistent, unleased
+  keys. Back them up with `/nodes/`. Deleting a claim by hand releases its host
+  to the next placement pass; prefer `DELETE /admin/placement/claims/{host}`.
+- **Managed llama.cpp nodes need a rebuild-free setup pass.** `setup.sh` now
+  also checks that `llama-server` accepts the profile options (`q4_0` KV,
+  `--spec-type`, draft cache types). The pinned v0.4.1 build passes; a custom
+  older pin fails at setup with "does not accept the catalog profile CLI".
+- **New llama.cpp sizing policy `profile`.** `auto` and `custom` behave as
+  before, still restricted to f16 and q8_0 KV. To override a profile on one
+  node, assign it an owner first, then use
+  `POST /admin/nodes/{host}/llamacpp/relaunch`. Taking ownership removes it
+  from automatic placement. A successful relaunch replaces the profile with
+  the requested policy; a failed relaunch restores the verified profile.
+  Nodes still controlled by automatic placement refuse custom relaunch with `409`.
+- **`PATCH /admin/nodes/{host}/owner` can now answer `409`.** It reserves the
+  host like every other lifecycle operation, on all nodes and not only on
+  automatic placements. While setup, relaunch, teardown or an automatic
+  placement holds the host, the request is refused at once with a message
+  naming the cause, and nothing is written. Repeat it when the operation
+  finishes. Scripts that assumed this call always succeeds on a registered
+  node need to handle `409`.
+- **`placement.max_attempts` counts attempts since the last success.** An
+  attempt interrupted by a gateway restart is counted, a limit lowered between
+  restarts applies to existing claims, and a successful provision resets the
+  count. Every launch, including the first on a host and the first after a
+  claim reset, asks the host for running setup or start commands first.
+- **Before upgrading with placement enabled:** configure QUADS, download each profile's files
+  with `POST /admin/models/download` at the revisions the catalog pins, check
+  `GET /admin/placement` shows every profile's files as present, list any host
+  that must stay out in `placement.exclude_hosts`, and leave
+  `placement.require_qualified_gpu` on so a profile only lands on GPU products
+  it has been validated on.
+
 ## Artifact Sources and Mirror Policy
 
 There is no single global mirror switch. Each source has a different trust and configuration boundary.
@@ -777,6 +824,7 @@ reprovisioning.
 There is no database migration to reverse, but rollback does not restore every previous behavior:
 
 - Node environments synchronized from the new frozen bundle remain on the new vLLM and FlashInfer versions until another reviewed bundle converges them.
+- Older gateways reject `sizing: profile` records, so their managed leases expire. Before rollback, disable placement and tear down profile nodes or take ownership and successfully relaunch them with a compatible `auto` or `custom` policy. Ownership alone is insufficient.
 - A managed key already deleted by lease expiry is not recreated by installing an older gateway.
 - Node records written without `managed: true` remain externally owned.
 - Clients changed to understand pre-stream non-200 responses and exhaustion markers should keep that handling; it is backward-compatible with older responses.

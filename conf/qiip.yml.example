@@ -137,6 +137,35 @@ quads:
   schedule_check_interval: 300
   schedule_lookahead_hours: 24
 
+placement:
+  # Automatic placement of catalog llama.cpp profiles on free single-GPU
+  # hosts. Needs QUADS. GET /admin/placement reports targets, claims, missing
+  # catalog files and per-model demand. Enabled by default; false opts out.
+  enabled: true
+  interval_seconds: 300
+  # Relative weights per catalog profile id. Zero or absent: never placed.
+  ratios:
+  # The default is 60% Qwen3.8-27B with the rest split equally three ways.
+    qwen3.8-27b-24g: 9
+    qwen3.6-35b-a3b-24g: 2
+    muse-glimmer-30b-24g: 2
+    gemma-4-31b-24g: 2
+  # Free VRAM kept beyond each profile's measured requirement.
+  reserve_mib: 256
+  # Attempts since the last successful provision, including one in flight.
+  max_attempts: 3
+  # Base retry backoff; also how long a host whose launch was blocked sits out.
+  retry_backoff_seconds: 900
+  claim_stale_seconds: 300
+  max_concurrent: 2
+  # Only place a profile on GPU products it has been validated on.
+  require_qualified_gpu: true
+  # Hosts automatic placement never touches.
+  exclude_hosts: []
+  # When not empty, the only hosts it may touch. Use it for a staged rollout:
+  # unlike exclude_hosts it also keeps out hosts that join later.
+  only_hosts: []
+
 redfish:
   # Set both credentials to enable BMC power management. Node DNS names must
   # also match routing.allowed_endpoint_hosts; IP literals are not accepted

@@ -275,19 +275,7 @@ async def test_real_engine_launch_output_survives_gateway_restart(
     attempt = provisioner.log_buffer.attempts["host1"]
     model = await provisioner._run_start_vllm("host1", model="org/model")
     assert model == "org/model"
-    # The engine sink commits on its own ~100ms flush; wait for the evidence to
-    # be durable before simulating the restart, so scheduling cannot make the
-    # finish beat the flush and decide the test.
-    for _ in range(100):
-        page = store.read(attempt)
-        if any(
-            r["source"] == "engine" and r["msg"] == "engine boot evidence"
-            for r in page["records"]
-        ):
-            break
-        await asyncio.sleep(0.05)
-    else:
-        pytest.fail("engine evidence was not recorded before the restart")
+    # Restart immediately: finish must flush the node sink before returning.
     reopened = AttemptLogStore(store.path)
     reopened.interrupt_running()
     collector = RemoteLogCollector(

@@ -529,6 +529,25 @@ class EtcdClient:
             return None
         return _header_revision(cast(dict[str, Any], result), "transaction")
 
+    def delete_if_revision(self, key: str, *, expected_mod_revision: int) -> bool:
+        """Delete *key* only if it is still the exact revision observed."""
+        raw_key = key.encode("utf-8")
+        result = self._client.transaction(
+            {
+                "compare": [
+                    {
+                        "key": _encode(raw_key),
+                        "result": "EQUAL",
+                        "target": "MOD",
+                        "mod_revision": str(expected_mod_revision),
+                    }
+                ],
+                "success": [{"request_delete_range": {"key": _encode(raw_key)}}],
+                "failure": [],
+            }
+        )
+        return bool(result.get("succeeded", False))
+
     def replace(
         self,
         key: str,

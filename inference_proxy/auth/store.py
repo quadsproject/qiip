@@ -1094,6 +1094,31 @@ class AuthStore:
             for row in rows
         ]
 
+    def get_usage_by_model(self) -> dict[str, UsageTotals]:
+        """Return request/token sums per served model, across every user."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT model,
+                       COALESCE(SUM(request_count), 0)     AS request_count,
+                       COALESCE(SUM(prompt_tokens), 0)     AS prompt_tokens,
+                       COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                       COALESCE(SUM(total_tokens), 0)      AS total_tokens
+                  FROM usage
+                 GROUP BY model
+                 ORDER BY model
+                """
+            ).fetchall()
+        return {
+            row["model"]: UsageTotals(
+                request_count=row["request_count"],
+                prompt_tokens=row["prompt_tokens"],
+                completion_tokens=row["completion_tokens"],
+                total_tokens=row["total_tokens"],
+            )
+            for row in rows
+        }
+
     def get_usage_totals_all(self) -> UsageTotals:
         """Return headline request/token sums across the whole store."""
         with self._lock:
