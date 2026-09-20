@@ -616,6 +616,7 @@ class NodeProvisioner:
         required = {
             *(engine_dir / name for name in _ENGINE_BUNDLE_FILES[engine]),
             common_dir / "setup-base.sh",
+            common_dir / "profiles.sh",
         }
         if self._remote_logs is not None:
             required.add(common_dir / "provision-logs.py")

@@ -92,6 +92,13 @@ An already-installed NVIDIA driver must exactly match
 `AUTOVLLM_NVIDIA_DRIVER_VERSION`; setup refuses to hot-swap a different live
 kernel driver. Custom NVIDIA or LLMFit versions require matching SHA-256 values.
 
+Setup and start select a tested runtime profile from measured hardware
+(compute capability, VRAM, OS/ABI), not GPU marketing names. `setup.sh`
+installs the profile's exact CUDA toolkit and verifies real CUDA execution
+before the engine install. Unsupported combinations are rejected with
+`[REJECT:unsupported_hardware:...]` and exit code 3. See
+`common/PROFILES.md` for the compatibility matrix and its validation status.
+
 ## Run
 
 Start vLLM (auto-detects GPU and selects a model):

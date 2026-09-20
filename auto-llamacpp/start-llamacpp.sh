@@ -49,7 +49,7 @@ MANAGED_GPU_FREE_MIB=()
 source "${SCRIPT_DIR}/llamacpp-process.sh"
 # Shared storage primitives (source/fstype/option verification).
 # shellcheck disable=SC1091 source=../common/setup-base.sh
-source "${SCRIPT_DIR}/../common/setup-base.sh"
+source "$(cd -- "${SCRIPT_DIR}/.." && pwd)/common/setup-base.sh"
 
 detect_gpu_info() {
     GPU_COUNT=0
@@ -252,30 +252,34 @@ configure_llamacpp_params() {
         PARALLEL=2
         CTX_SIZE=2048
     else
-        case "$GPU_MODEL" in
-            *"H100"*|*"A100"*)
+        case "$PROFILE_BUCKET" in
+            hopper|ampere-a100)
                 echo "High-end GPU detected: full GPU offload"
                 N_GPU_LAYERS=99
                 CTX_SIZE=32768
                 PARALLEL=8
                 ;;
-            *"T4"*)
+            turing)
                 echo "Tesla T4 detected: partial GPU offload"
                 N_GPU_LAYERS=99
                 CTX_SIZE=8192
                 PARALLEL=4
                 ;;
-            *"RTX"*|*"GeForce"*)
+            consumer-ada|consumer-ampere|consumer-turing)
                 echo "Consumer GPU detected: conservative GPU offload"
                 N_GPU_LAYERS=99
                 CTX_SIZE=8192
                 PARALLEL=4
                 ;;
-            *)
-                echo "Unknown GPU: using conservative defaults"
+            ampere-a30|ga102-dc|volta)
+                echo "Data-center GPU detected: conservative offload"
                 N_GPU_LAYERS=99
                 CTX_SIZE=4096
                 PARALLEL=4
+                ;;
+            *)
+                echo "FATAL: no runtime profile selected for this hardware; run setup.sh or check select_runtime_profile" >&2
+                return 1
                 ;;
         esac
     fi
@@ -649,6 +653,7 @@ run_llamacpp() {
 # llama.cpp Managed Configuration
 # ================================================
 # GPU:                ${GPU_COUNT} x ${GPU_MODEL} (${GPU_VRAM_GB} GB)
+# Profile:            ${PROFILE_BUCKET:-unknown} (${PROFILE_REASON:-})
 # Model:              ${MODEL_ALIAS}
 # GGUF:               ${GGUF_PATH}
 # VRAM Fit Target:    ${FIT_TARGET_MIB} MiB free per GPU
@@ -668,6 +673,7 @@ EOF
 # llama.cpp Configuration
 # ================================================
 # GPU:                ${GPU_COUNT} x ${GPU_MODEL} (${GPU_VRAM_GB} GB)
+# Profile:            ${PROFILE_BUCKET:-unknown} (${PROFILE_REASON:-})
 # Model:              ${MODEL_ALIAS}
 # GGUF:               ${GGUF_PATH}
 # GPU Layers:         ${N_GPU_LAYERS}
@@ -768,6 +774,11 @@ run_storage_preflight() {
 
 main() {
     detect_gpu_info
+    if [ "$GPU_COUNT" -gt 0 ]; then
+        select_runtime_profile llamacpp || exit $?
+        wait_nvswitch_fabric
+        fabric_ready
+    fi
     configure_llamacpp_params
     run_storage_preflight
     run_llamacpp

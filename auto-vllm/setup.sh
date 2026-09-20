@@ -127,6 +127,7 @@ install_vllm_unit() {
     sudo install -m 755 "${SCRIPT_DIR}/wait-fabric.sh" /usr/local/bin/wait-nvswitch-fabric
     sudo install -m 755 "${SCRIPT_DIR}/preflight.sh" /usr/local/bin/vllm-preflight
     sudo install -m 755 "${SCRIPT_DIR}/../common/setup-base.sh" /usr/local/bin/qiip-setup-base.sh
+    sudo install -m 755 "${SCRIPT_DIR}/../common/profiles.sh" /usr/local/bin/qiip-profiles.sh
     # A previous provisioning may have left a selection here; re-setup starts
     # from defaults and start-vllm.sh rewrites the file on first success.
     sudo rm -f /etc/vllm/vllm.env
@@ -167,8 +168,10 @@ main() {
         "AUTOVLLM_LLMFIT_SHA256"
     step system_update run_system_update
     step nvidia_driver install_nvidia_driver
+    select_runtime_profile vllm || exit $?
     step cuda_toolkit install_cuda_toolkit
     step fabric_manager ensure_fabric_manager
+    step cuda_proof verify_cuda_execution
     step vllm_install install_vllm
     step vllm_unit install_vllm_unit
     step nfs_mount mount_nfs_cache

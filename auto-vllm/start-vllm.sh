@@ -46,6 +46,8 @@ unset FLASHINFER_DISABLE_JIT FLASHINFER_CACHE_DIR
 source "${SCRIPT_DIR}/vllm-process.sh"
 # shellcheck source=auto-vllm/preflight.sh
 source "${SCRIPT_DIR}/preflight.sh"
+# shellcheck disable=SC1091 source=../common/setup-base.sh
+source "$(cd -- "${SCRIPT_DIR}/.." && pwd)/common/setup-base.sh"
 
 detect_gpu_info() {
     if ! command -v nvidia-smi &>/dev/null; then
@@ -90,8 +92,8 @@ configure_vllm_params() {
     EXTRA_ARGS=""
     DEFAULT_DTYPE=""
 
-    case "$GPU_MODEL" in
-        *"H100"*|*"A100"*)
+    case "$PROFILE_BUCKET" in
+        hopper|ampere-a100)
             echo "High-end GPU detected: optimizing for throughput"
             # BF16 weights need roughly two bytes per parameter. These
             # thresholds leave additional memory for KV cache and runtime
@@ -109,7 +111,7 @@ configure_vllm_params() {
             GPU_MEM_UTIL=0.90
             ;;
 
-        *"A30"*|*"A40"*)
+        ampere-a30|ga102-dc)
             # Ampere data-center cards (A30 24GB, A40 48GB). Not covered by the
             # A100/H100 branch: that branch assumes >=48GB per card and would
             # pick a model too large to leave any room for the KV cache here.
@@ -126,7 +128,7 @@ configure_vllm_params() {
             fi
             ;;
 
-        *"T4"*)
+        turing)
             echo "Tesla T4 detected: optimizing for memory efficiency"
             MAX_MODEL_LEN=2048
             MAX_BATCHED_TOKENS=2048
@@ -141,7 +143,7 @@ configure_vllm_params() {
             fi
             ;;
 
-        *"V100"*)
+        volta)
             echo "Tesla V100 detected: balanced configuration"
             GPU_MEM_UTIL=0.85
             MAX_MODEL_LEN=8192
@@ -154,7 +156,7 @@ configure_vllm_params() {
             fi
             ;;
 
-        *"RTX"*|*"GeForce"*)
+        consumer-ada|consumer-ampere|consumer-turing)
             echo "Consumer GPU detected: conservative settings"
             GPU_MEM_UTIL=0.80
             MAX_MODEL_LEN=4096
@@ -168,11 +170,8 @@ configure_vllm_params() {
             ;;
 
         *)
-            echo "Unknown GPU: using conservative defaults"
-            GPU_MEM_UTIL=0.75
-            MAX_MODEL_LEN=4096
-            MODEL="Qwen/Qwen2.5-7B-Instruct"
-            EXTRA_ARGS="--enforce-eager"
+            echo "FATAL: no runtime profile selected for this hardware; run setup.sh or check select_runtime_profile" >&2
+            return 1
             ;;
     esac
 
@@ -433,6 +432,7 @@ run_vllm() {
 # ================================================
 # GPU (physical):     $GPU_COUNT x $GPU_MODEL ($GPU_VRAM_GB GB)
 # CUDA Visible:       ${CUDA_VISIBLE_DEVICES:-all}
+# Profile:            ${PROFILE_BUCKET:-unknown} (${PROFILE_REASON:-})
 # Model:              $MODEL
 # Tensor Parallel:    $TENSOR_PARALLEL
 # Memory Util:        ${GPU_MEM_UTIL}
@@ -522,6 +522,7 @@ persist_vllm_env() {
 
 main() {
     detect_gpu_info
+    select_runtime_profile vllm || exit $?
     configure_vllm_params
 
     EXPECTED_GPU_COUNT="$GPU_COUNT"

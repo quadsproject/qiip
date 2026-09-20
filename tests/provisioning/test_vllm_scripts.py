@@ -64,6 +64,29 @@ case "$*" in
 esac
 """,
     )
+    # verify_cuda_execution compiles and runs a tiny probe; fake nvcc emits a
+    # runnable probe binary so the real proof path is exercised.
+    _write_executable(
+        bin_dir / "nvcc",
+        """#!/bin/bash
+out=""
+while [[ "$#" -gt 0 ]]; do
+    if [[ "$1" == "-o" ]]; then
+        out="$2"
+        shift 2
+    else
+        shift
+    fi
+done
+printf '#!/bin/bash\\nexit 0\\n' > "$out"
+chmod +x "$out"
+""",
+    )
+    _write_executable(
+        bin_dir / "lspci",
+        "#!/bin/bash\necho ''\n",
+    )
+    (tmp_path / "os-release").write_text("ID=rhel\nVERSION_ID=9.5\n")
     flashinfer_python = tmp_path / "fake-python"
     _write_executable(
         flashinfer_python,
@@ -152,6 +175,7 @@ fi
             "AUTOVLLM_TEST_LOG": str(process_log),
             "AUTOVLLM_NFS_MOUNT_POINT": str(cache_dir),
             "AUTOVLLM_TEST_GPU_COUNT": str(gpu_count),
+            "PROFILE_OS_RELEASE": str(tmp_path / "os-release"),
         }
     )
     if device_count is not None:
@@ -161,7 +185,7 @@ fi
 
 def _configured_profile(
     *,
-    gpu_model: str,
+    profile_bucket: str,
     gpu_count: int,
     gpu_vram_gb: int,
     overrides: dict[str, str] | None = None,
@@ -191,7 +215,7 @@ def _configured_profile(
             "-c",
             f"""
 source <(sed '/^main$/d' {START_SCRIPT!s})
-GPU_MODEL={gpu_model!r}
+PROFILE_BUCKET={profile_bucket!r}
 GPU_COUNT={gpu_count}
 GPU_VRAM_GB={gpu_vram_gb}
 configure_vllm_params
@@ -496,6 +520,7 @@ def _captured_vllm_argv(
     tmp_path: Path,
     extra_env: dict[str, str] | None = None,
     gpu_model: str = "NVIDIA A100",
+    gpu_compute_cap: str = "8.0",
 ) -> str:
     process_log = tmp_path / "process.log"
     vllm_bin = tmp_path / "fake-vllm"
@@ -512,6 +537,7 @@ while true; do sleep 1; done
         vllm_bin=vllm_bin,
         process_log=process_log,
         gpu_model=gpu_model,
+        gpu_compute_cap=gpu_compute_cap,
     )
     env.update(extra_env or {})
     try:
@@ -550,7 +576,7 @@ def test_empty_dtype_is_omitted_from_vllm_serve(tmp_path: Path) -> None:
 def test_t4_default_emits_single_float16_dtype(tmp_path: Path) -> None:
     # T4 forces float16 by default; it must reach vLLM as exactly one --dtype
     # argv value (it is no longer smuggled through EXTRA_ARGS).
-    argv = _captured_vllm_argv(tmp_path, gpu_model="Tesla T4")
+    argv = _captured_vllm_argv(tmp_path, gpu_model="Tesla T4", gpu_compute_cap="7.5")
     assert " --dtype float16" in f" {argv}"
     assert argv.count("--dtype") == 1
 
@@ -563,6 +589,7 @@ def test_dtype_override_wins_over_t4_default_without_duplicate(tmp_path: Path) -
         tmp_path,
         {"AUTOVLLM_DTYPE": "bfloat16"},
         gpu_model="Tesla T4",
+        gpu_compute_cap="7.5",
     )
     assert argv.count("--dtype") == 1
     assert " --dtype bfloat16" in f" {argv}"
@@ -681,28 +708,28 @@ while true; do sleep 1; done
 
 
 @pytest.mark.parametrize(
-    ("gpu_model", "gpu_count", "gpu_vram_gb", "expected"),
+    ("profile_bucket", "gpu_count", "gpu_vram_gb", "expected"),
     [
         (
-            "NVIDIA A100",
+            "ampere-a100",
             3,
             80,
             ["Qwen/Qwen2.5-72B-Instruct", "3", "0.90", "32768", "32768", "", ""],
         ),
         (
-            "NVIDIA A100",
+            "ampere-a100",
             2,
             80,
             ["Qwen/Qwen2.5-32B-Instruct", "2", "0.90", "32768", "32768", "", ""],
         ),
         (
-            "NVIDIA A100",
+            "ampere-a100",
             1,
             40,
             ["Qwen/Qwen2.5-14B-Instruct", "1", "0.90", "32768", "32768", "", ""],
         ),
         (
-            "Tesla V100",
+            "volta",
             2,
             32,
             [
@@ -716,7 +743,7 @@ while true; do sleep 1; done
             ],
         ),
         (
-            "Tesla V100",
+            "volta",
             3,
             32,
             [
@@ -730,7 +757,7 @@ while true; do sleep 1; done
             ],
         ),
         (
-            "NVIDIA GeForce RTX 4090",
+            "consumer-ada",
             1,
             24,
             [
@@ -744,7 +771,7 @@ while true; do sleep 1; done
             ],
         ),
         (
-            "NVIDIA RTX 6000 Ada",
+            "consumer-ada",
             1,
             48,
             [
@@ -757,17 +784,49 @@ while true; do sleep 1; done
                 "",
             ],
         ),
+        (
+            "ga102-dc",
+            1,
+            48,
+            ["Qwen/Qwen2.5-14B-Instruct", "1", "0.90", "32768", "32768", "", ""],
+        ),
+        (
+            "ampere-a30",
+            1,
+            24,
+            ["Qwen/Qwen2.5-7B-Instruct", "1", "0.90", "32768", "32768", "", ""],
+        ),
+        (
+            "consumer-ampere",
+            1,
+            24,
+            [
+                "Qwen/Qwen2.5-7B-Instruct",
+                "1",
+                "0.80",
+                "4096",
+                "32768",
+                "--enforce-eager",
+                "",
+            ],
+        ),
+        (
+            "turing",
+            1,
+            16,
+            ["Qwen/Qwen3-14B-AWQ", "1", "0.90", "8192", "8192", "", "float16"],
+        ),
     ],
 )
 def test_gpu_profile_matrix_selects_runnable_configuration(
-    gpu_model: str,
+    profile_bucket: str,
     gpu_count: int,
     gpu_vram_gb: int,
     expected: list[str],
 ) -> None:
     assert (
         _configured_profile(
-            gpu_model=gpu_model,
+            profile_bucket=profile_bucket,
             gpu_count=gpu_count,
             gpu_vram_gb=gpu_vram_gb,
         )
@@ -777,7 +836,7 @@ def test_gpu_profile_matrix_selects_runnable_configuration(
 
 def test_explicit_vllm_overrides_still_win() -> None:
     assert _configured_profile(
-        gpu_model="NVIDIA A100",
+        profile_bucket="ampere-a100",
         gpu_count=2,
         gpu_vram_gb=80,
         overrides={
@@ -804,7 +863,7 @@ def test_explicit_dtype_override_wins_over_v100_default() -> None:
     # V100 normally defaults to float16; an explicit override must replace it
     # rather than producing two conflicting --dtype arguments.
     assert _configured_profile(
-        gpu_model="Tesla V100",
+        profile_bucket="volta",
         gpu_count=2,
         gpu_vram_gb=32,
         overrides={"AUTOVLLM_DTYPE": "bfloat16"},
@@ -831,7 +890,7 @@ def test_invalid_dtype_override_is_rejected_by_allowlist() -> None:
             "-c",
             f"""
 source <(sed '/^main$/d' {START_SCRIPT!s})
-GPU_MODEL='NVIDIA A100'
+PROFILE_BUCKET='ampere-a100'
 GPU_COUNT=1
 GPU_VRAM_GB=80
 configure_vllm_params
@@ -857,7 +916,7 @@ def test_extra_args_containing_dtype_is_rejected() -> None:
             "-c",
             f"""
 source <(sed '/^main$/d' {START_SCRIPT!s})
-GPU_MODEL='NVIDIA A100'
+PROFILE_BUCKET='ampere-a100'
 GPU_COUNT=1
 GPU_VRAM_GB=80
 configure_vllm_params
@@ -924,7 +983,7 @@ def test_reserved_vllm_names_are_ignored_without_compatibility_warnings() -> Non
             "-c",
             f"""
 source <(sed '/^main$/d' {START_SCRIPT!s})
-GPU_MODEL='NVIDIA A100'
+PROFILE_BUCKET='ampere-a100'
 GPU_COUNT=2
 GPU_VRAM_GB=80
 configure_vllm_params
@@ -1924,7 +1983,7 @@ def test_profile_sizes_model_by_effective_tensor_parallel() -> None:
     """TP=1 on a 4x H100 host must pick a single-card model, not the 72B
     profile that would OOM on the allocated device."""
     result = _configured_profile(
-        gpu_model="NVIDIA H100",
+        profile_bucket="hopper",
         gpu_count=4,
         gpu_vram_gb=80,
         overrides={"AUTOVLLM_TENSOR_PARALLEL": "1"},
@@ -1957,6 +2016,7 @@ def test_start_vllm_persists_effective_launch_env(tmp_path: Path) -> None:
             "-c",
             f"""
 source <(sed '/^main$/d' {START_SCRIPT!s})
+PROFILE_BUCKET='ampere-a100'
 GPU_MODEL='NVIDIA A100'
 GPU_COUNT=4
 GPU_DEVICE_COUNT=1
@@ -1995,6 +2055,7 @@ def test_persist_vllm_env_rewrites_stale_device_keys(tmp_path: Path) -> None:
             "-c",
             f"""
 source <(sed '/^main$/d' {START_SCRIPT!s})
+PROFILE_BUCKET='ampere-a100'
 GPU_MODEL='NVIDIA A100'
 GPU_COUNT=2
 GPU_DEVICE_COUNT=2

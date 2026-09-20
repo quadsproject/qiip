@@ -165,6 +165,9 @@ def worker(config):
             marker = re.search(r"\[STEP:(\w+):(START|OK|WARN|FAIL)\]", message)
             if source == "setup.stdout" and marker:
                 current_stage = marker.group(1)
+            reject = re.search(r"\[REJECT:unsupported_hardware:(.*?)\]", message)
+            if reject and source.endswith("stderr"):
+                store.issue(attempt, f"unsupported_hardware: {reject.group(1)}")
             record(message, source, "warning" if source.endswith("stderr") else "info")
             if source == "journal.stderr":
                 store.issue(

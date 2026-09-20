@@ -2,6 +2,13 @@
 # Shared setup functions sourced by engine-specific setup.sh scripts.
 # Env vars use the AUTOVLLM_ prefix for backward compatibility.
 
+# Runtime profile catalog (measurement-driven engine selection)
+_qiip_profiles="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/profiles.sh"
+[ -f "$_qiip_profiles" ] || _qiip_profiles=/usr/local/bin/qiip-profiles.sh
+# shellcheck disable=SC1091,SC1090
+source "$_qiip_profiles"
+unset _qiip_profiles
+
 require_sha256() {
     local label="$1"
     local digest="$2"
@@ -144,14 +151,181 @@ install_nvidia_driver() {
     return "$status"
 }
 
+# Locates nvcc for the profile toolkit. The NVIDIA RHEL9 repo installs under
+# /usr/local/cuda-<version>/bin (no /usr/local/cuda symlink), so candidate
+# paths are checked in order; CUDA_NVCC always wins.
+find_nvcc() {
+    local required="${1:-${PROFILE_CUDA_TOOLKIT_VERSION:-}}"
+    local candidate
+    for candidate in \
+        "${CUDA_NVCC:-}" \
+        "/usr/local/cuda/bin/nvcc" \
+        "/usr/local/cuda-${required}/bin/nvcc" \
+        "$(command -v nvcc 2>/dev/null || true)"; do
+        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
 install_cuda_toolkit() {
-    sudo dnf -y install dnf-plugins-core
-    if [ -x /usr/local/cuda/bin/nvcc ]; then
-        echo "CUDA toolkit already installed, skipping"
-    else
-        sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
-        sudo dnf -y install cuda-toolkit
+    local required="${PROFILE_CUDA_TOOLKIT_VERSION}"
+    local nvcc
+    nvcc="$(find_nvcc "$required")" || nvcc=""
+    if [ -n "$nvcc" ] && [ -x "$nvcc" ]; then
+        local installed
+        installed=$("$nvcc" --version 2>/dev/null | grep -oP 'V\K[0-9]+\.[0-9]+' | head -1) || true
+        if [ "$installed" = "$required" ]; then
+            echo "CUDA toolkit ${required} already installed, skipping"
+            return 0
+        fi
+        echo "CUDA toolkit ${installed:-unknown} installed; installing exact ${required}"
     fi
+    sudo dnf -y install dnf-plugins-core
+    sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
+    local pkg="cuda-toolkit-${required//./-}"
+    if ! sudo dnf -y install "$pkg"; then
+        echo "FATAL: could not install ${pkg}; check the NVIDIA CUDA repository" >&2
+        return 1
+    fi
+    # The RHEL9 dnf packages install nvcc under /usr/local/cuda-<version>/bin
+    # without a /usr/local/cuda symlink, so keep the conventional path valid
+    # for engine scripts and parity with runfile installs. verify_cuda_execution
+    # (step cuda_proof) is the hard gate for actual toolkit usability.
+    sudo ln -sfn "cuda-${required}" /usr/local/cuda
+    echo "CUDA toolkit ${required} installed (${pkg})"
+}
+
+# Proves real CUDA execution (driver + toolkit + device) with a tiny
+# headless kernel. Fails closed with one actionable line; no X/GL needed.
+verify_cuda_execution() {
+    local nvcc
+    nvcc="$(find_nvcc)" || nvcc=""
+    if [ -z "$nvcc" ]; then
+        echo "FATAL: nvcc not found; install the profile CUDA toolkit first" >&2
+        return 1
+    fi
+    local work_dir
+    work_dir=$(mktemp -d "${INSTALL_TMP_DIR:-/tmp}/cuda-probe.XXXXXX")
+    cat > "${work_dir}/cuda_probe.cu" <<'EOF'
+__global__ void k(int *x) { *x = 42; }
+int main() {
+    int h = 0, *d;
+    if (cudaMalloc(&d, sizeof(int)) != cudaSuccess) { printf("cudaMalloc failed\n"); return 1; }
+    k<<<1, 1>>>(d);
+    if (cudaMemcpy(&h, d, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        printf("cudaMemcpy failed\n"); return 1;
+    }
+    cudaFree(d);
+    return h == 42 ? 0 : 1;
+}
+EOF
+    if ! "$nvcc" -o "${work_dir}/cuda_probe" "${work_dir}/cuda_probe.cu" 2>/dev/null; then
+        rm -rf "$work_dir"
+        echo "FATAL: nvcc failed to compile the CUDA execution probe" >&2
+        return 1
+    fi
+    if ! "${work_dir}/cuda_probe"; then
+        rm -rf "$work_dir"
+        echo "FATAL: CUDA execution probe failed on the device; driver/toolkit/device unusable" >&2
+        return 1
+    fi
+    rm -rf "$work_dir"
+    echo "CUDA execution verified: probe kernel compiled and ran"
+    return 0
+}
+
+# Static Fabric Manager checks: installed, version matches driver, service
+# active. Prints a FATAL reason on failure. rc-based, no _mark/_bail.
+fabric_static_ok() {
+    local driver_version fm_version
+    driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader \
+        | sed '/^[[:space:]]*$/d' | head -1 | xargs) || {
+        echo "FATAL: cannot query NVIDIA driver version (nvidia-smi failed)" >&2
+        return 1
+    }
+    # Prefer the binary version: redist installs bypass RPM.
+    fm_version=""
+    if [ -x /usr/bin/nv-fabricmanager ]; then
+        fm_version=$(nv-fabricmanager --version 2>/dev/null \
+            | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
+    fi
+    if [ -z "$fm_version" ] && rpm -q nvidia-fabricmanager &>/dev/null; then
+        fm_version=$(rpm -q --qf '%{VERSION}' nvidia-fabricmanager)
+    fi
+    if [ -z "$fm_version" ]; then
+        echo "FATAL: NVSwitch present but nvidia-fabricmanager not installed (run setup.sh)" >&2
+        return 1
+    fi
+    if [ "$fm_version" != "$driver_version" ]; then
+        echo "FATAL: Fabric Manager ${fm_version} != driver ${driver_version} — version mismatch causes CUDA error 802" >&2
+        return 1
+    fi
+    if ! systemctl is-active --quiet nvidia-fabricmanager; then
+        echo "FATAL: nvidia-fabricmanager.service not active — systemctl start nvidia-fabricmanager" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Returns 0 once fabric training is complete: nvidia-smi State Completed, or
+# the oneshot 580.x service exited successfully. rc-based.
+fabric_trained() {
+    local fabric_state
+    fabric_state=$(nvidia-smi -q 2>/dev/null \
+        | grep -A2 'Fabric' | grep 'State' | head -1 \
+        | awk -F: '{print $2}' | xargs) || true
+    if [ "$fabric_state" = "Completed" ]; then
+        return 0
+    fi
+    if [ "$(systemctl show -p Type --value nvidia-fabricmanager 2>/dev/null)" = "oneshot" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Waits for NVSwitch fabric training to complete. No-op without NVSwitches;
+# fails fast on static Fabric Manager problems instead of waiting blind.
+wait_nvswitch_fabric() {
+    local timeout="${AUTOVLLM_FM_TIMEOUT:-120}"
+    local nvswitch_count elapsed
+    nvswitch_count=$(lspci 2>/dev/null | grep -ci nvswitch || true)
+    if [ "$nvswitch_count" -eq 0 ]; then
+        return 0
+    fi
+    if ! fabric_static_ok; then
+        return 1
+    fi
+    elapsed=0
+    while [ "$elapsed" -lt "$timeout" ]; do
+        if fabric_trained; then
+            return 0
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    echo "FATAL: NVSwitch fabric training did not complete within ${timeout}s; check /var/log/fabricmanager.log" >&2
+    return 1
+}
+
+# Returns 0 when Fabric Manager is correctly installed and trained (no-op
+# without NVSwitches). rc-based: no preflight _mark/_bail dependency.
+fabric_ready() {
+    local nvswitch_count
+    nvswitch_count=$(lspci 2>/dev/null | grep -ci nvswitch || true)
+    if [ "$nvswitch_count" -eq 0 ]; then
+        return 0
+    fi
+    if ! fabric_static_ok; then
+        return 1
+    fi
+    if ! fabric_trained; then
+        echo "FATAL: Fabric State not Completed — check /var/log/fabricmanager.log" >&2
+        return 1
+    fi
+    return 0
 }
 
 install_fabricmanager_rpm() {

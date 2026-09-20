@@ -139,6 +139,7 @@ exit 99
     common_dir = bundle.parent / "common"
     common_dir.mkdir(exist_ok=True)
     shutil.copy(REPO_ROOT / "common" / "setup-base.sh", common_dir / "setup-base.sh")
+    shutil.copy(REPO_ROOT / "common" / "profiles.sh", common_dir / "profiles.sh")
     env = {
         **os.environ,
         "PATH": f"{fake_bin}:/usr/bin:/bin",

@@ -72,10 +72,17 @@ still applies, so build output remains a liveness signal.
 
 ## Shared setup infrastructure
 
-Shared setup functions (NVIDIA driver, CUDA toolkit, NFS mount, firewall,
-llmfit) live in `common/setup-base.sh`. Both `auto-vllm/setup.sh` and
-`auto-llamacpp/setup.sh` source this file. Do not duplicate shared logic
-in engine-specific scripts.
+Shared setup functions (NVIDIA driver, CUDA toolkit, Fabric Manager, NFS
+mount, firewall, llmfit) live in `common/setup-base.sh`. Both
+`auto-vllm/setup.sh` and `auto-llamacpp/setup.sh` source this file. Do not
+duplicate shared logic in engine-specific scripts.
+
+Both engines select a measured runtime profile (`common/profiles.sh`), install
+the profile's exact CUDA toolkit, verify real CUDA execution, and prepare
+Fabric Manager on NVSwitch hosts (`ensure_fabric_manager` plus a readiness
+gate at start). Unsupported combinations are rejected with
+`[REJECT:unsupported_hardware:...]` and exit code 3. See
+`common/PROFILES.md` for the compatibility matrix and its validation status.
 
 ## Setup
 
