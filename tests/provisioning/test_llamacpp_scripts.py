@@ -1068,6 +1068,33 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     assert "compute_capabilities=8.0,9.0" in marker_text
 
 
+def test_install_resolves_nvcc_after_toolkit_install(tmp_path: Path) -> None:
+    # A fresh node has no nvcc when setup.sh is sourced, and the toolkit step
+    # (a subshell) installs it later, so install_llamacpp must resolve nvcc at
+    # build time instead of trusting a value captured before main. Fails if
+    # resolution ever moves back to source time.
+    env, operation_log, _link_dir = _build_fixture(tmp_path)
+    del env["AUTOLLAMACPP_NVCC"]  # fresh node: no nvcc at source time
+    fake_nvcc = Path(env["PATH"].split(":")[0]) / "nvcc"
+    result = _run_shell(
+        _source_setup(
+            f"""
+find_nvcc() {{ echo {shlex.quote(str(fake_nvcc))}; }}
+install_llamacpp
+"""
+        ),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    configure = next(
+        line
+        for line in operation_log.read_text().splitlines()
+        if line.startswith("cmake <-S>")
+    )
+    assert f"<-DCMAKE_CUDA_COMPILER={fake_nvcc}>" in configure
+
+
 def test_install_does_not_require_ninja(tmp_path: Path) -> None:
     env, _operation_log, _link_dir = _build_fixture(tmp_path)
 

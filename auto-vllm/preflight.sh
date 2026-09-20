@@ -144,42 +144,10 @@ check_fabric() {
         _mark PASS "No NVSwitches — Fabric Manager not required"
         return 0
     fi
-
-    local driver_version fm_version
-    driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader \
-        | sed '/^[[:space:]]*$/d' | head -1 | xargs)
-
-    # Prefer the binary version — redist installs bypass RPM, so a stale
-    # RPM from a previous driver can report the wrong version.
-    if [ -x /usr/bin/nv-fabricmanager ]; then
-        fm_version=$(nv-fabricmanager --version 2>/dev/null \
-            | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1) || true
+    if ! fabric_ready; then
+        _bail "Fabric Manager not ready (see message above)"
     fi
-    if [ -z "$fm_version" ] && rpm -q nvidia-fabricmanager &>/dev/null; then
-        fm_version=$(rpm -q --qf '%{VERSION}' nvidia-fabricmanager)
-    fi
-    if [ -z "$fm_version" ]; then
-        _bail "NVSwitch present but nvidia-fabricmanager not installed (setup.sh ensure_fabric_manager)"
-    fi
-    if [ "$fm_version" != "$driver_version" ]; then
-        _bail "Fabric Manager ${fm_version} != driver ${driver_version} — version mismatch causes CUDA error 802"
-    fi
-
-    if ! systemctl is-active --quiet nvidia-fabricmanager; then
-        _bail "nvidia-fabricmanager.service not active — systemctl start nvidia-fabricmanager"
-    fi
-
-    local fabric_state
-    fabric_state=$(nvidia-smi -q 2>/dev/null \
-        | grep -A2 'Fabric' | grep 'State' | head -1 \
-        | awk -F: '{print $2}' | xargs) || true
-    if [ "$fabric_state" = "Completed" ]; then
-        _mark PASS "Fabric Manager ${fm_version}, training completed (nvidia-smi)"
-    elif [ "$(systemctl show -p Type --value nvidia-fabricmanager 2>/dev/null)" = "oneshot" ]; then
-        _mark PASS "Fabric Manager ${fm_version}, training completed (service exited successfully)"
-    else
-        _bail "Fabric State: '${fabric_state:-unknown}' (expected Completed) — check /var/log/fabricmanager.log"
-    fi
+    _mark PASS "Fabric Manager ready (version matches driver, training complete)"
 }
 
 # ── 3. Tensor-parallel default & CUDA device count ──────────────────────
@@ -195,9 +163,17 @@ profile_tensor_parallel() {
             device_count="$GPU_COUNT"
         fi
     fi
-    case "$GPU_MODEL" in
-        *"H100"*|*"A100"*|*"A30"*|*"A40"*|*"V100"*) echo "$device_count" ;;
-        *) echo 1 ;;
+    case "${PROFILE_BUCKET:-}" in
+        hopper|ampere-a100|ampere-a30|ga102-dc|volta) echo "$device_count" ;;
+        consumer-ada|consumer-ampere|consumer-turing|turing) echo 1 ;;
+        *)
+            # Bucket missing (standalone preflight, direct callers): fall back
+            # to the legacy name-based families.
+            case "${GPU_MODEL:-}" in
+                *"H100"*|*"A100"*|*"A30"*|*"A40"*|*"V100"*) echo "$device_count" ;;
+                *) echo 1 ;;
+            esac
+            ;;
     esac
 }
 
@@ -242,7 +218,17 @@ check_cuda_devices() {
     _mark PASS "physical=${GPU_COUNT} (nvidia-smi), CUDA-visible=${cuda_count}, allocated=${tp} for tensor-parallel"
 }
 
-# ── 4. Model path / space ───────────────────────────────────────────────
+# ── 4. Real CUDA execution proof ────────────────────────────────────────
+
+check_cuda_execution() {
+    if verify_cuda_execution; then
+        _mark PASS "CUDA execution probe compiled and ran"
+    else
+        _bail "CUDA execution failed (see message above)"
+    fi
+}
+
+# ── 5. Model path / space ───────────────────────────────────────────────
 
 # Mirrors the gateway's ModelCatalogService._snapshot_state (catalog.py): the
 # local-only snapshot_download call checks the cached tree manifest and rejects
@@ -479,7 +465,7 @@ check_model_topology() {
     esac
 }
 
-# ── 5. NFS mount health ────────────────────────────────────────────────
+# ── 6. NFS mount health ────────────────────────────────────────────────
 
 check_nfs_mounts() {
     # Managed runs may carry the exact export (AUTOVLLM_NFS_EXPORT); when
@@ -551,7 +537,7 @@ check_nfs_mounts() {
     fi
 }
 
-# ── 6. Attention backend & JIT toolchain ────────────────────────────────
+# ── 7. Attention backend & JIT toolchain ────────────────────────────────
 
 check_attention_backend() {
     local major="${GPU_COMPUTE_CAP%%.*}"
@@ -635,7 +621,7 @@ check_attention_backend() {
     fi
 }
 
-# ── 7. Persistence mode ────────────────────────────────────────────────
+# ── 8. Persistence mode ────────────────────────────────────────────────
 
 check_persistence_mode() {
     local probe_index=0
@@ -659,6 +645,7 @@ run_preflight() {
     check_driver
     check_fabric
     check_cuda_devices
+    check_cuda_execution
     check_model
     check_model_topology
     check_nfs_mounts

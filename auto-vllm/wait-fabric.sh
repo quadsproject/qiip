@@ -2,35 +2,14 @@
 set -euo pipefail
 
 # Standalone wait for NVSwitch fabric training. Used as systemd ExecStartPre
-# so vLLM cannot launch before CUDA peer access is available.
+# so vLLM cannot launch before CUDA peer access is available. The shared
+# implementation lives in common/setup-base.sh (wait_nvswitch_fabric).
 
-TIMEOUT="${AUTOVLLM_FM_TIMEOUT:-120}"
+# shellcheck disable=SC1091
+_qiip_lib="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/common/setup-base.sh"
+[ -f "$_qiip_lib" ] || _qiip_lib=/usr/local/bin/qiip-setup-base.sh
+# shellcheck disable=SC1090
+source "$_qiip_lib"
+unset _qiip_lib
 
-nvswitch_count=$(lspci 2>/dev/null | grep -ci nvswitch || true)
-if [ "$nvswitch_count" -eq 0 ]; then
-    exit 0
-fi
-
-elapsed=0
-while [ "$elapsed" -lt "$TIMEOUT" ]; do
-    state=$(nvidia-smi -q 2>/dev/null \
-        | grep -A2 'Fabric' | grep 'State' | head -1 \
-        | awk -F: '{print $2}' | xargs) || true
-    if [ "$state" = "Completed" ]; then
-        exit 0
-    fi
-
-    # Oneshot fabricmanager (580.x): service active = training done,
-    # even when nvidia-smi reports N/A.
-    svc_state=$(systemctl show -p ActiveState --value nvidia-fabricmanager 2>/dev/null) || true
-    if [ "$svc_state" = "active" ] \
-        && [ "$(systemctl show -p Type --value nvidia-fabricmanager 2>/dev/null)" = "oneshot" ]; then
-        exit 0
-    fi
-
-    sleep 2
-    elapsed=$((elapsed + 2))
-done
-
-echo "FATAL: NVSwitch fabric training did not complete within ${TIMEOUT}s; check /var/log/fabricmanager.log" >&2
-exit 1
+wait_nvswitch_fabric

@@ -191,7 +191,12 @@ install_llamacpp() {
         echo "FATAL: cmake and make are required to build llama.cpp" >&2
         return 1
     fi
-    if [ ! -x "$CUDA_NVCC" ]; then
+    # The toolkit step ran in its own subshell (step -> run_with_errexit), so
+    # resolve nvcc here, after select_runtime_profile pinned the toolkit. The
+    # profile dnf layout installs under /usr/local/cuda-<version>/bin and the
+    # toolkit step also symlinks /usr/local/cuda, so find_nvcc covers both.
+    CUDA_NVCC="$(find_nvcc)" || CUDA_NVCC=""
+    if [ -z "$CUDA_NVCC" ]; then
         echo "FATAL: CUDA nvcc is required to build managed llama.cpp" >&2
         return 1
     fi
@@ -323,7 +328,10 @@ main() {
         "AUTOLLAMACPP_SHA256"
     step system_update run_system_update
     step nvidia_driver install_nvidia_driver
+    select_runtime_profile llamacpp || exit $?
     step cuda_toolkit install_cuda_toolkit
+    step fabric_manager ensure_fabric_manager
+    step cuda_proof verify_cuda_execution
     step llamacpp_install install_llamacpp
     step nfs_mount mount_nfs_cache
     step firewall configure_firewall
