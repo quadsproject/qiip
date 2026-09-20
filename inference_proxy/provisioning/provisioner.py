@@ -44,17 +44,29 @@ from inference_proxy.models.node import (
     LlamaCppCacheType,
     LlamaCppFlashAttention,
     LlamaCppGPUState,
+    LlamaCppProfileRuntime,
     LlamaCppRuntimeEffective,
     LlamaCppRuntimeRequest,
     LlamaCppRuntimeState,
     LlamaCppSizingMode,
+    LlamaCppSpeculativeEffective,
+    LlamaCppSpeculativeType,
     Node,
+    NodeGPU,
+    NodePlacement,
     NodeStatus,
     VllmParams,
 )
 from inference_proxy.provisioning.host_lifecycle import (
     HostLifecycleCoordinator,
     HostLifecycleLease,
+)
+from inference_proxy.provisioning.llamacpp_profile import (
+    ProfileEvidence,
+    ProfileEvidenceError,
+    latest_launch,
+    parse_profile_evidence,
+    split_profile_sections,
 )
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
 from inference_proxy.provisioning.remote_logs import RemoteLogCollector
@@ -91,14 +103,14 @@ LLAMACPP_AGGREGATE_CONTEXT_PATTERN = re.compile(
     r"llama_context:\s+n_ctx\s*=\s*(?P<context>\d+)"
 )
 LLAMACPP_PLAN_PATTERN = re.compile(
-    r"qiip_fit_plan: sizing=(?P<sizing>auto|custom) "
+    r"qiip_fit_plan: sizing=(?P<sizing>auto|custom|profile) "
     r"train_context=(?P<train_context>\d+) "
     r"context_per_slot=(?P<context>\d+) "
     r"slots=(?P<slots>\d+) "
     r"aggregate_context=(?P<aggregate>\d+) "
     r"fit_target_mib=(?P<target>\d+) "
-    r"cache_type_k=(?P<cache_type_k>f16|q8_0) "
-    r"cache_type_v=(?P<cache_type_v>f16|q8_0) "
+    r"cache_type_k=(?P<cache_type_k>f16|q8_0|q4_0) "
+    r"cache_type_v=(?P<cache_type_v>f16|q8_0|q4_0) "
     r"flash_attn=(?P<flash_attn>auto|on) "
     r"estimator_overrun_used=(?P<estimator_overrun_used>true|false)"
 )
@@ -117,6 +129,14 @@ LLAMACPP_CONTEXT_OVERFLOW_PATTERN = re.compile(
 LLAMACPP_SLOT_CAP_PATTERN = re.compile(
     r"the slot context \((?P<context>\d+)\) exceeds the training context "
     r"of the model \((?P<train>\d+)\) - capping"
+)
+# qiip's own node-side provisioning commands, as they appear in ``ps`` args:
+# setup, engine start, and the detached command worker. The long-lived
+# ``provision-logs.py engine`` sink belongs to a running server, not to
+# provisioning, and must not match.
+_REMOTE_LIFECYCLE_PATTERN = re.compile(
+    r"(?:auto-(?:llamacpp|vllm)/(?:setup|start-[a-z]+)\.sh"
+    r"|common/provision-logs\.py worker\b)"
 )
 LLAMACPP_FIT_FAILURE_PATTERN = re.compile(r"failed to fit params to free device memory")
 _ENGINE_BUNDLE_FILES = {
@@ -207,6 +227,12 @@ class PreflightError(Exception):
         super().__init__(f"Pre-flight failed on {hostname}: {'; '.join(failures)}")
 
 
+def _plain_decimal(value: float) -> str:
+    """Format a bounded sampling value the way the start script validates it."""
+    text = f"{value:.4f}".rstrip("0")
+    return text + "0" if text.endswith(".") else text
+
+
 @dataclass(frozen=True)
 class ProvisioningIdentity:
     """Engine and immutable artifact selected for one provisioning operation."""
@@ -233,6 +259,7 @@ class LlamaCppRuntimeFit:
     gpu_layers: int
     total_layers: int
     estimator_overrun_used: bool
+    profile: ProfileEvidence | None = None
 
 
 def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
@@ -242,7 +269,22 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
     plans = list(LLAMACPP_PLAN_PATTERN.finditer(log_text))
     if not plans:
         raise ProvisioningError("llama.cpp startup log has no QIIP VRAM plan")
-    contexts = list(LLAMACPP_CONTEXT_PATTERN.finditer(log_text))
+    profile: ProfileEvidence | None = None
+    if plans[-1].group("sizing") == LlamaCppSizingMode.PROFILE.value:
+        # A profile launch also loads a speculative draft, which writes the
+        # same record kinds as the target. Read the target's records from the
+        # target's section only; the draft is verified separately.
+        try:
+            profile = parse_profile_evidence(log_text)
+            launch_text = latest_launch(log_text)
+            target_text = split_profile_sections(launch_text).target
+        except ProfileEvidenceError as exc:
+            raise ProvisioningError(str(exc)) from exc
+        slot_text = launch_text
+        log_text = target_text
+    else:
+        slot_text = log_text
+    contexts = list(LLAMACPP_CONTEXT_PATTERN.finditer(slot_text))
     if not contexts:
         raise ProvisioningError("llama.cpp startup log has no effective context record")
     aggregate_contexts = list(LLAMACPP_AGGREGATE_CONTEXT_PATTERN.finditer(log_text))
@@ -278,7 +320,22 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
         gpu_layers=int(offload["loaded"]),
         total_layers=int(offload["total"]),
         estimator_overrun_used=plan["estimator_overrun_used"] == "true",
+        profile=profile,
     )
+    if profile is None and LlamaCppCacheType.Q4_0.value in (
+        fit.cache_type_k,
+        fit.cache_type_v,
+    ):
+        raise ProvisioningError(
+            "llama.cpp planner sizing does not support a q4_0 KV cache"
+        )
+    if profile is not None and any(
+        record != (fit.cache_type_k, fit.cache_type_v)
+        for record in profile.target_cache_types
+    ):
+        raise ProvisioningError(
+            "llama.cpp runtime KV cache types differ from its VRAM plan"
+        )
     if (
         fit.train_context < 1
         or fit.context_per_slot < 1
@@ -302,7 +359,9 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
         )
     if fit.cache_type_k != fit.cache_type_v:
         raise ProvisioningError("llama.cpp managed startup requires matching K/V types")
-    expected_flash_attn = "auto" if fit.cache_type_k == "f16" else "on"
+    expected_flash_attn = (
+        "auto" if fit.cache_type_k == "f16" and profile is None else "on"
+    )
     if fit.flash_attn != expected_flash_attn:
         raise ProvisioningError(
             "llama.cpp managed cache type has an invalid Flash Attention policy"
@@ -421,6 +480,7 @@ class NodeProvisioner:
         self._nfs_export = nfs_export
         self._artifact_index = artifact_index
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._owner_updates: set[asyncio.Task[Node]] = set()
         self._provisioning_tasks: dict[str, _ProvisioningTask] = {}
         self._explicit_cancel_tasks: set[asyncio.Task[None]] = set()
 
@@ -657,6 +717,7 @@ class NodeProvisioner:
         artifact: ResolvedGGUFArtifact | None = None,
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
         vllm_params: VllmParams | None = None,
+        draft_artifact: ResolvedGGUFArtifact | None = None,
     ) -> dict[str, str]:
         """Return the exact environment accepted by the engine start script."""
         if engine == InferenceEngine.LLAMA_CPP:
@@ -689,6 +750,7 @@ class NodeProvisioner:
             env["AUTOLLAMACPP_MODEL_ALIAS"] = artifact.model_alias
             if self._nfs_export is not None:
                 env["AUTOVLLM_NFS_EXPORT"] = self._nfs_export
+            env.update(self._profile_script_env(request, draft_artifact))
         else:
             if llamacpp_request is not None:
                 raise ProvisioningError(
@@ -730,6 +792,61 @@ class NodeProvisioner:
                     )
         if self._hf_token:
             env["HF_TOKEN"] = self._hf_token
+        return env
+
+    @staticmethod
+    def _profile_script_env(
+        request: LlamaCppRuntimeRequest,
+        draft_artifact: ResolvedGGUFArtifact | None,
+    ) -> dict[str, str]:
+        """Return the typed profile inputs, or nothing for planner sizing."""
+        profile = request.profile
+        if profile is None:
+            if draft_artifact is not None:
+                raise ProvisioningError(
+                    "a draft artifact is only valid with a llama.cpp profile"
+                )
+            return {}
+        if (profile.draft_artifact_id is None) != (draft_artifact is None) or (
+            draft_artifact is not None
+            and draft_artifact.artifact_id != profile.draft_artifact_id
+        ):
+            raise ProvisioningError(
+                "the resolved draft artifact differs from the llama.cpp profile"
+            )
+        sampling = profile.sampling
+        env = {
+            "AUTOLLAMACPP_PROFILE_ID": profile.profile_id,
+            "AUTOLLAMACPP_PROFILE_VERSION": str(profile.profile_version),
+            "AUTOLLAMACPP_PROFILE_UBATCH": str(profile.ubatch),
+            "AUTOLLAMACPP_PROFILE_REQUIRED_FREE_MIB": str(profile.required_free_mib),
+            "AUTOLLAMACPP_PROFILE_GPU_NAME": profile.gpu_name,
+            "AUTOLLAMACPP_PROFILE_GPU_MIN_TOTAL_MIB": str(profile.gpu_min_total_mib),
+            "AUTOLLAMACPP_PROFILE_SPEC_TYPE": profile.speculative_type.value,
+            "AUTOLLAMACPP_PROFILE_SPEC_DRAFT_N_MAX": str(
+                profile.speculative_draft_n_max
+            ),
+            "AUTOLLAMACPP_PROFILE_TEMPERATURE": _plain_decimal(sampling.temperature),
+            "AUTOLLAMACPP_PROFILE_TOP_P": _plain_decimal(sampling.top_p),
+            "AUTOLLAMACPP_PROFILE_TOP_K": str(sampling.top_k),
+            "AUTOLLAMACPP_PROFILE_DISABLE_CUDA_GRAPHS": (
+                "1" if profile.disable_cuda_graphs else "0"
+            ),
+        }
+        if profile.draft_cache_type is not None:
+            env["AUTOLLAMACPP_PROFILE_DRAFT_CACHE_TYPE"] = (
+                profile.draft_cache_type.value
+            )
+        if draft_artifact is not None:
+            env["AUTOLLAMACPP_PROFILE_DRAFT_GGUF_PATH"] = (
+                draft_artifact.node_relative_entrypoint
+            )
+        if sampling.min_p is not None:
+            env["AUTOLLAMACPP_PROFILE_MIN_P"] = _plain_decimal(sampling.min_p)
+        if sampling.presence_penalty is not None:
+            env["AUTOLLAMACPP_PROFILE_PRESENCE_PENALTY"] = _plain_decimal(
+                sampling.presence_penalty
+            )
         return env
 
     def _default_llamacpp_runtime_request(self) -> LlamaCppRuntimeRequest:
@@ -1085,6 +1202,21 @@ class NodeProvisioner:
             )
 
         runtime = node.llamacpp_runtime
+        if (
+            request.sizing is LlamaCppSizingMode.PROFILE
+            or node.placement is not None
+            or (
+                runtime.requested.sizing is LlamaCppSizingMode.PROFILE
+                and not node.owner
+            )
+        ):
+            # An admin must take ownership before overriding automation.
+            # The old runtime remains intact until a verified replacement is
+            # committed, so a failed override can restore the exact profile.
+            raise RelaunchPreconditionError(
+                "Catalog-profile nodes are relaunched by automatic placement, "
+                "not with a custom sizing policy"
+            )
         if request.fit_target_mib >= min(gpu.total_mib for gpu in runtime.gpus):
             raise RelaunchValidationError(
                 "fit_target_mib must be smaller than every GPU's total VRAM"
@@ -1231,16 +1363,21 @@ class NodeProvisioner:
         request: LlamaCppRuntimeRequest,
     ) -> tuple[str, LlamaCppRuntimeState]:
         """Launch and verify one exact llama.cpp runtime policy."""
+        draft_artifact = await self._resolve_draft_artifact(request)
+        gpus = await self._read_gpu_inventory(hostname, profile=request.profile)
         model_name = await self._run_start_vllm(
             hostname,
             engine=InferenceEngine.LLAMA_CPP,
             artifact=artifact,
             llamacpp_request=request,
+            draft_artifact=draft_artifact,
         )
         await self._poll_health(hostname, engine=InferenceEngine.LLAMA_CPP)
         runtime = await self._verify_llamacpp_runtime(
             hostname,
             expected_request=request,
+            draft_artifact=draft_artifact,
+            gpus=gpus,
         )
         return model_name, runtime
 
@@ -1512,6 +1649,11 @@ class NodeProvisioner:
                         is LlamaCppSizingMode.AUTO
                     ):
                         rollback_message = "Automatic sizing restored"
+                    elif (
+                        previous_node.llamacpp_runtime.requested.sizing
+                        is LlamaCppSizingMode.PROFILE
+                    ):
+                        rollback_message = "Previous catalog profile restored"
                     else:
                         rollback_message = "Previous custom sizing restored"
                     self._log(hostname, "warning", rollback_message)
@@ -1669,9 +1811,42 @@ class NodeProvisioner:
     async def update_node_owner(self, hostname: str, owner: str) -> Node:
         """Set the owner of a registered node, preserving its etcd lease.
 
-        Uses a CAS on the record revision so a concurrent status/liveness
-        write is never clobbered; retries a bounded number of times, then
-        raises ``ProvisioningError``.
+        The change takes the host lifecycle lease, like setup, relaunch and
+        teardown. Those operations decide what to do with a node record and
+        then act on it later, and a provision writes its final record from its
+        own arguments, so an owner written in between would be erased. While
+        one of them holds the host this raises ``ProvisioningError`` at once
+        instead of queueing behind a provision that can take many minutes.
+
+        The write runs in its own task, which releases the lease when it ends.
+        Cancelling the caller (a client that disconnects) therefore cannot
+        free the host while the etcd write may still land.
+        """
+        lease = await self._lifecycle.try_acquire(hostname)
+        if lease is None:
+            raise ProvisioningError(
+                f"Node {hostname!r} has a lifecycle operation in progress "
+                "(setup, relaunch, teardown or automatic placement); change "
+                "its owner when that finishes"
+            )
+        task = asyncio.create_task(self._write_node_owner(hostname, owner))
+
+        def finished(done: asyncio.Task[Node]) -> None:
+            lease.release()
+            self._owner_updates.discard(done)
+            if not done.cancelled():
+                done.exception()  # Retrieved: an abandoned caller never reads it.
+
+        self._owner_updates.add(task)
+        task.add_done_callback(finished)
+        return await asyncio.shield(task)
+
+    async def _write_node_owner(self, hostname: str, owner: str) -> Node:
+        """Revision-checked owner write. The caller holds the lifecycle lease.
+
+        The compare-and-swap keeps a concurrent status or liveness write, which
+        does not take the lease, from being clobbered; it retries a bounded
+        number of times, then raises ``ProvisioningError``.
         """
         key = f"{self._etcd_client.prefix}{hostname}"
         record = await asyncio.to_thread(self._etcd_client.get_record, key)
@@ -1688,7 +1863,15 @@ class NodeProvisioner:
                 raise ProvisioningError(
                     f"Node {hostname!r} has an invalid etcd registration"
                 )
-            replacement = node.model_copy(update={"owner": owner})
+            # Assigning an owner is a person taking the node over: it stops
+            # being an automatic placement, so automation never retries,
+            # clears or counts it again.
+            replacement = node.model_copy(
+                update={
+                    "owner": owner,
+                    "placement": None if owner else node.placement,
+                }
+            )
             _, value = node_to_etcd(replacement, self._etcd_client.prefix)
             new_revision = await asyncio.to_thread(
                 self._etcd_client.replace_if_revision,
@@ -1817,6 +2000,7 @@ class NodeProvisioner:
         vllm_params: VllmParams | None = None,
         lifecycle_lease: HostLifecycleLease | None = None,
         owner: str = "",
+        placement: NodePlacement | None = None,
     ) -> None:
         """Provision *hostname* under the shared host lifecycle coordinator."""
         # Validate before acquiring the lifecycle lease or touching the host.
@@ -1832,6 +2016,21 @@ class NodeProvisioner:
         elif llamacpp_request is not None:
             raise ProvisioningError(
                 "llama.cpp sizing policy is only valid for llama_cpp provisioning"
+            )
+        draft_artifact = await self._resolve_draft_artifact(llamacpp_request)
+        if placement is not None and (
+            not managed
+            or owner
+            or llamacpp_request is None
+            or llamacpp_request.profile is None
+            or (placement.profile_id, placement.profile_version)
+            != (
+                llamacpp_request.profile.profile_id,
+                llamacpp_request.profile.profile_version,
+            )
+        ):
+            raise ProvisioningError(
+                "automatic placement provisions one managed, unowned catalog profile"
             )
         lease = lifecycle_lease
         if lease is None:
@@ -1859,6 +2058,8 @@ class NodeProvisioner:
                     artifact=artifact,
                     llamacpp_request=llamacpp_request,
                     owner=owner,
+                    draft_artifact=draft_artifact,
+                    placement=placement,
                 )
         except asyncio.CancelledError:
             explicit = asyncio.current_task() in self._explicit_cancel_tasks
@@ -1879,6 +2080,20 @@ class NodeProvisioner:
         finally:
             lease.release()
 
+    async def _resolve_draft_artifact(
+        self, request: LlamaCppRuntimeRequest | None
+    ) -> ResolvedGGUFArtifact | None:
+        """Resolve a profile's draft GGUF through the same artifact index."""
+        if (
+            request is None
+            or request.profile is None
+            or request.profile.draft_artifact_id is None
+        ):
+            return None
+        return await self.resolve_artifact_selection(
+            InferenceEngine.LLAMA_CPP, request.profile.draft_artifact_id
+        )
+
     async def _provision(
         self,
         hostname: str,
@@ -1890,6 +2105,8 @@ class NodeProvisioner:
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
         vllm_params: VllmParams | None = None,
         owner: str = "",
+        draft_artifact: ResolvedGGUFArtifact | None = None,
+        placement: NodePlacement | None = None,
     ) -> None:
         """Run full provisioning sequence on *hostname*.
 
@@ -1956,6 +2173,7 @@ class NodeProvisioner:
                 artifact_id=artifact_id,
                 last_heartbeat=datetime.now(UTC),
                 managed=managed,
+                placement=placement,
             )
             key, value = node_to_etcd(node, self._etcd_client.prefix)
             await asyncio.to_thread(self._etcd_client.put, key, value)
@@ -1981,6 +2199,12 @@ class NodeProvisioner:
             )
             current_step = "gpu_verify"
             await self._verify_gpu(hostname)
+            gpus = await self._read_gpu_inventory(
+                hostname,
+                profile=(
+                    llamacpp_request.profile if llamacpp_request is not None else None
+                ),
+            )
             current_step = "starting_engine"
             if engine == InferenceEngine.LLAMA_CPP:
                 starting_step = ProvisioningStep.STARTING_LLAMACPP
@@ -1999,6 +2223,7 @@ class NodeProvisioner:
                 artifact=artifact,
                 llamacpp_request=llamacpp_request,
                 vllm_params=vllm_params,
+                draft_artifact=draft_artifact,
             )
             current_step = "health_poll"
             await self._update_state(
@@ -2014,6 +2239,8 @@ class NodeProvisioner:
                     expected_request=(
                         llamacpp_request or self._default_llamacpp_runtime_request()
                     ),
+                    draft_artifact=draft_artifact,
+                    gpus=gpus,
                 )
             current_step = "registering"
             await self._update_state(
@@ -2028,6 +2255,8 @@ class NodeProvisioner:
                 artifact_id=artifact_id,
                 llamacpp_runtime=llamacpp_runtime,
                 owner=owner,
+                gpus=gpus,
+                placement=placement,
             )
             await self._update_state(
                 hostname, ProvisioningStep.COMPLETE, started_at=provision_started_at
@@ -2053,6 +2282,7 @@ class NodeProvisioner:
                     artifact_id=artifact_id,
                     last_heartbeat=datetime.now(UTC),
                     managed=managed,
+                    placement=placement,
                 )
                 f_key, f_value = node_to_etcd(failed_node, self._etcd_client.prefix)
                 if value is not None:
@@ -2180,6 +2410,78 @@ class NodeProvisioner:
             raise ProvisioningError(f"No GPUs detected on {hostname} after setup")
         self._log(hostname, "info", f"Detected {len(gpu_lines)} GPU(s)")
 
+    async def _read_gpu_inventory(
+        self, hostname: str, *, profile: LlamaCppProfileRuntime | None
+    ) -> tuple[NodeGPU, ...]:
+        """Read each GPU's identity from the node itself.
+
+        QUADS reports a product string and a processor count, not which GPUs a
+        booted host exposes. A catalog profile must find exactly the GPU it
+        was planned for: one device, the product's ``nvidia-smi`` name, and at
+        least the product's total memory. For every other setup the inventory
+        is recorded when available and never blocks the setup.
+        """
+        required = profile is not None
+        try:
+            output = await self._ssh_run_command(
+                hostname,
+                "nvidia-smi --query-gpu=index,uuid,name,memory.total "
+                "--format=csv,noheader,nounits",
+            )
+            gpus: list[NodeGPU] = []
+            for line in output.splitlines():
+                if not line.strip():
+                    continue
+                index, uuid, name, total = (part.strip() for part in line.split(","))
+                gpus.append(
+                    NodeGPU(
+                        index=int(index), uuid=uuid, name=name, total_mib=int(total)
+                    )
+                )
+            if not gpus:
+                raise ValueError("nvidia-smi returned no GPUs")
+        except Exception as exc:
+            if required:
+                raise ProvisioningError(
+                    f"could not read the GPU inventory of {hostname}: {exc}"
+                ) from exc
+            self._log(hostname, "warning", f"GPU inventory was not recorded: {exc}")
+            return ()
+        if profile is not None:
+            if len(gpus) != 1:
+                raise ProvisioningError(
+                    "catalog profiles support exactly one GPU per host; "
+                    f"{hostname} has {len(gpus)}"
+                )
+            gpu = gpus[0]
+            if gpu.name != profile.gpu_name:
+                raise ProvisioningError(
+                    f"profile {profile.profile_id} was planned for a "
+                    f"{profile.gpu_name!r}, but {hostname} has a {gpu.name!r}"
+                )
+            if gpu.total_mib < profile.gpu_min_total_mib:
+                raise ProvisioningError(
+                    f"profile {profile.profile_id} needs a GPU with at least "
+                    f"{profile.gpu_min_total_mib} MiB, but {hostname} reports "
+                    f"{gpu.total_mib} MiB"
+                )
+        return tuple(sorted(gpus, key=lambda gpu: gpu.index))
+
+    async def remote_lifecycle_processes(self, hostname: str) -> list[str]:
+        """Return qiip setup/start commands still running on *hostname*.
+
+        Cancelling a gateway task does not always stop its remote command.
+        Anything that is about to start provisioning on a host it did not just
+        provision itself asks the host first. Raises when the host cannot be
+        asked: "unknown" must never be read as "nothing is running".
+        """
+        output = await self._ssh_run_command(hostname, "ps -eo pid=,args=")
+        return [
+            line.strip()
+            for line in output.splitlines()
+            if _REMOTE_LIFECYCLE_PATTERN.search(line)
+        ]
+
     async def _stop_failed_llamacpp_start(self, hostname: str) -> None:
         """Best-effort cleanup after post-health llama.cpp verification fails."""
         command = self._script_command(
@@ -2202,11 +2504,110 @@ class NodeProvisioner:
                 f"also failed: {exc}",
             )
 
+    @staticmethod
+    def _verify_profile_evidence(
+        fit: LlamaCppRuntimeFit,
+        expected_request: LlamaCppRuntimeRequest,
+        draft_artifact: ResolvedGGUFArtifact | None,
+        gpus: tuple[NodeGPU, ...],
+        memory_rows: list[LlamaCppGPUState],
+    ) -> LlamaCppSpeculativeEffective | None:
+        """Compare a profile launch with the requested profile, field by field.
+
+        The profile id in the log is a label the start script echoed back. It
+        proves nothing, so every value the profile fixes is checked against
+        what llama-server itself reported.
+        """
+        profile = expected_request.profile
+        evidence = fit.profile
+        if profile is None:
+            if evidence is not None:
+                raise ProvisioningError(
+                    "llama.cpp launched a catalog profile that was not requested"
+                )
+            return None
+        if evidence is None:
+            raise ProvisioningError(
+                "llama.cpp startup log has no catalog profile evidence"
+            )
+        expected_draft_cache = (
+            profile.draft_cache_type.value
+            if profile.draft_cache_type is not None
+            else None
+        )
+        expected_draft_gguf = (
+            draft_artifact.node_relative_entrypoint
+            if draft_artifact is not None
+            else None
+        )
+        if (
+            evidence.profile_id != profile.profile_id
+            or evidence.profile_version != profile.profile_version
+            or evidence.ubatch != profile.ubatch
+            or evidence.spec_type != profile.speculative_type.value
+            or evidence.spec_draft_n_max != profile.speculative_draft_n_max
+            or evidence.draft_cache_type != expected_draft_cache
+            or evidence.draft_gguf != expected_draft_gguf
+            or evidence.required_free_mib != profile.required_free_mib
+            or evidence.cuda_graphs_disabled != profile.disable_cuda_graphs
+        ):
+            raise ProvisioningError(
+                "llama.cpp runtime differs from its requested catalog profile"
+            )
+        if (profile.draft_artifact_id is None) != (draft_artifact is None):
+            raise ProvisioningError(
+                "the verified draft artifact differs from the catalog profile"
+            )
+        if evidence.gpu_free_mib < profile.required_free_mib + fit.fit_target_mib:
+            raise ProvisioningError(
+                "llama.cpp launched with less free VRAM than the profile requires"
+            )
+        if len(memory_rows) != 1 or len(gpus) != 1:
+            raise ProvisioningError("catalog profiles support exactly one GPU per host")
+        if (
+            gpus[0].name != profile.gpu_name
+            or gpus[0].total_mib < profile.gpu_min_total_mib
+            or memory_rows[0].total_mib < profile.gpu_min_total_mib
+        ):
+            raise ProvisioningError(
+                "llama.cpp launched on a GPU other than the profile's product"
+            )
+        if evidence.gpu_uuid != gpus[0].uuid:
+            raise ProvisioningError(
+                "llama.cpp launched on a GPU other than the inventoried one"
+            )
+        shares_cache = (
+            profile.speculative_type is LlamaCppSpeculativeType.DRAFT_MTP_ASSISTANT
+        )
+        if evidence.draft_shares_target_cache != shares_cache:
+            raise ProvisioningError(
+                "llama.cpp draft cache sharing differs from the catalog profile"
+            )
+        return LlamaCppSpeculativeEffective(
+            type=LlamaCppSpeculativeType(evidence.spec_type),
+            draft_n_max=evidence.spec_draft_n_max,
+            draft_gpu_layers=evidence.draft_gpu_layers,
+            draft_total_layers=evidence.draft_total_layers,
+            draft_cache_type_k=(
+                None
+                if evidence.draft_cache_type_k is None
+                else LlamaCppCacheType(evidence.draft_cache_type_k)
+            ),
+            draft_cache_type_v=(
+                None
+                if evidence.draft_cache_type_v is None
+                else LlamaCppCacheType(evidence.draft_cache_type_v)
+            ),
+            draft_shares_target_cache=shares_cache,
+        )
+
     async def _verify_llamacpp_runtime(
         self,
         hostname: str,
         *,
         expected_request: LlamaCppRuntimeRequest,
+        draft_artifact: ResolvedGGUFArtifact | None = None,
+        gpus: tuple[NodeGPU, ...] = (),
     ) -> LlamaCppRuntimeState:
         """Fail closed unless the healthy server proves the managed fit contract."""
         try:
@@ -2257,7 +2658,10 @@ class NodeProvisioner:
                 raise ProvisioningError(
                     "llama.cpp runtime fit target differs from its requested value"
                 )
-            if expected_request.sizing is LlamaCppSizingMode.CUSTOM:
+            speculative = self._verify_profile_evidence(
+                fit, expected_request, draft_artifact, gpus, memory_rows
+            )
+            if expected_request.sizing is not LlamaCppSizingMode.AUTO:
                 expected_cache_type = expected_request.cache_type
                 assert expected_cache_type is not None
                 if (
@@ -2267,7 +2671,8 @@ class NodeProvisioner:
                     or fit.cache_type_v != expected_cache_type.value
                 ):
                     raise ProvisioningError(
-                        "llama.cpp runtime differs from its requested custom sizing"
+                        "llama.cpp runtime differs from its requested "
+                        f"{expected_request.sizing.value} sizing"
                     )
             if (
                 fit.estimator_overrun_used
@@ -2296,6 +2701,8 @@ class NodeProvisioner:
                     gpu_layers=fit.gpu_layers,
                     total_layers=fit.total_layers,
                     estimator_overrun_used=fit.estimator_overrun_used,
+                    ubatch=fit.profile.ubatch if fit.profile is not None else None,
+                    speculative=speculative,
                 ),
                 gpus=tuple(sorted(memory_rows, key=lambda row: row.index)),
                 observed_at=datetime.now(UTC),
@@ -2335,6 +2742,7 @@ class NodeProvisioner:
         artifact: ResolvedGGUFArtifact | None = None,
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
         vllm_params: VllmParams | None = None,
+        draft_artifact: ResolvedGGUFArtifact | None = None,
     ) -> str:
         """Run the engine start script and extract model name from stdout."""
         if engine == InferenceEngine.LLAMA_CPP:
@@ -2349,6 +2757,7 @@ class NodeProvisioner:
                 artifact,
                 llamacpp_request=llamacpp_request,
                 vllm_params=vllm_params,
+                draft_artifact=draft_artifact,
             ),
             scripts_dir=self._engine_scripts_dir(engine).name,
         )
@@ -2466,6 +2875,8 @@ class NodeProvisioner:
         llamacpp_runtime: LlamaCppRuntimeState | None = None,
         self_setup: bool = False,
         owner: str = "",
+        gpus: tuple[NodeGPU, ...] = (),
+        placement: NodePlacement | None = None,
     ) -> None:
         """Register node in etcd with correct fields (D-11, D-12)."""
         node = Node(
@@ -2480,6 +2891,8 @@ class NodeProvisioner:
             managed=managed,
             self_setup=self_setup,
             owner=owner,
+            gpus=gpus,
+            placement=placement,
         )
         key, value = node_to_etcd(node, self._etcd_client.prefix)
         # ponytail: etcd3gw is sync, asyncio.to_thread wraps it (Pitfall 5)

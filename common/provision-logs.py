@@ -362,8 +362,6 @@ def worker(config):
                 if now >= collection_deadline:
                     store.issue(attempt, "Node collection deadline reached")
                 break
-        if engine_path and "engine" not in store.get(attempt)["sources"]:
-            store.issue(attempt, "Engine startup log unavailable", source="engine")
     except Exception as exc:
         store.issue(attempt, "Node recorder failed: " + str(exc), source="recorder")
         if launched:
@@ -458,6 +456,7 @@ def worker(config):
 def engine_sink():
     """Keep draining the engine pipe even if recording or raw-tail storage fails."""
     store = None
+    config = {}
     previous_handlers = {}
 
     def stop_recording(signum, frame):
@@ -483,6 +482,12 @@ def engine_sink():
         # Even reporting the failure can fail (e.g. a full log filesystem).
         with suppress(Exception):
             print("Engine logging stopped: " + str(exc), file=sys.stderr)
+    finally:
+        if store is not None and config.get("phase"):
+            with suppress(Exception):
+                store.update_phase(
+                    config["attempt_id"], config["phase"], engine_recording=False
+                )
     # Never SIGPIPE an otherwise healthy engine because its evidence expired
     # or the recorder failed, including during initialization or file close.
     for sig in previous_handlers:
@@ -503,6 +508,7 @@ def capture_engine_output(config, store):
     batch = []
     issues = set()
     buffered = 0
+    recording = True
     flush_at = time.monotonic() + 0.1
     tail_limit = max(
         1,
@@ -522,17 +528,32 @@ def capture_engine_output(config, store):
             )
         )
 
-    def flush():
-        nonlocal buffered, flush_at
-        if batch or issues:
+    def flush(*, eof=False):
+        nonlocal buffered, flush_at, recording
+        if recording:
             try:
-                recording = not store.get(config["attempt_id"]).get("stop_collection")
+                stopping = bool(store.get(config["attempt_id"]).get("stop_collection"))
             except KeyError:
                 recording = False
+                stopping = True
             if recording:
-                store.append_many(config["attempt_id"], batch)
+                # A stop request closes durable capture after the buffered
+                # batch, never before it. Include an unterminated final line.
+                if stopping and pending:
+                    line(bytes(pending))
+                    pending.clear()
+                if batch:
+                    store.append_many(config["attempt_id"], batch)
                 for issue in issues:
                     store.issue(config["attempt_id"], issue)
+                if stopping or eof:
+                    if config.get("phase"):
+                        store.update_phase(
+                            config["attempt_id"],
+                            config["phase"],
+                            engine_recording=False,
+                        )
+                    recording = False
         batch.clear()
         issues.clear()
         buffered = 0
@@ -551,7 +572,8 @@ def capture_engine_output(config, store):
                 if not chunk:
                     if pending:
                         line(bytes(pending))
-                    flush()
+                        pending.clear()
+                    flush(eof=True)
                     return
                 if not path.exists():
                     return  # The caller continues draining an evicted raw tail.
@@ -658,7 +680,13 @@ def main():
             store.update(
                 attempt, status="running", stop_collection=False, cancel_command=False
             )
-            store.update_phase(attempt, phase, status="launching", recording=True)
+            store.update_phase(
+                attempt,
+                phase,
+                status="launching",
+                recording=True,
+                **({"engine_recording": True} if config.get("engine_log") else {}),
+            )
             proc = subprocess.Popen(
                 [sys.executable, str(Path(__file__).resolve()), "worker"],
                 stdin=subprocess.PIPE,
@@ -683,12 +711,22 @@ def main():
         deadline = time.monotonic() + 5
         while (
             any(
-                p.get("recording")
+                p.get("recording") or p.get("engine_recording")
                 for p in store.get(attempt).get("phases", {}).values()
             )
             and time.monotonic() < deadline
         ):
             time.sleep(0.1)
+        metadata = store.get(attempt)
+        if any(p.get("engine_recording") for p in metadata.get("phases", {}).values()):
+            store.issue(
+                attempt, "Engine log flush acknowledgement unavailable", source="engine"
+            )
+        elif (
+            any("engine_recording" in p for p in metadata.get("phases", {}).values())
+            and "engine" not in metadata["sources"]
+        ):
+            store.issue(attempt, "Engine startup log unavailable", source="engine")
     elif action != "read":
         raise ValueError("Unknown recorder action")
     try:

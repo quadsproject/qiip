@@ -473,7 +473,11 @@ EOF
 
     local engine_log_fd
     if [ -n "${QIIP_LOG_CONFIG:-}" ]; then
-        exec {engine_log_fd}> >(python3 "${SCRIPT_DIR}/../common/provision-logs.py" engine >/dev/null 2>&1)
+        # "exec" matters: bash 5.1 (RHEL 9) otherwise keeps a wrapper shell alive
+        # for the process substitution, and that shell still holds this script's
+        # stdout and stderr. The gateway's command worker reads those until EOF,
+        # so it would never see the start command finish.
+        exec {engine_log_fd}> >(exec python3 "${SCRIPT_DIR}/../common/provision-logs.py" engine >/dev/null 2>&1)
     else
         exec {engine_log_fd}> "$VLLM_LOG_FILE"
     fi

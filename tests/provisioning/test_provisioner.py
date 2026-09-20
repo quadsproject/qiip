@@ -924,6 +924,8 @@ async def test_llamacpp_custom_request_reaches_the_provisioning_body() -> None:
         artifact=_artifact(),
         llamacpp_request=request,
         owner="",
+        draft_artifact=None,
+        placement=None,
     )
     lease.release.assert_called_once_with()
 
@@ -2726,7 +2728,7 @@ class TestVerifyGpu:
 
         assert events == ["health", "runtime", "register"]
         verify_runtime.assert_awaited_once_with(
-            "host1", expected_request=_auto_request()
+            "host1", expected_request=_auto_request(), draft_artifact=None, gpus=()
         )
         assert register.await_args is not None
         assert register.await_args.kwargs["llamacpp_runtime"] == runtime

@@ -174,6 +174,27 @@ verify_managed_server_cli() {
         echo "FATAL: built llama-server does not accept the managed Q8 KV CLI" >&2
         return 1
     fi
+    # Catalog profiles launch with these options. Reject a pin that lacks any
+    # of them at setup time, not after a model has been loaded.
+    if ! "$binary" \
+        --cache-type-k q4_0 \
+        --cache-type-v q4_0 \
+        --flash-attn on \
+        --ubatch-size 256 \
+        --spec-type draft-mtp \
+        --spec-draft-n-max 2 \
+        --cache-type-k-draft f16 \
+        --cache-type-v-draft f16 \
+        --no-mmproj \
+        --jinja \
+        --version >/dev/null 2>&1 \
+        || ! "$binary" \
+            --spec-type draft-dflash \
+            --spec-draft-n-max 7 \
+            --version >/dev/null 2>&1; then
+        echo "FATAL: built llama-server does not accept the catalog profile CLI" >&2
+        return 1
+    fi
 }
 
 install_llamacpp() {

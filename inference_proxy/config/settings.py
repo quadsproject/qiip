@@ -497,6 +497,68 @@ class QUADSSettings(BaseModel):
         return self
 
 
+class PlacementSettings(BaseModel):
+    """Automatic fixed-ratio placement of catalog profiles on free GPUs.
+
+    Enabled by default. It needs QUADS, because a host is only
+    placed while QUADS shows it free for the whole scheduling window.
+    ``ratios`` maps a catalog profile id to a relative weight; profiles left
+    out, or given zero, are never placed automatically.
+    """
+
+    enabled: bool = True
+    interval_seconds: int = Field(default=300, ge=30)
+    # 60% Qwen3.8-27B; the other 40% split equally three ways.
+    ratios: dict[str, int] = {
+        "qwen3.8-27b-24g": 9,
+        "qwen3.6-35b-a3b-24g": 2,
+        "muse-glimmer-30b-24g": 2,
+        "gemma-4-31b-24g": 2,
+    }
+    # Free VRAM kept beyond a profile's own measured requirement, both before
+    # the launch and after the model has loaded.
+    reserve_mib: int = Field(default=256, ge=1)
+    # Attempts since the last successful provision, the one in flight included.
+    max_attempts: int = Field(default=3, ge=1, le=20)
+    # Base retry backoff. Also how long an unclaimed host whose launch was
+    # blocked by remote work is left out of planning.
+    retry_backoff_seconds: int = Field(default=900, ge=30)
+    # A provisioning claim whose holder stopped refreshing it for this long is
+    # treated as abandoned (for example after a gateway restart).
+    claim_stale_seconds: int = Field(default=300, ge=60)
+    max_concurrent: int = Field(default=2, ge=1, le=32)
+    # Place a profile only on GPU products it has been run on for real.
+    require_qualified_gpu: bool = True
+    # Hosts automatic placement never touches, even when they are eligible.
+    exclude_hosts: list[str] = []
+    # When not empty, the only hosts automatic placement may touch. For staged
+    # rollout: unlike an exclusion list, it also keeps out hosts that join later.
+    only_hosts: list[str] = []
+
+    @field_validator("ratios")
+    @classmethod
+    def ratios_are_usable(cls, value: dict[str, int]) -> dict[str, int]:
+        from inference_proxy.placement.catalog import BUILTIN_PROFILES
+
+        known = {profile.profile_id for profile in BUILTIN_PROFILES}
+        unknown = sorted(set(value) - known)
+        if unknown:
+            raise ValueError(
+                f"placement.ratios names unknown catalog profiles: {unknown}; "
+                f"known: {sorted(known)}"
+            )
+        if any(weight < 0 for weight in value.values()):
+            raise ValueError("placement.ratios weights must not be negative")
+        if not any(weight > 0 for weight in value.values()):
+            raise ValueError("placement.ratios needs at least one positive weight")
+        return value
+
+    @field_validator("exclude_hosts", "only_hosts")
+    @classmethod
+    def exclude_hosts_are_canonical(cls, value: list[str]) -> list[str]:
+        return sorted({host.strip().lower().rstrip(".") for host in value if host})
+
+
 class LLMFitSettings(BaseModel):
     """LLMFit remote execution configuration."""
 
@@ -974,6 +1036,7 @@ class Settings(BaseSettings):
     ssh: SSHSettings = SSHSettings()
     provisioning: ProvisioningSettings = ProvisioningSettings()
     quads: QUADSSettings = QUADSSettings()
+    placement: PlacementSettings = PlacementSettings()
     redfish: RedfishSettings = RedfishSettings()
     llmfit: LLMFitSettings = LLMFitSettings()
     huggingface: HuggingFaceSettings

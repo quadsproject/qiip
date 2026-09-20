@@ -3225,6 +3225,25 @@ class TestUpdateNodeOwner:
 
         assert response.status_code == 404
 
+    def test_patch_owner_busy_host_409(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """A host held by setup, relaunch, teardown or placement says so."""
+        mock_provisioner.update_node_owner = AsyncMock(
+            side_effect=ProvisioningError(
+                "Node 'gpu01' has a lifecycle operation in progress"
+            )
+        )
+
+        response = client.patch(
+            "/admin/nodes/gpu01/owner", json={"owner": "alice@example.com"}
+        )
+
+        assert response.status_code == 409
+        assert "lifecycle operation in progress" in response.json()["detail"]
+
     def test_patch_owner_invalid_email_422(
         self,
         client: TestClient,

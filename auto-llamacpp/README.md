@@ -170,11 +170,49 @@ The managed planner first estimates F16 for both K and V. If that policy cannot
 fully offload one request at the 4,096-token floor while preserving the reserve,
 it retries the complete plan with Q8_0 for both K and V. Q8_0 V requires Flash
 Attention in llama.cpp, so the fallback passes `--flash-attn on` to both the
-estimator and server; the F16 policy retains `auto`. QIIP does not automatically
-select Q4 or mixed cache types. If Q8_0 cannot meet the minimum plan, setup fails
+estimator and server; the F16 policy retains `auto`. The planner never selects
+Q4 or mixed cache types (a catalog profile may fix `q4_0`; see below). If Q8_0 cannot meet the minimum plan, setup fails
 instead of accepting lower KV precision or CPU layer spill. Q8_0 can change
 generation relative to F16, which is why it is a capacity fallback rather than
 the default for every model.
+
+### Catalog profiles
+
+A catalog profile (`inference_proxy/placement/catalog.py`) is a third sizing
+policy, `profile`, beside `auto` and `custom`. It launches one measured
+configuration instead of planning one: a fixed context, one slot, a fixed KV
+cache type (`q4_0` is available here and only here), a fixed micro-batch and
+speculative decoding (`draft-mtp` from the target file, `draft-dflash` with a
+second GGUF from the shared cache, or `draft-mtp-assistant`: an MTP head shipped
+as its own GGUF, as Gemma 4 does, which reads the target's KV cache and has none
+of its own; llama-server is still started with `--spec-type draft-mtp`).
+
+`llama-fit-params` cannot estimate a speculative draft, so a profile does not
+call the planner's estimator. The managed invariants still hold, and are all
+verified from the server's own startup log and `nvidia-smi`, never from the
+profile label:
+
+- the host exposes exactly one GPU, it is the GPU product the profile was planned
+  for (its `nvidia-smi` name, with at least that product's total memory), and the
+  launch ran on the inventoried UUID. The QUADS inventory string only nominates a
+  host; it is never evidence of what the booted host exposes;
+- the context does not exceed the model's training context;
+- free VRAM before the launch covers the profile's measured requirement plus the
+  reserve (`AUTOLLAMACPP_FIT_TARGET_MIB`). The measured requirement excludes the
+  process's CUDA context while `nvidia-smi` free memory includes it, so the
+  profile adds an explicit CUDA-context allowance;
+- target and draft are verified separately: the target is fully offloaded with
+  the planned cache types, micro-batch and context; the draft is the planned
+  artifact, fully offloaded, with the planned cache type, implementation and
+  draft length;
+- free VRAM after the load is still at least the reserve.
+
+Every profile input is an enumeration, a bounded number or a validated
+cache-relative path. There is no free-form argument channel, and planner sizing
+rejects every `AUTOLLAMACPP_PROFILE_*` input. `setup.sh` checks that the built
+`llama-server` accepts the profile options, so an incompatible pin fails at
+setup rather than after a model has loaded. Nodes running a profile refuse the
+custom relaunch endpoint.
 
 Pure recurrent-state models (Mamba- and RWKV-family architectures) keep no
 attention KV cache: llama.cpp allocates fixed F32 recurrent state and ignores

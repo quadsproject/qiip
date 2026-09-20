@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import runpy
 import signal
@@ -81,7 +82,8 @@ print(json.dumps(counts))
                 consumer.kill()
     counts = json.loads(output)
     assert 2 <= counts["commits"] < 20
-    assert counts["get"] == counts["commits"]
+    # Metadata is polled at batch boundaries, including idle stop checks.
+    assert counts["commits"] <= counts["get"] < 40
     store = AttemptLogStore(tmp_path / "attempts.sqlite3")
     assert len(store.read("b" * 32, limit=3000)["records"]) == 2001
 
@@ -446,3 +448,142 @@ async def test_stream_in_memory_fallback_resumes_from_offset() -> None:
     content = "".join([str(chunk) async for chunk in response.body_iterator])
     assert "resumed" in content
     assert "earlier" not in content
+
+
+@pytest.mark.parametrize("close_pipe", [False, True])
+def test_finish_waits_for_buffered_engine_output_and_keeps_draining(
+    tmp_path: Path,
+    close_pipe: bool,
+) -> None:
+    """Hold the sink at its first flush until finish has requested a stop."""
+    consumer_script = r"""
+import json, os, runpy, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1] + '/inference_proxy/provisioning')
+recorder = runpy.run_path(sys.argv[1] + '/common/provision-logs.py')
+root = Path(sys.argv[2])
+config = dict(root=str(root), max_bytes=4194304, attempt_max_bytes=2097152,
+              max_attempts=2, retention_days=7, max_record_bytes=1024,
+              attempt_id='c' * 32, phase='d' * 32, engine='vllm',
+              engine_log=str(root / 'engine.log'))
+store = recorder['open_store'](config)
+store.create('host1', attempt_id=config['attempt_id'])
+store.update_phase(config['attempt_id'], config['phase'], recording=False,
+                   engine_recording=True)
+(root / 'config.json').write_text(json.dumps(config))
+original_get = store.get
+first = True
+def get(*args, **kwargs):
+    global first
+    if first:
+        first = False
+        (root / 'flushing').touch()
+        deadline = time.monotonic() + 5
+        while not (root / 'release').exists():
+            assert time.monotonic() < deadline, 'flush was never released'
+            time.sleep(.01)
+    return original_get(*args, **kwargs)
+store.get = get
+recorder['engine_sink'].__globals__['open_store'] = lambda config: store
+os.environ['QIIP_LOG_CONFIG'] = json.dumps(config)
+recorder['engine_sink']()
+"""
+    finish_script = """
+import runpy, sys
+sys.path.insert(0, sys.argv[1] + '/inference_proxy/provisioning')
+path = sys.argv[1] + '/common/provision-logs.py'
+sys.argv = [path, 'finish']
+runpy.run_path(path, run_name='__main__')
+"""
+    with subprocess.Popen(
+        [sys.executable, "-c", consumer_script, str(ROOT), str(tmp_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ) as sink:
+        finish = None
+        try:
+            assert sink.stdin is not None
+            sink.stdin.write(b"engine boot evidence\nengine stderr evidence\npartial")
+            sink.stdin.flush()
+            if close_pipe:
+                sink.stdin.close()
+                sink.stdin = None
+            deadline = time.monotonic() + 5
+            while not (tmp_path / "flushing").exists():
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            config = (tmp_path / "config.json").read_text()
+            store = AttemptLogStore(tmp_path / "attempts.sqlite3")
+            finish = subprocess.Popen(
+                [sys.executable, "-c", finish_script, str(ROOT)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert finish.stdin is not None
+            finish.stdin.write(config.encode())
+            finish.stdin.close()
+            deadline = time.monotonic() + 5
+            while not store.get("c" * 32).get("stop_collection"):
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            # finish must wait for the engine sink, whose final flush is held.
+            with pytest.raises(subprocess.TimeoutExpired):
+                finish.wait(timeout=0.1)
+            (tmp_path / "release").touch()
+            assert finish.wait(timeout=5) == 0
+            assert finish.stdout is not None
+            page = json.loads(finish.stdout.read())
+            assert [r["msg"] for r in page["records"] if r["source"] == "engine"] == [
+                "engine boot evidence",
+                "engine stderr evidence",
+                "partial",
+            ]
+            if not close_pipe:
+                assert sink.poll() is None, (
+                    "finish stopped the live engine's pipe reader"
+                )
+            _, errors = sink.communicate(
+                None if close_pipe else b"after stop\n" * 20000, timeout=5
+            )
+            assert sink.returncode == 0, errors.decode()
+            assert len(store.read("c" * 32)["records"]) == 3
+        finally:
+            (tmp_path / "release").touch()
+            if finish is not None and finish.poll() is None:
+                finish.kill()
+                finish.wait()
+            if sink.poll() is None:
+                sink.kill()
+                sink.wait()
+
+
+@pytest.mark.parametrize("engine_recording", [True, False, None])
+def test_finish_reports_missing_engine_ack_or_output_without_waiting_forever(
+    tmp_path: Path,
+    recorder: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    engine_recording: bool | None,
+) -> None:
+    store = AttemptLogStore(tmp_path / "logs.sqlite3")
+    attempt = store.create("host1")
+    phase: dict[str, object] = {"recording": False}
+    if engine_recording is not None:
+        phase["engine_recording"] = engine_recording
+    store.update_phase(attempt, "phase", **phase)
+    main = recorder["main"]
+    monkeypatch.setitem(main.__globals__, "open_store", lambda config: store)
+    monkeypatch.setattr(sys, "argv", ["provision-logs.py", "finish"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"attempt_id": attempt})))
+    monkeypatch.setattr(time, "monotonic", MagicMock(side_effect=[0, 6]))
+    main()
+    page = json.loads(capsys.readouterr().out)
+    issues = page["attempt"].get("issues", [])
+    if engine_recording is True:
+        assert "Engine log flush acknowledgement unavailable" in issues
+    elif engine_recording is False:
+        assert "Engine startup log unavailable" in issues
+    else:
+        assert not issues

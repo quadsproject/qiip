@@ -19,6 +19,22 @@ MANAGED_REQUESTED_CONTEXT="${AUTOLLAMACPP_MANAGED_CONTEXT_PER_SLOT:-}"
 MANAGED_REQUESTED_PARALLEL="${AUTOLLAMACPP_MANAGED_PARALLEL:-}"
 MANAGED_REQUESTED_CACHE_TYPE="${AUTOLLAMACPP_MANAGED_CACHE_TYPE:-}"
 MANAGED_ALLOW_ESTIMATOR_OVERRUN="${AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN:-0}"
+PROFILE_ID="${AUTOLLAMACPP_PROFILE_ID:-}"
+PROFILE_VERSION="${AUTOLLAMACPP_PROFILE_VERSION:-}"
+PROFILE_UBATCH="${AUTOLLAMACPP_PROFILE_UBATCH:-}"
+PROFILE_REQUIRED_FREE_MIB="${AUTOLLAMACPP_PROFILE_REQUIRED_FREE_MIB:-}"
+PROFILE_GPU_NAME="${AUTOLLAMACPP_PROFILE_GPU_NAME:-}"
+PROFILE_GPU_MIN_TOTAL_MIB="${AUTOLLAMACPP_PROFILE_GPU_MIN_TOTAL_MIB:-}"
+PROFILE_SPEC_TYPE="${AUTOLLAMACPP_PROFILE_SPEC_TYPE:-}"
+PROFILE_SPEC_DRAFT_N_MAX="${AUTOLLAMACPP_PROFILE_SPEC_DRAFT_N_MAX:-}"
+PROFILE_DRAFT_CACHE_TYPE="${AUTOLLAMACPP_PROFILE_DRAFT_CACHE_TYPE:-}"
+PROFILE_DRAFT_GGUF_RELATIVE_PATH="${AUTOLLAMACPP_PROFILE_DRAFT_GGUF_PATH:-}"
+PROFILE_TEMPERATURE="${AUTOLLAMACPP_PROFILE_TEMPERATURE:-}"
+PROFILE_TOP_P="${AUTOLLAMACPP_PROFILE_TOP_P:-}"
+PROFILE_TOP_K="${AUTOLLAMACPP_PROFILE_TOP_K:-}"
+PROFILE_MIN_P="${AUTOLLAMACPP_PROFILE_MIN_P:-}"
+PROFILE_PRESENCE_PENALTY="${AUTOLLAMACPP_PROFILE_PRESENCE_PENALTY:-}"
+PROFILE_DISABLE_CUDA_GRAPHS="${AUTOLLAMACPP_PROFILE_DISABLE_CUDA_GRAPHS:-0}"
 SCRIPT_DIR="${AUTOLLAMACPP_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 LLAMACPP_BIN="${AUTOLLAMACPP_BIN:-/usr/local/bin/llama-server}"
 LLAMACPP_FIT_BIN="${AUTOLLAMACPP_FIT_BIN:-/usr/local/bin/llama-fit-params}"
@@ -35,6 +51,9 @@ LLAMACPP_MAX_AGGREGATE_CONTEXT=4294967040
 LLAMACPP_ESTIMATE_ROUNDING_MIB=4
 LLAMACPP_PRIMARY_CACHE_TYPE=f16
 LLAMACPP_FALLBACK_CACHE_TYPE=q8_0
+LLAMACPP_PROFILE_ONLY_CACHE_TYPE=q4_0
+PROFILE_DRAFT_GGUF_PATH=""
+PROFILE_GPU_UUID=""
 MANAGED_CONTEXT_PER_SLOT=0
 MANAGED_PARALLEL=0
 MANAGED_AGGREGATE_CONTEXT=0
@@ -68,29 +87,27 @@ detect_gpu_info() {
     fi
 }
 
-resolve_gguf_artifact() {
-    if [ -z "$GGUF_RELATIVE_PATH" ]; then
-        echo "FATAL: AUTOLLAMACPP_GGUF_PATH must name an exact cache-relative .gguf file" >&2
+# Resolve one cache-relative GGUF path under the NFS mount and print the
+# validated path. $1 is the relative path, $2 the variable named in errors and
+# $3 a short description of the file.
+resolve_shared_gguf() {
+    local relative="$1"
+    local variable="$2"
+    local description="$3"
+    if [[ "$relative" == /* ]]; then
+        echo "FATAL: ${variable} must be relative to the NFS mount" >&2
         return 1
     fi
-    if [ -z "$MODEL_ALIAS" ]; then
-        echo "FATAL: AUTOLLAMACPP_MODEL_ALIAS must name the selected artifact" >&2
-        return 1
-    fi
-    if [[ "$GGUF_RELATIVE_PATH" == /* ]]; then
-        echo "FATAL: AUTOLLAMACPP_GGUF_PATH must be relative to the NFS mount" >&2
-        return 1
-    fi
-    case "$GGUF_RELATIVE_PATH" in
+    case "$relative" in
         ../*|*/../*|.|./*|*/./*|*//*|*\\*)
-            echo "FATAL: AUTOLLAMACPP_GGUF_PATH must be a canonical relative POSIX path" >&2
+            echo "FATAL: ${variable} must be a canonical relative POSIX path" >&2
             return 1
             ;;
     esac
-    case "$GGUF_RELATIVE_PATH" in
+    case "$relative" in
         *.gguf) ;;
         *)
-            echo "FATAL: AUTOLLAMACPP_GGUF_PATH must end in .gguf" >&2
+            echo "FATAL: ${variable} must end in .gguf" >&2
             return 1
             ;;
     esac
@@ -101,36 +118,35 @@ resolve_gguf_artifact() {
         echo "FATAL: NFS mount is unavailable: ${NFS_MOUNT_POINT}" >&2
         return 1
     }
-    candidate="${mount_root}/${GGUF_RELATIVE_PATH}"
+    candidate="${mount_root}/${relative}"
     resolved=$(readlink -f -- "$candidate") || {
-        echo "FATAL: selected GGUF artifact is unavailable: ${GGUF_RELATIVE_PATH}" >&2
+        echo "FATAL: ${description} is unavailable: ${relative}" >&2
         return 1
     }
     case "$resolved" in
         "${mount_root}"/*) ;;
         *)
-            echo "FATAL: selected GGUF artifact escapes the NFS mount" >&2
+            echo "FATAL: ${description} escapes the NFS mount" >&2
             return 1
             ;;
     esac
     if [ ! -f "$resolved" ]; then
-        echo "FATAL: selected GGUF artifact is not a regular file: ${GGUF_RELATIVE_PATH}" >&2
+        echo "FATAL: ${description} is not a regular file: ${relative}" >&2
         return 1
     fi
     # llama.cpp derives sibling split paths from the entrypoint filename. Keep
     # the validated symlink path so the -00001-of-0000N.gguf suffix survives.
-    GGUF_PATH="$candidate"
     # Verify every declared shard of a split-family GGUF: llama.cpp derives
     # sibling paths from the entrypoint filename, so a missing shard surfaces
     # later only as a failed load. The gateway owns the exact file set/sizes
     # (artifacts.py); the node verifies count + readability of the family.
     local base
-    base=$(basename -- "$GGUF_PATH")
+    base=$(basename -- "$candidate")
     if [[ "$base" =~ ^(.*)-([0-9]{5})-of-([0-9]{5})\.gguf$ ]]; then
         local prefix family_total dir missing total_shards
         prefix="${BASH_REMATCH[1]}"
         family_total="${BASH_REMATCH[3]}"
-        dir=$(dirname -- "$GGUF_PATH")
+        dir=$(dirname -- "$candidate")
         missing=0
         # The padded total keeps leading zeroes (used verbatim in sibling
         # filenames); Bash arithmetic would read 00010 as octal, so force
@@ -148,7 +164,152 @@ resolve_gguf_artifact() {
             return 1
         fi
     elif [ ! -r "$resolved" ]; then
-        echo "FATAL: selected GGUF artifact is not readable: ${GGUF_RELATIVE_PATH}" >&2
+        echo "FATAL: ${description} is not readable: ${relative}" >&2
+        return 1
+    fi
+    printf '%s\n' "$candidate"
+}
+
+resolve_gguf_artifact() {
+    if [ -z "$GGUF_RELATIVE_PATH" ]; then
+        echo "FATAL: AUTOLLAMACPP_GGUF_PATH must name an exact cache-relative .gguf file" >&2
+        return 1
+    fi
+    if [ -z "$MODEL_ALIAS" ]; then
+        echo "FATAL: AUTOLLAMACPP_MODEL_ALIAS must name the selected artifact" >&2
+        return 1
+    fi
+    GGUF_PATH=$(resolve_shared_gguf \
+        "$GGUF_RELATIVE_PATH" AUTOLLAMACPP_GGUF_PATH "selected GGUF artifact")
+    if [ -n "$PROFILE_DRAFT_GGUF_RELATIVE_PATH" ]; then
+        PROFILE_DRAFT_GGUF_PATH=$(resolve_shared_gguf \
+            "$PROFILE_DRAFT_GGUF_RELATIVE_PATH" \
+            AUTOLLAMACPP_PROFILE_DRAFT_GGUF_PATH "selected draft GGUF artifact")
+        if [ "$PROFILE_DRAFT_GGUF_PATH" = "$GGUF_PATH" ]; then
+            echo "FATAL: the draft GGUF artifact must differ from the target" >&2
+            return 1
+        fi
+    fi
+}
+
+# Catalog profiles replace the VRAM planner with one measured configuration.
+# Every input is an enumeration or a bounded number: none of them can carry
+# additional llama-server argv.
+validate_profile_inputs() {
+    local decimal='^(0|[1-9][0-9]{0,2})(\.[0-9]{1,4})?$'
+    if [ "$MANAGED_ALLOW_ESTIMATOR_OVERRUN" != "0" ]; then
+        echo "FATAL: profile sizing does not accept estimator overrun" >&2
+        return 1
+    fi
+    if [[ ! "$PROFILE_ID" =~ ^[a-z0-9][a-z0-9._-]{0,63}$ ]]; then
+        echo "FATAL: AUTOLLAMACPP_PROFILE_ID must be a catalog profile id" >&2
+        return 1
+    fi
+    if [[ ! "$PROFILE_VERSION" =~ ^[1-9][0-9]{0,8}$ ]]; then
+        echo "FATAL: AUTOLLAMACPP_PROFILE_VERSION must be a positive integer" >&2
+        return 1
+    fi
+    if [[ ! "$MANAGED_REQUESTED_CONTEXT" =~ ^[1-9][0-9]{0,9}$ ]] \
+        || [ "$MANAGED_REQUESTED_CONTEXT" -gt "$LLAMACPP_MAX_AGGREGATE_CONTEXT" ] \
+        || [ $((MANAGED_REQUESTED_CONTEXT % LLAMACPP_CONTEXT_ALIGNMENT)) -ne 0 ]; then
+        echo "FATAL: profile context_per_slot must be a positive 256-token increment" >&2
+        return 1
+    fi
+    if [ "$MANAGED_REQUESTED_PARALLEL" != "1" ]; then
+        echo "FATAL: profile sizing serves exactly one slot" >&2
+        return 1
+    fi
+    case "$MANAGED_REQUESTED_CACHE_TYPE" in
+        "$LLAMACPP_PRIMARY_CACHE_TYPE"|"$LLAMACPP_FALLBACK_CACHE_TYPE"|"$LLAMACPP_PROFILE_ONLY_CACHE_TYPE") ;;
+        *)
+            echo "FATAL: profile KV cache type must be f16, q8_0 or q4_0" >&2
+            return 1
+            ;;
+    esac
+    if [[ ! "$PROFILE_UBATCH" =~ ^[1-9][0-9]{1,3}$ ]] \
+        || [ "$PROFILE_UBATCH" -lt 32 ] || [ "$PROFILE_UBATCH" -gt 4096 ]; then
+        echo "FATAL: AUTOLLAMACPP_PROFILE_UBATCH must be between 32 and 4096" >&2
+        return 1
+    fi
+    if [[ ! "$PROFILE_REQUIRED_FREE_MIB" =~ ^[1-9][0-9]{0,6}$ ]]; then
+        echo "FATAL: AUTOLLAMACPP_PROFILE_REQUIRED_FREE_MIB must be a positive integer MiB value" >&2
+        return 1
+    fi
+    if [[ ! "$PROFILE_GPU_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9\ ._-]{1,127}$ ]]; then
+        echo "FATAL: AUTOLLAMACPP_PROFILE_GPU_NAME must be an nvidia-smi product name" >&2
+        return 1
+    fi
+    if [[ ! "$PROFILE_GPU_MIN_TOTAL_MIB" =~ ^[1-9][0-9]{0,6}$ ]]; then
+        echo "FATAL: AUTOLLAMACPP_PROFILE_GPU_MIN_TOTAL_MIB must be a positive integer MiB value" >&2
+        return 1
+    fi
+    if [[ ! "$PROFILE_SPEC_DRAFT_N_MAX" =~ ^[1-9][0-9]?$ ]] \
+        || [ "$PROFILE_SPEC_DRAFT_N_MAX" -gt 16 ]; then
+        echo "FATAL: AUTOLLAMACPP_PROFILE_SPEC_DRAFT_N_MAX must be between 1 and 16" >&2
+        return 1
+    fi
+    case "$PROFILE_SPEC_TYPE" in
+        draft-mtp)
+            if [ -n "$PROFILE_DRAFT_GGUF_RELATIVE_PATH" ]; then
+                echo "FATAL: MTP drafts from the target file and takes no draft GGUF" >&2
+                return 1
+            fi
+            case "$PROFILE_DRAFT_CACHE_TYPE" in
+                "$LLAMACPP_PRIMARY_CACHE_TYPE"|"$LLAMACPP_FALLBACK_CACHE_TYPE"|"$LLAMACPP_PROFILE_ONLY_CACHE_TYPE") ;;
+                *)
+                    echo "FATAL: MTP profiles must state an f16, q8_0 or q4_0 draft cache type" >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+        draft-mtp-assistant)
+            # An MTP head shipped as its own GGUF (Gemma 4). It has no KV
+            # cache of its own, so a draft cache type would be meaningless.
+            if [ -z "$PROFILE_DRAFT_GGUF_RELATIVE_PATH" ]; then
+                echo "FATAL: MTP assistant profiles require AUTOLLAMACPP_PROFILE_DRAFT_GGUF_PATH" >&2
+                return 1
+            fi
+            if [ -n "$PROFILE_DRAFT_CACHE_TYPE" ]; then
+                echo "FATAL: an MTP assistant shares the target KV cache and takes no draft cache type" >&2
+                return 1
+            fi
+            ;;
+        draft-dflash)
+            if [ -z "$PROFILE_DRAFT_GGUF_RELATIVE_PATH" ]; then
+                echo "FATAL: DFlash profiles require AUTOLLAMACPP_PROFILE_DRAFT_GGUF_PATH" >&2
+                return 1
+            fi
+            if [ -n "$PROFILE_DRAFT_CACHE_TYPE" ]; then
+                echo "FATAL: DFlash profiles use the default draft cache type" >&2
+                return 1
+            fi
+            ;;
+        *)
+            echo "FATAL: AUTOLLAMACPP_PROFILE_SPEC_TYPE must be draft-mtp, draft-mtp-assistant or draft-dflash" >&2
+            return 1
+            ;;
+    esac
+    if [[ ! "$PROFILE_TEMPERATURE" =~ $decimal ]] \
+        || [[ ! "$PROFILE_TOP_P" =~ $decimal ]]; then
+        echo "FATAL: profile temperature and top_p must be plain decimals" >&2
+        return 1
+    fi
+    if [[ ! "$PROFILE_TOP_K" =~ ^(0|[1-9][0-9]{0,3})$ ]]; then
+        echo "FATAL: profile top_k must be an integer" >&2
+        return 1
+    fi
+    if [ -n "$PROFILE_MIN_P" ] && [[ ! "$PROFILE_MIN_P" =~ $decimal ]]; then
+        echo "FATAL: profile min_p must be a plain decimal" >&2
+        return 1
+    fi
+    if [ -n "$PROFILE_PRESENCE_PENALTY" ] \
+        && [[ ! "${PROFILE_PRESENCE_PENALTY#-}" =~ $decimal ]]; then
+        echo "FATAL: profile presence_penalty must be a plain decimal" >&2
+        return 1
+    fi
+    if [ "$PROFILE_DISABLE_CUDA_GRAPHS" != "0" ] \
+        && [ "$PROFILE_DISABLE_CUDA_GRAPHS" != "1" ]; then
+        echo "FATAL: AUTOLLAMACPP_PROFILE_DISABLE_CUDA_GRAPHS must be 0 or 1" >&2
         return 1
     fi
 }
@@ -176,7 +337,38 @@ configure_llamacpp_params() {
             echo "FATAL: AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN must be 0 or 1" >&2
             return 1
         fi
+        if [ "$MANAGED_SIZING" != "profile" ]; then
+            local profile_input
+            for profile_input in \
+                AUTOLLAMACPP_PROFILE_ID \
+                AUTOLLAMACPP_PROFILE_VERSION \
+                AUTOLLAMACPP_PROFILE_UBATCH \
+                AUTOLLAMACPP_PROFILE_REQUIRED_FREE_MIB \
+                AUTOLLAMACPP_PROFILE_GPU_NAME \
+                AUTOLLAMACPP_PROFILE_GPU_MIN_TOTAL_MIB \
+                AUTOLLAMACPP_PROFILE_SPEC_TYPE \
+                AUTOLLAMACPP_PROFILE_SPEC_DRAFT_N_MAX \
+                AUTOLLAMACPP_PROFILE_DRAFT_CACHE_TYPE \
+                AUTOLLAMACPP_PROFILE_DRAFT_GGUF_PATH \
+                AUTOLLAMACPP_PROFILE_TEMPERATURE \
+                AUTOLLAMACPP_PROFILE_TOP_P \
+                AUTOLLAMACPP_PROFILE_TOP_K \
+                AUTOLLAMACPP_PROFILE_MIN_P \
+                AUTOLLAMACPP_PROFILE_PRESENCE_PENALTY; do
+                if [ -n "${!profile_input:-}" ]; then
+                    echo "FATAL: ${profile_input} is only valid with profile sizing" >&2
+                    return 1
+                fi
+            done
+            if [ "$PROFILE_DISABLE_CUDA_GRAPHS" != "0" ]; then
+                echo "FATAL: AUTOLLAMACPP_PROFILE_DISABLE_CUDA_GRAPHS is only valid with profile sizing" >&2
+                return 1
+            fi
+        fi
         case "$MANAGED_SIZING" in
+            profile)
+                validate_profile_inputs
+                ;;
             auto)
                 if [ -n "$MANAGED_REQUESTED_CONTEXT" ] \
                     || [ -n "$MANAGED_REQUESTED_PARALLEL" ] \
@@ -229,7 +421,7 @@ configure_llamacpp_params() {
                 fi
                 ;;
             *)
-                echo "FATAL: managed sizing must be auto or custom" >&2
+                echo "FATAL: managed sizing must be auto, custom or profile" >&2
                 return 1
                 ;;
         esac
@@ -301,6 +493,16 @@ clear_script_environment() {
     unset AUTOLLAMACPP_MANAGED_PARALLEL AUTOLLAMACPP_MANAGED_CACHE_TYPE
     unset AUTOLLAMACPP_MANAGED_ALLOW_ESTIMATOR_OVERRUN
     unset AUTOVLLM_NFS_EXPORT
+    unset AUTOLLAMACPP_PROFILE_ID AUTOLLAMACPP_PROFILE_VERSION
+    unset AUTOLLAMACPP_PROFILE_UBATCH AUTOLLAMACPP_PROFILE_REQUIRED_FREE_MIB
+    unset AUTOLLAMACPP_PROFILE_GPU_NAME AUTOLLAMACPP_PROFILE_GPU_MIN_TOTAL_MIB
+    unset AUTOLLAMACPP_PROFILE_SPEC_TYPE AUTOLLAMACPP_PROFILE_SPEC_DRAFT_N_MAX
+    unset AUTOLLAMACPP_PROFILE_DRAFT_CACHE_TYPE AUTOLLAMACPP_PROFILE_DRAFT_GGUF_PATH
+    unset AUTOLLAMACPP_PROFILE_TEMPERATURE AUTOLLAMACPP_PROFILE_TOP_P
+    unset AUTOLLAMACPP_PROFILE_TOP_K AUTOLLAMACPP_PROFILE_MIN_P
+    unset AUTOLLAMACPP_PROFILE_PRESENCE_PENALTY
+    unset AUTOLLAMACPP_PROFILE_DISABLE_CUDA_GRAPHS
+    unset GGML_CUDA_DISABLE_GRAPHS
     unset AUTOLLAMACPP_SCRIPT_DIR AUTOLLAMACPP_BIN AUTOLLAMACPP_FIT_BIN
     unset AUTOLLAMACPP_INSTALL_ROOT
     unset AUTOLLAMACPP_PID_FILE
@@ -556,6 +758,56 @@ plan_managed_cache_policy() {
     return 0
 }
 
+# A catalog profile is one measured configuration for one GPU. llama-fit-params
+# cannot estimate a speculative draft, so the launch gate is the profile's
+# measured requirement instead: free memory as nvidia-smi reports it before
+# the launch must cover that requirement plus the operator's reserve.
+plan_profile_configuration() {
+    local train_context="$1"
+    local free_mib needed_mib uuid_output
+    if [ "$GPU_COUNT" -ne 1 ]; then
+        echo "FATAL: catalog profiles support exactly one GPU per host; found ${GPU_COUNT}" >&2
+        return 1
+    fi
+    # The profile was measured on one GPU product. A host whose inventory
+    # string is stale must not run it on something else.
+    if [ "$GPU_MODEL" != "$PROFILE_GPU_NAME" ]; then
+        echo "FATAL: profile ${PROFILE_ID} was planned for '${PROFILE_GPU_NAME}', but this host has '${GPU_MODEL}'" >&2
+        return 1
+    fi
+    if [ "$GPU_VRAM_MB" -lt "$PROFILE_GPU_MIN_TOTAL_MIB" ]; then
+        echo "FATAL: profile ${PROFILE_ID} needs a GPU with at least ${PROFILE_GPU_MIN_TOTAL_MIB} MiB, but this one reports ${GPU_VRAM_MB} MiB" >&2
+        return 1
+    fi
+    if [ "$MANAGED_REQUESTED_CONTEXT" -gt "$train_context" ]; then
+        echo "FATAL: profile context_per_slot ${MANAGED_REQUESTED_CONTEXT} exceeds model training context ${train_context}" >&2
+        return 1
+    fi
+    if ! uuid_output=$(nvidia-smi --query-gpu=uuid --format=csv,noheader); then
+        echo "FATAL: could not query the GPU UUID for the profile launch" >&2
+        return 1
+    fi
+    PROFILE_GPU_UUID="${uuid_output//[[:space:]]/}"
+    if [[ ! "$PROFILE_GPU_UUID" =~ ^GPU-[0-9a-fA-F-]{8,64}$ ]]; then
+        echo "FATAL: nvidia-smi returned an invalid GPU UUID: ${PROFILE_GPU_UUID}" >&2
+        return 1
+    fi
+    free_mib="${MANAGED_GPU_FREE_MIB[0]}"
+    needed_mib=$((PROFILE_REQUIRED_FREE_MIB + FIT_TARGET_MIB))
+    if [ "$free_mib" -lt "$needed_mib" ]; then
+        echo "FATAL: profile ${PROFILE_ID} needs ${PROFILE_REQUIRED_FREE_MIB} MiB plus a ${FIT_TARGET_MIB} MiB reserve, but the GPU has ${free_mib} MiB free" >&2
+        return 1
+    fi
+    MANAGED_CACHE_TYPE_K="$MANAGED_REQUESTED_CACHE_TYPE"
+    MANAGED_CACHE_TYPE_V="$MANAGED_REQUESTED_CACHE_TYPE"
+    MANAGED_FLASH_ATTN=on
+    MANAGED_CONTEXT_PER_SLOT="$MANAGED_REQUESTED_CONTEXT"
+    MANAGED_PARALLEL=1
+    MANAGED_AGGREGATE_CONTEXT=$(managed_aggregate_context \
+        "$MANAGED_CONTEXT_PER_SLOT" "$MANAGED_PARALLEL")
+    echo "Selected catalog profile ${PROFILE_ID} v${PROFILE_VERSION}: ${MANAGED_CONTEXT_PER_SLOT} tokens, ${MANAGED_CACHE_TYPE_K}/${MANAGED_CACHE_TYPE_V} KV cache, ${PROFILE_SPEC_TYPE} n_max ${PROFILE_SPEC_DRAFT_N_MAX}; ${free_mib} MiB free covers ${needed_mib} MiB"
+}
+
 plan_managed_configuration() {
     local train_context min_context status
 
@@ -563,6 +815,11 @@ plan_managed_configuration() {
     read_managed_gpu_free_memory
     train_context=$(read_model_train_context)
     MANAGED_TRAIN_CONTEXT="$train_context"
+
+    if [ "$MANAGED_SIZING" = "profile" ]; then
+        plan_profile_configuration "$train_context"
+        return
+    fi
 
     if [ "$MANAGED_SIZING" = "custom" ]; then
         if [ "$MANAGED_REQUESTED_CONTEXT" -gt "$train_context" ]; then
@@ -667,6 +924,18 @@ run_llamacpp() {
 # ================================================
 
 EOF
+        if [ "$MANAGED_SIZING" = "profile" ]; then
+            cat <<EOF
+# Catalog Profile:    ${PROFILE_ID} v${PROFILE_VERSION}
+# Micro-batch:        ${PROFILE_UBATCH}
+# Speculation:        ${PROFILE_SPEC_TYPE}, n_max ${PROFILE_SPEC_DRAFT_N_MAX}
+# Draft GGUF:         ${PROFILE_DRAFT_GGUF_PATH:-(target file)}
+# Required Free VRAM: ${PROFILE_REQUIRED_FREE_MIB} MiB before launch
+# GPU UUID:           ${PROFILE_GPU_UUID}
+# ================================================
+
+EOF
+        fi
     else
         cat <<EOF
 
@@ -693,7 +962,11 @@ EOF
 
     local engine_log_fd
     if [ -n "${QIIP_LOG_CONFIG:-}" ]; then
-        exec {engine_log_fd}> >(python3 "${SCRIPT_DIR}/../common/provision-logs.py" engine >/dev/null 2>&1)
+        # "exec" matters: bash 5.1 (RHEL 9) otherwise keeps a wrapper shell alive
+        # for the process substitution, and that shell still holds this script's
+        # stdout and stderr. The gateway's command worker reads those until EOF,
+        # so it would never see the start command finish.
+        exec {engine_log_fd}> >(exec python3 "${SCRIPT_DIR}/../common/provision-logs.py" engine >/dev/null 2>&1)
     else
         exec {engine_log_fd}> "$LLAMACPP_LOG_FILE"
     fi
@@ -710,6 +983,79 @@ EOF
             "$MANAGED_CACHE_TYPE_V" \
             "$MANAGED_FLASH_ATTN" \
             "$MANAGED_ESTIMATOR_OVERRUN_USED" >&"$engine_log_fd"
+    fi
+
+    if [ "$MANAGED" = "1" ] && [ "$MANAGED_SIZING" = "profile" ]; then
+        printf 'qiip_profile_plan: profile_id=%s profile_version=%s ubatch=%s spec_type=%s spec_draft_n_max=%s draft_cache_type=%s draft_gguf=%s required_free_mib=%s gpu_free_mib=%s gpu_uuid=%s cuda_graphs=%s\n' \
+            "$PROFILE_ID" \
+            "$PROFILE_VERSION" \
+            "$PROFILE_UBATCH" \
+            "$PROFILE_SPEC_TYPE" \
+            "$PROFILE_SPEC_DRAFT_N_MAX" \
+            "${PROFILE_DRAFT_CACHE_TYPE:-default}" \
+            "${PROFILE_DRAFT_GGUF_RELATIVE_PATH:-none}" \
+            "$PROFILE_REQUIRED_FREE_MIB" \
+            "${MANAGED_GPU_FREE_MIB[0]}" \
+            "$PROFILE_GPU_UUID" \
+            "$([ "$PROFILE_DISABLE_CUDA_GRAPHS" = "1" ] && echo off || echo on)" \
+            >&"$engine_log_fd"
+        # Same fixed managed invariants as the planner launch below: one
+        # unified KV buffer, full GPU offload, no runtime re-fitting. The
+        # profile adds only typed, validated options.
+        # llama-server has one MTP implementation; an assistant differs only
+        # in drafting from its own file.
+        local server_spec_type="$PROFILE_SPEC_TYPE"
+        if [ "$server_spec_type" = "draft-mtp-assistant" ]; then
+            server_spec_type="draft-mtp"
+        fi
+        local -a profile_args=(
+            --ubatch-size "$PROFILE_UBATCH"
+            --spec-type "$server_spec_type"
+            --spec-draft-n-max "$PROFILE_SPEC_DRAFT_N_MAX"
+        )
+        if [ -n "$PROFILE_DRAFT_GGUF_PATH" ]; then
+            profile_args+=(--model-draft "$PROFILE_DRAFT_GGUF_PATH")
+        fi
+        if [ -n "$PROFILE_DRAFT_CACHE_TYPE" ]; then
+            profile_args+=(
+                --cache-type-k-draft "$PROFILE_DRAFT_CACHE_TYPE"
+                --cache-type-v-draft "$PROFILE_DRAFT_CACHE_TYPE"
+            )
+        fi
+        profile_args+=(
+            --no-mmproj
+            --jinja
+            --temp "$PROFILE_TEMPERATURE"
+            --top-p "$PROFILE_TOP_P"
+            --top-k "$PROFILE_TOP_K"
+        )
+        if [ -n "$PROFILE_MIN_P" ]; then
+            profile_args+=(--min-p "$PROFILE_MIN_P")
+        fi
+        if [ -n "$PROFILE_PRESENCE_PENALTY" ]; then
+            profile_args+=(--presence-penalty "$PROFILE_PRESENCE_PENALTY")
+        fi
+        if [ "$PROFILE_DISABLE_CUDA_GRAPHS" = "1" ]; then
+            export GGML_CUDA_DISABLE_GRAPHS=1
+        fi
+        "$LLAMACPP_BIN" \
+            --model "$GGUF_PATH" \
+            --host 0.0.0.0 \
+            --port "$API_PORT" \
+            --alias "$MODEL_ALIAS" \
+            --ctx-size "$MANAGED_AGGREGATE_CONTEXT" \
+            --parallel "$MANAGED_PARALLEL" \
+            --kv-unified \
+            --gpu-layers all \
+            --cache-type-k "$MANAGED_CACHE_TYPE_K" \
+            --cache-type-v "$MANAGED_CACHE_TYPE_V" \
+            --flash-attn "$MANAGED_FLASH_ATTN" \
+            --fit off \
+            "${profile_args[@]}" \
+            --verbosity 4 \
+            --metrics \
+            >&"$engine_log_fd" 2>&1 &
+    elif [ "$MANAGED" = "1" ]; then
         # llama.cpp's auto parallel value is a fixed four, not a VRAM fit. The
         # planner uses llama-fit-params to select the largest full-context slot
         # count that preserves the requested free-memory margin. A unified KV
