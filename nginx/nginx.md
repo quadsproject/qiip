@@ -8,23 +8,23 @@ keepalive, HTTP/2, and long generation-friendly timeouts.
 Two deployment methods are documented here, both using the same
 `nginx/nginx.conf`:
 
-1. **Podman container** - rootless systemd user service (Quadlet), pasta
+1. **RPM (dnf) install** - distribution nginx on the same host, systemd unit.
+2. **Podman container** - rootless systemd user service (Quadlet), pasta
    networking, first-run self-signed certificate generation.
-2. **RPM (dnf) install** - distribution nginx on the same host, systemd unit.
 
 This is strictly optional. The gateway runs fine without it, and the two
 methods are alternatives on one host (both bind 80/443).
 
 ## Table of contents
 
-- [Method 1: Podman container](#method-1-podman-container)
-  - [Build the image](#build-the-image)
-  - [Prepare config, certificates and unit](#prepare-config-certificates-and-unit)
-  - [Install and start](#install-and-start)
-- [Method 2: RPM install](#method-2-rpm-install)
+- [Method 1: RPM install](#method-1-rpm-install)
   - [Install nginx](#install-nginx)
   - [Deploy the config](#deploy-the-config)
   - [SELinux and firewall](#selinux-and-firewall)
+  - [Install and start](#install-and-start)
+- [Method 2: Podman container](#method-2-podman-container)
+  - [Build the image](#build-the-image)
+  - [Prepare config, certificates and unit](#prepare-config-certificates-and-unit)
   - [Install and start](#install-and-start-1)
 - [Certificates](#certificates)
   - [Generate a self-signed pair](#generate-a-self-signed-pair)
@@ -44,21 +44,91 @@ methods are alternatives on one host (both bind 80/443).
   `uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 5000`
   (the README Quick Start now uses this port), then check
   `curl -s http://localhost:5000/health` returns `{"status": "ok", ...}`.
-  Method 1 needs `--host 0.0.0.0`: a loopback-only listener cannot be reached
+  Method 2 needs `--host 0.0.0.0`: a loopback-only listener cannot be reached
   from the pasta container.
 - Fedora 40+ host for both methods (the container image is Fedora-based), or
-  a Rocky/RHEL 9.6+ host for Method 2 only, with **nginx >= 1.25.1** (the
+  a Rocky/RHEL 9.6+ host for Method 1 only, with **nginx >= 1.25.1** (the
   config uses `http2 on;`, which older nginx rejects). Fedora ships nginx
   1.28+ by default. EL9's stock nginx is 1.20 and only the `nginx:1.26`
   module stream (available since 9.6) supports `http2 on;`; enable it before
-  installing (see [Method 2](#method-2-rpm-install)). IPv6 is
+  installing (see [Method 1](#method-1-rpm-install)). IPv6 is
   optional: on an IPv4-only host, remove the two `listen [::]:...` lines
   from the config (see [Troubleshooting](#troubleshooting)) - nginx fails
   to start with "Address family not supported" otherwise.
-- For Method 1: podman (tested on 5.8.4) and a rootless user.
-- For Method 2: sudo.
+- For Method 2: podman (tested on 5.8.4) and a rootless user.
+- For Method 1: sudo.
 
-## Method 1: Podman container
+## Method 1: RPM install
+
+The same `nginx/nginx.conf`, installed into the distribution nginx. Good for
+hosts that already run nginx as a system service, and the path where the
+[ansible-sslcerts](#rpm-ansible-sslcerts) playbook's normal handler
+(restart of the system `nginx` unit) works unchanged.
+
+Steps for RPM install (sections below, in order).
+
+### Install nginx
+
+```bash
+# EL9 (Rocky/RHEL 9.6+) only: the stock nginx is 1.20, which rejects
+# `http2 on;`. If a different nginx stream is already enabled, run
+# `sudo dnf module reset -y nginx` first.
+sudo dnf module enable -y nginx:1.26
+sudo dnf install -y nginx openssl
+# nginx needs its temp dirs; the package does not create /var/cache/nginx.
+sudo install -d -o nginx -g nginx /var/cache/nginx
+# SELinux: label it with the packaged context (httpd_cache_t) or nginx cannot
+# create its temp dirs/files under it.
+sudo restorecon -R /var/cache/nginx
+```
+
+### Deploy the config
+
+Fetch the repo config (or copy it from a checkout), substitute the FQDN, and
+drop any packaged vhosts under `conf.d/`/`default.d/` - a defensive no-op on
+Fedora and EL9, which ship none (their stock `listen 80` server lives inline
+in `/etc/nginx/nginx.conf`, which this deploy replaces wholesale). The
+upstream stays `127.0.0.1:5000` for bare-metal nginx.
+
+```bash
+FQDN=$(hostname -f)
+
+sudo curl -fsSL -o /etc/nginx/nginx.conf \
+  https://raw.githubusercontent.com/quadsproject/qiip/main/nginx/nginx.conf
+sudo sed -i "s/{FQDN}/$FQDN/g" /etc/nginx/nginx.conf
+
+sudo rm -f /etc/nginx/conf.d/*.conf /etc/nginx/default.d/*.conf
+```
+
+From a checkout, replace the `curl` line with
+`sudo cp nginx/nginx.conf /etc/nginx/nginx.conf`.
+
+### SELinux and firewall
+
+nginx is confined to `httpd_t`; proxying to the gateway port needs the
+network-connect boolean. Open 80/443 and keep 5000 closed externally (the
+`/v1/*` inference endpoints are unauthenticated).
+
+```bash
+sudo setsebool -P httpd_can_network_connect on
+sudo firewall-cmd --permanent --add-service=http
+sudo firewall-cmd --permanent --add-service=https
+sudo firewall-cmd --permanent --remove-port=5000/tcp
+sudo firewall-cmd --reload
+```
+
+### Install and start
+
+The cert pair must already exist (generate it first, see
+[Certificates](#certificates)); otherwise `nginx -t` fails with
+`cannot load certificate ... BIO_new_file() failed`.
+
+```bash
+sudo nginx -t
+sudo systemctl enable --now nginx
+```
+
+## Method 2: Podman container
 
 Rootless podman runs the proxy as a systemd **user** unit (Quadlet) with
 `pasta` networking: dual-stack, no shared host netns, no root.
@@ -169,76 +239,6 @@ tail -f ~/.config/qiip-nginx/logs/access.log
 `copytruncate` is used instead of a logrotate reopen signal because nginx
 keeps the file descriptors open; copytruncate is simplest and loses at most
 access-log buffering (flush=5s).
-
-## Method 2: RPM install
-
-The same `nginx/nginx.conf`, installed into the distribution nginx. Good for
-hosts that already run nginx as a system service, and the path where the
-[ansible-sslcerts](#rpm-ansible-sslcerts) playbook's normal handler
-(restart of the system `nginx` unit) works unchanged.
-
-Steps for RPM install (sections below, in order).
-
-### Install nginx
-
-```bash
-# EL9 (Rocky/RHEL 9.6+) only: the stock nginx is 1.20, which rejects
-# `http2 on;`. If a different nginx stream is already enabled, run
-# `sudo dnf module reset -y nginx` first.
-sudo dnf module enable -y nginx:1.26
-sudo dnf install -y nginx openssl
-# nginx needs its temp dirs; the package does not create /var/cache/nginx.
-sudo install -d -o nginx -g nginx /var/cache/nginx
-# SELinux: label it with the packaged context (httpd_cache_t) or nginx cannot
-# create its temp dirs/files under it.
-sudo restorecon -R /var/cache/nginx
-```
-
-### Deploy the config
-
-Fetch the repo config (or copy it from a checkout), substitute the FQDN, and
-drop any packaged vhosts under `conf.d/`/`default.d/` - a defensive no-op on
-Fedora and EL9, which ship none (their stock `listen 80` server lives inline
-in `/etc/nginx/nginx.conf`, which this deploy replaces wholesale). The
-upstream stays `127.0.0.1:5000` for bare-metal nginx.
-
-```bash
-FQDN=$(hostname -f)
-
-sudo curl -fsSL -o /etc/nginx/nginx.conf \
-  https://raw.githubusercontent.com/quadsproject/qiip/main/nginx/nginx.conf
-sudo sed -i "s/{FQDN}/$FQDN/g" /etc/nginx/nginx.conf
-
-sudo rm -f /etc/nginx/conf.d/*.conf /etc/nginx/default.d/*.conf
-```
-
-From a checkout, replace the `curl` line with
-`sudo cp nginx/nginx.conf /etc/nginx/nginx.conf`.
-
-### SELinux and firewall
-
-nginx is confined to `httpd_t`; proxying to the gateway port needs the
-network-connect boolean. Open 80/443 and keep 5000 closed externally (the
-`/v1/*` inference endpoints are unauthenticated).
-
-```bash
-sudo setsebool -P httpd_can_network_connect on
-sudo firewall-cmd --permanent --add-service=http
-sudo firewall-cmd --permanent --add-service=https
-sudo firewall-cmd --permanent --remove-port=5000/tcp
-sudo firewall-cmd --reload
-```
-
-### Install and start
-
-The cert pair must already exist (generate it first, see
-[Certificates](#certificates)); otherwise `nginx -t` fails with
-`cannot load certificate ... BIO_new_file() failed`.
-
-```bash
-sudo nginx -t
-sudo systemctl enable --now nginx
-```
 
 ## Certificates
 
