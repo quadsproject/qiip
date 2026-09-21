@@ -90,6 +90,10 @@ def _signature(attempt: dict[str, Any], original: str) -> tuple[str, bool]:
         return "v1:unsupported_hardware", True
     for signature, pattern in (
         ("cuda_out_of_memory", r"cuda out of memory|cuda error: out of memory"),
+        (
+            "cuda_probe_compile",
+            r"FATAL: nvcc failed to compile the CUDA execution probe",
+        ),
         ("disk_full", r"no space left on device"),
         (
             "kernel_headers",
