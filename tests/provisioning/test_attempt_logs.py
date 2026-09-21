@@ -120,6 +120,10 @@ def harness(tmp_path: Path) -> tuple[NodeProvisioner, LocalNodeSSH, AttemptLogSt
     shutil.copy(
         ROOT / "inference_proxy/provisioning/log_store.py", node / "common/log_store.py"
     )
+    shutil.copy(
+        ROOT / "inference_proxy/provisioning/diagnostics.py",
+        node / "common/diagnostics.py",
+    )
     fake_engine = tmp_path / "fake-vllm"
     _write_executable(
         fake_engine,

@@ -148,6 +148,33 @@ class AttemptLogStore:
                 raise KeyError(attempt_id)
             return self._manifest(row)
 
+    def tail(self, attempt_id: str, source: str, *, max_bytes: int) -> dict[str, Any]:
+        """Read a bounded suffix for a diagnostic snapshot, newest evidence first."""
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT payload FROM records WHERE attempt=? "
+                "AND json_extract(payload,'$.source')=? ORDER BY seq DESC LIMIT 201",
+                (attempt_id, source),
+            ).fetchall()
+        if not rows:
+            return dict(
+                status="unavailable", reason="No retained output for this source"
+            )
+        records = [json.loads(row[0]) for row in reversed(rows)]
+        raw = "\n".join(r["msg"] for r in records).encode("utf-8")
+        lines = raw[-max_bytes:].decode("utf-8", errors="ignore").splitlines()
+        truncated = (
+            len(rows) == 201
+            or len(raw) > max_bytes
+            or len(lines) > 200
+            or any(r["truncated"] for r in records)
+        )
+        return dict(
+            status="truncated" if truncated else "collected",
+            truncated=truncated,
+            output="\n".join(lines[-200:]),
+        )
+
     @staticmethod
     def _manifest(row: sqlite3.Row) -> dict[str, Any]:
         result: dict[str, Any] = json.loads(row["metadata"])
@@ -157,7 +184,19 @@ class AttemptLogStore:
             dropped_records=row["dropped"],
             retained_bytes=row["bytes"],
         )
-        result["incomplete"] = bool(result["issues"] or row["dropped"])
+        diagnostic_sources = result.get("diagnostics", {}).get("sources", {}).values()
+        for source in diagnostic_sources:
+            if source.get("first_seq", row["dropped"]) < row["dropped"]:
+                source.update(
+                    truncated=True, reason="Diagnostic records evicted by retention"
+                )
+                if source["status"] == "collected":
+                    source["status"] = "truncated"
+        result["incomplete"] = bool(
+            result["issues"]
+            or row["dropped"]
+            or any(source["status"] != "collected" for source in diagnostic_sources)
+        )
         return result
 
     def history(
@@ -236,7 +275,28 @@ class AttemptLogStore:
             if row is None:
                 raise KeyError(attempt_id)
             metadata = json.loads(row[0])
-            metadata.setdefault("phases", {}).setdefault(phase, {}).update(changes)
+            info = metadata.setdefault("phases", {}).setdefault(phase, {})
+            if (
+                changes.get("status") in {"launching", "running"}
+                and "started_at" not in info
+            ):
+                changes.setdefault("started_at", timestamp())
+            if changes.get("status") == "complete" and "finished_at" not in info:
+                changes["finished_at"] = timestamp()
+                # Older node records have no command start time. Preserve that
+                # uncertainty instead of inventing a duration during recovery.
+                changes["duration_seconds"] = (
+                    max(
+                        0,
+                        (
+                            datetime.fromisoformat(changes["finished_at"])
+                            - datetime.fromisoformat(info["started_at"])
+                        ).total_seconds(),
+                    )
+                    if info.get("started_at")
+                    else None
+                )
+            info.update(changes)
             self._update(db, attempt_id, metadata)
 
     def update(self, attempt_id: str, **fields: Any) -> None:

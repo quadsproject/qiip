@@ -68,11 +68,18 @@ class RemoteCommandError(Exception):
     """Raised when a remote command exits with non-zero status."""
 
     def __init__(
-        self, host: str, command: str, exit_status: int, stderr: str = ""
+        self,
+        host: str,
+        command: str,
+        exit_status: int,
+        stderr: str = "",
+        *,
+        exit_signal: str | None = None,
     ) -> None:
         self.host = host
         self.command = command
         self.exit_status = exit_status
+        self.exit_signal = exit_signal
         self.stderr = stderr
         tail = _stderr_tail(stderr) if stderr else ""
         msg = f"Command '{command}' on {host} exited with status {exit_status}"
@@ -256,6 +263,9 @@ class SSHClient:
                         command,
                         process.exit_status,
                         stderr=stderr_output,
+                        exit_signal=process.exit_signal[0]
+                        if process.exit_signal
+                        else None,
                     )
 
         async def supervise() -> None:
@@ -358,6 +368,9 @@ class SSHClient:
                         command,
                         exit_status,
                         stderr=stderr,
+                        exit_signal=result.exit_signal[0]
+                        if result.exit_signal
+                        else None,
                     )
 
                 log.debug("ssh_run_complete", exit_status=exit_status)

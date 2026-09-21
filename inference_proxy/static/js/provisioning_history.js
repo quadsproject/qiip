@@ -6,6 +6,9 @@ document.addEventListener("DOMContentLoaded", function () {
   if (!panel) return;
   var select = document.getElementById("attempt-select");
   var summary = document.getElementById("attempt-summary");
+  var failureDetails = document.getElementById("attempt-failure-details");
+  var diagnostics = document.getElementById("attempt-diagnostics");
+  var diagnosticSources = document.getElementById("attempt-diagnostic-sources");
   var issues = document.getElementById("attempt-issues");
   var output = document.getElementById("attempt-output");
   var query = document.getElementById("attempt-query");
@@ -27,9 +30,28 @@ document.addEventListener("DOMContentLoaded", function () {
 
   function attemptUrl() { return base + "/" + encodeURIComponent(select.value); }
   function showManifest(attempt) {
-    summary.textContent = attempt.status + " · " + attempt.engine + " · " +
+    summary.textContent = (attempt.failure_summary ? attempt.failure_summary + "\n" : "") +
+      attempt.status + " · " + attempt.engine + " · " +
       (attempt.model || "model not selected") + " · " + attempt.stage + " · " +
-      attempt.bundle_version + (attempt.failure_summary ? "\n" + attempt.failure_summary : "");
+      attempt.bundle_version;
+    var failure = attempt.failure;
+    failureDetails.textContent = failure ? "Failed at " + failure.failed_at + " after " +
+      Number(failure.duration_seconds).toFixed(1) + "s" +
+      (failure.exit_code != null ? " · exit " + failure.exit_code : "") +
+      (failure.signal != null ? " · signal " + failure.signal : "") +
+      (failure.command ? " · command " + failure.command.stage + " (" +
+        (failure.command.phase_id || failure.command.sha256) + ")" : "") : "";
+    diagnostics.hidden = !attempt.diagnostics;
+    diagnosticSources.textContent = "";
+    Object.entries((attempt.diagnostics || {}).sources || {}).forEach(function (entry) {
+      var name = entry[0], detail = entry[1];
+      var item = document.createElement("li");
+      item.textContent = name + ": " + detail.status.replace(/_/g, " ") +
+        (detail.collected_at ? " · " + detail.collected_at : "") +
+        (detail.reason ? " · " + detail.reason : "") +
+        (detail.deferred ? " · retry available" : "");
+      diagnosticSources.appendChild(item);
+    });
     var notices = (attempt.issues || []).slice();
     if (attempt.dropped_records) notices.push(attempt.dropped_records + " gateway records evicted by retention.");
     issues.textContent = notices.join("\n");
@@ -67,7 +89,7 @@ document.addEventListener("DOMContentLoaded", function () {
       offset = page.next_offset;
       more.hidden = !page.has_more;
     } catch (error) {
-      if (current === generation) summary.textContent = error.message;
+      if (current === generation) issues.textContent = error.message;
     }
   }
 
@@ -89,10 +111,12 @@ document.addEventListener("DOMContentLoaded", function () {
       collect.disabled = !select.value;
       if (!select.value) {
         summary.textContent = "No retained attempts for this node.";
+        failureDetails.textContent = "";
+        diagnostics.hidden = true;
         download.hidden = true;
       } else if (!append) await logs(false);
       if (data.evicted_attempts) issues.textContent += "\n" + data.evicted_attempts + " older attempt manifests evicted across this gateway.";
-    } catch (error) { summary.textContent = error.message; }
+    } catch (error) { issues.textContent = error.message; }
   }
 
   select.addEventListener("change", function () { query.value = ""; source.value = ""; logs(false); });
@@ -104,11 +128,11 @@ document.addEventListener("DOMContentLoaded", function () {
     if (!select.value) return;
     var selected = select.value;
     collect.disabled = true;
-    summary.textContent = "Retrieving missed output from the node…";
+    issues.textContent = "Retrieving logs and deferred diagnostics from the node…";
     try {
       await request(attemptUrl() + "/collect", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
       if (selected === select.value) await logs(false);
-    } catch (error) { summary.textContent = error.message; }
+    } catch (error) { issues.textContent = error.message; }
     finally { collect.disabled = false; }
   });
   history(false);

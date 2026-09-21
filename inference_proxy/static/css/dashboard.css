@@ -1363,7 +1363,9 @@ footer p { margin: 0; }
   color: var(--text);
 }
 .attempt-issues { color: var(--warning); white-space: pre-line; }
-#attempt-summary { overflow-wrap: anywhere; }
+#attempt-summary { overflow-wrap: anywhere; white-space: pre-line; }
+#attempt-failure-details, #attempt-diagnostic-sources { overflow-wrap: anywhere; }
+#attempt-diagnostics { margin-bottom: 0.75rem; }
 #attempt-more { margin-top: 0.75rem; }
 
 .attempt-toolbar [hidden], #attempt-more[hidden] { display: none; }

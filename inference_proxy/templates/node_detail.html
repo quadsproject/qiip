@@ -222,6 +222,12 @@
                     <button type="button" id="attempt-refresh" class="btn btn-secondary">Refresh history</button>
                 </div>
                 <p id="attempt-summary" role="status" aria-live="polite"></p>
+                <p id="attempt-failure-details"></p>
+                <details id="attempt-diagnostics" hidden>
+                    <summary>Failure diagnostics</summary>
+                    <p>Snapshots show when each source was collected. Unavailable sources can be retried with Retrieve from node.</p>
+                    <ul id="attempt-diagnostic-sources"></ul>
+                </details>
                 <p id="attempt-issues" class="attempt-issues"></p>
                 <form id="attempt-search" class="attempt-toolbar">
                     <label for="attempt-query">Search full logs</label>
@@ -230,7 +236,7 @@
                     <select id="attempt-source"><option value="">All sources</option></select>
                     <button class="btn btn-secondary" type="submit">Search</button>
                     <button class="btn btn-secondary" type="button" id="attempt-collect">Retrieve from node</button>
-                    <a id="attempt-download" class="btn btn-secondary" hidden>Download log bundle</a>
+                    <a id="attempt-download" class="btn btn-secondary" hidden>Download attempt bundle</a>
                 </form>
                 <div id="attempt-output" class="log-viewer" aria-label="Attempt log records"></div>
                 <button type="button" id="attempt-more" class="btn btn-secondary" hidden>Load more records</button>

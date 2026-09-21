@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import shlex
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from typing import Any
 from weakref import WeakValueDictionary
 
 from inference_proxy.config.settings import ProvisioningSettings
+from inference_proxy.provisioning.diagnostics import SOURCE_NAMES
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
-from inference_proxy.provisioning.log_store import AttemptLogStore
+from inference_proxy.provisioning.log_store import AttemptLogStore, timestamp
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
     SSHClient,
@@ -34,6 +37,120 @@ class RemoteLogCollector:
         self.buffer = buffer
         self.settings = settings
         self._locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self._diagnostic_locks: WeakValueDictionary[str, asyncio.Lock] = (
+            WeakValueDictionary()
+        )
+
+    def record_failure(self, attempt_id: str, stage: str, error: BaseException) -> None:
+        """Save the original failure before making any diagnostic SSH requests."""
+        attempt = self.store.get(attempt_id)
+        if attempt.get("failure"):
+            return
+        cause: BaseException | None = error
+        command_error: RemoteCommandError | None = None
+        while cause is not None:
+            if isinstance(cause, RemoteCommandError):
+                command_error = cause
+                break
+            cause = cause.__cause__
+        now = datetime.now(UTC)
+        command = attempt.get("active_command")
+        if command_error and (not command or command_error.command != command["stage"]):
+            command = dict(
+                stage=stage,
+                phase_id=None,
+                sha256=hashlib.sha256(command_error.command.encode()).hexdigest(),
+            )
+        if command:
+            phase = attempt.get("remote_phases", {}).get(command["phase_id"], {})
+            command = {
+                **command,
+                **{
+                    key: phase[key]
+                    for key in (
+                        "started_at",
+                        "finished_at",
+                        "duration_seconds",
+                        "exit_status",
+                    )
+                    if key in phase
+                },
+            }
+        exit_status = command_error.exit_status if command_error else None
+        failure = dict(
+            failed_stage=stage,
+            original_error=str(error)[:8192],
+            error_type=type(error).__name__,
+            started_at=attempt["started_at"],
+            failed_at=now.isoformat(),
+            duration_seconds=max(
+                0, (now - datetime.fromisoformat(attempt["started_at"])).total_seconds()
+            ),
+            command=command,
+            exit_code=exit_status
+            if exit_status is not None and exit_status >= 0
+            else None,
+            signal=(command_error.exit_signal if command_error else None)
+            or (-exit_status if exit_status is not None and exit_status < 0 else None),
+        )
+        self.store.update(
+            attempt_id,
+            failure=failure,
+            failure_summary=f"{stage}: {error}",
+            diagnostics=dict(
+                sources={
+                    name: dict(
+                        status="unavailable", deferred=True, reason="Collection pending"
+                    )
+                    for name in SOURCE_NAMES
+                }
+            ),
+        )
+
+    async def diagnose(self, attempt_id: str) -> None:
+        """Best-effort bounded collection; never substitute a collector error."""
+        lock = self._diagnostic_locks.setdefault(attempt_id, asyncio.Lock())
+        try:
+            async with asyncio.timeout(self.settings.diagnostics_timeout):
+                async with lock:
+                    attempt = self.store.get(attempt_id)
+                    if not attempt.get("failure"):
+                        return
+                    sources = attempt.get("diagnostics", {}).get("sources", {})
+                    if sources and not any(s.get("deferred") for s in sources.values()):
+                        return
+                    async with self._locks.setdefault(attempt_id, asyncio.Lock()):
+                        page = await self._request(
+                            attempt_id,
+                            "diagnose",
+                            failure=attempt["failure"],
+                            mount_point=self.settings.nfs_mount_point,
+                            diagnostics_source_timeout=self.settings.diagnostics_source_timeout,
+                            # Reserve time for transfer/ingestion inside the gateway budget.
+                            diagnostics_timeout=self.settings.diagnostics_timeout * 0.8,
+                            diagnostics_source_max_bytes=self.settings.diagnostics_source_max_bytes,
+                        )
+                        await self._ingest(attempt_id, page)
+                    if page["has_more"]:
+                        await self.collect(attempt_id)
+        except Exception as exc:
+            # Avoid command strings (which can contain credentials) in failures.
+            reason = (
+                "Collection deadline exceeded"
+                if isinstance(exc, TimeoutError)
+                else f"Collection unavailable ({type(exc).__name__})"
+            )
+            attempt = self.store.get(attempt_id)
+            diagnostics = attempt.get("diagnostics", {})
+            for source in diagnostics.get("sources", {}).values():
+                if source.get("deferred"):
+                    source.update(
+                        status="timed_out"
+                        if isinstance(exc, TimeoutError)
+                        else "unavailable",
+                        reason=reason,
+                    )
+            self.store.update(attempt_id, diagnostics=diagnostics)
 
     def config(self, attempt_id: str) -> dict[str, Any]:
         attempt = self.store.get(attempt_id)
@@ -100,7 +217,9 @@ class RemoteLogCollector:
             stdout, _stderr, _status = await self.ssh.run(
                 config["hostname"],
                 command,
-                timeout=30,
+                timeout=self.settings.diagnostics_timeout
+                if action == "diagnose"
+                else 30,
                 log_label=f"provisioning log recorder ({action})",
             )
         except RemoteCommandError as exc:
@@ -172,6 +291,66 @@ class RemoteLogCollector:
             ],
         )
         remote = page["attempt"]
+        diagnostic_fields: dict[str, Any] = {}
+        current = self.store.get(attempt_id)
+        failure = current.get("failure")
+        if failure and failure.get("command"):
+            phase = remote.get("phases", {}).get(failure["command"].get("phase_id"), {})
+            failure["command"].update(
+                {
+                    key: phase[key]
+                    for key in (
+                        "started_at",
+                        "finished_at",
+                        "duration_seconds",
+                        "exit_status",
+                    )
+                    if key in phase
+                }
+            )
+            diagnostic_fields["failure"] = failure
+        if "diagnostics" in remote:
+            previous = current.get("diagnostics", {}).get("sources", {})
+            sources = {}
+            for name, source in remote["diagnostics"]["sources"].items():
+                detail = dict(source)
+                first, last = (
+                    detail.pop("first_seq", None),
+                    detail.pop("last_seq", None),
+                )
+                if first is not None:
+                    detail.update(remote_first_seq=first, remote_last_seq=last)
+                    old = previous.get(name, {})
+                    local = [
+                        entry["seq"]
+                        for entry in added
+                        if entry["source"] == "diagnostics." + name
+                        and first <= entry["remote_seq"] <= last
+                    ]
+                    if (
+                        old.get("remote_first_seq") == first
+                        and old.get("first_seq") is not None
+                    ):
+                        local.extend([old["first_seq"], old["last_seq"]])
+                    if local:
+                        detail.update(first_seq=min(local), last_seq=max(local))
+                    if last >= current["remote_cursor"]:
+                        detail.update(
+                            status="unavailable",
+                            deferred=True,
+                            reason="Snapshot recorded on node; retrieval pending",
+                        )
+                    elif first < remote["dropped_records"]:
+                        detail.update(
+                            status="truncated",
+                            truncated=True,
+                            reason="Diagnostic records evicted by node retention",
+                        )
+                sources[name] = detail
+            diagnostic_fields["diagnostics"] = {
+                **remote["diagnostics"],
+                "sources": sources,
+            }
         issues = []
         for issue in remote["issues"]:
             message = "Node: " + issue
@@ -188,6 +367,7 @@ class RemoteLogCollector:
             remote_sources=remote["sources"],
             remote_dropped_records=remote["dropped_records"],
             issues=issues[-32:],
+            **diagnostic_fields,
         )
         # An empty retained suffix still needs an explicit gap and cursor advance.
         if (
@@ -258,7 +438,11 @@ class RemoteLogCollector:
         # Record launch intent before touching SSH. If launch acknowledgement is
         # lost, only retrieve this identity; never repeat setup or engine launch.
         attempt = self.store.get(attempt_id)
-        self.store.update(attempt_id, phases=[*attempt.get("phases", []), phase])
+        self.store.update(
+            attempt_id,
+            phases=[*attempt.get("phases", []), phase],
+            active_command=dict(phase_id=phase, stage=stage, started_at=timestamp()),
+        )
         try:
             page = await self._request(
                 attempt_id,

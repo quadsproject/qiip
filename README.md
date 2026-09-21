@@ -1472,6 +1472,25 @@ attempt fails with an explicit collection warning. Recorded commands retain the
 configured SSH total and inactivity deadlines; llama.cpp setup retains its longer
 setup timeout.
 
+Failed attempts automatically collect a diagnostic bundle. The original error
+appears first in the attempt history, with the failed stage, command identity,
+available exit code or signal, timestamps, and elapsed time. The bundle includes
+setup and engine log tails, NVIDIA/Fabric Manager service journals, GPU and OOM
+kernel messages, OS/kernel details, GPU inventory and free VRAM, driver/toolkit
+and runtime versions, RAM, disk usage, and the model-cache mount state.
+
+Each source reports `collected`, `unavailable`, `timed_out`, or `truncated`.
+Defaults limit each source to 3 seconds, 200 lines, and 16 KiB, and the overall
+diagnostic collection to 25 seconds. Configure `diagnostics_source_timeout`,
+`diagnostics_timeout`, and `diagnostics_source_max_bytes` under `provisioning`.
+Payloads share the existing attempt retention budgets. A failed collector never
+replaces the provisioning error. Journal queries retain the original failure
+window; system snapshots carry their collection time, including after reconnect.
+The attempt API's log manifest and downloadable bundle include these details.
+Use **Retrieve from node** to retry deferred sources; startup reconciliation and
+the next operation on that host also retrieve pending evidence without relaunching
+the failed command. No periodic retry runs solely for diagnostics.
+
 At startup the gateway reconciles every host with an unfinished attempt in the
 background (`reconcile_pending_operations`). Before each provision or relaunch
 on a host, and during teardown, it rechecks that host. Both paths ask the node

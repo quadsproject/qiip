@@ -328,6 +328,9 @@ class ProvisioningSettings(BaseModel):
     log_remote_max_attempts: int = Field(default=32, ge=1)
     log_reconnect_attempts: int = Field(default=3, ge=0, le=20)
     log_poll_interval: float = Field(default=1, gt=0)
+    diagnostics_source_timeout: float = Field(default=3, gt=0, le=60)
+    diagnostics_timeout: float = Field(default=25, gt=0, le=300)
+    diagnostics_source_max_bytes: int = Field(default=16_384, ge=256, le=65_536)
     nfs_mount_point: str = "/srv/hf-cache"
     nvidia_driver_version: str = DEFAULT_NVIDIA_DRIVER_VERSION
     nvidia_driver_sha256: str = DEFAULT_NVIDIA_DRIVER_SHA256

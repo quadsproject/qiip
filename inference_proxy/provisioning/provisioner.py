@@ -501,6 +501,7 @@ class NodeProvisioner:
             *self._engine_scripts_dir(engine).glob("*"),
             *self._common_scripts_dir().glob("*"),
             Path(__file__).with_name("log_store.py"),
+            Path(__file__).with_name("diagnostics.py"),
         ]
         for path in sorted(files):
             if path.is_file():
@@ -524,8 +525,23 @@ class NodeProvisioner:
             raise KeyError(attempt_id)
         # The durable manifest describes any unavailable source.
         with suppress(SSHConnectionError, TimeoutError):
-            await self._remote_logs.collect(attempt_id)
+            async with asyncio.timeout(self._settings.diagnostics_timeout):
+                await self._remote_logs.collect(attempt_id)
+        await self._remote_logs.diagnose(attempt_id)
         return store.get(attempt_id)
+
+    async def _capture_failure(
+        self, hostname: str, stage: str, error: BaseException
+    ) -> None:
+        try:
+            attempt_id = self._log_buffer.attempts.get(hostname)
+            if self._remote_logs is not None and attempt_id is not None:
+                self._remote_logs.record_failure(attempt_id, stage, error)
+                await self._remote_logs.diagnose(attempt_id)
+        except Exception:
+            logger.warning(
+                "failure_diagnostics_unavailable", hostname=hostname, exc_info=True
+            )
 
     async def _finish_remote_logs(self, hostname: str, *, cancel: bool = False) -> None:
         try:
@@ -538,9 +554,10 @@ class NodeProvisioner:
             task = asyncio.current_task()
             # A gateway shutdown stops retrieval, not the detached node worker.
             interrupted = bool(task and task.cancelling()) and not cancel
-            await self._remote_logs.collect(
-                attempt_id, finish=not interrupted, cancel=cancel
-            )
+            async with asyncio.timeout(self._settings.diagnostics_timeout):
+                await self._remote_logs.collect(
+                    attempt_id, finish=not interrupted, cancel=cancel
+                )
         except Exception:
             logger.warning(
                 "remote_logs_finish_failed", hostname=hostname, exc_info=True
@@ -909,9 +926,14 @@ class NodeProvisioner:
         if store is not None and attempt_id is not None:
             fields: dict[str, object] = {"stage": failed_step or step.value}
             if error:
+                failure = store.get(attempt_id).get("failure")
                 fields.update(
                     status="failed",
-                    failure_summary=f"{failed_step or step.value}: {error}",
+                    failure_summary=(
+                        f"{failure['failed_stage']}: {failure['original_error']}"
+                        if failure
+                        else f"{failed_step or step.value}: {error}"
+                    ),
                 )
             store.update(attempt_id, **fields)
         state = ProvisioningState(
@@ -1048,7 +1070,7 @@ class NodeProvisioner:
             if attempt.get("status") not in {"running", "interrupted", "failed"}:
                 continue
             with suppress(Exception):
-                await self._remote_logs.collect(attempt["attempt_id"])
+                await self.collect_logs(hostname, attempt["attempt_id"])
 
     async def reconcile_pending_operations(self) -> None:
         """Best-effort startup recovery for hosts with unfinished remote work.
@@ -1558,6 +1580,8 @@ class NodeProvisioner:
             self._log(hostname, "info", "llama.cpp relaunch complete")
             return
         except BaseException as error:
+            if isinstance(error, Exception):
+                await self._capture_failure(hostname, current_step, error)
             if (
                 stop_attempted
                 and relaunch_record is not None
@@ -2154,6 +2178,7 @@ class NodeProvisioner:
                 error=str(exc),
                 started_at=provision_started_at,
             )
+            await self._capture_failure(hostname, "preflight", exc)
             self._log_buffer.mark_complete(hostname)
             raise
 
@@ -2191,6 +2216,7 @@ class NodeProvisioner:
                 nonlocal current_step
                 current_step = step
 
+            current_step = "setup"
             await self._run_setup(
                 hostname,
                 started_at=provision_started_at,
@@ -2271,6 +2297,7 @@ class NodeProvisioner:
                 error=str(exc),
                 started_at=provision_started_at,
             )
+            await self._capture_failure(hostname, current_step, exc)
             # Update node entry to FAILED so it doesn't stay stuck as PROVISIONING
             try:
                 failed_node = Node(
@@ -2322,6 +2349,11 @@ class NodeProvisioner:
                 hostname,
                 Path(__file__).with_name("log_store.py"),
                 "common/log_store.py",
+            )
+            await self._ssh_client.upload(
+                hostname,
+                Path(__file__).with_name("diagnostics.py"),
+                "common/diagnostics.py",
             )
 
     async def _upload_scripts(
@@ -3286,6 +3318,7 @@ class NodeProvisioner:
                 error=str(exc),
                 started_at=teardown_started_at,
             )
+            await self._capture_failure(hostname, "teardown", exc)
             if self._registry is not None:
                 self._registry.update_status(
                     hostname,

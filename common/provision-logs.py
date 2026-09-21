@@ -662,7 +662,7 @@ def main():
         print(json.dumps({"active": bool(live), **live}))
         return
     attempt = config["attempt_id"]
-    if action == "launch":
+    if action in {"launch", "diagnose"}:
         try:
             store.get(attempt)
         except KeyError:
@@ -674,6 +674,33 @@ def main():
                 bundle_version=config["bundle_version"],
                 attempt_id=attempt,
             )
+    if action == "diagnose":
+        from diagnostics import collect
+
+        # Diagnostics do not change command or attempt status. Sources commit
+        # separately so a dropped SSH response can be retrieved after reconnect.
+        metadata = store.get(attempt)
+        if not metadata.get("failure"):
+            store.update(attempt, failure=config["failure"])
+        if not metadata.get("phases"):
+            # Preflight failures have no worker to finalize this remote row.
+            store.update(
+                attempt, status="failed", finished_at=config["failure"]["failed_at"]
+            )
+        with (Path(config["root"]) / "diagnostics.lock").open("a") as lock:
+            # Serialize snapshots across gateway instances without blocking a
+            # live setup/engine worker or exceeding the collection deadline.
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(
+                    json.dumps(
+                        {"unavailable": "Another diagnostic collection is active"}
+                    )
+                )
+                return
+            collect(config, store)
+    elif action == "launch":
         phase = config["phase"]
         metadata = store.get(attempt)
         if phase not in metadata.get("phases", {}):
@@ -684,6 +711,7 @@ def main():
                 attempt,
                 phase,
                 status="launching",
+                stage=config["stage"],
                 recording=True,
                 **({"engine_recording": True} if config.get("engine_log") else {}),
             )

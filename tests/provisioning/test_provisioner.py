@@ -2863,7 +2863,7 @@ class TestStateTracking:
         last_state = state_writes[-1]
         assert last_state["current_step"] == "failed"
         # D-03: failed_step must be the actual step name, not the exception class name
-        assert last_state["failed_step"] == "uploading_scripts"
+        assert last_state["failed_step"] == "setup"
         assert last_state["failed_step"] != "RemoteCommandError"
         assert last_state["error"] is not None
 

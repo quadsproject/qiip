@@ -30,7 +30,11 @@ let boot;
 const attempt = { attempt_id: "abc", status: "failed", operation: "provision", engine: "vllm",
   started_at: "2026-09-16T12:00:00Z", model: "org/model", stage: "driver", bundle_version: "sha256:abc",
   sources: {"setup.stderr": "collected"}, issues: ["source unavailable"], dropped_records: 2,
-  failure_summary: "driver rejected" };
+  failure_summary: "driver rejected",
+  failure: {failed_at: "2026-09-16T12:01:00Z", duration_seconds: 60, exit_code: 7,
+    command: {stage: "setup", phase_id: "phase-1"}},
+  diagnostics: {sources: {gpu: {status: "timed_out", deferred: true, reason: "<untrusted source>"},
+    kernel_gpu_oom: {status: "collected", collected_at: "2026-09-16T12:01:02Z"}}} };
 const context = {
   NODE_ID: "host1", console,
   document: {
@@ -53,6 +57,8 @@ async function settle() { for (let n=0;n<15;n++) await Promise.resolve(); }
   boot(); await settle();
   const get = id => elements.get(id);
   const initial = { summary: get("attempt-summary").textContent, issues: get("attempt-issues").textContent,
+    details: get("attempt-failure-details").textContent,
+    diagnostics: get("attempt-diagnostic-sources").children.map(c => c.textContent),
     literal: get("attempt-output").children[0].textContent, download: get("attempt-download").href };
   get("attempt-query").value = "failure & detail?";
   get("attempt-search").listeners.submit({preventDefault(){}}); await settle();
@@ -68,7 +74,13 @@ async function settle() { for (let n=0;n<15;n++) await Promise.resolve(); }
         check=True,
     )
     output = json.loads(result.stdout)
-    assert "driver rejected" in output["initial"]["summary"]
+    assert output["initial"]["summary"].startswith("driver rejected\n")
+    assert "exit 7" in output["initial"]["details"]
+    assert "phase-1" in output["initial"]["details"]
+    assert (
+        "gpu: timed out · <untrusted source> · retry available"
+        in output["initial"]["diagnostics"]
+    )
     assert "2 gateway records evicted" in output["initial"]["issues"]
     assert "3 older attempt manifests evicted" in output["initial"]["issues"]
     assert "<img src=x onerror=alert(1)>" in output["initial"]["literal"]
