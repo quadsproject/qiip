@@ -939,6 +939,8 @@ class NodeProvisioner:
             attempt_id = None
         if store is not None and attempt_id is not None:
             fields: dict[str, object] = {"stage": failed_step or step.value}
+            if step == ProvisioningStep.COMPLETE:
+                fields["ready_at"] = now.isoformat()
             if error:
                 failure = store.get(attempt_id).get("failure")
                 fields.update(

@@ -181,6 +181,23 @@ async def user_detail_page(
 
 
 @dashboard_router.get(
+    "/dashboard/reliability", response_class=HTMLResponse, response_model=None
+)
+async def reliability_page(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> HTMLResponse | RedirectResponse:
+    _, denied = _admin_or_signin(request, settings)
+    if denied is not None:
+        return denied
+    return templates.TemplateResponse(
+        request=request,
+        name="reliability.html",
+        context={"active_page": "admin"},
+    )
+
+
+@dashboard_router.get(
     "/dashboard/admin", response_class=HTMLResponse, response_model=None
 )
 async def admin_page(

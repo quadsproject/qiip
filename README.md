@@ -330,6 +330,7 @@ Admin-authenticated endpoints (HTTP Basic or admin-role session):
 | `DELETE` | `/admin/users/{user_id}/admin` | Revoke the admin role (204) |
 | `GET` | `/admin/provisioning/tasks` | List provisioning task states |
 | `GET` | `/admin/provisioning/{hostname}/logs` | Stream provisioning logs over SSE |
+| `GET` | `/admin/provisioning/reliability` | Fleet outcomes, explicit metric denominators, recurring failures, and JSON export (admin only) |
 | `GET` | `/admin/quads/status` | QUADS integration and cache status |
 | `GET` | `/admin/nodes/{hostname}/power` | Read Redfish power state |
 | `POST` | `/admin/nodes/{hostname}/power` | Execute an allowed Redfish power action |
@@ -1474,6 +1475,13 @@ If completion cannot be established within the deadline, the
 attempt fails with an explicit collection warning. Recorded commands retain the
 configured SSH total and inactivity deadlines; llama.cpp setup retains its longer
 setup timeout.
+
+The **Admin > Fleet reliability** page reports first-attempt success, retry
+recovery, readiness time, cancellations, and unsupported-node outcomes from
+retained attempts. It groups failures by signature and environment, links to
+the relevant attempts and diagnostic bundles, and exports the selected cohort.
+See [fleet reliability measurements](docs/fleet-reliability.md) for metric
+definitions, evidence limits, and the baseline/canary procedure.
 
 Failed attempts automatically collect a diagnostic bundle. The original error
 appears first in the attempt history, with the failed stage, command identity,
