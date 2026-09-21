@@ -121,6 +121,14 @@ physical GPU, driver, storage server, or real inference workload.
 
 ## Local verification
 
+Automated validation of commit `c37e088` is complete: 2,811 local tests passed,
+with 93.72% branch-enabled coverage. One test was skipped because the local
+CUDA compiler was unavailable. Lint, formatting, and strict type checks passed.
+GitHub CI also passed both [Quality](https://github.com/quadsproject/qiip/actions/runs/35651756542/job/106505598981)
+and [Python 3.13](https://github.com/quadsproject/qiip/actions/runs/35651756542/job/106505599225).
+These results validate the implementation; the real-node observations in the
+baseline/canary record remain unmeasured.
+
 `tests/provisioning/fixtures/reliability.json` covers retries, a bundle change,
 first-attempt success, cancellation, unsupported hardware, a running attempt,
 an interrupted attempt, failed recovery, legacy history, and excluded teardown.
