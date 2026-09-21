@@ -56,6 +56,7 @@ class ProvisioningState(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     hostname: str
+    attempt_id: str | None = None
     current_step: ProvisioningStep
     started_at: datetime
     updated_at: datetime

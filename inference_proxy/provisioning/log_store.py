@@ -181,6 +181,51 @@ class AttemptLogStore:
             ).fetchone()[0]
         return dict(attempts=attempts, total=total, evicted_attempts=evicted)
 
+    def attempts_metadata_by_host(
+        self, hostname: str
+    ) -> list[tuple[str, dict[str, Any]]]:
+        """Return ``(attempt_id, metadata)`` pairs for *hostname*, newest first."""
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT id, metadata FROM attempts WHERE hostname=? ORDER BY created DESC",
+                (hostname,),
+            ).fetchall()
+        return [(row[0], json.loads(row[1])) for row in rows]
+
+    def latest_running(self, hostname: str, exclude: str | None = None) -> str | None:
+        """Return the newest running attempt id for *hostname*.
+
+        Used by the node recorder to name the holder when the host-scoped
+        mutation lock is busy.
+        """
+        with self._db() as db:
+            row = db.execute(
+                "SELECT id FROM attempts WHERE hostname=? AND id != ? "
+                "AND json_extract(metadata,'$.status')='running' "
+                "ORDER BY created DESC LIMIT 1",
+                (hostname, exclude or ""),
+            ).fetchone()
+            return row["id"] if row is not None else None
+
+    def pending_hosts(self) -> list[str]:
+        """Return hostnames whose newest attempt is not terminal-evidenced.
+
+        Reconciliation candidates: the newest attempt per host is still
+        running, was interrupted, or failed without mirrored terminal remote
+        phases. Relaunch operations are excluded (owned by relaunch recovery).
+        """
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT hostname FROM attempts a "
+                "GROUP BY hostname "
+                "HAVING json_extract(("
+                "SELECT metadata FROM attempts b WHERE b.hostname=a.hostname "
+                "ORDER BY b.created DESC LIMIT 1),'$.status') IN "
+                "('running','interrupted','failed') "
+                "ORDER BY MAX(created) DESC"
+            ).fetchall()
+            return [row["hostname"] for row in rows]
+
     def update_phase(self, attempt_id: str, phase: str, **changes: Any) -> None:
         """Atomically merge a node worker's phase state with current metadata."""
         with self._db() as db:

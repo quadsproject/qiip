@@ -12,11 +12,12 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -95,6 +96,12 @@ async def _safe_async_cleanup(
             resource=resource,
             exc_info=True,
         )
+
+
+async def _cancel_task(task: asyncio.Task[None]) -> None:
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 def _safe_sync_cleanup(resource: str, cleanup: Callable[[], None]) -> None:
@@ -476,6 +483,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "provisioner",
                 provisioner.shutdown,
             )
+            if asyncio.iscoroutinefunction(
+                getattr(provisioner, "reconcile_pending_operations", None)
+            ):
+                # Recovery evidence for operations interrupted by a restart
+                # before serving mutations. Best-effort background: the
+                # per-mutation hook in provision/teardown/relaunch is the gate.
+                startup_reconcile = asyncio.create_task(
+                    provisioner.reconcile_pending_operations(),
+                    name="provisioning-startup-reconcile",
+                )
+                resources.push_async_callback(
+                    _safe_async_cleanup,
+                    "startup reconcile",
+                    lambda: _cancel_task(startup_reconcile),
+                )
 
             if resolved_settings.quads.base_url is not None:
                 quads_server_timezone = resolved_settings.quads.server_timezone

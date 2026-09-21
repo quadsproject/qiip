@@ -776,6 +776,8 @@ class NodeProvisioner:
         now = datetime.now(UTC)
         store = self._log_buffer.store
         attempt_id = self._log_buffer.attempts.get(hostname)
+        if not isinstance(attempt_id, str):
+            attempt_id = None
         if store is not None and attempt_id is not None:
             fields: dict[str, object] = {"stage": failed_step or step.value}
             if error:
@@ -786,6 +788,7 @@ class NodeProvisioner:
             store.update(attempt_id, **fields)
         state = ProvisioningState(
             hostname=hostname,
+            attempt_id=attempt_id,
             current_step=step,
             started_at=started_at or now,
             updated_at=now,
@@ -806,6 +809,133 @@ class NodeProvisioner:
             if stream == "stdout":
                 lines.append(line)
         return "\n".join(lines)
+
+    async def _reconcile_host(self, hostname: str, *, block: bool = True) -> bool:
+        """Recover evidence and detect live remote work on the node.
+
+        Runs under the host lifecycle lease before any new remote mutation.
+        The node is the authority on its own process groups: a read-only
+        ``active`` probe reports whether any attempt on this host still has a
+        live or surviving phase, so a newer local attempt cannot shadow an
+        older survivor and a second gateway cannot fence-bypass. Fresh or
+        legacy nodes get the compatible recorder placed first so the probe is
+        authoritative. Returns True when a live remote operation blocks a new
+        mutation (block=True) or a live survivor was recorded (block=False).
+        Never re-runs remote setup or engine launch.
+        """
+        store = self._log_buffer.store
+        if store is None or self._remote_logs is None:
+            return False
+        # A fresh node has no recorder yet and a legacy node lacks the
+        # ``active`` action; placing the compatible recorder first makes the
+        # probe authoritative. Uploading never starts a process, so fencing
+        # before setup begins is preserved. Best-effort: an unreachable node
+        # still blocks below through the probe itself.
+        with suppress(Exception):
+            await self._ensure_remote_recorder(hostname)
+        probe = await self._remote_logs.host_active(hostname)
+        if probe.get("unreachable"):
+            history = await asyncio.to_thread(store.history, hostname, limit=1)
+            if history["attempts"]:
+                store.issue(
+                    history["attempts"][0]["attempt_id"],
+                    f"Host unreachable during reconcile: {probe.get('error', '')}",
+                )
+            return block
+        if not probe.get("active"):
+            # A command can finish while the gateway is down; recover its
+            # terminal phase, exit status, and unseen records even when
+            # nothing is live anymore.
+            await self._recover_pending_evidence(hostname)
+            return False
+
+        status = probe.get("status")
+        reason = (
+            "Remote operation is still running on the node; "
+            "wait for it to finish or tear the host down before retrying"
+            if status in {"running", "launching"}
+            else (
+                "Remote process survived cancellation; it must be torn down "
+                "before retrying this host"
+            )
+        )
+        holder = probe.get("holder")
+        match = None
+        if isinstance(holder, str):
+            history = await asyncio.to_thread(store.history, hostname)
+            match = next(
+                (a for a in history["attempts"] if a["attempt_id"] == holder), None
+            )
+        if match is not None:
+            # Mirror remaining evidence for the holder before writing, and
+            # re-check: a phase that completed during the probe is not a block.
+            # A failed collection must retain the block; stale cached phases
+            # are no proof that the probed operation finished.
+            collected = True
+            try:
+                await self._remote_logs.collect(match["attempt_id"])
+            except Exception:
+                collected = False
+            phases = store.get(match["attempt_id"]).get("remote_phases") or {}
+            phase_id = probe.get("phase")
+            probed = phases.get(phase_id) if isinstance(phase_id, str) else None
+            if probed is None and phases:
+                probed = next(reversed(phases.values()))
+            if collected and probed is not None and probed.get("status") == "complete":
+                return False
+        else:
+            history = await asyncio.to_thread(store.history, hostname, limit=1)
+            match = history["attempts"][0] if history["attempts"] else None
+        if match is None:
+            return block
+        survivor = status == "survivor"
+        existing = match.get("failure_summary") or ""
+        summary = (
+            existing
+            if reason in existing
+            else (f"{existing} (reconcile: {reason})" if existing else reason)
+        )
+        store.update(
+            match["attempt_id"],
+            status="interrupted",
+            survivor=survivor,
+            failure_summary=summary,
+        )
+        store.issue(match["attempt_id"], reason + "; conflicting retries blocked")
+        return block
+
+    async def _recover_pending_evidence(self, hostname: str) -> None:
+        """Mirror remote evidence for unfinished attempts when nothing is live.
+
+        A detached command can finish while the gateway is down; the active
+        probe then reports no live phase, but the terminal phase, exit status,
+        and unseen records still belong in the gateway store before the next
+        mutation is allowed.
+        """
+        store = self._log_buffer.store
+        if store is None or self._remote_logs is None:
+            return
+        history = await asyncio.to_thread(store.history, hostname, limit=5)
+        for attempt in history["attempts"]:
+            if attempt.get("status") not in {"running", "interrupted", "failed"}:
+                continue
+            with suppress(Exception):
+                await self._remote_logs.collect(attempt["attempt_id"])
+
+    async def reconcile_pending_operations(self) -> None:
+        """Best-effort startup recovery for hosts with unfinished remote work.
+
+        Runs in the background so a slow or unreachable host cannot block
+        startup; the per-mutation ``_reconcile_host`` hook is the safety gate.
+        """
+        store = self._log_buffer.store
+        if store is None or self._remote_logs is None:
+            return
+        hostnames = await asyncio.to_thread(store.pending_hosts)
+        for hostname in hostnames:
+            with suppress(Exception):
+                await self._reconcile_host(hostname)
+            logger.info("startup_reconcile_finished", hostname=hostname)
 
     async def _power_on_if_needed(self, hostname: str) -> None:
         """Power on the host via Redfish if configured (D-01, D-06, D-07).
@@ -1074,6 +1204,11 @@ class NodeProvisioner:
             raise ValueError("lifecycle lease does not own this host")
 
         try:
+            if await self._reconcile_host(hostname):
+                raise RelaunchPreconditionError(
+                    "A prior provisioning operation is still active on the node; "
+                    "wait for it to finish or tear the host down before retrying"
+                )
             await self._relaunch_llamacpp(hostname, request)
         finally:
             lease.release()
@@ -1758,6 +1893,14 @@ class NodeProvisioner:
             engine=engine,
             vllm_params=vllm_params.model_dump() if vllm_params else None,
         )
+        # Reachability first: a powered-off host must reach its BMC power-on
+        # step before the reconcile gate can judge it as unreachable.
+        await self._power_on_if_needed(hostname)
+        if await self._reconcile_host(hostname):
+            raise ProvisioningError(
+                "A prior provisioning operation is still active on the node; "
+                "wait for it to finish or tear the host down before retrying"
+            )
         self._begin_log(
             hostname, engine, model=artifact.model_alias if artifact else model
         )
@@ -1766,7 +1909,6 @@ class NodeProvisioner:
         await self._update_state(
             hostname, ProvisioningStep.PENDING, started_at=provision_started_at
         )
-        await self._power_on_if_needed(hostname)
         await self._update_state(
             hostname, ProvisioningStep.PREFLIGHT, started_at=provision_started_at
         )
@@ -1926,19 +2068,28 @@ class NodeProvisioner:
 
         logger.info("provisioning_complete", hostname=hostname)
 
-    async def _upload_scripts(
-        self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
-    ) -> None:
-        """Copy provisioning scripts to the remote host via SCP."""
-        scripts_dir, common_dir = self._required_script_bundles(engine)
-        await self._ssh_client.upload(hostname, scripts_dir)
-        await self._ssh_client.upload(hostname, common_dir)
+    async def _ensure_remote_recorder(self, hostname: str) -> None:
+        """Idempotently place the node recorder so the active probe is valid.
+
+        Fresh nodes have no ``common/provision-logs.py`` and nodes provisioned
+        by an older gateway lack the ``active`` action; uploading first lets
+        the reconcile gate distinguish "no evidence" from "unreachable".
+        """
+        await self._ssh_client.upload(hostname, self._common_scripts_dir())
         if self._remote_logs is not None:
             await self._ssh_client.upload(
                 hostname,
                 Path(__file__).with_name("log_store.py"),
                 "common/log_store.py",
             )
+
+    async def _upload_scripts(
+        self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
+    ) -> None:
+        """Copy provisioning scripts to the remote host via SCP."""
+        scripts_dir, _common_dir = self._required_script_bundles(engine)
+        await self._ssh_client.upload(hostname, scripts_dir)
+        await self._ensure_remote_recorder(hostname)
 
     async def _run_setup(
         self,
@@ -2540,6 +2691,12 @@ class NodeProvisioner:
             raise ValueError("lifecycle lease does not own this host")
 
         try:
+            if await self._reconcile_host(hostname, block=False):
+                logger.warning(
+                    "teardown_reconcile_survivor",
+                    hostname=hostname,
+                    reason="a prior remote operation is still active on the node",
+                )
             engine = self._resolve_teardown_engine(
                 hostname,
                 force=force,

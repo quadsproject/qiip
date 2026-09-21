@@ -54,11 +54,42 @@ class RemoteLogCollector:
             after=attempt["remote_cursor"],
         )
 
-    async def _request(
+    async def _run_recorder(
         self, attempt_id: str, action: str, **extra: Any
     ) -> dict[str, Any]:
         config = self.config(attempt_id)
         config.update(extra)
+        return await self._run_recorder_with_config(config, action)
+
+    async def _request(
+        self, attempt_id: str, action: str, **extra: Any
+    ) -> dict[str, Any]:
+        page = await self._run_recorder(attempt_id, action, **extra)
+        if page.get("unavailable"):
+            raise SSHConnectionError(
+                self.config(attempt_id)["hostname"],
+                str(page["unavailable"]),
+            )
+        return page
+
+    def _host_config(self, hostname: str) -> dict[str, Any]:
+        """Recorder config for host-level actions that have no attempt row."""
+        return dict(
+            hostname=hostname,
+            root=self.settings.log_remote_root,
+            max_bytes=self.settings.log_remote_max_bytes,
+            attempt_max_bytes=self.settings.log_remote_attempt_max_bytes,
+            max_attempts=self.settings.log_remote_max_attempts,
+            retention_days=self.settings.log_remote_retention_days,
+            max_record_bytes=self.settings.log_max_entry_bytes,
+            health_timeout=self.settings.health_poll_timeout,
+            inactivity_timeout=self.ssh.inactivity_timeout,
+            after=0,
+        )
+
+    async def _run_recorder_with_config(
+        self, config: dict[str, Any], action: str
+    ) -> dict[str, Any]:
         command = (
             "printf %s "
             + shlex.quote(json.dumps(config))
@@ -83,13 +114,28 @@ class RemoteLogCollector:
             page: dict[str, Any] = json.loads(stdout)
             if not isinstance(page, dict):
                 raise ValueError("expected object")
-            if page.get("unavailable"):
-                raise ValueError(str(page["unavailable"]))
             return page
         except ValueError as exc:
             raise SSHConnectionError(
                 config["hostname"], f"Node logs unavailable: {exc}"
             ) from None
+
+    async def host_active(self, hostname: str) -> dict[str, Any]:
+        """Return whether the node has any live phase for *hostname*.
+
+        The node is the authority on its own process groups: this probe
+        re-checks recorded pids so an orphan left by a dead recorder is closed
+        (and does not block the host forever) while a genuinely live or
+        surviving phase is reported as active. The recorder ``active`` action
+        opens the node store, which creates the log root/database and prunes
+        expired attempts as a side effect, so this is not a no-write probe.
+        """
+        try:
+            return await self._run_recorder_with_config(
+                self._host_config(hostname), "active"
+            )
+        except (SSHConnectionError, TimeoutError) as exc:
+            return {"unreachable": True, "error": str(exc)}
 
     async def _ingest(
         self, attempt_id: str, page: dict[str, Any]

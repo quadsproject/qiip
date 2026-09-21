@@ -414,6 +414,13 @@ EOF
             "${dtype_args[@]+"${dtype_args[@]}"}"
     fi
 
+    # The recorder unlocks at the serving-process handoff so the long-lived
+    # engine and its log sink cannot hold the host mutation fence after the
+    # launch step completes.
+    if [ -n "${QIIP_LOCK_FD:-}" ] && [[ "${QIIP_LOCK_FD}" =~ ^[0-9]+$ ]] && [ "${QIIP_LOCK_FD}" -ge 3 ]; then
+        eval "exec ${QIIP_LOCK_FD}>&-"
+    fi
+
     local engine_log_fd
     if [ -n "${QIIP_LOG_CONFIG:-}" ]; then
         exec {engine_log_fd}> >(python3 "${SCRIPT_DIR}/../common/provision-logs.py" engine >/dev/null 2>&1)
