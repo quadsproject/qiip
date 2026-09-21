@@ -88,6 +88,9 @@ from inference_proxy.quads.poller import QUADSPoller
 
 logger = structlog.get_logger()
 
+# A process-list probe must not inherit the long setup command deadlines.
+_REMOTE_PROBE_TIMEOUT_SECONDS = 10.0
+
 # Node states that mean a placement's server was registered and is being
 # health-checked. Automation never rebuilds one of these.
 _SERVING_NODE_STATUSES = frozenset(
@@ -187,6 +190,11 @@ class PlacementReconciler:
     @property
     def profiles(self) -> tuple[ModelProfile, ...]:
         return self._profiles
+
+    @property
+    def launch_blockers(self) -> dict[str, str]:
+        """Last observed host blockers, retained until a fresh check succeeds."""
+        return {host: reason for host, (_, reason) in self._deferred.items()}
 
     def start(self) -> None:
         if not self._settings.enabled:
@@ -303,14 +311,16 @@ class PlacementReconciler:
         hosts = {canonical_hostname(host.hostname): host for host in self._poller.hosts}
         blocked = {item.claim.hostname for item in settled} | set(unreadable)
         candidates, skipped = self._candidates(available, blocked, planned, now)
-        plan = plan_placements(planned, held, candidates)
-
         budget = self._settings.max_concurrent - sum(
             1
             for item in settled
             if item.claim.state is ClaimState.PROVISIONING
             and item.claim.holder == self._holder
         )
+        if budget > 0:
+            candidates, unreachable = await self._ready_candidates(candidates)
+            skipped.extend(unreachable)
+        plan = plan_placements(planned, held, candidates)
         started: list[str] = []
         classes = {item.hostname: item.gpu_class for item in candidates}
 
@@ -633,12 +643,59 @@ class PlacementReconciler:
     async def _remote_work_blocker(self, hostname: str) -> str | None:
         """Why a launch must wait for the host itself, or ``None``."""
         try:
-            running = await self._provisioner.remote_lifecycle_processes(hostname)
+            async with asyncio.timeout(_REMOTE_PROBE_TIMEOUT_SECONDS):
+                running = await self._provisioner.remote_lifecycle_processes(hostname)
         except Exception as exc:
-            return f"could not verify that no earlier provisioning is running: {exc}"
+            detail = str(exc) or type(exc).__name__
+            return f"could not verify that no earlier provisioning is running: {detail}"
         if running:
             return "an earlier provisioning command is still running on the host"
         return None
+
+    async def _ready_candidates(
+        self, candidates: list[Candidate]
+    ) -> tuple[list[Candidate], list[SkippedHost]]:
+        """Apportion profiles against hosts we can actually launch on.
+
+        A failed first launch otherwise leaves its assigned profile missing
+        while healthy hosts permanently receive the wrong small-fleet mix.
+        Launch still repeats its check under its own lease to close the gap
+        between this snapshot and the actual mutation.
+        """
+        limit = asyncio.Semaphore(8)
+
+        async def check(candidate: Candidate) -> str | None:
+            async with limit:
+                hostname = candidate.hostname
+                lease = await self._provisioner.try_reserve_host(hostname)
+                if lease is None:
+                    return "host lifecycle operation in progress"
+                try:
+                    if not self._may_replace(self._registry.get(hostname), None):
+                        return "node changed before readiness check"
+                    blocker = await self._remote_work_blocker(hostname)
+                    if blocker is not None:
+                        reason = f"blocked: {blocker}"
+                        self._deferred[hostname] = (
+                            self._clock()
+                            + timedelta(seconds=self._settings.retry_backoff_seconds),
+                            reason,
+                        )
+                        return reason
+                    if not self._may_replace(self._registry.get(hostname), None):
+                        return "node changed during readiness check"
+                    return None
+                finally:
+                    lease.release()
+
+        reasons = await asyncio.gather(*(check(candidate) for candidate in candidates))
+        ready, skipped = [], []
+        for candidate, reason in zip(candidates, reasons, strict=True):
+            if reason is None:
+                ready.append(candidate)
+            else:
+                skipped.append(SkippedHost(candidate.hostname, reason))
+        return ready, skipped
 
     async def _drop(self, stored: StoredClaim) -> StoredClaim | None:
         if await self._claims.delete(stored):

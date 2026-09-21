@@ -291,9 +291,11 @@ def get_quads_poller(request: Request) -> QUADSPoller | None:
 
 def get_unified_node_service(request: Request) -> UnifiedNodeService:
     """Build UnifiedNodeService from app.state components."""
+    reconciler = getattr(request.app.state, "placement_reconciler", None)
     return UnifiedNodeService(
         registry=request.app.state.registry,
         poller=request.app.state.quads_poller,
         cb_registry=request.app.state.circuit_breaker_registry,
         tracker=request.app.state.node_selector.tracker,
+        placement_blockers=reconciler.launch_blockers if reconciler else None,
     )

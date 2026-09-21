@@ -932,6 +932,107 @@ def _skips(rig: Rig) -> dict[str, str]:
 
 
 @pytest.mark.asyncio
+async def test_stalled_readiness_probe_defers_host_without_blocking_placement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "inference_proxy.placement.reconciler._REMOTE_PROBE_TIMEOUT_SECONDS",
+        0.01,
+    )
+    rig = Rig(_l4s(2), max_concurrent=1, retry_backoff_seconds=60)
+    original = rig.provisioner.remote_lifecycle_processes
+    stalled = True
+    cancelled = asyncio.Event()
+    checks = 0
+
+    async def probe(hostname: str) -> list[str]:
+        nonlocal checks
+        if hostname == "l4-01":
+            checks += 1
+            if stalled:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+        return await original(hostname)
+
+    monkeypatch.setattr(rig.provisioner, "remote_lifecycle_processes", probe)
+    await asyncio.wait_for(rig.run(), timeout=1)
+
+    assert _placed(rig) == {"l4-00": "qwen3.8-27b-24g"}
+    assert cancelled.is_set()
+    assert "TimeoutError" in _skips(rig)["l4-01"]
+    assert "l4-01" not in await rig.claims()
+    assert not rig.provisioner.lifecycle.is_busy("l4-01")
+    await rig.run()
+    assert checks == 1, "a timed-out host must respect the backoff"
+
+    stalled = False
+    rig.clock.advance(61)
+    await rig.run()
+    assert set(_placed(rig)) == {"l4-00", "l4-01"}
+    assert "l4-01" not in rig.reconciler.launch_blockers
+
+
+@pytest.mark.asyncio
+async def test_launch_recheck_also_bounds_a_stalled_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "inference_proxy.placement.reconciler._REMOTE_PROBE_TIMEOUT_SECONDS",
+        0.01,
+    )
+    rig = Rig(_l4s(1))
+    checks = 0
+
+    async def probe(hostname: str) -> list[str]:
+        nonlocal checks
+        checks += 1
+        if checks > 1:
+            await asyncio.Event().wait()
+        return []
+
+    monkeypatch.setattr(rig.provisioner, "remote_lifecycle_processes", probe)
+    await asyncio.wait_for(rig.run(), timeout=1)
+
+    assert checks == 2
+    assert rig.provisioner.calls == []
+    assert await rig.claims() == {}
+    assert "TimeoutError" in rig.reconciler.launch_blockers["l4-00"]
+    assert not rig.provisioner.lifecycle.is_busy("l4-00")
+
+
+@pytest.mark.asyncio
+async def test_unreachable_hosts_do_not_take_reachable_profile_shares() -> None:
+    rig = Rig(_l4s(1))
+    await rig.run()
+    rig.poller.hosts = _l4s(8)
+    rig.quads.available = [host.hostname for host in rig.poller.hosts]
+    unreachable = {"l4-01", "l4-02", "l4-03", "l4-07"}
+    rig.provisioner.remote_check_errors = {
+        hostname: TimeoutError() for hostname in unreachable
+    }
+
+    await rig.run()
+
+    assert set(_placed(rig)) == {"l4-00", "l4-04", "l4-05", "l4-06"}
+    assert set(_placed(rig).values()) == {
+        profile.profile_id for profile in BUILTIN_PROFILES
+    }
+    assert all("TimeoutError" in _skips(rig)[host] for host in unreachable)
+    assert unreachable.isdisjoint(await rig.claims())
+    assert set(rig.reconciler.launch_blockers) == unreachable
+
+    # Recovery needs no configuration edits or claim reset.
+    rig.provisioner.remote_check_errors.clear()
+    rig.clock.advance(rig.settings.retry_backoff_seconds + 1)
+    await rig.run()
+    assert len(await rig.claims()) == 8
+    assert list(_placed(rig).values()).count("qwen3.8-27b-24g") == 5
+    assert rig.reconciler.launch_blockers == {}
+
+
+@pytest.mark.asyncio
 async def test_a_reset_does_not_bypass_the_remote_work_guard() -> None:
     """Reset deletes the claim; the running setup.sh is still on the host."""
     rig = await _failed_once()
@@ -990,7 +1091,9 @@ async def test_a_first_launch_is_blocked_and_its_share_goes_to_another_host(
     await rig.run()
 
     assert _placed(rig) == {"l4-01": "qwen3.8-27b-24g"}
-    assert rig.provisioner.remote_checks == ["l4-00", "l4-01"]
+    # The deferred host is not retried; the ready host is checked for planning
+    # and again under the launch lease.
+    assert rig.provisioner.remote_checks == ["l4-00", "l4-01", "l4-01"]
     assert _skips(rig)["l4-00"].startswith("blocked: ")
 
 

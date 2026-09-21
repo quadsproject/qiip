@@ -118,6 +118,7 @@ def _service(
     tracker: ConnectionTracker | None = None,
     *,
     include_poller: bool = True,
+    placement_blockers: dict[str, str] | None = None,
 ) -> UnifiedNodeService:
     resolved_poller = poller
     if resolved_poller is None and include_poller:
@@ -127,11 +128,24 @@ def _service(
         poller=resolved_poller,
         cb_registry=cb_registry or CircuitBreakerRegistry(),
         tracker=tracker or ConnectionTracker(),
+        placement_blockers=placement_blockers,
     )
 
 
 class TestAvailableOnly:
     """QUADS-only host (available, not in etcd) returns state=available."""
+
+    def test_quads_availability_does_not_hide_a_placement_blocker(self) -> None:
+        poller = _poller(hosts=[_host("gpu01")], available=["gpu01"])
+        reason = "blocked: SSH connection timed out"
+        svc = _service(poller=poller, placement_blockers={"gpu01": reason})
+
+        node = svc.get_unified_nodes()[0]
+
+        assert node.state == "available"  # still unreserved in QUADS
+        assert node.placement_blocker == reason
+        assert node.actions == ["setup"]  # admins can still attempt recovery
+        assert svc.get_unified_nodes(viewer_admin=False) == []
 
     def test_available_host_state_and_actions(self) -> None:
         poller = _poller(hosts=[_host("gpu01")], available=["gpu01"])

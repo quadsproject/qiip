@@ -365,8 +365,10 @@ async function refreshDashboard() {
 
         const tdState = document.createElement("td");
         const stateBadge = document.createElement("span");
-        stateBadge.className = `badge badge-${node.state}`;
-        stateBadge.textContent = node.state;
+        const displayState = node.placement_blocker ? "blocked" : node.state;
+        stateBadge.className = `badge badge-${displayState}`;
+        stateBadge.textContent = displayState;
+        if (node.placement_blocker) stateBadge.title = node.placement_blocker;
         tdState.appendChild(stateBadge);
         tr.appendChild(tdState);
 

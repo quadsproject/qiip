@@ -631,7 +631,9 @@ async function refreshDetail() {
       var tdEn = document.createElement("td"); tdEn.textContent = formatInferenceEngine(node.engine); tr.appendChild(tdEn);
 
       var tdSt = document.createElement("td");
-      var sb = document.createElement("span"); sb.className = "badge badge-" + node.state; sb.textContent = node.state;
+      var displayState = node.placement_blocker ? "blocked" : node.state;
+      var sb = document.createElement("span"); sb.className = "badge badge-" + displayState; sb.textContent = displayState;
+      if (node.placement_blocker) sb.title = node.placement_blocker;
       tdSt.appendChild(sb); tr.appendChild(tdSt);
 
       var tdCo = document.createElement("td"); tdCo.className = "num"; tdCo.textContent = node.state === "available" ? "—" : node.active_connections; tr.appendChild(tdCo);

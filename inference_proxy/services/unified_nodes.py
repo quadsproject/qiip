@@ -9,6 +9,8 @@ adds unregistered hosts that are currently available.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.admin import AdminNodeResponse, TaskStatusResponse
 from inference_proxy.models.node import Node
@@ -40,11 +42,13 @@ class UnifiedNodeService:
         poller: QUADSPoller | None,
         cb_registry: CircuitBreakerRegistry,
         tracker: ConnectionTracker,
+        placement_blockers: Mapping[str, str] | None = None,
     ) -> None:
         self._registry = registry
         self._poller = poller
         self._cb_registry = cb_registry
         self._tracker = tracker
+        self._placement_blockers = placement_blockers or {}
 
     def get_unified_nodes(
         self,
@@ -90,6 +94,14 @@ class UnifiedNodeService:
         for node in etcd_map.values():
             result.append(self._from_etcd(node, task_map=task_map))
 
+        result = [
+            node.model_copy(
+                update={"placement_blocker": self._placement_blockers[node.node_id]}
+            )
+            if node.state == "available" and node.node_id in self._placement_blockers
+            else node
+            for node in result
+        ]
         return self._finalize(result, viewer_admin, viewer_email)
 
     @staticmethod
