@@ -221,6 +221,34 @@ def test_generic_signature_normalizes_host_ids_and_numbers(
     assert report["groups"][0]["dimensions"]["signature"].startswith("v1:unclassified:")
 
 
+def test_cuda_probe_compile_failures_group_despite_different_log_tails(
+    fleet: AttemptLogStore,
+) -> None:
+    errors = {
+        "g1": (
+            "cuda_proof: setup exited with status 1\n"
+            "tzdata-java installed\nCUDA toolkit 13.0 installed\n"
+            "FATAL: nvcc failed to compile the CUDA execution probe\n"
+            "[STEP:cuda_proof:FAIL]"
+        ),
+        "g2": (
+            "cuda_proof: setup exited with status 1\n"
+            "CUDA toolkit 13.0 already installed, skipping\n"
+            '/tmp/cuda-probe.ABC123/cuda_probe.cu(4): error: identifier "printf" '
+            "is undefined\n"
+            "FATAL: nvcc failed to compile the CUDA execution probe\n"
+            "[STEP:cuda_proof:FAIL]"
+        ),
+    }
+    for attempt_id, error in errors.items():
+        fleet.update(attempt_id, failure_summary=error)
+    report = build_report(fleet, hostnames=["failed-retry"])
+    assert len(report["groups"]) == 1
+    assert report["groups"][0]["dimensions"] == {"signature": "v1:cuda_probe_compile"}
+    assert report["groups"][0]["count"] == 2
+    assert {a["attempt_id"]: a["original_error"] for a in report["attempts"]} == errors
+
+
 def test_unsupported_marker_in_remote_issues_and_legacy_retry(
     fleet: AttemptLogStore,
 ) -> None:
