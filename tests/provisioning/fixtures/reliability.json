@@ -1,0 +1,13 @@
+[
+  {"id":"a1","host":"retry-host","minute":0,"status":"failed","stage":"starting_engine","error":"CUDA out of memory","bundle":"before"},
+  {"id":"a2","host":"retry-host","minute":10,"status":"complete","stage":"complete","ready_minute":15,"bundle":"after"},
+  {"id":"b1","host":"first-success","minute":1,"status":"complete","stage":"complete","ready_minute":3},
+  {"id":"c1","host":"cancelled-host","minute":2,"status":"failed","stage":"cancelled","error":"Provisioning cancelled by teardown"},
+  {"id":"d1","host":"unsupported-host","minute":3,"status":"failed","stage":"setup","error":"[REJECT:unsupported_hardware:no tested profile]"},
+  {"id":"e1","host":"running-host","minute":4,"status":"running","stage":"setup"},
+  {"id":"f1","host":"interrupted-host","minute":5,"status":"interrupted","stage":"starting_engine"},
+  {"id":"g1","host":"failed-retry","minute":6,"status":"failed","stage":"setup","error":"No space left on device"},
+  {"id":"g2","host":"failed-retry","minute":12,"status":"failed","stage":"setup","error":"No space left on device"},
+  {"id":"h1","host":"legacy-host","minute":7,"status":"complete","stage":"complete","legacy":true},
+  {"id":"t1","host":"teardown-host","minute":8,"status":"complete","stage":"teardown_complete","operation":"teardown"}
+]

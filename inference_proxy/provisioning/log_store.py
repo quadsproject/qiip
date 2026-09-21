@@ -11,6 +11,7 @@ WAL in addition to payloads; long-lived readers may delay checkpoints.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -132,6 +133,42 @@ class AttemptLogStore:
         )
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
+            if operation == "provision":
+                # Retry identity survives gateway restarts and bundle changes.
+                # Legacy or evicted history cannot establish a first attempt.
+                prior = db.execute(
+                    "SELECT metadata FROM attempts WHERE hostname=? "
+                    "ORDER BY created DESC, id DESC LIMIT 1",
+                    (hostname,),
+                ).fetchone()
+                previous = json.loads(prior[0]) if prior else {}
+                retry = (
+                    previous.get("operation") == "provision"
+                    and previous.get("engine") == engine
+                    and previous.get("requested_model", previous.get("model")) == model
+                    and previous.get("status") in {"failed", "interrupted", "running"}
+                    and previous.get("stage") != "cancelled"
+                )
+                evicted = db.execute(
+                    "SELECT value FROM statistics WHERE name='evicted_attempts'"
+                ).fetchone()[0]
+                metadata.update(
+                    requested_model=model,
+                    series_id=previous.get("series_id", attempt_id)
+                    if retry
+                    else attempt_id,
+                    series_started_at=previous.get(
+                        "series_started_at", previous.get("started_at")
+                    )
+                    if retry
+                    else metadata["started_at"],
+                    attempt_number=(previous.get("attempt_number") or 0) + 1
+                    if retry
+                    else 1,
+                    series_origin_known=bool(previous.get("series_origin_known"))
+                    if retry
+                    else bool(prior or not evicted),
+                )
             db.execute(
                 "INSERT INTO attempts(id,hostname,created,metadata) VALUES(?,?,?,?)",
                 (attempt_id, hostname, time.time(), json.dumps(metadata)),
@@ -233,6 +270,59 @@ class AttemptLogStore:
                 (hostname,),
             ).fetchall()
         return [(row[0], json.loads(row[1])) for row in rows]
+
+    def reliability_snapshot(self) -> dict[str, Any]:
+        """Read manifests and bounded environment evidence in one SQLite snapshot.
+
+        Reporting never contacts nodes or retries commands. Only the latest
+        complete diagnostic source is used, not a mixture of older snapshots.
+        """
+        self.prune()
+        with self._db() as db:
+            db.execute("BEGIN")
+            attempts = []
+            for row in db.execute(
+                "SELECT * FROM attempts ORDER BY created, id"
+            ).fetchall():
+                attempt = self._manifest(row)
+                evidence = {}
+                for name in ("os", "kernel", "gpu", "runtime"):
+                    source = (
+                        attempt.get("diagnostics", {}).get("sources", {}).get(name, {})
+                    )
+                    first, last = source.get("first_seq"), source.get("last_seq")
+                    if (
+                        source.get("status") != "collected"
+                        or source.get("deferred")
+                        or source.get("truncated")
+                        or first is None
+                        or last is None
+                        or first < row["dropped"]
+                    ):
+                        continue
+                    records = db.execute(
+                        "SELECT payload FROM records WHERE attempt=? AND seq BETWEEN ? AND ? "
+                        "AND json_extract(payload,'$.source')=? ORDER BY seq LIMIT 202",
+                        (row["id"], first, last, "diagnostics." + name),
+                    ).fetchall()
+                    values = [json.loads(record[0]) for record in records]
+                    if (
+                        not values
+                        or len(values) > 201
+                        or values[0]["seq"] != first
+                        or values[-1]["seq"] != last
+                        or any(value["truncated"] for value in values)
+                    ):
+                        continue
+                    output = "".join(value["msg"] for value in values)
+                    if len(output.encode("utf-8")) <= 65536:
+                        evidence[name] = output
+                attempt["environment_evidence"] = evidence
+                attempts.append(attempt)
+            evicted = db.execute(
+                "SELECT value FROM statistics WHERE name='evicted_attempts'"
+            ).fetchone()[0]
+        return dict(attempts=attempts, evicted_attempts=evicted)
 
     def latest_running(self, hostname: str, exclude: str | None = None) -> str | None:
         """Return the newest running attempt id for *hostname*.
@@ -420,6 +510,11 @@ class AttemptLogStore:
         if remote_seq is not None and remote_seq < row["remote_cursor"]:
             return None
         metadata = json.loads(row["metadata"])
+        if source in {"setup.stdout", "start.stdout"}:
+            profile = re.search(r"\[PROFILE:select:([\w.-]+) \(([^\]\r\n]+)\)\]", msg)
+            if profile:
+                metadata["runtime_profile"] = profile.group(1)[:200]
+                metadata["hardware_signature"] = profile.group(2)[:2048]
         if journal_cursor is not None:
             if metadata.get("journal_cursor") == journal_cursor:
                 return None

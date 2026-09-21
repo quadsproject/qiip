@@ -13,7 +13,8 @@ import json
 import zlib
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime
+from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
@@ -81,6 +82,7 @@ from inference_proxy.provisioning.provisioner import (
     RelaunchValidationError,
     SelfSetupError,
 )
+from inference_proxy.provisioning.reliability import GroupBy, build_report
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
     SSHConnectionError,
@@ -821,6 +823,40 @@ def _attempt_store(provisioner: NodeProvisioner) -> AttemptLogStore:
             status_code=503, detail="Durable provisioning logs unavailable"
         )
     return store
+
+
+@admin_router.get("/provisioning/reliability", response_model=None)
+async def provisioning_reliability(
+    since: datetime | None = None,
+    until: datetime | None = None,
+    group_by: GroupBy = "signature",
+    hostname: Annotated[list[str] | None, Query(max_length=100)] = None,
+    download: bool = False,
+    provisioner: NodeProvisioner = Depends(get_provisioner),
+) -> dict[str, Any] | JSONResponse:
+    """Export the same retained cohort and evidence shown in the fleet view."""
+    if any(value is not None and value.tzinfo is None for value in (since, until)):
+        raise HTTPException(
+            status_code=422, detail="Report timestamps require a timezone"
+        )
+    if since and until and since >= until:
+        raise HTTPException(status_code=422, detail="since must be earlier than until")
+    report = await asyncio.to_thread(
+        build_report,
+        _attempt_store(provisioner),
+        since=since,
+        until=until,
+        group_by=group_by,
+        hostnames=[_validated_hostname(host) for host in hostname or []],
+    )
+    if download:
+        return JSONResponse(
+            report,
+            headers={
+                "Content-Disposition": 'attachment; filename="fleet-reliability.json"'
+            },
+        )
+    return report
 
 
 def _owned_attempt(

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>QIIP - Fleet reliability</title>
+    <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/reliability.css') }}">
+    <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
+</head>
+<body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    {% include "partials/navbar.html" %}
+    <div class="dashboard">
+        <header class="dashboard-header">
+            <div><h1>Fleet reliability</h1><p>Provisioning outcomes from retained attempts</p></div>
+            <a class="btn" href="/dashboard/admin">Back to admin</a>
+        </header>
+        <main id="main-content">
+            <section class="card" aria-label="Report filters">
+                <form id="reliability-filters" class="reliability-filters">
+                    <label>From (UTC, inclusive)<input id="reliability-since" type="datetime-local"></label>
+                    <label>To (UTC, exclusive)<input id="reliability-until" type="datetime-local"></label>
+                    <label>Hostnames (comma separated)<input id="reliability-hostnames" type="text" placeholder="All retained hosts"></label>
+                    <label>Group failures by<select id="reliability-group">
+                        <option value="signature">Error signature</option><option value="stage">Stage</option>
+                        <option value="engine">Engine</option><option value="runtime_version">Runtime version</option>
+                        <option value="gpu_family">GPU family / reported model</option><option value="os">Operating system</option>
+                        <option value="kernel">Kernel</option><option value="bundle_version">Setup bundle</option>
+                        <option value="all">All dimensions</option>
+                    </select></label>
+                    <button class="btn btn-primary" type="submit">Update report</button>
+                    <a class="btn" id="reliability-download" hidden>Download JSON</a>
+                </form>
+                <p id="reliability-status" role="status" aria-live="polite">Loading report...</p>
+            </section>
+            <div id="reliability-report" hidden>
+                <section class="card" aria-labelledby="reliability-outcomes-title">
+                    <h2 class="card-title" id="reliability-outcomes-title">Outcomes and denominators</h2>
+                    <p id="reliability-outcomes"></p>
+                    <div class="table-wrap"><table>
+                        <thead><tr><th scope="col">Measure</th><th scope="col">Result</th><th scope="col">Definition</th></tr></thead>
+                        <tbody id="reliability-metrics"></tbody>
+                    </table></div>
+                </section>
+                <section class="card" aria-labelledby="reliability-evidence-title">
+                    <h2 class="card-title" id="reliability-evidence-title">Evidence coverage</h2>
+                    <p id="reliability-evidence"></p><ul id="reliability-warnings"></ul>
+                    <p class="muted-status">A baseline requires representative real nodes. Export the same cohort before and after a canary, then record operator-approved targets. Synthetic checks do not establish fleet success rates.</p>
+                </section>
+                <section class="card" aria-labelledby="reliability-failures-title">
+                    <h2 class="card-title" id="reliability-failures-title">Recurring failures</h2>
+                    <p class="muted-status">Open a group for original errors, attempt logs and diagnostic bundles. Signatures identify symptoms; they do not confirm a root cause.</p>
+                    <div id="reliability-groups"></div>
+                </section>
+                <section class="card" aria-labelledby="reliability-attempts-title">
+                    <h2 class="card-title" id="reliability-attempts-title">All selected attempts</h2>
+                    <div id="reliability-attempts"></div>
+                </section>
+            </div>
+            <noscript>This report requires JavaScript. Use the authenticated /admin/provisioning/reliability JSON endpoint to retrieve the measurements.</noscript>
+        </main>
+    </div>
+    <script src="{{ static_asset_url(request, 'js/reliability.js') }}"></script>
+</body>
+</html>

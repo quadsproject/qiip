@@ -1,0 +1,13 @@
+.reliability-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 1rem; }
+.reliability-filters label { display: grid; gap: .5rem; flex: 1 1 12rem; }
+.reliability-filters input, .reliability-filters select { min-height: 44px; max-width: 100%; padding: .5rem; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--surface); color: var(--text); }
+.reliability-filters .btn { min-height: 44px; }
+#reliability-download[hidden] { display: none; }
+#reliability-report details { border-top: 1px solid var(--border); padding: .5rem 0; }
+#reliability-report summary { cursor: pointer; min-height: 44px; padding: .75rem .25rem; overflow-wrap: anywhere; }
+#reliability-report pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; background: var(--bg); }
+#reliability-report td, #reliability-report p { overflow-wrap: anywhere; }
+#reliability-report li { margin: .5rem 0; }
+.reliability-links { display: flex; flex-wrap: wrap; gap: 1rem; }
+.reliability-links a { display: inline-flex; align-items: center; min-height: 44px; }
+#reliability-report :focus-visible, .reliability-filters :focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
