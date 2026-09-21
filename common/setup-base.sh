@@ -199,7 +199,7 @@ install_cuda_toolkit() {
 }
 
 # Proves real CUDA execution (driver + toolkit + device) with a tiny
-# headless kernel. Fails closed with one actionable line; no X/GL needed.
+# headless kernel. Keeps compiler diagnostics on failure; no X/GL needed.
 verify_cuda_execution() {
     local nvcc
     nvcc="$(find_nvcc)" || nvcc=""
@@ -210,6 +210,7 @@ verify_cuda_execution() {
     local work_dir
     work_dir=$(mktemp -d "${INSTALL_TMP_DIR:-/tmp}/cuda-probe.XXXXXX")
     cat > "${work_dir}/cuda_probe.cu" <<'EOF'
+#include <stdio.h>
 __global__ void k(int *x) { *x = 42; }
 int main() {
     int h = 0, *d;
@@ -222,7 +223,7 @@ int main() {
     return h == 42 ? 0 : 1;
 }
 EOF
-    if ! "$nvcc" -o "${work_dir}/cuda_probe" "${work_dir}/cuda_probe.cu" 2>/dev/null; then
+    if ! "$nvcc" -o "${work_dir}/cuda_probe" "${work_dir}/cuda_probe.cu"; then
         rm -rf "$work_dir"
         echo "FATAL: nvcc failed to compile the CUDA execution probe" >&2
         return 1

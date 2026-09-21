@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -316,7 +317,9 @@ def _proof_env(
         else "printf '#!/bin/bash\\nexit 0\\n'"
     )
     compile_line = (
-        "exit 1" if not compile_ok else f'{probe_body} > "$out"\nchmod +x "$out"'
+        'echo "nvcc fatal: unsupported host compiler" >&2\nexit 1'
+        if not compile_ok
+        else f'{probe_body} > "$out"\nchmod +x "$out"'
     )
     _write_executable(
         bin_dir / "nvcc",
@@ -347,6 +350,28 @@ def test_verify_cuda_execution_compiles_and_runs_probe(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert "CUDA execution verified" in result.stdout
+
+
+def test_cuda_probe_compiles_with_real_nvcc(tmp_path: Path) -> None:
+    nvcc = shutil.which("nvcc")
+    if nvcc is None:
+        pytest.skip("CUDA compiler unavailable")
+    env = _proof_env(tmp_path)
+    # Compile the actual generated source without needing a GPU to execute it.
+    _write_executable(
+        Path(env["CUDA_NVCC"]),
+        f'''#!/bin/bash
+set -e
+"{nvcc}" -c "$3" -o "$2.o"
+printf '#!/bin/bash\\nexit 0\\n' > "$2"
+chmod +x "$2"
+''',
+    )
+    env["INSTALL_TMP_DIR"] = str(tmp_path)
+    result = _source_and_call(SETUP_BASE, "verify_cuda_execution", env)
+    assert result.returncode == 0, result.stderr
+    assert "CUDA execution verified" in result.stdout
+    assert not list(tmp_path.glob("cuda-probe.*"))
 
 
 def test_verify_cuda_execution_fails_closed_when_probe_fails(
@@ -389,13 +414,16 @@ def test_fabric_helpers_noop_without_nvswitch(tmp_path: Path) -> None:
 
 def test_verify_cuda_execution_fails_on_compile_error(tmp_path: Path) -> None:
     env = _proof_env(tmp_path, compile_ok=False)
+    env["INSTALL_TMP_DIR"] = str(tmp_path)
     result = _source_and_call(
         SETUP_BASE,
         'verify_cuda_execution\necho "rc=$?"',
         env,
     )
     assert result.stdout.splitlines()[-1] == "rc=1"
+    assert "nvcc fatal: unsupported host compiler" in result.stderr
     assert "FATAL: nvcc failed to compile" in result.stderr
+    assert not list(tmp_path.glob("cuda-probe.*"))
 
 
 def test_toolkit_install_failure_is_transient(tmp_path: Path) -> None:

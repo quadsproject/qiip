@@ -214,6 +214,7 @@ class TestAdminNodesPopulated:
             "admin_only",
             "failed_step",
             "error",
+            "placement_blocker",
             "owner",
         }
         assert set(node.keys()) == expected
@@ -333,6 +334,7 @@ class TestAdminNodesPopulated:
                 "name": "",
                 "failed_step": None,
                 "error": None,
+                "placement_blocker": None,
             }
         ]
         assert any(

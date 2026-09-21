@@ -875,6 +875,7 @@ tbody tr:last-child td { border-bottom: none; }
 .badge-unhealthy,
 .badge-open,
 .badge-failed,
+.badge-blocked,
 .badge-relaunch_failed {
   background: var(--danger-bg);
   color: var(--danger);

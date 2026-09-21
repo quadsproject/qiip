@@ -73,6 +73,7 @@ class AdminNodeResponse(BaseModel):
     admin_only: bool = False
     failed_step: str | None = None
     error: str | None = None
+    placement_blocker: str | None = None
     owner: str = ""
 
 

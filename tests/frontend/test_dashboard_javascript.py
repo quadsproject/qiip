@@ -98,6 +98,13 @@ vm.runInContext(source, sandbox);
   process.stdout.write(JSON.stringify({
     captured: captured.map(function (c) { return c.url; }),
     nodeCount: byId("node-count").textContent,
+    badges: (function () {
+      var row = byId("node-table-body").children[0];
+      if (!row) return [];
+      return row.children.flatMap(function (cell) { return cell.children || []; })
+        .filter(function (el) { return (el.className || "").startsWith("badge "); })
+        .map(function (el) { return { text: el.textContent, title: el.title || "" }; });
+    })(),
     nodeIdLink: (function () {
       var row = byId("node-table-body").children[0];
       if (!row || !row.children[0] || !row.children[0].children[0]) return null;
@@ -164,6 +171,15 @@ def _node_payload() -> dict[str, Any]:
         "gpu_model": None,
         "actions": [],
     }
+
+
+def test_unreachable_available_host_displays_blocker() -> None:
+    node = _node_payload()
+    reason = "blocked: SSH connection timed out"
+    node.update(state="available", placement_blocker=reason)
+    result = _run_harness(lexical_role="admin", admin_nodes=[node])
+    assert {"text": "blocked", "title": reason} in result["badges"]
+    assert all(badge["text"] != "available" for badge in result["badges"])
 
 
 def test_user_role_fetches_fleet_endpoint() -> None:
