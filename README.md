@@ -1484,8 +1484,14 @@ Defaults limit each source to 3 seconds, 200 lines, and 16 KiB, and the overall
 diagnostic collection to 25 seconds. Configure `diagnostics_source_timeout`,
 `diagnostics_timeout`, and `diagnostics_source_max_bytes` under `provisioning`.
 Payloads share the existing attempt retention budgets. A failed collector never
-replaces the provisioning error. Journal queries retain the original failure
-window; system snapshots carry their collection time, including after reconnect.
+replaces the provisioning error. Journal queries start at the original attempt
+time and extend through recovered command completion if detached setup continues
+after an SSH failure. A successful empty journal search is complete; collection
+errors and unfinished command windows remain deferred. System snapshots carry
+their collection time, including after reconnect. Retrieval deadlines leave a
+durable warning and mark the bundle incomplete. Diagnostic records preserve whole
+lines when they fit; oversized lines split at UTF-8 character boundaries within
+the record byte limit, so searches spanning those fragments are not supported.
 The attempt API's log manifest and downloadable bundle include these details.
 Use **Retrieve from node** to retry deferred sources; startup reconciliation and
 the next operation on that host also retrieve pending evidence without relaunching

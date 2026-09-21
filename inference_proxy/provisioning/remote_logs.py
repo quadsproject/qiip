@@ -14,7 +14,11 @@ from typing import Any
 from weakref import WeakValueDictionary
 
 from inference_proxy.config.settings import ProvisioningSettings
-from inference_proxy.provisioning.diagnostics import SOURCE_NAMES
+from inference_proxy.provisioning.diagnostics import (
+    JOURNAL_SOURCES,
+    SOURCE_NAMES,
+    journal_until,
+)
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
 from inference_proxy.provisioning.log_store import AttemptLogStore, timestamp
 from inference_proxy.provisioning.ssh_client import (
@@ -117,6 +121,17 @@ class RemoteLogCollector:
                     if not attempt.get("failure"):
                         return
                     sources = attempt.get("diagnostics", {}).get("sources", {})
+                    for name in JOURNAL_SOURCES:
+                        source = sources.get(name)
+                        if source is not None and source.get(
+                            "window_until"
+                        ) != journal_until(attempt["failure"]):
+                            source["deferred"] = True
+                    if sources:
+                        self.store.update(
+                            attempt_id,
+                            diagnostics={**attempt["diagnostics"], "sources": sources},
+                        )
                     if sources and not any(s.get("deferred") for s in sources.values()):
                         return
                     async with self._locks.setdefault(attempt_id, asyncio.Lock()):

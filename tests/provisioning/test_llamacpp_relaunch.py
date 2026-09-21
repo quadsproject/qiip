@@ -371,6 +371,32 @@ async def test_cancellation_after_stop_rolls_back_before_propagating() -> None:
     assert _node_from_value(state["record"].value) == restored
 
 
+async def test_cancellation_during_failure_diagnostics_still_restores_engine() -> None:
+    previous = _node()
+    provisioner, registry, _etcd, state, writes = _provisioner(previous)
+    entered = asyncio.Event()
+
+    async def stall(*args: Any) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    provisioner._launch_llamacpp_runtime.side_effect = [  # type: ignore[attr-defined]
+        ProvisioningError("replacement failed"),
+        ("org/model-GGUF", previous.llamacpp_runtime),
+    ]
+    with patch.object(provisioner, "_capture_failure", side_effect=stall):
+        task = asyncio.create_task(provisioner.relaunch_llamacpp("host1", _request()))
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert writes == [(NodeStatus.RELAUNCHING, 7001), (NodeStatus.HEALTHY, 7001)]
+    restored = registry.get("host1")
+    assert restored is not None
+    assert restored.llamacpp_runtime == previous.llamacpp_runtime
+    assert _node_from_value(state["record"].value) == restored
+
+
 @pytest.mark.asyncio
 async def test_failed_request_and_rollback_enter_persistent_terminal_state() -> None:
     provisioner, registry, etcd, state, writes = _provisioner()

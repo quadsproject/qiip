@@ -525,10 +525,25 @@ class NodeProvisioner:
             raise KeyError(attempt_id)
         # The durable manifest describes any unavailable source.
         with suppress(SSHConnectionError, TimeoutError):
-            async with asyncio.timeout(self._settings.diagnostics_timeout):
-                await self._remote_logs.collect(attempt_id)
+            await self._collect_remote_logs(attempt_id)
         await self._remote_logs.diagnose(attempt_id)
         return store.get(attempt_id)
+
+    async def _collect_remote_logs(
+        self, attempt_id: str, *, finish: bool = False, cancel: bool = False
+    ) -> None:
+        assert self._remote_logs is not None
+        try:
+            async with asyncio.timeout(self._settings.diagnostics_timeout):
+                await self._remote_logs.collect(
+                    attempt_id, finish=finish, cancel=cancel
+                )
+        except TimeoutError:
+            # The outer deadline cancels collect(), bypassing its error handler.
+            self._remote_logs.store.issue(
+                attempt_id, "Remote log retrieval deadline exceeded", source="remote"
+            )
+            raise
 
     async def _capture_failure(
         self, hostname: str, stage: str, error: BaseException
@@ -554,10 +569,9 @@ class NodeProvisioner:
             task = asyncio.current_task()
             # A gateway shutdown stops retrieval, not the detached node worker.
             interrupted = bool(task and task.cancelling()) and not cancel
-            async with asyncio.timeout(self._settings.diagnostics_timeout):
-                await self._remote_logs.collect(
-                    attempt_id, finish=not interrupted, cancel=cancel
-                )
+            await self._collect_remote_logs(
+                attempt_id, finish=not interrupted, cancel=cancel
+            )
         except Exception:
             logger.warning(
                 "remote_logs_finish_failed", hostname=hostname, exc_info=True
@@ -1580,8 +1594,13 @@ class NodeProvisioner:
             self._log(hostname, "info", "llama.cpp relaunch complete")
             return
         except BaseException as error:
+            diagnostic_cancel: asyncio.CancelledError | None = None
             if isinstance(error, Exception):
-                await self._capture_failure(hostname, current_step, error)
+                try:
+                    await self._capture_failure(hostname, current_step, error)
+                except asyncio.CancelledError as cancelled:
+                    # Diagnostics are secondary to restoring the stopped engine.
+                    diagnostic_cancel = cancelled
             if (
                 stop_attempted
                 and relaunch_record is not None
@@ -1688,6 +1707,8 @@ class NodeProvisioner:
                         error=f"{error}; {rollback_message}",
                         started_at=started_at,
                     )
+                    if diagnostic_cancel is not None:
+                        raise diagnostic_cancel from error
                     raise
 
             if (
@@ -1723,6 +1744,8 @@ class NodeProvisioner:
                 error=str(error),
                 started_at=started_at,
             )
+            if diagnostic_cancel is not None:
+                raise diagnostic_cancel from error
             raise
         finally:
             if keepalive is not None:
@@ -2297,7 +2320,6 @@ class NodeProvisioner:
                 error=str(exc),
                 started_at=provision_started_at,
             )
-            await self._capture_failure(hostname, current_step, exc)
             # Update node entry to FAILED so it doesn't stay stuck as PROVISIONING
             try:
                 failed_node = Node(
@@ -2327,6 +2349,7 @@ class NodeProvisioner:
                         )
             except Exception:
                 logger.warning("failed_node_update_failed", hostname=hostname)
+            await self._capture_failure(hostname, current_step, exc)
             raise
         finally:
             await self._finish_remote_logs(

@@ -12,11 +12,13 @@ import selectors
 import signal
 import subprocess
 import time
+from collections.abc import Iterator
 from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any
 
 LOG_SOURCES = ("setup.stdout", "setup.stderr", "start.stdout", "start.stderr", "engine")
+JOURNAL_SOURCES = ("nvidia_services", "kernel_gpu_oom")
 SYSTEM_SOURCES = (
     "nvidia_services",
     "kernel_gpu_oom",
@@ -37,11 +39,21 @@ def timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()  # noqa: UP017 - node Python 3.9
 
 
+def journal_until(failure: dict[str, Any]) -> float:
+    """Include recovered command completion without changing the original failure."""
+    command = failure.get("command") or {}
+    end = max(
+        datetime.fromisoformat(failure["failed_at"]),
+        datetime.fromisoformat(command.get("finished_at") or failure["failed_at"]),
+    )
+    return end.timestamp() + 1
+
+
 def source_commands(config: dict[str, Any]) -> dict[str, list[str]]:
     failure = config["failure"]
     # Epoch timestamps avoid journalctl's locale-dependent date parsing.
     since = "@" + str(datetime.fromisoformat(failure["started_at"]).timestamp())
-    until = "@" + str(datetime.fromisoformat(failure["failed_at"]).timestamp() + 1)
+    until = "@" + str(journal_until(failure))
     journal = [
         "journalctl",
         "--no-pager",
@@ -70,7 +82,7 @@ def source_commands(config: dict[str, Any]) -> dict[str, list[str]]:
         ],
         "kernel_gpu_oom": [
             *journal,
-            "--kernel",
+            "_TRANSPORT=kernel",
             "--case-sensitive=no",
             "--grep=NVRM|Xid|nvidia|GPU|out of memory|oom|killed process",
         ],
@@ -95,7 +107,9 @@ def source_commands(config: dict[str, Any]) -> dict[str, list[str]]:
     }
 
 
-def capture(command: list[str], timeout: float, max_bytes: int) -> dict[str, Any]:
+def capture(
+    command: list[str], timeout: float, max_bytes: int, *, journal: bool = False
+) -> dict[str, Any]:
     """Drain both streams with constant memory and kill descendants on timeout."""
     started = time.monotonic()
     result: dict[str, Any] = {
@@ -106,17 +120,21 @@ def capture(command: list[str], timeout: float, max_bytes: int) -> dict[str, Any
     }
     tail = bytearray()
     seen = 0
+    stderr_seen = 0
     try:
         proc = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
             start_new_session=True,
+            env={**os.environ, "LC_ALL": "C"} if journal else None,
         )
         assert proc.stdout is not None
+        assert proc.stderr is not None
         try:
             with selectors.DefaultSelector() as selector:
                 selector.register(proc.stdout, selectors.EVENT_READ)
+                selector.register(proc.stderr, selectors.EVENT_READ)
                 deadline = started + timeout
                 try:
                     while selector.get_map():
@@ -129,12 +147,25 @@ def capture(command: list[str], timeout: float, max_bytes: int) -> dict[str, Any
                                 selector.unregister(key.fileobj)
                                 continue
                             seen += len(chunk)
+                            if key.fileobj is proc.stderr:
+                                stderr_seen += len(chunk)
                             tail.extend(chunk)
                             del tail[:-max_bytes]
                     proc.wait(timeout=max(0.001, deadline - time.monotonic()))
                     result["status"] = (
                         "collected" if proc.returncode == 0 else "unavailable"
                     )
+                    # journalctl --grep exits 1 for an empty successful search.
+                    # Do not accept errors or permission warnings as empty results.
+                    if (
+                        journal
+                        and proc.returncode == 1
+                        and not stderr_seen
+                        and seen <= max_bytes
+                        and tail.strip() == b"-- No entries --"
+                    ):
+                        result.update(status="collected", empty=True)
+                        tail.clear()
                 except (TimeoutError, subprocess.TimeoutExpired):
                     result.update(
                         status="timed_out", reason="Source collection deadline exceeded"
@@ -152,6 +183,7 @@ def capture(command: list[str], timeout: float, max_bytes: int) -> dict[str, Any
                 result["signal"] = -code if code is not None and code < 0 else None
         finally:
             proc.stdout.close()
+            proc.stderr.close()
     except OSError as exc:
         result.update(status="unavailable", reason=str(exc)[:512])
     decoded = tail.decode("utf-8", errors="replace").encode("utf-8")
@@ -169,15 +201,55 @@ def capture(command: list[str], timeout: float, max_bytes: int) -> dict[str, Any
     return result
 
 
+def record_chunks(output: str, max_bytes: int) -> Iterator[str]:
+    """Keep lines searchable; split oversized lines at UTF-8 character boundaries."""
+    if max_bytes < 4:
+        raise ValueError("Record cap must fit a UTF-8 character (at least 4 bytes)")
+    pending = ""
+    for line in output.splitlines(keepends=True):
+        if len((pending + line).encode("utf-8")) <= max_bytes:
+            pending += line
+            continue
+        if pending:
+            yield pending
+        encoded = line.encode("utf-8")
+        while len(encoded) > max_bytes:
+            chunk = encoded[:max_bytes].decode("utf-8", errors="ignore")
+            yield chunk
+            encoded = encoded[len(chunk.encode("utf-8")) :]
+        pending = encoded.decode("utf-8")
+    if pending:
+        yield pending
+
+
 def collect(config: dict[str, Any], store: Any) -> None:
     """Persist each source before moving on, preserving useful partial results."""
     attempt_id = config["attempt_id"]
-    sources = store.get(attempt_id).get("diagnostics", {}).get("sources", {})
+    attempt = store.get(attempt_id)
+    sources = attempt.get("diagnostics", {}).get("sources", {})
+    failure = dict(config["failure"])
+    command = dict(failure.get("command") or {})
+    # The detached worker may have finished since the gateway last read its phase.
+    phase = attempt.get("phases", {}).get(command.get("phase_id"), {})
+    if phase.get("finished_at"):
+        command["finished_at"] = phase["finished_at"]
+    failure["command"] = command
+    config = {**config, "failure": failure}
+    window_until = journal_until(failure)
+    command_pending = bool(command.get("phase_id") and not command.get("finished_at"))
     deadline = time.monotonic() + config["diagnostics_timeout"]
     commands = source_commands(config)
     max_bytes = config["diagnostics_source_max_bytes"]
     for name in SOURCE_NAMES:
-        if sources.get(name, {}).get("status") in {"collected", "truncated"}:
+        previous = sources.get(name, {})
+        if (
+            previous.get("status") in {"collected", "truncated"}
+            and not previous.get("deferred")
+            and (
+                name not in JOURNAL_SOURCES
+                or previous.get("window_until") == window_until
+            )
+        ):
             continue
         remaining = deadline - time.monotonic()
         result: dict[str, Any]
@@ -194,6 +266,7 @@ def collect(config: dict[str, Any], store: Any) -> None:
                         commands[name],
                         min(remaining, config["diagnostics_source_timeout"]),
                         max_bytes,
+                        journal=name in JOURNAL_SOURCES,
                     )
             except Exception as exc:
                 result = dict(
@@ -203,19 +276,21 @@ def collect(config: dict[str, Any], store: Any) -> None:
         output = result.pop("output", "")
         result.setdefault("collected_at", timestamp())
         result["deferred"] = result["status"] in {"unavailable", "timed_out"}
+        if name in JOURNAL_SOURCES:
+            result["window_until"] = window_until
+            if command_pending:
+                result.update(deferred=True, reason="Remote command completion pending")
         if output:
-            # Split UTF-8 text without exceeding the store's individual record cap.
-            chunk = max(1, store.max_record_bytes // 4)
             entries = store.append_many(
                 attempt_id,
                 [
                     dict(
-                        msg=output[pos : pos + chunk],
+                        msg=chunk,
                         source="diagnostics." + name,
                         stage="diagnostics",
                         ts=result["collected_at"],
                     )
-                    for pos in range(0, len(output), chunk)
+                    for chunk in record_chunks(output, store.max_record_bytes)
                 ],
             )
             result["first_seq"] = entries[0]["seq"]

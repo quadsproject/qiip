@@ -47,7 +47,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class LocalNodeSSH(SSHClient):
     def __init__(self, root: Path, environment: dict[str, str]) -> None:
-        super().__init__(SSHSettings(streaming_command_timeout=5))
+        # Startup scans the host's /proc before launching the controlled engine.
+        # Allow room for that scan under coverage and on busy runners.
+        super().__init__(SSHSettings(streaming_command_timeout=15))
         self.root = root
         self.environment = environment
         self.lose_launch = False

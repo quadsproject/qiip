@@ -195,7 +195,10 @@ class AttemptLogStore:
         result["incomplete"] = bool(
             result["issues"]
             or row["dropped"]
-            or any(source["status"] != "collected" for source in diagnostic_sources)
+            or any(
+                source["status"] != "collected" or source.get("deferred")
+                for source in diagnostic_sources
+            )
         )
         return result
 

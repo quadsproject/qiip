@@ -6,8 +6,11 @@ import asyncio
 import gzip
 import json
 import re
+import shlex
+import shutil
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -16,7 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pytest_httpx import HTTPXMock
 
-from inference_proxy.models.node import InferenceEngine
+from inference_proxy.models.node import InferenceEngine, NodeStatus
 from inference_proxy.provisioning import diagnostics
 from inference_proxy.provisioning.log_store import AttemptLogStore
 from inference_proxy.provisioning.provisioner import (
@@ -70,7 +73,8 @@ def _prepare(
         Path(ssh.environment["PATH"].split(":")[0]) / "journalctl",
         """#!/bin/bash
 case "$*" in
-  *--kernel*) echo 'Out of memory: Killed process 123 (vllm)'; echo 'NVRM: Xid 79 GPU lost' ;;
+  *--kernel*) echo 'journalctl: unrecognized option --kernel' >&2; exit 1 ;;
+  *_TRANSPORT=kernel*) echo 'Out of memory: Killed process 123 (vllm)'; echo 'NVRM: Xid 79 GPU lost' ;;
   *) echo 'NVIDIA Fabric Manager failed initialization' ;;
 esac
 """,
@@ -183,11 +187,35 @@ async def test_ssh_loss_defers_sources_and_recovers_without_relaunch(
     )
 
 
+@pytest.mark.parametrize("delay", [0, 2])
 async def test_disconnect_at_setup_boundary_retains_remote_failure(
     harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+    delay: int,
 ) -> None:
     provisioner, ssh, store = harness
     _prepare(provisioner, ssh, "CUDA initialization failed while disconnected")
+    if delay:
+        evidence = ssh.root / "kernel-event-time"
+        setup = ssh.root / "auto-vllm/setup.sh"
+        setup.write_text(
+            setup.read_text().replace(
+                "install_cuda_toolkit() { echo",
+                f"install_cuda_toolkit() {{ sleep {delay}; date +%s.%N > {shlex.quote(str(evidence))}; echo",
+            )
+        )
+        _write_executable(
+            Path(ssh.environment["PATH"].split(":")[0]) / "journalctl",
+            f"""#!{sys.executable}
+import pathlib, sys
+event = pathlib.Path({str(evidence)!r})
+until = float(next(arg.removeprefix('--until=@') for arg in sys.argv if arg.startswith('--until=')))
+if event.exists() and float(event.read_text()) <= until:
+    print('late kernel OOM evidence')
+else:
+    print('-- No entries --')
+    sys.exit(1)
+""",
+        )
     provisioner._settings.log_reconnect_attempts = 0
     original_run = ssh.run
     disconnected = False
@@ -215,13 +243,26 @@ async def test_disconnect_at_setup_boundary_retains_remote_failure(
     assert all(
         source["deferred"] for source in attempt["diagnostics"]["sources"].values()
     )
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(delay + 0.5)
     await provisioner.collect_logs("host1", attempt["attempt_id"])
     recovered = store.get(attempt["attempt_id"])
     assert (
         recovered["failure"]["original_error"] == attempt["failure"]["original_error"]
     )
     assert recovered["failure"]["command"]["exit_status"] == 1
+    if delay:
+        observed_failure = datetime.fromisoformat(attempt["failure"]["failed_at"])
+        completion = datetime.fromisoformat(
+            recovered["failure"]["command"]["finished_at"]
+        )
+        assert (completion - observed_failure).total_seconds() > 1
+        source = recovered["diagnostics"]["sources"]["kernel_gpu_oom"]
+        assert source["window_until"] >= completion.timestamp()
+        assert store.read(
+            attempt["attempt_id"],
+            source="diagnostics.kernel_gpu_oom",
+            query="late kernel OOM",
+        )["records"]
     assert store.read(
         attempt["attempt_id"],
         source="diagnostics.setup.stderr",
@@ -326,7 +367,7 @@ def test_node_deadline_and_independent_collector_failure(tmp_path: Path) -> None
     )
     calls = 0
 
-    def broken(*args: Any) -> dict[str, Any]:
+    def broken(*args: Any, **kwargs: Any) -> dict[str, Any]:
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -427,3 +468,190 @@ async def test_lost_diagnostic_response_recovers_node_snapshot(
     assert recovered["diagnostics"]["sources"]["os"]["status"] == "collected"
     assert node.get(attempt)["status"] == "failed"
     assert ssh.launches == 0
+
+
+def _config(attempt_id: str) -> dict[str, Any]:
+    return dict(
+        attempt_id=attempt_id,
+        engine="vllm",
+        mount_point="/tmp",
+        diagnostics_timeout=5,
+        diagnostics_source_timeout=2,
+        diagnostics_source_max_bytes=32768,
+        failure=dict(
+            started_at="1970-01-01T00:00:01+00:00",
+            failed_at="1970-01-01T00:00:02+00:00",
+        ),
+    )
+
+
+@pytest.mark.skipif(
+    shutil.which("journalctl") is None, reason="journalctl not installed"
+)
+def test_kernel_journal_argv_is_supported() -> None:
+    argv = diagnostics.source_commands(_config("unused"))["kernel_gpu_oom"]
+    assert "_TRANSPORT=kernel" in argv
+    assert not {"--kernel", "--dmesg", "-k", "--boot", "-b"}.intersection(argv)
+    result = diagnostics.capture(argv, 2, 4096, journal=True)
+    assert result["exit_code"] in {0, 1}
+    assert "unrecognized option" not in result["output"]
+    assert "Invalid argument" not in result["output"]
+
+
+@pytest.mark.parametrize("error", [False, True])
+def test_empty_journal_is_complete_but_real_errors_are_deferred(
+    tmp_path: Path, error: bool
+) -> None:
+    journal = tmp_path / "journalctl"
+    _write_executable(
+        journal,
+        "#!/bin/sh\nprintf '%s\\n' '-- No entries --'\n"
+        + ("echo 'Failed to open journal: Permission denied' >&2\n" if error else "")
+        + "exit 1\n",
+    )
+    store = AttemptLogStore(tmp_path / "node.sqlite3")
+    attempt = store.create("host1")
+    store.update(
+        attempt,
+        diagnostics=dict(
+            sources={
+                name: dict(status="collected") for name in diagnostics.SOURCE_NAMES
+            }
+        ),
+    )
+    config = _config(attempt)
+    commands = {name: [str(journal)] for name in diagnostics.JOURNAL_SOURCES}
+    with patch.object(diagnostics, "source_commands", return_value=commands):
+        diagnostics.collect(config, store)
+        first = store.get(attempt)
+        diagnostics.collect(config, store)
+    source = first["diagnostics"]["sources"]["kernel_gpu_oom"]
+    assert source["status"] == ("unavailable" if error else "collected")
+    assert source["deferred"] is error
+    assert first["incomplete"] is error
+    if not error:
+        assert source["empty"]
+        assert not store.read(attempt)["records"]
+        assert store.get(attempt)["diagnostics"] == first["diagnostics"]
+
+
+async def test_cancelling_diagnostics_persists_failed_provisioning_node(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    provisioner, ssh, store = harness
+    _prepare(provisioner, ssh, "original setup failure")
+    entered = asyncio.Event()
+
+    async def stall(_attempt: str) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    assert provisioner._remote_logs is not None
+    with patch.object(provisioner._remote_logs, "diagnose", side_effect=stall):
+        task = asyncio.create_task(provisioner._provision("host1", model="org/model"))
+        await asyncio.wait_for(entered.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    replaces = provisioner._etcd_client.replace.call_args_list  # type: ignore[attr-defined]
+    assert any(
+        json.loads(call.args[2])["status"] == NodeStatus.FAILED for call in replaces
+    )
+    attempt = store.history("host1")["attempts"][0]
+    assert attempt["failure"]["failed_stage"] == "cuda_toolkit"
+    assert "setup" in attempt["failure"]["original_error"]
+
+
+@pytest.mark.parametrize("finish", [False, True])
+async def test_retrieval_deadline_persists_manifest_warning(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore], finish: bool
+) -> None:
+    provisioner, _, store = harness
+    provisioner._settings.diagnostics_timeout = 0.01
+    provisioner._begin_log("host1", InferenceEngine.VLLM)
+    attempt = provisioner.log_buffer.attempts["host1"]
+    store.update_phase(attempt, "setup", status="running")
+
+    async def stall(*args: Any, **kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    assert provisioner._remote_logs is not None
+    with patch.object(provisioner._remote_logs, "collect", side_effect=stall):
+        if finish:
+            await provisioner._finish_remote_logs("host1")
+            provisioner._mark_log_complete("host1")
+        else:
+            await provisioner.collect_logs("host1", attempt)
+    # Reopening the database verifies the warning survives process restarts.
+    manifest = AttemptLogStore(store.path).get(attempt)
+    assert manifest["incomplete"]
+    assert "Remote log retrieval deadline exceeded" in manifest["issues"]
+
+
+def test_diagnostic_chunks_keep_short_lines_searchable(tmp_path: Path) -> None:
+    store = AttemptLogStore(tmp_path / "node.sqlite3")
+    attempt = store.create("host1")
+    # The short marker line straddles the former 4096-character slice boundary.
+    output = "x" * 4089 + "\nSEARCH_MARKER retained evidence\n" + "é☃😀" * 4000
+    with patch.object(
+        diagnostics,
+        "capture",
+        side_effect=lambda *a, **kw: dict(status="collected", output=output),
+    ):
+        diagnostics.collect(_config(attempt), store)
+    records = store.read(attempt, source="diagnostics.os")["records"]
+    assert "".join(record["msg"] for record in records) == output
+    assert all(
+        len(record["msg"].encode()) <= store.max_record_bytes for record in records
+    )
+    assert store.read(attempt, source="diagnostics.os", query="SEARCH_MARKER")[
+        "records"
+    ]
+    assert not store.get(attempt)["issues"]
+
+
+def test_journal_recollects_through_recovered_command_completion(
+    tmp_path: Path,
+) -> None:
+    store = AttemptLogStore(tmp_path / "node.sqlite3")
+    attempt = store.create("host1")
+    config = _config(attempt)
+    config["failure"].update(
+        original_error="original SSH failure", command=dict(phase_id="setup")
+    )
+    original = dict(config["failure"])
+    seen_windows: list[float] = []
+
+    def capture(argv: list[str], *args: Any, **kwargs: Any) -> dict[str, Any]:
+        if kwargs["journal"]:
+            until = float(
+                next(
+                    arg.removeprefix("--until=@")
+                    for arg in argv
+                    if arg.startswith("--until=")
+                )
+            )
+            seen_windows.append(until)
+            return dict(
+                status="collected", output="late OOM evidence" if until >= 5 else ""
+            )
+        return dict(status="collected", output="")
+
+    with patch.object(diagnostics, "capture", side_effect=capture):
+        diagnostics.collect(config, store)
+        pending = store.get(attempt)
+        assert pending["incomplete"]
+        assert pending["diagnostics"]["sources"]["kernel_gpu_oom"]["deferred"]
+        # Detached setup fails two seconds after the gateway observes SSH loss.
+        store.update_phase(
+            attempt, "setup", finished_at="1970-01-01T00:00:04+00:00", exit_status=7
+        )
+        diagnostics.collect(config, store)
+        diagnostics.collect(config, store)
+    assert seen_windows == [3, 3, 5, 5]
+    assert config["failure"] == original
+    source = store.get(attempt)["diagnostics"]["sources"]["kernel_gpu_oom"]
+    assert not source["deferred"]
+    assert store.read(attempt, source="diagnostics.kernel_gpu_oom", query="late OOM")[
+        "records"
+    ]
