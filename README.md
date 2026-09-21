@@ -180,6 +180,9 @@ sends base64-encoded credentials --not encryption --on every request. A trusted
 work LAN may use HTTP; use a TLS terminator whenever that network path is not
 trusted.
 
+> [!TIP]
+> For production deployments it's best to use a reverse proxy, see our [nginx setup](nginx/nginx.md).
+
 Optional TLS termination (rootless Podman container or RPM nginx, self-signed
 certificate bootstrap): see [nginx/nginx.md](nginx/nginx.md).
 
