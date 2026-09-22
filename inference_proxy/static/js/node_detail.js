@@ -54,7 +54,7 @@ var ACTION_CONFIG = {
   teardown: {
     method: "DELETE", url: function (id) { return "/admin/nodes/" + id; },
     body: null, confirm: true, danger: true,
-    confirmMsg: function (id) { return "Teardown " + id + "? This will drain connections and stop the container."; },
+    confirmMsg: function (id) { return "Teardown " + id + "? This will drain connections, stop inference, and suspend automatic placement until resumed."; },
     label: "Teardown", pendingLabel: "Tearing down…", css: "btn-danger",
     successMsg: function (id) { return "Teardown started for " + id; },
   },
@@ -69,14 +69,14 @@ var ACTION_CONFIG = {
   cancel: {
     method: "DELETE", url: function (id) { return "/admin/nodes/" + id; },
     body: null, confirm: true, danger: true,
-    confirmMsg: function (id) { return "Cancel provisioning for " + id + "?"; },
+    confirmMsg: function (id) { return "Cancel provisioning for " + id + "? Automatic placement will stay suspended until resumed."; },
     label: "Cancel", pendingLabel: "Cancelling…", css: "btn-danger",
     successMsg: function (id) { return "Cancelled provisioning for " + id; },
   },
   force_teardown: {
     method: "DELETE", url: function (id) { return "/admin/nodes/" + id + "?force=true"; },
     body: null, confirm: true, danger: true,
-    confirmMsg: function (id) { return "Force teardown " + id + "? This will immediately stop the container without draining."; },
+    confirmMsg: function (id) { return "Force teardown " + id + "? This will immediately stop inference without draining and suspend automatic placement until resumed."; },
     label: "Force Teardown", pendingLabel: "Forcing…", css: "btn-danger",
     successMsg: function (id) { return "Teardown started for " + id; },
   },

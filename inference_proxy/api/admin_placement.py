@@ -20,6 +20,8 @@ from pydantic import BaseModel, ConfigDict
 from inference_proxy.auth.dependencies import get_auth_store
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import (
+    get_placement_suspensions,
+    get_provisioner,
     get_request_metrics,
     get_settings,
     require_admin_auth,
@@ -28,6 +30,9 @@ from inference_proxy.config.settings import Settings
 from inference_proxy.placement.catalog import CATALOG_VERSION
 from inference_proxy.placement.claims import ClaimState, PlacementClaim
 from inference_proxy.placement.reconciler import PlacementReconciler
+from inference_proxy.placement.suspensions import SuspensionStore
+from inference_proxy.provisioning.provisioner import NodeProvisioner
+from inference_proxy.quads.client import canonical_hostname
 from inference_proxy.routing.request_metrics import RequestMetrics
 
 admin_placement_router = APIRouter(
@@ -103,6 +108,7 @@ class ModelUsageStatus(BaseModel):
 class PlacementStatusResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
+    suspended_hosts: tuple[str, ...] = ()
     available: bool
     enabled: bool
     catalog_version: int
@@ -156,11 +162,19 @@ async def get_placement_status(
     settings: Annotated[Settings, Depends(get_settings)],
     request_metrics: Annotated[RequestMetrics, Depends(get_request_metrics)],
     store: Annotated[AuthStore, Depends(get_auth_store)],
+    suspensions: Annotated[SuspensionStore, Depends(get_placement_suspensions)],
 ) -> PlacementStatusResponse:
     """Return placement targets, claims, missing files and model demand."""
     usage = _usage(request_metrics, store)
+    try:
+        suspended_hosts = tuple(sorted(await suspensions.list()))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="Could not read placement suspensions"
+        ) from exc
     if reconciler is None:
         return PlacementStatusResponse(
+            suspended_hosts=suspended_hosts,
             available=False,
             enabled=settings.placement.enabled,
             catalog_version=CATALOG_VERSION,
@@ -193,6 +207,8 @@ async def get_placement_status(
         error = error or f"could not read placement claims: {exc}"
     counts: dict[str, dict[str, int]] = {}
     for claim in claims:
+        if claim.hostname in suspended_hosts:
+            continue
         bucket = counts.setdefault(
             claim.profile_id, {"held": 0, "serving": 0, "pending": 0, "failed": 0}
         )
@@ -207,6 +223,7 @@ async def get_placement_status(
             bucket["failed"] += 1
     missing_profiles = {item.profile_id for item in missing}
     return PlacementStatusResponse(
+        suspended_hosts=suspended_hosts,
         available=True,
         enabled=status.enabled,
         catalog_version=CATALOG_VERSION,
@@ -268,3 +285,28 @@ async def reset_placement_claim(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not removed:
         raise HTTPException(status_code=404, detail="No such placement claim")
+
+
+@admin_placement_router.delete("/suspensions/{hostname}", status_code=204)
+async def resume_placement(
+    hostname: str,
+    suspensions: Annotated[SuspensionStore, Depends(get_placement_suspensions)],
+    provisioner: Annotated[NodeProvisioner, Depends(get_provisioner)],
+) -> None:
+    """Allow future automatic placement; never interrupt current host work."""
+    hostname = canonical_hostname(hostname)
+    lease = await provisioner.try_reserve_host(hostname)
+    if lease is None:
+        raise HTTPException(
+            status_code=409, detail="Host lifecycle operation in progress"
+        )
+    try:
+        await suspensions.resume(hostname)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="Could not resume automatic placement"
+        ) from exc
+    finally:
+        lease.release()

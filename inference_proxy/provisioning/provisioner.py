@@ -405,8 +405,12 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
     return fit
 
 
+class ProvisioningOperationChangedError(RuntimeError):
+    """The inspected provisioning operation no longer owns the host."""
+
+
 @dataclass
-class _ProvisioningTask:
+class ProvisioningTask:
     task: asyncio.Task[None]
     identity: ProvisioningIdentity
     operation: BackgroundOperation
@@ -481,7 +485,7 @@ class NodeProvisioner:
         self._artifact_index = artifact_index
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._owner_updates: set[asyncio.Task[Node]] = set()
-        self._provisioning_tasks: dict[str, _ProvisioningTask] = {}
+        self._provisioning_tasks: dict[str, ProvisioningTask] = {}
         self._explicit_cancel_tasks: set[asyncio.Task[None]] = set()
 
     @property
@@ -3048,7 +3052,7 @@ class NodeProvisioner:
             if task_name is None:
                 task_name = f"{operation.value}:{provisioning_hostname}"
 
-        record: _ProvisioningTask | None = None
+        record: ProvisioningTask | None = None
         scheduled_coro = coro
         if provisioning_hostname is not None:
 
@@ -3074,7 +3078,7 @@ class NodeProvisioner:
         if provisioning_hostname is not None:
             if provisioning_identity is None:  # narrowed by the paired check above
                 raise RuntimeError("provisioning identity was not initialized")
-            record = _ProvisioningTask(task, provisioning_identity, operation)
+            record = ProvisioningTask(task, provisioning_identity, operation)
             self._provisioning_tasks[provisioning_hostname] = record
 
         def _task_done(done_task: asyncio.Task[None]) -> None:
@@ -3120,16 +3124,43 @@ class NodeProvisioner:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    def active_provision(self, hostname: str) -> ProvisioningTask | None:
+        """Inspect the current provisioning operation without mutating it."""
+        record = self._provisioning_tasks.get(hostname)
+        if (
+            record is None
+            or record.task.done()
+            or record.operation is not BackgroundOperation.PROVISION
+        ):
+            return None
+        return record
+
     async def cancel_active_provision(
         self, hostname: str
     ) -> ProvisioningIdentity | None:
-        """Cancel *hostname* provisioning and return its serving identity."""
-        record = self._provisioning_tasks.get(hostname)
-        if record is None or record.task.done():
-            return None
-        if record.operation is not BackgroundOperation.PROVISION:
-            return None
+        """Cancel the current provision for automatic-placement fencing.
 
+        Manual teardown must instead inspect, persist suspension, and then
+        cancel that inspected record through ``cancel_provision``.
+        """
+        record = self.active_provision(hostname)
+        if record is None:
+            return None
+        return await self.cancel_provision(hostname, record)
+
+    async def cancel_provision(
+        self, hostname: str, record: ProvisioningTask
+    ) -> ProvisioningIdentity:
+        """Cancel only the inspected record, never its replacement.
+
+        There is no await between checking identity and cancelling the task.
+        Callers may safely persist operator intent after inspection without
+        risking cancellation of another operation that took its place.
+        """
+        if self.active_provision(hostname) is not record:
+            raise ProvisioningOperationChangedError(
+                f"Provisioning operation for '{hostname}' changed; retry teardown"
+            )
         task = record.task
         self._explicit_cancel_tasks.add(task)
         try:

@@ -74,6 +74,7 @@ from inference_proxy.placement.planner import (
     PlannedProfile,
     plan_placements,
 )
+from inference_proxy.placement.suspensions import SuspensionStore
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     ProvisioningCapacityError,
@@ -157,6 +158,7 @@ class PlacementReconciler:
         provisioner: NodeProvisioner,
         artifact_index: GGUFArtifactIndex,
         claims: ClaimStore,
+        suspensions: SuspensionStore,
         lookahead_hours: int,
         profiles: Sequence[ModelProfile] = BUILTIN_PROFILES,
         clock: Callable[[], datetime] = utcnow,
@@ -169,6 +171,7 @@ class PlacementReconciler:
         self._provisioner = provisioner
         self._artifacts = artifact_index
         self._claims = claims
+        self._suspensions = suspensions
         self._lookahead_hours = lookahead_hours
         self._profiles = tuple(profiles)
         self._clock = clock
@@ -270,6 +273,7 @@ class PlacementReconciler:
         except Exception as exc:
             return failed(f"could not scan the GGUF cache: {exc}")
         try:
+            suspended = await self._suspensions.list()
             claims, unreadable = await self._claims.list()
         except Exception as exc:
             return failed(
@@ -298,6 +302,12 @@ class PlacementReconciler:
 
         settled: list[StoredClaim] = []
         for stored in claims:
+            if stored.claim.hostname in suspended:
+                # Teardown leaves claims behind. Forget only after the node is
+                # gone, without clearing registration or touching the host.
+                if self._registry.get(stored.claim.hostname) is None:
+                    await self._drop(stored)
+                continue
             kept = await self._settle_claim(stored, available, now)
             if kept is not None:
                 settled.append(kept)
@@ -310,7 +320,13 @@ class PlacementReconciler:
         planned = self._planned_profiles(resolution)
         hosts = {canonical_hostname(host.hostname): host for host in self._poller.hosts}
         blocked = {item.claim.hostname for item in settled} | set(unreadable)
-        candidates, skipped = self._candidates(available, blocked, planned, now)
+        candidates, skipped = self._candidates(
+            available, blocked | suspended, planned, now
+        )
+        skipped.extend(
+            SkippedHost(host, "automatic placement suspended by an administrator")
+            for host in sorted(suspended)
+        )
         budget = self._settings.max_concurrent - sum(
             1
             for item in settled
@@ -383,7 +399,7 @@ class PlacementReconciler:
         # Report what is held now, including what this pass just started.
         held_now = {profile.profile_id: 0 for profile in self._profiles}
         for item in final_claims:
-            if item.claim.counts_toward_ratio:
+            if item.claim.hostname not in suspended and item.claim.counts_toward_ratio:
                 held_now[item.claim.profile_id] = (
                     held_now.get(item.claim.profile_id, 0) + 1
                 )
@@ -745,6 +761,10 @@ class PlacementReconciler:
             return False
         handed_over = False
         try:
+            # Re-check durable operator intent under the lifecycle lease, even
+            # when this pass planned before a manual teardown completed.
+            if hostname in await self._suspensions.list():
+                return False
             # Re-check under the lease: an operator may have acted since the
             # snapshot this pass planned from.
             if not self._may_replace(self._registry.get(hostname), existing):

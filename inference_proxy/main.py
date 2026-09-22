@@ -67,6 +67,7 @@ from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.openai import ErrorDetail, ErrorResponse
 from inference_proxy.placement.claims import ClaimStore
 from inference_proxy.placement.reconciler import PlacementReconciler
+from inference_proxy.placement.suspensions import SuspensionStore
 from inference_proxy.plugins.interfaces.auth import AuthPlugin
 from inference_proxy.plugins.manager import PluginManager
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
@@ -220,6 +221,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         async with AsyncExitStack() as resources:
             etcd_client = EtcdClient(resolved_settings.etcd)
+            suspensions = SuspensionStore(etcd_client)
+            app.state.placement_suspensions = suspensions
             resources.callback(_safe_sync_cleanup, "etcd client", etcd_client.close)
             registry = NodeRegistry()
             lease_manager = NodeLeaseManager(etcd_client)
@@ -562,6 +565,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     provisioner=provisioner,
                     artifact_index=artifact_index,
                     claims=ClaimStore(etcd_client),
+                    suspensions=suspensions,
                     lookahead_hours=(resolved_settings.quads.schedule_lookahead_hours),
                 )
                 placement_reconciler.start()

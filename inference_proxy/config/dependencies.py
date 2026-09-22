@@ -27,6 +27,7 @@ from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.huggingface.catalog import ModelCatalogService
 from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.llmfit.runner import LLMFitRunner
+from inference_proxy.placement.suspensions import SuspensionStore
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.proxy.client import ProxyClient
 from inference_proxy.quads.client import QUADSClient
@@ -299,3 +300,13 @@ def get_unified_node_service(request: Request) -> UnifiedNodeService:
         tracker=request.app.state.node_selector.tracker,
         placement_blockers=reconciler.launch_blockers if reconciler else None,
     )
+
+
+def get_placement_suspensions(request: Request) -> SuspensionStore:
+    """Operator intent is available even without QUADS or a running planner."""
+    store = getattr(request.app.state, "placement_suspensions", None)
+    if not isinstance(store, SuspensionStore):
+        raise HTTPException(
+            status_code=503, detail="Placement suspension store unavailable"
+        )
+    return store
