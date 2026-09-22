@@ -84,8 +84,8 @@ unknown environment dimensions because diagnostics are collected on failure.
 
 ## Baseline and canary record
 
-**Status: historical snapshot and matched L4 pilot complete; target agreement
-pending.** On 2026-09-21 the operator supplied a
+**Status: historical snapshot and matched L4 pilot complete; pilot targets
+accepted.** On 2026-09-21 the operator supplied a
 development gateway, the existing workload configuration, and no maintenance
 constraints. The initially selected T4 hostname returned authoritative
 `NXDOMAIN`; the operator replaced it with a reachable, managed L4 node. The
@@ -149,15 +149,16 @@ cycle took 626.648662 seconds from the teardown request, including placement's
 configured scheduling and recovery delays. That time is outside the report's
 setup-to-readiness definition and is recorded separately.
 
-The proposed pilot targets are one successful first attempt, zero cancellations
-and unsupported outcomes, and readiness within 120% of the observed baseline
-(89.465836 seconds). They await operator agreement. A successful pilot on this
-one node cannot establish fleet-wide failure probabilities; retry recovery
-remains unmeasured unless a real failed series is retried.
+On 2026-09-22 the operator accepted these pilot targets: one successful first
+attempt, zero cancellations and unsupported outcomes, and readiness at or below
+89.5 seconds (rounded from 120% of the observed baseline). The measured candidate
+meets every accepted target. A successful pilot on this one node cannot establish
+fleet-wide failure probabilities; retry recovery remains unmeasured unless a real
+failed series is retried.
 
 The candidate completed one first attempt successfully, with a recorded readiness
 duration of 72.521237 seconds and no cancellation or unsupported outcome. This
-is 97.27% of the observed baseline duration and meets the proposed threshold.
+is 97.27% of the observed baseline duration and meets the accepted threshold.
 The complete recovery cycle took 636.394442 seconds, including placement delays.
 The same inference request returned HTTP 200 and `READY`; all six original
 serving nodes were healthy afterward. One sample per version establishes this
@@ -204,7 +205,7 @@ For additional cohorts, follow this procedure:
 5. Fill in the record below and link both exports and diagnostic bundles before
    closing the fleet-validation criteria of issue #124.
 
-| Observation | Matched baseline | Canary | Proposed pilot target (agreement pending) |
+| Observation | Matched baseline | Canary | Accepted pilot target |
 | --- | --- | --- | --- |
 | Host cohort and workload | One L4; existing Qwen3.6 profile above | Same node, artifact, and requested profile | Preserve workload |
 | Provisioning attempt ID | `dc078743e2f94134b97fc69097b68726` | `b72add89a89649d7a8e6babfed88c6d5` | Exact attempt drill-down |
@@ -213,7 +214,7 @@ For additional cohorts, follow this procedure:
 | Terminal attempt outcomes | 1 succeeded, 0 failed | 1 succeeded, 0 failed | 1 successful first attempt |
 | First-attempt success (count/denominator) | Legacy report unmeasured; supervised cycle observed 1 success in 1 attempt | 1/1 (100%) | 1/1 |
 | Retry recovery (count/denominator) | Unmeasured (0 eligible series) | Unmeasured | Observe real retries only |
-| Readiness median and sample count | Legacy report unmeasured; operator observed 74.554863 s | 72.521237 s, 1 sample | At most 89.465836 s |
+| Readiness median and sample count | Legacy report unmeasured; operator observed 74.554863 s | 72.521237 s, 1 sample | At most 89.5 s |
 | Cancellation / unsupported counts | 0/1 each | 0/1 each | 0 each |
 | Unknown outcomes and evidence gaps | 0 unknown outcomes; 1 unknown origin/environment and incomplete manifest | 0 unknown outcomes/origins; 1 incomplete manifest with 3 unknown environment dimensions | Keep evidence gaps visible |
 | Full recovery cycle, including placement delays | 626.648662 s | 636.394442 s | Record separately |
