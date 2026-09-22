@@ -4,7 +4,11 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>QIIP - Fleet reliability</title>
+    <meta name="description" content="Inspect fleet provisioning outcomes, recurring failures, and retained diagnostic evidence.">
     <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
     <link rel="stylesheet" href="{{ static_asset_url(request, 'css/reliability.css') }}">
     <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
@@ -15,13 +19,13 @@
     <div class="dashboard">
         <header class="dashboard-header">
             <div><h1>Fleet reliability</h1><p>Provisioning outcomes from retained attempts</p></div>
-            <a class="btn" href="/dashboard/admin">Back to admin</a>
+            <div class="header-right"><a class="btn" href="/dashboard/admin">Back to admin</a></div>
         </header>
         <main id="main-content">
             <section class="card" aria-label="Report filters">
                 <form id="reliability-filters" class="reliability-filters">
-                    <label>From (UTC, inclusive)<input id="reliability-since" type="datetime-local"></label>
-                    <label>To (UTC, exclusive)<input id="reliability-until" type="datetime-local"></label>
+                    <label>From (local time, inclusive)<input id="reliability-since" type="datetime-local" step="1"></label>
+                    <label>To (local time, exclusive)<input id="reliability-until" type="datetime-local" step="1"></label>
                     <label>Hostnames (comma separated)<input id="reliability-hostnames" type="text" placeholder="All retained hosts"></label>
                     <label>Group failures by<select id="reliability-group">
                         <option value="signature">Error signature</option><option value="stage">Stage</option>
@@ -62,6 +66,9 @@
             <noscript>This report requires JavaScript. Use the authenticated /admin/provisioning/reliability JSON endpoint to retrieve the measurements.</noscript>
         </main>
     </div>
+    <footer>
+        <p>QIIP Inference Proxy</p>
+    </footer>
     <script src="{{ static_asset_url(request, 'js/reliability.js') }}"></script>
 </body>
 </html>

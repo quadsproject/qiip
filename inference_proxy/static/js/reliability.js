@@ -74,20 +74,28 @@ document.addEventListener("DOMContentLoaded", function () {
     get("download").hidden = true;
     get("report").hidden = true;
     get("status").textContent = "Loading report...";
-    ["since", "until"].forEach(function (key) {
-      if (get(key).value) params.set(key, get(key).value + ":00Z");
-    });
-    get("hostnames").value.split(",").map(function (host) { return host.trim(); }).filter(Boolean)
-      .forEach(function (host) { params.append("hostname", host); });
-    params.set("group_by", get("group").value);
-    var url = "/admin/provisioning/reliability?" + params.toString();
     try {
+      ["since", "until"].forEach(function (key) {
+        if (get(key).value) params.set(key, new Date(get(key).value).toISOString());
+      });
+      get("hostnames").value.split(",").map(function (host) { return host.trim(); }).filter(Boolean)
+        .forEach(function (host) { params.append("hostname", host); });
+      params.set("group_by", get("group").value);
+      var url = "/admin/provisioning/reliability?" + params.toString();
       var response = await fetch(url);
-      if (!response.ok) throw new Error("Report unavailable (" + response.status + "). Check the time range and hostnames, then retry.");
+      if (!response.ok) {
+        var message = "Report unavailable (" + response.status + "). Please retry.";
+        try {
+          var detail = (await response.json()).detail;
+          if (Array.isArray(detail)) detail = detail.map(function (item) { return item && item.msg; }).filter(Boolean).join("; ");
+          if (typeof detail === "string" && detail) message = detail;
+        } catch (_) { /* A proxy may return a non-JSON error body. */ }
+        throw new Error(message);
+      }
       var report = await response.json();
       if (current !== generation) return;
       render(report);
-      get("status").textContent = "Snapshot: " + report.generated_at + ". Times are UTC; records are selected by attempt start.";
+      get("status").textContent = "Snapshot: " + report.generated_at + ". Filters use your local time; report and export timestamps are UTC. Records are selected by attempt start.";
       get("download").href = url + "&download=true";
       get("download").hidden = false;
     } catch (error) { if (current === generation) get("status").textContent = error.message; }

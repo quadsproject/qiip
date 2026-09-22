@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+_SOURCE_RECORD_BUDGET = 201
+
 
 def timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()  # noqa: UP017 - node Python 3.9
@@ -78,6 +80,11 @@ class AttemptLogStore:
                 AFTER DELETE ON records BEGIN
                     UPDATE statistics SET value=value-OLD.bytes WHERE name='retained_bytes';
                 END;
+                CREATE TRIGGER IF NOT EXISTS attempt_host_eviction
+                AFTER DELETE ON attempts BEGIN
+                    INSERT INTO statistics VALUES ('evicted_attempts:' || OLD.hostname, 1)
+                    ON CONFLICT(name) DO UPDATE SET value=value+1;
+                END;
             """)
             db.execute("BEGIN IMMEDIATE")
             if (
@@ -90,6 +97,14 @@ class AttemptLogStore:
                 db.execute(
                     "INSERT INTO statistics SELECT 'retained_bytes', coalesce(sum(bytes),0) FROM records"
                 )
+            # Historical eviction totals cannot be attributed to individual hosts.
+            db.execute(
+                "INSERT OR IGNORE INTO statistics "
+                "SELECT 'unattributed_evicted_attempts', value - "
+                "(SELECT coalesce(sum(value),0) FROM statistics "
+                "WHERE name LIKE 'evicted_attempts:%') "
+                "FROM statistics WHERE name='evicted_attempts'"
+            )
             self._prune(db)
 
     @contextmanager
@@ -150,7 +165,11 @@ class AttemptLogStore:
                     and previous.get("stage") != "cancelled"
                 )
                 evicted = db.execute(
-                    "SELECT value FROM statistics WHERE name='evicted_attempts'"
+                    "SELECT value FROM statistics WHERE name=?",
+                    ("evicted_attempts:" + hostname,),
+                ).fetchone()
+                unattributed = db.execute(
+                    "SELECT value FROM statistics WHERE name='unattributed_evicted_attempts'"
                 ).fetchone()[0]
                 metadata.update(
                     requested_model=model,
@@ -167,7 +186,7 @@ class AttemptLogStore:
                     else 1,
                     series_origin_known=bool(previous.get("series_origin_known"))
                     if retry
-                    else bool(prior or not evicted),
+                    else bool(prior or not (evicted or unattributed)),
                 )
             db.execute(
                 "INSERT INTO attempts(id,hostname,created,metadata) VALUES(?,?,?,?)",
@@ -185,23 +204,47 @@ class AttemptLogStore:
                 raise KeyError(attempt_id)
             return self._manifest(row)
 
+    @staticmethod
+    def _source_records(
+        db: sqlite3.Connection,
+        attempt_id: str,
+        source: str,
+        *,
+        first_seq: int = 0,
+        last_seq: int | None = None,
+        newest_first: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Read a bounded source, including one record to detect overflow."""
+        order = "DESC" if newest_first else "ASC"
+        rows = db.execute(
+            "SELECT payload FROM records WHERE attempt=? "
+            "AND json_extract(payload,'$.source')=? "
+            "AND seq>=? AND (? IS NULL OR seq<=?) "
+            f"ORDER BY seq {order} LIMIT ?",
+            (
+                attempt_id,
+                source,
+                first_seq,
+                last_seq,
+                last_seq,
+                _SOURCE_RECORD_BUDGET + 1,
+            ),
+        ).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
     def tail(self, attempt_id: str, source: str, *, max_bytes: int) -> dict[str, Any]:
         """Read a bounded suffix for a diagnostic snapshot, newest evidence first."""
         with self._db() as db:
-            rows = db.execute(
-                "SELECT payload FROM records WHERE attempt=? "
-                "AND json_extract(payload,'$.source')=? ORDER BY seq DESC LIMIT 201",
-                (attempt_id, source),
-            ).fetchall()
-        if not rows:
+            records = self._source_records(db, attempt_id, source, newest_first=True)
+        if not records:
             return dict(
                 status="unavailable", reason="No retained output for this source"
             )
-        records = [json.loads(row[0]) for row in reversed(rows)]
+        records = list(reversed(records[:_SOURCE_RECORD_BUDGET]))
         raw = "\n".join(r["msg"] for r in records).encode("utf-8")
         lines = raw[-max_bytes:].decode("utf-8", errors="ignore").splitlines()
         truncated = (
-            len(rows) == 201
+            len(records) == _SOURCE_RECORD_BUDGET
             or len(raw) > max_bytes
             or len(lines) > 200
             or any(r["truncated"] for r in records)
@@ -300,15 +343,16 @@ class AttemptLogStore:
                         or first < row["dropped"]
                     ):
                         continue
-                    records = db.execute(
-                        "SELECT payload FROM records WHERE attempt=? AND seq BETWEEN ? AND ? "
-                        "AND json_extract(payload,'$.source')=? ORDER BY seq LIMIT 202",
-                        (row["id"], first, last, "diagnostics." + name),
-                    ).fetchall()
-                    values = [json.loads(record[0]) for record in records]
+                    values = self._source_records(
+                        db,
+                        row["id"],
+                        "diagnostics." + name,
+                        first_seq=first,
+                        last_seq=last,
+                    )
                     if (
                         not values
-                        or len(values) > 201
+                        or len(values) > _SOURCE_RECORD_BUDGET
                         or values[0]["seq"] != first
                         or values[-1]["seq"] != last
                         or any(value["truncated"] for value in values)
@@ -322,7 +366,14 @@ class AttemptLogStore:
             evicted = db.execute(
                 "SELECT value FROM statistics WHERE name='evicted_attempts'"
             ).fetchone()[0]
-        return dict(attempts=attempts, evicted_attempts=evicted)
+            unattributed = db.execute(
+                "SELECT value FROM statistics WHERE name='unattributed_evicted_attempts'"
+            ).fetchone()[0]
+        return dict(
+            attempts=attempts,
+            evicted_attempts=evicted,
+            unattributed_evicted_attempts=unattributed,
+        )
 
     def latest_running(self, hostname: str, exclude: str | None = None) -> str | None:
         """Return the newest running attempt id for *hostname*.
@@ -514,7 +565,6 @@ class AttemptLogStore:
             profile = re.search(r"\[PROFILE:select:([\w.-]+) \(([^\]\r\n]+)\)\]", msg)
             if profile:
                 metadata["runtime_profile"] = profile.group(1)[:200]
-                metadata["hardware_signature"] = profile.group(2)[:2048]
         if journal_cursor is not None:
             if metadata.get("journal_cursor") == journal_cursor:
                 return None

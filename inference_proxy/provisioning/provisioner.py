@@ -588,6 +588,7 @@ class NodeProvisioner:
                 and task not in self._explicit_cancel_tasks
                 and store
                 and attempt_id
+                and store.get(attempt_id)["status"] != "complete"
             ):
                 store.update(
                     attempt_id,
@@ -940,7 +941,11 @@ class NodeProvisioner:
         if store is not None and attempt_id is not None:
             fields: dict[str, object] = {"stage": failed_step or step.value}
             if step == ProvisioningStep.COMPLETE:
-                fields["ready_at"] = now.isoformat()
+                fields.update(
+                    status="complete",
+                    ready_at=now.isoformat(),
+                    finished_at=now.isoformat(),
+                )
             if error:
                 failure = store.get(attempt_id).get("failure")
                 fields.update(
@@ -2111,6 +2116,16 @@ class NodeProvisioner:
                     placement=placement,
                 )
         except asyncio.CancelledError:
+            store = self._log_buffer.store
+            attempt_id = self._log_buffer.attempts.get(hostname)
+            attempt = store.get(attempt_id) if store and attempt_id else {}
+            if (
+                attempt.get("status") == "complete"
+                and attempt.get("stage") == "complete"
+            ):
+                # Cancellation during final log retrieval cannot undo registration.
+                self._mark_log_complete(hostname)
+                raise
             explicit = asyncio.current_task() in self._explicit_cancel_tasks
             message = (
                 "Provisioning cancelled by teardown"
