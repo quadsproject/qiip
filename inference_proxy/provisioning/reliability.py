@@ -261,6 +261,10 @@ def build_report(
         warnings.append(
             "Retention evicted attempt manifests. This report is not a complete fleet history; export cohorts before they expire."
         )
+    if snapshot["unattributed_evicted_attempts"]:
+        warnings.append(
+            "Historical evictions predate per-host tracking. New attempts without a retained predecessor have unknown origins because the evicted hostnames are unavailable."
+        )
     return {
         "schema_version": 1,
         "signature_version": 1,
@@ -314,6 +318,7 @@ def build_report(
             unknown_origin_attempts=sum(not a["series_origin_known"] for a in attempts),
             invalid_start_times=invalid_dates,
             evicted_attempts=snapshot["evicted_attempts"],
+            unattributed_evicted_attempts=snapshot["unattributed_evicted_attempts"],
             excluded_operations=len(snapshot["attempts"]) - len(all_attempts),
         ),
         "warnings": warnings,

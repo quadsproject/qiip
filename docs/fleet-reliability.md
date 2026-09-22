@@ -5,8 +5,10 @@ Open **Admin > Fleet reliability** (`/dashboard/reliability`). The page and
 reads the gateway's retained SQLite attempt records; it never contacts a node
 or runs setup, launch, or diagnostic commands.
 
-Filter by UTC start time and representative hostnames, inspect recurring
-failures, and download JSON. `since` is inclusive and `until` exclusive; both
+Filter by start time and representative hostnames, inspect recurring failures,
+and download JSON. The page accepts browser-local date and time and converts
+them to UTC for both the report and download. Report and export timestamps are
+UTC. API `since` is inclusive and `until` exclusive; both
 require timezone offsets. Repeat `hostname` to select multiple nodes. The
 `group_by` parameter accepts `signature`, `stage`, `engine`, `runtime_version`,
 `gpu_family`, `os`, `kernel`, `bundle_version`, or `all`. `download=true` returns
@@ -21,6 +23,12 @@ record. Registration/adoption, relaunch, and teardown are excluded. Rejected
 API requests, power-on failures, and reconcile failures that occur before an
 attempt record exists are outside the denominator.
 
+Without a time window, attempts with invalid or missing start timestamps remain
+in the report and may contribute to outcome counts and denominators. Setting
+either time bound excludes those attempts because their position in the window
+is unknown. `evidence.invalid_start_times` counts them within the selected host
+cohort in both cases.
+
 A provisioning series starts with the first recorded setup for a host and
 requested engine/model. Subsequent failed, running, or interrupted attempts
 for that same target belong to the series. A completed operation, explicit
@@ -31,8 +39,13 @@ automatically selected model retains the original unspecified requested target.
 Series identity, ordinal, and start time are committed with the attempt and
 survive gateway restarts. This defines first attempts within recorded series,
 not the first setup in a machine's lifetime. Legacy attempts without this
-identity have unknown origins. If retention has removed history and there is
-no retained predecessor, a new origin is conservatively unknown. Legacy
+identity have unknown origins. Evictions are tracked per host: if retention has
+removed that host's history and there is no retained predecessor, a new origin
+is conservatively unknown. Evictions on unrelated hosts do not affect it.
+Older stores may contain eviction totals without hostnames. These are reported
+as `evidence.unattributed_evicted_attempts` with a warning; when that count is
+nonzero, attempts without a retained predecessor still have unknown origins.
+The upgrade cannot recover hostnames from already deleted records. Legacy
 records remain available for outcomes, failure grouping, and drill-down.
 
 | Measure | Numerator / sample | Denominator |

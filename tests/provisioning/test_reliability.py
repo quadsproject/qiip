@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 from datetime import UTC, datetime, timedelta
@@ -18,6 +19,7 @@ from inference_proxy.provisioning.log_store import AttemptLogStore
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.provisioning.reliability import DIMENSIONS, build_report
 from inference_proxy.provisioning.ssh_client import RemoteCommandError
+from inference_proxy.provisioning.state import ProvisioningStep
 from tests.provisioning.test_attempt_logs import LocalNodeSSH
 from tests.provisioning.test_attempt_logs import harness as harness
 from tests.provisioning.test_diagnostics import _prepare
@@ -166,10 +168,101 @@ def test_eviction_legacy_and_empty_denominators(tmp_path: Path) -> None:
     assert report["evidence"]["evicted_attempts"] == 1
     assert report["metrics"]["retry_recovery"]["denominator"] == 0
     new = store.create("unseen-host", engine="vllm")
-    assert store.get(new)["series_origin_known"] is False
+    assert store.get(new)["series_origin_known"] is True
+    store.update(new, status="complete", stage="complete")
+    report = build_report(store)
+    assert report["metrics"]["first_attempt_success"]["percent"] == 100
+    reopened = AttemptLogStore(store.path, max_attempts=1)
+    returning = reopened.create("host", engine="vllm")
+    assert reopened.get(returning)["series_origin_known"] is False
     empty = build_report(store, hostnames=["absent"])
     assert empty["metrics"]["first_attempt_success"]["percent"] is None
     assert empty["metrics"]["time_to_usable_inference"]["median_seconds"] is None
+
+
+def test_expired_teardown_only_obscures_its_own_host(tmp_path: Path) -> None:
+    store = AttemptLogStore(tmp_path / "expired.sqlite3")
+    old = store.create("old-host", operation="teardown")
+    store.update(old, status="complete", stage="teardown_complete")
+    with store._db() as db:
+        db.execute("UPDATE attempts SET created=0 WHERE id=?", (old,))
+    reopened = AttemptLogStore(store.path)
+    new = reopened.create("new-host", engine="vllm")
+    assert reopened.get(new)["series_origin_known"] is True
+    returning = reopened.create("old-host", engine="vllm")
+    assert reopened.get(returning)["series_origin_known"] is False
+    reopened.update(returning, status="complete", stage="complete")
+    fresh_series = reopened.create("old-host", engine="vllm")
+    assert reopened.get(fresh_series)["series_origin_known"] is True
+
+
+def test_invalid_start_is_retained_only_without_time_bounds(
+    fleet: AttemptLogStore,
+) -> None:
+    fleet.update("b1", started_at="invalid")
+    report = build_report(fleet, hostnames=["first-success"])
+    assert report["attempt_count"] == 1
+    assert report["evidence"]["invalid_start_times"] == 1
+    assert report["metrics"]["first_attempt_success"]["percent"] == 100
+    for since, until in ((START, None), (None, START + timedelta(days=1))):
+        report = build_report(
+            fleet, hostnames=["first-success"], since=since, until=until
+        )
+        assert report["attempt_count"] == 0
+        assert report["evidence"]["invalid_start_times"] == 1
+        assert report["metrics"]["first_attempt_success"]["percent"] is None
+
+
+def test_upgrade_preserves_unattributed_historical_evictions(tmp_path: Path) -> None:
+    store = AttemptLogStore(tmp_path / "legacy.sqlite3")
+    with store._db() as db:
+        db.execute("DELETE FROM statistics WHERE name='unattributed_evicted_attempts'")
+        db.execute("UPDATE statistics SET value=2 WHERE name='evicted_attempts'")
+    reopened = AttemptLogStore(store.path)
+    first = reopened.create("host", engine="vllm")
+    assert not reopened.get(first)["series_origin_known"]
+    reopened.update(first, status="complete", stage="complete")
+    next_series = reopened.create("host", engine="vllm")
+    assert reopened.get(next_series)["series_origin_known"]
+    report = build_report(AttemptLogStore(store.path))
+    assert report["evidence"]["unattributed_evicted_attempts"] == 2
+    assert any("predate per-host tracking" in warning for warning in report["warnings"])
+
+
+@pytest.mark.parametrize("count", [200, 201, 202])
+def test_source_read_limits_preserve_latest_tail_and_exact_snapshot(
+    tmp_path: Path, count: int
+) -> None:
+    store = AttemptLogStore(tmp_path / "source.sqlite3")
+    attempt = store.create("host")
+    _source(store, attempt, "kernel", "old snapshot")
+    records = store.append_many(
+        attempt,
+        [dict(source="diagnostics.kernel", msg=f"line-{i}") for i in range(count)],
+    )
+    store.update(
+        attempt,
+        diagnostics={
+            "sources": {
+                "kernel": dict(
+                    status="collected",
+                    first_seq=records[0]["seq"],
+                    last_seq=records[-1]["seq"],
+                )
+            }
+        },
+    )
+    store.append(attempt, "different source")
+    tail = store.tail(attempt, "diagnostics.kernel", max_bytes=65536)
+    assert tail["truncated"]
+    assert tail["output"].splitlines() == [
+        f"line-{i}" for i in range(count - 200, count)
+    ]
+    evidence = store.reliability_snapshot()["attempts"][0]["environment_evidence"]
+    if count <= 201:
+        assert evidence["kernel"] == "".join(f"line-{i}" for i in range(count))
+    else:
+        assert "kernel" not in evidence
 
 
 def test_success_requires_registration_and_readiness_time_is_not_invented(
@@ -355,3 +448,51 @@ async def test_real_setup_failure_then_launch_success_is_one_recovered_series(
     assert report["metrics"]["retry_recovery"]["percent"] == 100
     assert report["metrics"]["time_to_usable_inference"]["samples"] == 1
     assert ssh.launches == 3  # failed setup, retried setup, successful start
+
+
+@pytest.mark.parametrize("entrypoint", ["_provision", "provision"])
+async def test_registered_success_survives_shutdown_before_log_finalization(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+    entrypoint: str,
+) -> None:
+    provisioner, ssh, store = harness
+    _prepare(provisioner, ssh)
+    provisioner._poll_health = AsyncMock()  # type: ignore[method-assign]
+    provisioner._finish_remote_logs = AsyncMock(  # type: ignore[method-assign]
+        side_effect=asyncio.CancelledError
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await getattr(provisioner, entrypoint)("host1", model="org/model")
+    reopened = AttemptLogStore(store.path)
+    reopened.interrupt_running()
+    report = build_report(reopened)
+    assert report["outcomes"]["success"] == 1
+    attempt = report["attempts"][0]
+    assert attempt["ready_at"] == attempt["finished_at"]
+    assert report["metrics"]["first_attempt_success"]["percent"] == 100
+    assert report["metrics"]["time_to_usable_inference"]["samples"] == 1
+
+
+async def test_late_cancellation_does_not_overwrite_recorded_success(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    provisioner, _, store = harness
+    provisioner.log_buffer.create("host1")
+    await provisioner._update_state("host1", ProvisioningStep.COMPLETE)
+    registered = asyncio.Event()
+
+    async def finalize() -> None:
+        try:
+            registered.set()
+            await asyncio.Event().wait()
+        finally:
+            provisioner._mark_log_complete("host1")
+
+    task = asyncio.create_task(finalize())
+    await registered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert build_report(store)["outcomes"]["success"] == 1
+    attempt = store.get(provisioner.log_buffer.attempts["host1"])
+    assert attempt["finished_at"] == attempt["ready_at"]

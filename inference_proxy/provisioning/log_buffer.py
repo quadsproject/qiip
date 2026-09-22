@@ -194,7 +194,7 @@ class ProvisioningLogBuffer:
             current = self.store.get(attempt_id)
             self.store.update(
                 attempt_id,
-                finished_at=datetime.now(UTC).isoformat(),
+                finished_at=current.get("finished_at") or datetime.now(UTC).isoformat(),
                 status="complete"
                 if current["status"] == "running"
                 else current["status"],
