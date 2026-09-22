@@ -46,13 +46,14 @@ from inference_proxy.config.dependencies import (
 )
 from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.registry import NodeRegistry
-from inference_proxy.models.node import NodeStatus
+from inference_proxy.models.node import InferenceEngine, NodeStatus
 from inference_proxy.onboarding.harness import HARNESSES, Harness, get_harness
 from inference_proxy.onboarding.script import (
     HEREDOC_DELIMITER,
     render_expired_script,
     render_setup_script,
 )
+from inference_proxy.placement.catalog import BUILTIN_PROFILES
 
 logger = structlog.get_logger()
 
@@ -167,6 +168,48 @@ def _served_routes() -> set[str]:
     return {getattr(route, "path", "") for route in inference_router.routes}
 
 
+def _model_details(
+    user: User, settings: Settings, registry: NodeRegistry, models: list[str]
+) -> dict[str, dict[str, object]]:
+    """Describe verified profile runtimes, never infer capabilities from a name."""
+    nodes = registry.get_all()
+    pickable = set(
+        pickable_endpoints(user.email, settings, nodes, is_admin=user.is_admin)
+    )
+    profiles = {(p.profile_id, p.version): p for p in BUILTIN_PROFILES}
+    details: dict[str, dict[str, object]] = {}
+    for model in models:
+        limits: list[int] = []
+        for node in nodes:
+            if (
+                node.model != model
+                or node.node_id not in pickable
+                or node.status != NodeStatus.HEALTHY
+            ):
+                continue
+            runtime = node.llamacpp_runtime
+            configured = runtime.requested.profile if runtime else None
+            profile = (
+                profiles.get((configured.profile_id, configured.profile_version))
+                if configured
+                else None
+            )
+            # A shared alias may also route to a custom or self-setup runtime.
+            # Do not present a profile's limits as a promise for those routes.
+            if node.engine != InferenceEngine.LLAMA_CPP or not runtime or not profile:
+                limits = []
+                break
+            limits.append(min(profile.context, runtime.effective.slot_context_limit))
+        if limits:
+            details[model] = {
+                "context_tokens": min(limits),
+                # All four catalog profiles explicitly launch with --no-mmproj
+                # in auto-llamacpp/start-llamacpp.sh's managed profile path.
+                "input_modalities": ["text"],
+            }
+    return details
+
+
 def _harness_view(harness: Harness, served: set[str]) -> dict[str, object]:
     return {
         "id": harness.id,
@@ -238,6 +281,7 @@ async def onboarding_state(
     """Everything the page needs: identity, token, models, harnesses."""
     token = await asyncio.to_thread(store.get_active_token, user.id)
     served = _served_routes()
+    models = _available_models(user, settings, registry)
     return {
         "user": {
             "name": user.name,
@@ -246,7 +290,8 @@ async def onboarding_state(
             "is_admin": user.is_admin,
         },
         "token": _token_view(token),
-        "models": _available_models(user, settings, registry),
+        "models": models,
+        "model_details": _model_details(user, settings, registry, models),
         "harnesses": [_harness_view(harness, served) for harness in HARNESSES],
     }
 

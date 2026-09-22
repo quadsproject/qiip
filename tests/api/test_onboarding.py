@@ -18,10 +18,12 @@ from inference_proxy.auth.dependencies import get_auth_plugin
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.registry import NodeRegistry
-from inference_proxy.models.node import Node, NodeStatus
+from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.onboarding.harness import HARNESSES, get_harness
 from inference_proxy.onboarding.script import render_setup_script
+from inference_proxy.placement.catalog import BUILTIN_PROFILES, ModelProfile
 from tests.auth.conftest import FakeAuthPlugin
+from tests.provisioning.test_llamacpp_relaunch import _runtime
 
 SECRET = "test-session-secret"
 MODEL_A = "org/model-a"
@@ -53,6 +55,85 @@ def user_client(
     )
     assert response.headers["location"] == "/start"
     return client
+
+
+@pytest.mark.parametrize("profile", BUILTIN_PROFILES, ids=lambda p: p.profile_id)
+def test_model_information_uses_approved_runtime(
+    user_client: TestClient, test_registry: NodeRegistry, profile: ModelProfile
+) -> None:
+    request = profile.runtime_request(
+        reserve_mib=256,
+        draft_artifact_id="a" * 64 if profile.draft else None,
+        gpu_class="l4",
+    )
+    runtime = _runtime(request)
+    test_registry.add(
+        _node(
+            "profile-host",
+            profile.target.repo_id,
+            engine=InferenceEngine.LLAMA_CPP,
+            llamacpp_runtime=runtime,
+        )
+    )
+    state = user_client.get("/onboarding/state").json()
+    assert state["model_details"] == {
+        profile.target.repo_id: {
+            "context_tokens": profile.context,
+            "input_modalities": ["text"],
+        }
+    }
+    assert MODEL_A in state["models"] and MODEL_A not in state["model_details"]
+
+    # A lower observed limit wins over the catalog's configured ceiling.
+    lower = runtime.model_copy(
+        update={
+            "effective": runtime.effective.model_copy(
+                update={"slot_context_limit": 8192}
+            )
+        }
+    )
+    test_registry.add(
+        _node(
+            "smaller-host",
+            profile.target.repo_id,
+            engine=InferenceEngine.LLAMA_CPP,
+            llamacpp_runtime=lower,
+        )
+    )
+    assert (
+        user_client.get("/onboarding/state").json()["model_details"][
+            profile.target.repo_id
+        ]["context_tokens"]
+        == 8192
+    )
+
+    # A custom route sharing the model ID prevents unsupported promises.
+    test_registry.add(_node("custom-host", profile.target.repo_id))
+    assert (
+        profile.target.repo_id
+        not in user_client.get("/onboarding/state").json()["model_details"]
+    )
+
+
+def test_model_information_does_not_expose_private_profiles(
+    user_client: TestClient, test_registry: NodeRegistry
+) -> None:
+    profile = BUILTIN_PROFILES[0]
+    runtime = _runtime(
+        profile.runtime_request(reserve_mib=256, draft_artifact_id=None, gpu_class="l4")
+    )
+    test_registry.add(
+        _node(
+            "private-profile",
+            profile.target.repo_id,
+            engine=InferenceEngine.LLAMA_CPP,
+            llamacpp_runtime=runtime,
+            owner="someone-else@example.com",
+        )
+    )
+    state = user_client.get("/onboarding/state").json()
+    assert profile.target.repo_id not in state["models"]
+    assert state["model_details"] == {}
 
 
 def _mint(
@@ -122,7 +203,14 @@ class TestStartPage:
         assert harnesses["codex"]["multi_model"] is False
 
     @pytest.mark.parametrize(
-        "asset", ["css/dashboard.css", "css/start.css", "js/start.js", "img/qiip.svg"]
+        "asset",
+        [
+            "css/dashboard.css",
+            "css/start.css",
+            "js/start.js",
+            "js/model_info.js",
+            "img/qiip.svg",
+        ],
     )
     def test_assets_are_content_versioned(
         self, user_client: TestClient, asset: str

@@ -133,6 +133,7 @@
 
   // ---- step engine --------------------------------------------------------
   function show(stepEl, dir, onEnter) {
+    window.QiipModelInfo.close();
     var previous = current;
     clearInterval(countdown);
     transitioning = true;
@@ -393,12 +394,12 @@
       if (!choice.models.length && available.length === 1) choice.models = [available[0]];
 
       var go = button(choice.mint ? "Create my token" : "Get my setup command", null, true);
-      var grid = el("div", "ob-choices is-list");
+      var grid = el("div", "ob-choices is-models");
       grid.setAttribute("role", "group");
       grid.setAttribute("aria-label", "Models");
       var sync = function () {
         go.disabled = choice.models.length === 0;
-        Array.prototype.forEach.call(grid.children, function (card) {
+        Array.prototype.forEach.call(grid.querySelectorAll("button[data-model]"), function (card) {
           card.setAttribute(
             "aria-pressed",
             String(choice.models.indexOf(card.dataset.model) !== -1)
@@ -409,7 +410,7 @@
         var card = el("button", "ob-choice is-mono" + (multi ? " is-multi" : ""));
         card.type = "button";
         card.dataset.model = model;
-        card.appendChild(el("span", "ob-choice-label", model));
+        card.appendChild(el("span", "ob-choice-label", window.QiipModelInfo.displayName(model)));
         card.addEventListener("click", function () {
           var at = choice.models.indexOf(model);
           if (!multi) choice.models = [model];
@@ -417,7 +418,7 @@
           else choice.models.splice(at, 1);
           sync();
         });
-        grid.appendChild(card);
+        grid.appendChild(window.QiipModelInfo.wrap(card, model, (data.model_details || {})[model]));
       });
       sync();
 
@@ -488,7 +489,12 @@
         grid,
         actions
       );
-      return { nodes: nodes, primary: go, enterHint: true };
+      return { nodes: nodes, primary: go, enterHint: true, onEnter: function () {
+        window.QiipModelInfo.sizeChoices(grid);
+        if (document.fonts) document.fonts.ready.then(function () {
+          if (grid.isConnected) window.QiipModelInfo.sizeChoices(grid);
+        });
+      } };
     },
 
     done: function () {
@@ -667,13 +673,14 @@
       // unrestricted, and narrowing it here could not be undone.
       var editable = token.exportable;
       var paint = function () {
-        Array.prototype.forEach.call(chips.children, function (chip) {
+        Array.prototype.forEach.call(chips.querySelectorAll("button[data-model]"), function (chip) {
           chip.setAttribute("aria-pressed", String(active.indexOf(chip.dataset.model) !== -1));
         });
       };
       all.forEach(function (model) {
         var offline = data.models.indexOf(model) === -1;
-        var chip = el("button", "ob-model", offline ? model + " (offline)" : model);
+        var name = window.QiipModelInfo.displayName(model);
+        var chip = el("button", "ob-model", offline ? name + " (offline)" : name);
         chip.type = "button";
         chip.dataset.model = model;
         chip.disabled = !editable;
@@ -706,7 +713,7 @@
             }
           });
         });
-        chips.appendChild(chip);
+        chips.appendChild(window.QiipModelInfo.wrap(chip, model, (data.model_details || {})[model]));
       });
       paint();
       card.append(row, facts, labelRow, chips);
