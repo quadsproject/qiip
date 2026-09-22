@@ -1,6 +1,6 @@
 /* Automatic model placement card on the admin page.
  *
- * Read-only: shows what GET /admin/placement reports. Everything is written
+ * Shows placement status and lets admins resume suspended hosts. Everything is written
  * with textContent, so host names and error text from the API are never
  * interpreted as markup.
  */
@@ -71,6 +71,54 @@ function fillPlacementTable(body, rows, columns, emptyText) {
   }
 }
 
+function fillSuspendedHosts(hosts) {
+  const section = document.getElementById("placement-suspensions");
+  const body = document.getElementById("placement-suspension-body");
+  section.hidden = hosts.length === 0;
+  body.replaceChildren();
+  for (const hostname of hosts) {
+    const tr = document.createElement("tr");
+    const host = document.createElement("td");
+    host.textContent = hostname;
+    const action = document.createElement("td");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn btn-neutral";
+    button.textContent = "Resume automatic placement";
+    button.setAttribute("aria-label", "Resume automatic placement for " + hostname);
+    button.addEventListener("click", async () => {
+      const confirmed = await confirmDialog({
+        title: "Resume automatic placement",
+        message: hostname + " will be eligible on the next placement pass, subject to availability and configuration.",
+        confirmLabel: "Resume",
+        danger: false,
+      });
+      if (!confirmed) return;
+      button.disabled = true;
+      const status = document.getElementById("placement-resume-status");
+      status.textContent = "Resuming " + hostname + "…";
+      try {
+        const response = await fetch("/admin/placement/suspensions/" + encodeURIComponent(hostname), {
+          method: "DELETE",
+        });
+        if (!response.ok) {
+          const error = await response.json();
+          throw new Error(error.detail || "HTTP " + response.status);
+        }
+        status.textContent = "Automatic placement resumed for " + hostname + ".";
+        await refreshPlacement();
+      } catch (error) {
+        status.textContent = "Could not resume: " + error.message;
+        button.disabled = false;
+      }
+    });
+    action.appendChild(button);
+    tr.appendChild(host);
+    tr.appendChild(action);
+    body.appendChild(tr);
+  }
+}
+
 async function refreshPlacement() {
   const status = document.getElementById("placement-status");
   if (!status) return;
@@ -79,6 +127,7 @@ async function refreshPlacement() {
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const data = await resp.json();
     status.textContent = placementSummary(data);
+    fillSuspendedHosts(data.suspended_hosts || []);
     fillPlacementTable(document.getElementById("placement-profile-body"),
       placementProfileRows(data), 7, "No catalog profiles to show.");
     fillPlacementTable(document.getElementById("placement-issue-body"),

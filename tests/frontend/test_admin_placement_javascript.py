@@ -155,3 +155,64 @@ def test_the_card_never_builds_markup_from_api_text() -> None:
 
     assert "innerHTML" not in source
     assert "insertAdjacentHTML" not in source
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+def test_resume_action_requires_confirmation_and_preserves_errors(outcome: str) -> None:
+    node = shutil.which("node")
+    assert node is not None
+    harness = r"""
+const fs = require('fs');
+const vm = require('vm');
+const context = {};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+const elements = {};
+function element() {
+  return {children: [], textContent: '', disabled: false,
+    appendChild(child) { this.children.push(child); },
+    replaceChildren() { this.children = []; },
+    setAttribute(name, value) { this[name] = value; },
+    addEventListener(name, handler) { this[name] = handler; }};
+}
+context.document = {createElement: element,
+  getElementById(id) { return elements[id] ||= element(); }};
+const outcome = process.argv[2];
+const requests = [];
+let confirmations = 0, refreshed = false;
+context.confirmDialog = async () => { confirmations++; return outcome !== 'cancel'; };
+context.fetch = async (url, options) => {
+  requests.push([url, options.method]);
+  return {ok: outcome === 'success', status: 409,
+    json: async () => ({detail: 'Host lifecycle operation in progress'})};
+};
+context.refreshPlacement = async () => { refreshed = true; context.fillSuspendedHosts([]); };
+(async () => {
+  context.fillSuspendedHosts(['host <unsafe>']);
+  const row = elements['placement-suspension-body'].children[0];
+  const button = row.children[1].children[0];
+  await button.click();
+  console.log(JSON.stringify({requests, confirmations, refreshed,
+    name: row.children[0].textContent, disabled: button.disabled,
+    status: elements['placement-resume-status']?.textContent || ''}));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    result = subprocess.run(
+        [node, "-e", harness, str(_SOURCE), outcome],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["confirmations"] == 1
+    assert data["name"] == "host <unsafe>"
+    assert data["requests"] == (
+        []
+        if outcome == "cancel"
+        else [["/admin/placement/suspensions/host%20%3Cunsafe%3E", "DELETE"]]
+    )
+    assert data["refreshed"] is (outcome == "success")
+    if outcome == "failure":
+        assert data["disabled"] is False
+        assert "Host lifecycle operation in progress" in data["status"]

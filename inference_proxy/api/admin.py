@@ -25,6 +25,7 @@ from inference_proxy.config.dependencies import (
     get_catalog_service,
     get_download_service,
     get_llmfit_runner,
+    get_placement_suspensions,
     get_provisioner,
     get_quads_client,
     get_quads_poller,
@@ -71,6 +72,7 @@ from inference_proxy.models.node import (
     NodeStatus,
     VllmParams,
 )
+from inference_proxy.placement.suspensions import SuspensionStore
 from inference_proxy.provisioning.log_store import AttemptLogStore
 from inference_proxy.provisioning.provisioner import (
     BackgroundOperation,
@@ -78,6 +80,7 @@ from inference_proxy.provisioning.provisioner import (
     ProvisioningCapacityError,
     ProvisioningError,
     ProvisioningIdentity,
+    ProvisioningOperationChangedError,
     RelaunchPreconditionError,
     RelaunchValidationError,
     SelfSetupError,
@@ -1056,6 +1059,7 @@ async def teardown_node(
     recovery_engine: InferenceEngine | None = None,
     registry: NodeRegistry = Depends(get_registry),
     provisioner: NodeProvisioner = Depends(get_provisioner),
+    suspensions: SuspensionStore = Depends(get_placement_suspensions),
 ) -> TeardownResponse:
     """Trigger teardown of a node (runs in background)."""
     node_id = canonical_hostname(node_id)
@@ -1069,6 +1073,21 @@ async def teardown_node(
                 "remove it from the fleet instead of tearing it down"
             ),
         )
+
+    async def persist_suspension() -> None:
+        try:
+            await suspensions.suspend(node_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("placement_suspend_failed", hostname=node_id)
+            raise HTTPException(
+                status_code=503,
+                detail="Could not suspend automatic placement; teardown was not started",
+            ) from exc
+
+    suspended_before_cancel = False
+    suspended_detail = "automatic placement is suspended; retry teardown or resume"
 
     if recovery_engine is not None:
         if not force:
@@ -1095,21 +1114,39 @@ async def teardown_node(
                 detail=f"Host lifecycle operation already in progress for '{node_id}'",
             )
     else:
-        cancelled_identity = await provisioner.cancel_active_provision(node_id)
-        lease = await provisioner.try_reserve_host(node_id)
+        active = provisioner.active_provision(node_id)
+        if existing is None and active is None:
+            raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+        if active is not None:
+            # This task holds the lifecycle lease. Persist before cancelling it;
+            # a store failure must leave active provisioning completely untouched.
+            await persist_suspension()
+            suspended_before_cancel = True
+            try:
+                cancelled_identity = await provisioner.cancel_provision(node_id, active)
+            except ProvisioningOperationChangedError as exc:
+                raise HTTPException(
+                    status_code=409, detail=f"{exc}; {suspended_detail}"
+                ) from exc
+            except Exception as exc:
+                logger.exception("teardown_cancel_failed", hostname=node_id)
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Could not cancel provisioning; {suspended_detail}",
+                ) from exc
+        try:
+            lease = await provisioner.try_reserve_host(node_id)
+        except Exception as exc:
+            detail = "Could not reserve host for teardown"
+            if suspended_before_cancel:
+                detail += f"; {suspended_detail}"
+            raise HTTPException(status_code=503, detail=detail) from exc
         if lease is None:
-            if cancelled_identity is not None:
-                detail = (
-                    f"Host '{node_id}' was re-reserved after provisioning "
-                    "cancellation; wait for the current operation to finish and "
-                    "retry teardown"
-                )
+            if suspended_before_cancel:
+                detail = f"Host '{node_id}' was re-reserved after provisioning cancellation; {suspended_detail}"
             else:
                 detail = f"Host lifecycle operation already in progress for '{node_id}'"
-            raise HTTPException(
-                status_code=409,
-                detail=detail,
-            )
+            raise HTTPException(status_code=409, detail=detail)
 
     transferred = False
     try:
@@ -1136,6 +1173,26 @@ async def teardown_node(
             and recovery_engine is None
         ):
             raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+        if suspended_before_cancel:
+            # Resume can win the gap between cancelling the old task and taking
+            # its lease. Respect that choice rather than writing another opt-out.
+            try:
+                still_suspended = node_id in await suspensions.list()
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Could not verify automatic placement suspension; retry teardown or resume",
+                ) from exc
+            if not still_suspended:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Automatic placement was resumed during teardown; retry teardown if still intended",
+                )
+        else:
+            # Registered nodes and force recovery are validated under the lease
+            # before persisting anything. Rejected requests leave no opt-out.
+            await persist_suspension()
 
         async def _teardown_and_cleanup() -> None:
             try:

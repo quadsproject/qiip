@@ -600,6 +600,31 @@ using only the catalog models and their pinned configurations. Set
   automatic placement provisioned). Existing records load unchanged. A
   gateway without profile support cannot read profile node records; see
   [Rollback](#rollback).
+- **Manual teardown suspends automatic placement for the host.** Teardown,
+  force teardown, and cancellation through `DELETE /admin/nodes/{host}` now
+  persist an opt-out before starting teardown. It survives node deletion and
+  gateway restarts, including when placement is disabled or QUADS is absent.
+  If suspension cannot be saved, teardown returns `503` without cancelling an
+  active provisioning task. The handler inspects the operation first, saves
+  suspension, then cancels only that inspected operation; if it was replaced,
+  the request returns `409` without cancelling its replacement.
+  If cancellation or subsequent lease acquisition fails, the response explains
+  that automatic placement remains suspended: retry teardown or resume it.
+  A `503` can therefore leave a visible suspension even when teardown did not
+  run. If another admin resumes placement during cancellation, the handler
+  checks suspension under the teardown lease and returns `409` without stopping
+  the node or recreating the suspension. Failed teardown also keeps suspension.
+  Scheduled teardown and automatic recovery do not create suspensions.
+- **Resume from Admin > Automatic Model Placement > Suspended hosts**, or use
+  `DELETE /admin/placement/suspensions/{host}`. The host becomes eligible on a
+  subsequent placement pass; GPU qualification, availability, ownership,
+  exclusions, and retry limits still apply. Resume returns `409` during a host
+  lifecycle operation. Manual setup and claim reset do not implicitly resume
+  automation. `GET /admin/placement` includes `suspended_hosts` even with
+  placement disabled or QUADS absent.
+- **Back up `/placement/suspensions/` alongside `/placement/claims/` and `/nodes/`.**
+  Suspension keys are persistent and unleased. Their presence blocks placement
+  even if the stored value cannot be parsed.
 - **A new etcd prefix, `/placement/claims/`.** Claims are persistent, unleased
   keys. Back them up with `/nodes/`. Deleting a claim by hand releases its host
   to the next placement pass; prefer `DELETE /admin/placement/claims/{host}`.
