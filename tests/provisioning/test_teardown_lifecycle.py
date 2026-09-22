@@ -18,11 +18,13 @@ from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.admin import SetupRequest
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
 from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
+from inference_proxy.placement.suspensions import SuspensionStore
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     ProvisioningIdentity,
 )
 from inference_proxy.provisioning.ssh_client import RemoteCommandError
+from tests.placement.fakes import FakeEtcd
 
 _ENDPOINT_POLICY = EndpointPolicy.from_values(
     allowed_hosts=["gpu01"],
@@ -61,20 +63,26 @@ def _provisioner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("storage_fails", [False, True])
 async def test_teardown_cancels_active_provision(
     test_registry: NodeRegistry,
     monkeypatch: pytest.MonkeyPatch,
+    storage_fails: bool,
 ) -> None:
     """The DELETE handler awaits real task cancellation before teardown."""
     etcd = MagicMock()
     provisioner = _provisioner(etcd=etcd, registry=test_registry)
+    suspension_etcd = FakeEtcd()
+    suspensions = SuspensionStore(suspension_etcd)
     poll_started = asyncio.Event()
     teardown_started = asyncio.Event()
     order: list[str] = []
     scheduled: list[asyncio.Task[None]] = []
 
-    async def run_inline(function: Callable[..., Any], *args: Any) -> Any:
-        return function(*args)
+    async def run_inline(
+        function: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        return function(*args, **kwargs)
 
     monkeypatch.setattr(asyncio, "to_thread", run_inline)
 
@@ -83,6 +91,8 @@ async def test_teardown_cancels_active_provision(
         try:
             await asyncio.Event().wait()
         finally:
+            if not storage_fails:
+                assert "/placement/suspensions/gpu01" in suspension_etcd.data
             order.append("provision_cancelled")
 
     async def teardown(
@@ -151,9 +161,28 @@ async def test_teardown_cancels_active_provision(
         await asyncio.wait_for(poll_started.wait(), timeout=1)
         provision_task = scheduled[0]
 
+        if storage_fails:
+            suspension_etcd.fail = True
+            with pytest.raises(HTTPException) as exc:
+                await teardown_node(
+                    "gpu01",
+                    force=False,
+                    registry=test_registry,
+                    provisioner=provisioner,
+                    suspensions=suspensions,
+                )
+            assert exc.value.status_code == 503
+            assert not provision_task.done()
+            assert len(scheduled) == 1
+            assert order == []
+            assert not teardown_started.is_set()
+            assert suspension_etcd.data == {}
+            return
+
         response = await asyncio.wait_for(
             teardown_node(
                 "gpu01",
+                suspensions=suspensions,
                 force=False,
                 registry=test_registry,
                 provisioner=provisioner,
@@ -207,8 +236,10 @@ async def test_cancelled_provision_identity_beats_stale_registry_engine(
     scheduled: list[asyncio.Task[None]] = []
     observed_engines: list[InferenceEngine] = []
 
-    async def run_inline(function: Callable[..., Any], *args: Any) -> Any:
-        return function(*args)
+    async def run_inline(
+        function: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
+        return function(*args, **kwargs)
 
     async def blocked_provision() -> None:
         started.set()
@@ -258,6 +289,7 @@ async def test_cancelled_provision_identity_beats_stale_registry_engine(
 
     response = await teardown_node(
         "gpu01",
+        suspensions=SuspensionStore(FakeEtcd()),
         registry=registry,
         provisioner=provisioner,
     )
@@ -272,12 +304,15 @@ async def test_cancelled_provision_identity_beats_stale_registry_engine(
 async def test_force_recovery_requires_force_and_an_unknown_node() -> None:
     registry = NodeRegistry()
     provisioner = MagicMock()
+    provisioner.active_provision = MagicMock(return_value=None)
+    provisioner.cancel_provision = AsyncMock(return_value=None)
     provisioner.cancel_active_provision = AsyncMock(return_value=None)
     provisioner.try_reserve_host = AsyncMock(return_value=MagicMock())
 
     with pytest.raises(HTTPException) as missing_force:
         await teardown_node(
             "gpu01",
+            suspensions=SuspensionStore(FakeEtcd()),
             recovery_engine=InferenceEngine.LLAMA_CPP,
             registry=registry,
             provisioner=provisioner,
@@ -294,6 +329,7 @@ async def test_force_recovery_requires_force_and_an_unknown_node() -> None:
     with pytest.raises(HTTPException) as registered:
         await teardown_node(
             "gpu01",
+            suspensions=SuspensionStore(FakeEtcd()),
             force=True,
             recovery_engine=InferenceEngine.LLAMA_CPP,
             registry=registry,
@@ -310,12 +346,15 @@ async def test_force_recovery_validates_endpoint_before_reserving_host() -> None
     provisioner.validate_endpoint.side_effect = EndpointValidationError(
         "backend endpoint host is not allowed"
     )
+    provisioner.active_provision = MagicMock(return_value=None)
+    provisioner.cancel_provision = AsyncMock(return_value=None)
     provisioner.cancel_active_provision = AsyncMock(return_value=None)
     provisioner.try_reserve_host = AsyncMock()
 
     with pytest.raises(HTTPException) as caught:
         await teardown_node(
             "outside-policy",
+            suspensions=SuspensionStore(FakeEtcd()),
             force=True,
             recovery_engine=InferenceEngine.LLAMA_CPP,
             registry=NodeRegistry(),
@@ -332,12 +371,15 @@ async def test_force_recovery_validates_endpoint_before_reserving_host() -> None
 @pytest.mark.asyncio
 async def test_force_recovery_never_cancels_busy_unknown_work() -> None:
     provisioner = MagicMock()
+    provisioner.active_provision = MagicMock(return_value=None)
+    provisioner.cancel_provision = AsyncMock(return_value=None)
     provisioner.cancel_active_provision = AsyncMock(return_value=None)
     provisioner.try_reserve_host = AsyncMock(return_value=None)
 
     with pytest.raises(HTTPException) as caught:
         await teardown_node(
             "gpu01",
+            suspensions=SuspensionStore(FakeEtcd()),
             force=True,
             recovery_engine=InferenceEngine.LLAMA_CPP,
             registry=NodeRegistry(),
@@ -354,6 +396,8 @@ async def test_force_recovery_rejects_registration_race_after_lease() -> None:
     registry = NodeRegistry()
     provisioner = MagicMock()
     lease = MagicMock()
+    provisioner.active_provision = MagicMock(return_value=None)
+    provisioner.cancel_provision = AsyncMock(return_value=None)
     provisioner.cancel_active_provision = AsyncMock(return_value=None)
 
     async def reserve(_hostname: str) -> MagicMock:
@@ -371,6 +415,7 @@ async def test_force_recovery_rejects_registration_race_after_lease() -> None:
     with pytest.raises(HTTPException) as caught:
         await teardown_node(
             "gpu01",
+            suspensions=SuspensionStore(FakeEtcd()),
             force=True,
             recovery_engine=InferenceEngine.LLAMA_CPP,
             registry=registry,
@@ -388,6 +433,8 @@ async def test_force_recovery_rejects_registration_race_after_lease() -> None:
 async def test_force_recovery_dispatches_explicit_engine() -> None:
     provisioner = MagicMock()
     lease = MagicMock()
+    provisioner.active_provision = MagicMock(return_value=None)
+    provisioner.cancel_provision = AsyncMock(return_value=None)
     provisioner.cancel_active_provision = AsyncMock(return_value=None)
     provisioner.try_reserve_host = AsyncMock(return_value=lease)
     provisioner.teardown = AsyncMock()
@@ -407,6 +454,7 @@ async def test_force_recovery_dispatches_explicit_engine() -> None:
 
     response = await teardown_node(
         "gpu01",
+        suspensions=SuspensionStore(FakeEtcd()),
         force=True,
         recovery_engine=InferenceEngine.LLAMA_CPP,
         registry=NodeRegistry(),
@@ -437,6 +485,8 @@ async def test_teardown_schedule_failure_releases_lifecycle_lease() -> None:
     )
     provisioner = MagicMock()
     lease = MagicMock()
+    provisioner.active_provision = MagicMock(return_value=None)
+    provisioner.cancel_provision = AsyncMock(return_value=None)
     provisioner.cancel_active_provision = AsyncMock(return_value=None)
     provisioner.try_reserve_host = AsyncMock(return_value=lease)
     provisioner.fire_background.side_effect = RuntimeError("scheduler unavailable")
@@ -444,6 +494,7 @@ async def test_teardown_schedule_failure_releases_lifecycle_lease() -> None:
     with pytest.raises(RuntimeError, match="scheduler unavailable"):
         await teardown_node(
             "gpu01",
+            suspensions=SuspensionStore(FakeEtcd()),
             registry=registry,
             provisioner=provisioner,
         )
@@ -648,3 +699,62 @@ async def test_failed_provision_does_not_resurrect_deleted_node(
     assert "Command 'upload'" in str(result[0])
     assert "/nodes/gpu01" not in node_state
     etcd.replace.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_refuses_replaced_record() -> None:
+    from inference_proxy.provisioning.provisioner import (
+        ProvisioningOperationChangedError,
+    )
+
+    provisioner = _provisioner()
+    finish = asyncio.Event()
+
+    async def wait_finish() -> None:
+        await finish.wait()
+
+    first = provisioner.fire_background(
+        wait_finish(),
+        provisioning_hostname="gpu01",
+        provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
+    )
+    record = provisioner.active_provision("gpu01")
+    assert record is not None
+    finish.set()
+    await first
+    finish.clear()
+    replacement = provisioner.fire_background(
+        wait_finish(),
+        provisioning_hostname="gpu01",
+        provisioning_identity=ProvisioningIdentity(InferenceEngine.LLAMA_CPP),
+    )
+    try:
+        with pytest.raises(ProvisioningOperationChangedError):
+            await provisioner.cancel_provision("gpu01", record)
+        assert not replacement.done()
+        assert not replacement.cancelling()
+    finally:
+        await provisioner.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_inspection_does_not_return_relaunch() -> None:
+    from inference_proxy.provisioning.provisioner import BackgroundOperation
+
+    provisioner = _provisioner()
+
+    async def wait_forever() -> None:
+        await asyncio.Event().wait()
+
+    task = provisioner.fire_background(
+        wait_forever(),
+        provisioning_hostname="gpu01",
+        provisioning_identity=ProvisioningIdentity(InferenceEngine.LLAMA_CPP),
+        operation=BackgroundOperation.RELAUNCH,
+    )
+    try:
+        assert provisioner.active_provision("gpu01") is None
+        assert await provisioner.cancel_active_provision("gpu01") is None
+        assert not task.cancelling()
+    finally:
+        await provisioner.shutdown()

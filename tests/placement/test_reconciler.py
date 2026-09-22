@@ -18,6 +18,7 @@ from inference_proxy.placement.reconciler import (
     PlacementReconciler,
     PlacementStatus,
 )
+from inference_proxy.placement.suspensions import SuspensionStore
 from inference_proxy.provisioning.host_lifecycle import HostLifecycleLease
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.quads.client import QUADSClient
@@ -73,6 +74,7 @@ class Rig:
             provisioner=cast(NodeProvisioner, self.provisioner),
             artifact_index=cast(GGUFArtifactIndex, self.index),
             claims=ClaimStore(self.etcd),
+            suspensions=SuspensionStore(self.etcd),
             lookahead_hours=24,
             profiles=QUALIFIED,
             clock=self.clock,

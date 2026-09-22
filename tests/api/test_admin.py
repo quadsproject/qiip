@@ -1663,7 +1663,7 @@ class TestTeardownEndpoint:
 
         assert response.status_code == 409
         assert "operation already in progress" in response.json()["detail"]
-        mock_provisioner.cancel_active_provision.assert_awaited_once_with("gpu01")
+        mock_provisioner.cancel_provision.assert_not_awaited()
         mock_provisioner.fire_background.assert_not_called()
 
     def test_cancel_handoff_reports_when_host_is_re_reserved(
@@ -1675,7 +1675,7 @@ class TestTeardownEndpoint:
         test_registry.add(_make_node(node_id="gpu01"))
         call_order: list[str] = []
 
-        async def cancel(_hostname: str) -> MagicMock:
+        async def cancel(_hostname: str, _record: object) -> MagicMock:
             call_order.append("cancel")
             return MagicMock()
 
@@ -1683,7 +1683,8 @@ class TestTeardownEndpoint:
             call_order.append("reserve")
             return None
 
-        mock_provisioner.cancel_active_provision.side_effect = cancel
+        mock_provisioner.active_provision.return_value = MagicMock()
+        mock_provisioner.cancel_provision.side_effect = cancel
         mock_provisioner.try_reserve_host.side_effect = reserve
 
         response = client.delete("/admin/nodes/gpu01")

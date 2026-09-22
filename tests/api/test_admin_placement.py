@@ -16,6 +16,7 @@ from inference_proxy.huggingface.artifacts import GGUFArtifactIndex
 from inference_proxy.placement.catalog import BUILTIN_PROFILES
 from inference_proxy.placement.claims import ClaimStore
 from inference_proxy.placement.reconciler import PlacementReconciler
+from inference_proxy.placement.suspensions import SuspensionStore
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.quads.client import QUADSClient
 from inference_proxy.quads.poller import QUADSPoller
@@ -45,6 +46,7 @@ def _reconciler(*, artifacts: bool = True, enabled: bool = True) -> PlacementRec
             FakeArtifactIndex(catalog_artifacts() if artifacts else []),
         ),
         claims=ClaimStore(FakeEtcd()),
+        suspensions=SuspensionStore(FakeEtcd()),
         lookahead_hours=24,
         profiles=tuple(
             p.model_copy(update={"qualified_gpus": ("l4",)}) for p in BUILTIN_PROFILES

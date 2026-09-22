@@ -20,7 +20,7 @@ const ACTION_CONFIG = {
     body: null,
     confirm: true,
     confirmMsg: (nodeId) =>
-      `Teardown node ${nodeId}? This will drain connections and stop the container.`,
+      `Teardown node ${nodeId}? This will drain connections, stop inference, and suspend automatic placement until resumed.`,
     danger: true,
     label: "Teardown",
     pendingLabel: "Tearing down…",
@@ -44,7 +44,7 @@ const ACTION_CONFIG = {
     url: (nodeId) => `/admin/nodes/${nodeId}`,
     body: null,
     confirm: true,
-    confirmMsg: (nodeId) => `Cancel provisioning for ${nodeId}?`,
+    confirmMsg: (nodeId) => `Cancel provisioning for ${nodeId}? Automatic placement will stay suspended until resumed.`,
     danger: true,
     label: "Cancel",
     pendingLabel: "Cancelling…",
@@ -57,7 +57,7 @@ const ACTION_CONFIG = {
     body: null,
     confirm: true,
     confirmMsg: (nodeId) =>
-      `Force teardown ${nodeId}? This will immediately stop the container without draining.`,
+      `Force teardown ${nodeId}? This will immediately stop inference without draining and suspend automatic placement until resumed.`,
     danger: true,
     label: "Force Teardown",
     pendingLabel: "Forcing…",
