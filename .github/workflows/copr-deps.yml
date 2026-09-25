@@ -22,7 +22,7 @@ jobs:
     if: github.repository == 'quadsproject/qiip'
     steps:
       - name: Install tooling
-        run: dnf -y install git make rpm-build python3-devel pyproject-rpm-macros python3-pip
+        run: dnf -y install git make rpm-build python3-devel pyproject-rpm-macros python3-pip copr-cli
 
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
