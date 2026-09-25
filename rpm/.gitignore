@@ -1,0 +1,7 @@
+*.spec
+*.tar.gz
+*.src.rpm
+noarch/
+usr/
+qiip-dev/
+rpmbuild/
