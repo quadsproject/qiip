@@ -17,6 +17,7 @@ The guide separates three kinds of change:
 - [Catalog profiles and automatic placement](#28-catalog-profiles-and-automatic-model-placement)
 - [Artifact sources and mirror policy](#artifact-sources-and-mirror-policy)
 - [Client-visible compatibility changes](#client-visible-compatibility-changes)
+- [RPM install migration](#rpm-install-migration)
 - [Operational runbooks](#operational-runbooks)
 - [Verification checklist](#verification-checklist)
 
@@ -752,6 +753,34 @@ until every gateway that may provision or display the node understands it.
 | **Correctness fix** | Generated agent-config keys are now identified by an internal `purpose` marker instead of their display name. Tokens that users themselves created with the name `agent-config` (an allowed name in earlier builds) are preserved untouched — including their endpoint pins — and are no longer revoked or replaced by a config download. Only purpose-marked keys are governed by the one-active-per-user invariant. | Legacy `agent-config`-named rows keep working exactly as before (they appear in the profile token list and can be revoked like any other token). Keys generated before this build remain valid: with the same session secret the next config download reuses and marks the recognizable generated key. If the session secret changed before that migration, the old unmarked key can no longer be recognized and stays valid — revoke it explicitly, since secret rotation alone does not invalidate it. |
 | **New surface** | `POST /admin/nodes/pool` accepts `"admin_only": true` (implies `"self_setup": true`) to register an admin-only inference server from an existing OpenAI-compatible URL, plus an optional operator-facing `"name"` shown in the admin fleet view. Admin-only nodes are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never appear in `/fleet/nodes` or public `/v1/models`, render bold with an `admin_only` badge on the admin fleet page, and are removed with the normal pool deletion endpoint. `/admin/nodes[]` gains `admin_only` and `name`. | No action unless you adopt admin-only servers; the admin-only flag and name are additive and default to false/empty for all existing records. |
 | **New surface** | `GET /fleet/nodes` returns the registered-node view for signed-in non-admins: admin-only servers removed, operational actions stripped, and nodes owned by another user excluded (endpoint/model/engine/artifact/GPU identity stays private per RFE-107, matching `/v1/models` and the endpoint picker). The dashboard JS uses it for non-admin viewers while admins keep `/admin/nodes`. | Signed-in non-admin users now see the fleet (unowned nodes plus their own); treat `/fleet/nodes` as org-internal inventory that never enumerates another user's private nodes. |
+
+## RPM install migration
+
+The qiip RPM uses a different layout from the git-checkout convention
+(`/opt/inference-proxy` + uv venv):
+
+- service unit: `/usr/lib/systemd/system/inference-proxy.service` (system
+  `python3`, `WorkingDirectory=/usr/share/qiip`, `EnvironmentFile=-/etc/qiip/qiip.env`)
+- node engine bundles: `/usr/share/qiip/{auto-vllm,auto-llamacpp,common}`
+- config examples: `/etc/qiip/conf/*.yml.example`
+- writable data: `/var/lib/qiip` (`provisioning-logs.sqlite3`, `qiip.db`)
+- nginx bundle: `/usr/share/qiip/nginx/{nginx.conf,gen-cert.sh}`
+
+To move an existing gateway to the RPM install:
+
+1. Remove any stale unit copy so the RPM unit wins:
+   `sudo rm -f /etc/systemd/system/inference-proxy.service && sudo systemctl daemon-reload`.
+2. Stop the checkout service: `sudo systemctl stop inference-proxy`.
+3. Copy writable data: `sudo mv /opt/inference-proxy/data/qiip.db /var/lib/qiip/`
+   and `.../data/provisioning-logs.sqlite3` (new location defaults).
+4. Move settings: copy `INFERENCE_PROXY_*` values from
+   `/opt/inference-proxy/.env` into `/etc/qiip/qiip.env`.
+5. `sudo dnf install qiip` (after `dnf copr enable quadsdev/qiip-deps` and
+   `quadsdev/qiip`), copy the config examples, then
+   `sudo systemctl enable --now inference-proxy`.
+
+The old `/opt/inference-proxy` checkout is no longer needed by the service;
+keep it only for development.
 
 ## Operational Runbooks
 
