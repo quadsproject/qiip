@@ -2,10 +2,10 @@
 name = "inference-proxy"
 version = "0.1.0"
 description = "QUADS LLM Inference Proxy - routes requests to vLLM nodes"
-requires-python = ">=3.12,<3.14"
+requires-python = ">=3.12,<3.15"
 dependencies = [
     "fastapi>=0.135,<1.0",
-    "uvicorn[standard]>=0.45",
+    "uvicorn>=0.45",
     "pydantic>=2.10,<3.0",
     "pydantic-settings>=2.14",
     "structlog>=26.1.0",
@@ -35,6 +35,21 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+# Keep 0.x semantics: feat bumps minor, breaking bumps minor, fix bumps patch.
+allow_zero_version = true
+major_on_zero = false
+
+[tool.semantic_release.branches.main]
+match = "main"
+prerelease = false
+
+[tool.semantic_release.branches.development]
+match = "development"
+prerelease = true
+prerelease_token = "dev"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

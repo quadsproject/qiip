@@ -1,0 +1,59 @@
+name: COPR dependencies
+
+# Dependency RPMs are pinned (see copr-deps/README.md) and published to
+# quadsdev/qiip-deps once, not per qiip release. Run this on demand only
+# when a dependency version is bumped; the qiip/qiip-dev COPR builds reuse
+# the published RPMs as-is.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: copr-deps
+  cancel-in-progress: false
+
+jobs:
+  build_deps:
+    name: Build and submit dependency RPMs
+    runs-on: ubuntu-latest
+    container: fedora:43
+    if: github.repository == 'quadsproject/qiip'
+    steps:
+      - name: Install tooling
+        run: dnf -y install git make rpm-build python3-devel pyproject-rpm-macros python3-pip
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Work around GHA permission issue
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup COPR config
+        env:
+          API_TOKEN_CONTENT: ${{ secrets.COPR_API_TOKEN }}
+        run: |
+          umask 077
+          mkdir -p "$HOME/.config"
+          echo "$API_TOKEN_CONTENT" > "$HOME/.config/copr"
+
+      - name: Fetch sdist sources
+        run: |
+          cd copr-deps
+          for spec in *.spec; do
+            version="$(awk '/^Version: /{print $2; exit}' "$spec")"
+            pkg="${spec%.spec}"
+            pip download --quiet --no-deps --no-binary=:all: "${pkg}==${version}" -d .
+          done
+
+      - name: Build SRPMs and submit to COPR
+        run: |
+          cd copr-deps
+          for spec in *.spec; do
+            rpmbuild -bs --define "_sourcedir $PWD" --define "_srcrpmdir $PWD" "$spec"
+          done
+          for srpm in *.src.rpm; do
+            echo "Submitting $srpm to quadsdev/qiip-deps"
+            copr build quadsdev/qiip-deps "$srpm"
+          done
