@@ -8,6 +8,10 @@
 [![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/sadsfae/188b760b19592c8913101f598f7cb382/raw/qiip-coverage.json)](https://github.com/quadsproject/qiip/actions/workflows/ci.yml)
 [![vLLM](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/sadsfae/188b760b19592c8913101f598f7cb382/raw/qiip-vllm.json)](https://docs.vllm.ai/)
 [![llama.cpp](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/sadsfae/188b760b19592c8913101f598f7cb382/raw/qiip-llamacpp.json)](https://github.com/ggml-org/llama.cpp)
+[![Release](https://img.shields.io/github/v/release/quadsproject/qiip)](https://github.com/quadsproject/qiip/releases)
+[![Dev release](https://img.shields.io/github/v/release/quadsproject/qiip?include_prereleases&sort=semver)](https://github.com/quadsproject/qiip/releases)
+[![COPR qiip](https://copr.fedorainfracloud.org/coprs/quadsdev/qiip/package/qiip/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/quadsdev/qiip/package/qiip/)
+[![COPR qiip-dev](https://copr.fedorainfracloud.org/coprs/quadsdev/qiip-dev/package/qiip-dev/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/quadsdev/qiip-dev/package/qiip-dev/)
 
 A QUADS-native inference abstraction framework that automates installation,
 drivers, setup, and presentation of disparate, free or idle NVIDIA GPU systems
@@ -75,6 +79,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Send a request](#send-a-request)
   - [Use with the OpenAI Python SDK](#use-with-the-openai-python-sdk)
   - [Chat playground](#chat-playground)
+- [RPM installation](#rpm-installation)
 - [API Endpoints](#api-endpoints)
   - [Claude Code and Codex](#claude-code-and-codex)
   - [Administrative access](#administrative-access)
@@ -104,6 +109,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Run tests](#run-tests)
   - [Lint and format](#lint-and-format)
   - [Type check](#type-check)
+- [Releases (stable and development trains)](docs/releases.md)
 - [Durable provisioning evidence](#durable-provisioning-evidence)
 - [Troubleshooting](#troubleshooting)
   - [Reading provisioning logs offline](#reading-provisioning-logs-offline)
@@ -112,7 +118,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 
 ## Requirements
 
-- Python 3.12 or 3.13
+- Python 3.12, 3.13, or 3.14
 - [uv](https://github.com/astral-sh/uv) (package manager)
 - Node.js for the frontend behavioral tests (CI uses version 24; not required
   at runtime)
@@ -230,8 +236,9 @@ print(response.choices[0].message.content)
 
 ### Deploy with systemd
 
-A production deployment ships a systemd unit (`systemd/inference-proxy.service`)
-matching the stage/dev convention: repo checkout at `/opt/inference-proxy`
+For RPM installs see [RPM installation](#rpm-installation). A git-checkout
+deployment (stage/dev convention) uses
+`systemd/inference-proxy.service`: repo checkout at `/opt/inference-proxy`
 (uv-synced), settings in `/opt/inference-proxy/.env`, the service listening on
 port **5000**, and nginx terminating TLS and proxying to it
 (`nginx/nginx.conf`). Install it with:
@@ -256,6 +263,54 @@ If such a model reports that conversation roles must alternate, clear the
 System Prompt and retry. Failed turns are not retained in the next request's
 history; partial assistant text already shown after a connection failure is
 retained so the visible transcript and future context stay aligned.
+
+## RPM installation
+
+Published on COPR for Fedora 43/44. Install the stable train:
+
+```bash
+sudo dnf copr enable quadsdev/qiip-deps   # dependency RPMs, one-time
+sudo dnf copr enable quadsdev/qiip
+sudo dnf install qiip
+```
+
+> [!NOTE]
+> RPM installs use the system Python 3.14 (the Fedora 43/44 default). The
+> packages require `python3 >= 3.12` and `< 3.15`.
+
+Two packages, one train each; they ship the same files and cannot be
+installed together:
+
+| Package | Train | COPR project |
+|---------|-------|--------------|
+| `qiip` | Stable (`main`) | `quadsdev/qiip` |
+| `qiip-dev` | Development (`development`) | `quadsdev/qiip-dev` |
+
+`qiip-dev` conflicts with `qiip`: enable `quadsdev/qiip-dev` and
+`dnf install qiip-dev` when you want the development branch. See
+[releases](docs/releases.md) for the versioning, changelog, and badge
+details.
+
+Configure and start:
+
+```bash
+sudo cp /etc/qiip/conf/qiip.yml.example /etc/qiip/conf/qiip.yml
+# edit qiip.yml (admin credentials, huggingface.cache_dir), then:
+sudo systemctl enable --now inference-proxy
+```
+
+The package ships nginx support (`nginx.conf` and `gen-cert.sh` under
+`/usr/share/qiip/nginx`; see [nginx.md](nginx/nginx.md) Method 1), the node
+engine bundles under `/usr/share/qiip`, and writes data to `/var/lib/qiip`.
+
+> [!NOTE]
+> The `Release` workflow needs three COPR projects before its first run:
+> `quadsdev/qiip` (exists), `quadsdev/qiip-dev`, and `quadsdev/qiip-deps`
+> (see [copr-deps/README.md](copr-deps/README.md)). Keep the
+> `COPR_API_TOKEN` repository secret set, build and enable the dependency
+> project, and give the qiip projects Fedora 43/44 chroots with the qiip-deps
+> repository enabled. Fedora 45 is not yet covered (its default python3 is
+> 3.15, above the supported `<3.15` range).
 
 ## API Endpoints
 
@@ -1416,7 +1471,11 @@ correctly.
 ### CI badges
 
 After `Quality` passes on `main`, a separate non-blocking job publishes the
-coverage, vLLM, and llama.cpp badges to the configured Gist. `GIST_SECRET` must
+coverage, vLLM, and llama.cpp badges to the configured Gist. The release and
+COPR badges at the top of this README are live: the GitHub release badges come
+from the `Release` workflow (stable releases on `main`, dev prereleases on
+`development`), and the COPR badges reflect the last build of
+`quadsdev/qiip` and `quadsdev/qiip-dev`. `GIST_SECRET` must
 be a fine-grained personal access token with only the **Gists: write** user
 permission. Prefer a service identity, record the token's expiration, and
 replace the repository secret before it expires. To change the publishing

@@ -69,7 +69,15 @@ Steps for RPM install (sections below, in order).
 
 ### Install nginx
 
+The qiip RPM bundles nginx support: it `Requires: nginx` (and `openssl`),
+ships the config at `/usr/share/qiip/nginx/nginx.conf`, the cert generator
+at `/usr/share/qiip/nginx/gen-cert.sh`, and creates `/var/cache/nginx` on
+install. Installing `qiip` (or `qiip-dev`) therefore skips the manual steps
+below; only the cert pair is still needed (see
+[Certificates](#certificates)).
+
 ```bash
+# Manual install (git-checkout deployment) or EL9:
 # EL9 (Rocky/RHEL 9.6+) only: the stock nginx is 1.20, which rejects
 # `http2 on;`. If a different nginx stream is already enabled, run
 # `sudo dnf module reset -y nginx` first.
@@ -84,24 +92,26 @@ sudo restorecon -R /var/cache/nginx
 
 ### Deploy the config
 
-Fetch the repo config (or copy it from a checkout), substitute the FQDN, and
-drop any packaged vhosts under `conf.d/`/`default.d/` - a defensive no-op on
-Fedora and EL9, which ship none (their stock `listen 80` server lives inline
-in `/etc/nginx/nginx.conf`, which this deploy replaces wholesale). The
+Fetch the repo config (or copy it from a checkout, or use the bundled copy
+when the qiip RPM is installed), substitute the FQDN, and drop any packaged
+vhosts under `conf.d/`/`default.d/` - a defensive no-op on Fedora and EL9,
+which ship none (their stock `listen 80` server lives inline in
+`/etc/nginx/nginx.conf`, which this deploy replaces wholesale). The
 upstream stays `127.0.0.1:5000` for bare-metal nginx.
 
 ```bash
 FQDN=$(hostname -f)
 
-sudo curl -fsSL -o /etc/nginx/nginx.conf \
-  https://raw.githubusercontent.com/quadsproject/qiip/main/nginx/nginx.conf
+if rpm -q qiip >/dev/null 2>&1; then
+  sudo cp /usr/share/qiip/nginx/nginx.conf /etc/nginx/nginx.conf
+else
+  sudo curl -fsSL -o /etc/nginx/nginx.conf \
+    https://raw.githubusercontent.com/quadsproject/qiip/main/nginx/nginx.conf
+fi
 sudo sed -i "s/{FQDN}/$FQDN/g" /etc/nginx/nginx.conf
 
 sudo rm -f /etc/nginx/conf.d/*.conf /etc/nginx/default.d/*.conf
 ```
-
-From a checkout, replace the `curl` line with
-`sudo cp nginx/nginx.conf /etc/nginx/nginx.conf`.
 
 ### SELinux and firewall
 
@@ -264,13 +274,17 @@ For a real CA, the `.pem` file must contain the leaf plus any intermediates
 ### Generate a self-signed pair
 
 One shared script does both methods: it is the container entrypoint and a
-host one-shot. Install it on an RPM host (single source is
-`nginx/gen-cert.sh`; fetch it or copy it from a checkout):
+host one-shot. The qiip RPM installs it at
+`/usr/share/qiip/nginx/gen-cert.sh` already executable; for a git-checkout
+deployment, install it manually (single source is `nginx/gen-cert.sh`):
 
 ```bash
-sudo curl -fsSL -o /usr/local/sbin/gen-cert.sh \
-  https://raw.githubusercontent.com/quadsproject/qiip/main/nginx/gen-cert.sh
-sudo chmod 0555 /usr/local/sbin/gen-cert.sh
+# RPM install: script already present as /usr/share/qiip/nginx/gen-cert.sh
+if ! rpm -q qiip >/dev/null 2>&1; then
+  sudo curl -fsSL -o /usr/local/sbin/gen-cert.sh \
+    https://raw.githubusercontent.com/quadsproject/qiip/main/nginx/gen-cert.sh
+  sudo chmod 0555 /usr/local/sbin/gen-cert.sh
+fi
 ```
 
 From a checkout, replace the `curl` line with
@@ -283,7 +297,9 @@ the script regenerates both and preserves the surviving file as `<name>.stale`.
 
 ```bash
 FQDN=$(hostname -f)
-sudo env QIIP_FQDN="$FQDN" CERTS_DIR=/etc/pki/tls/certs /usr/local/sbin/gen-cert.sh
+CERTGEN=/usr/local/sbin/gen-cert.sh
+if rpm -q qiip >/dev/null 2>&1; then CERTGEN=/usr/share/qiip/nginx/gen-cert.sh; fi
+sudo env QIIP_FQDN="$FQDN" CERTS_DIR=/etc/pki/tls/certs "$CERTGEN"
 openssl x509 -in /etc/pki/tls/certs/$FQDN.pem -noout -subject -enddate
 # subject=CN = <fqdn>; notAfter = 10 years out
 ```

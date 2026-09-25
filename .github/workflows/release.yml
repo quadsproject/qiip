@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+      - development
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize runs on the same branch, but never cancel: python-semantic-
+  # release pushes use GITHUB_TOKEN (which does not re-trigger workflows),
+  # and cancelling a running release run would drop its COPR submission.
+  group: release-${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  # Only run release machinery when code (not docs/markdown/assets) changed
+  # since the last release. Message-level gating (fix:/feat: vs docs:/chore:)
+  # is python-semantic-release's job; this gate covers markdown-only commits.
+  gate:
+    name: Code-change gate
+    runs-on: ubuntu-latest
+    outputs:
+      code_changed: ${{ steps.gate.outputs.code_changed }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect code changes since last release
+        id: gate
+        run: |
+          # On main, ignore vX.Y.Z-dev.N prerelease tags from the development
+          # train so the first development->main merge is treated as a release
+          # (its tree equals the dev-tagged tree). On development, dev tags are
+          # the right base and are used as-is.
+          case "$GITHUB_REF_NAME" in
+            main) extra="--exclude=*-dev.*";;
+            *) extra="";;
+          esac
+          last_tag="$(git describe --tags --abbrev=0 $extra 2>/dev/null || true)"
+          if [[ -z "$last_tag" ]]; then
+            # First release: treat everything as code until the first tag.
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$last_tag" HEAD -- . \
+            ':(exclude)*.md' ':(exclude)docs/**' ':(exclude)assets/**')"
+          if [[ -n "$changed" ]]; then
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Only docs/markdown/assets changed since $last_tag; skipping release"
+            echo "code_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  semantic:
+    name: Semantic release
+    needs: gate
+    if: >-
+      needs.gate.outputs.code_changed == 'true' &&
+      github.repository == 'quadsproject/qiip'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      released: ${{ steps.psr.outputs.released }}
+      tag: ${{ steps.psr.outputs.tag }}
+      version: ${{ steps.psr.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Python semantic release
+        id: psr
+        uses: python-semantic-release/python-semantic-release@9a026e9303981c866c3425723009becb2437c757 # v10.6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  copr_build:
+    name: COPR build
+    needs: semantic
+    if: >-
+      needs.semantic.outputs.released == 'true' &&
+      github.repository == 'quadsproject/qiip'
+    runs-on: ubuntu-latest
+    container: fedora:43
+    permissions:
+      contents: read
+    steps:
+      - name: Install tooling
+        run: dnf -y install git @development-tools @rpm-development-tools \
+          copr-cli make python3-devel pyproject-rpm-macros
+
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.semantic.outputs.tag }}
+
+      - name: Work around GHA permission issue
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup COPR config
+        env:
+          API_TOKEN_CONTENT: ${{ secrets.COPR_API_TOKEN }}
+        run: |
+          umask 077
+          mkdir -p "$HOME/.config"
+          echo "$API_TOKEN_CONTENT" > "$HOME/.config/copr"
+
+      - name: Build SRPM and submit to COPR
+        env:
+          PROJECT: ${{ github.ref_name == 'main' && 'qiip' || 'qiip-dev' }}
+        run: |
+          cd rpm
+          make srpm NAME="$PROJECT"
+          srpm_file="$(find . -name '*.src.rpm' -type f | head -n 1)"
+          if [[ -z "$srpm_file" ]]; then
+            echo "No .src.rpm found after 'make srpm'" >&2
+            exit 1
+          fi
+          echo "Submitting $srpm_file to quadsdev/$PROJECT"
+          copr build "quadsdev/$PROJECT" "$srpm_file"

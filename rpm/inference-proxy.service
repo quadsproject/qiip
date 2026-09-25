@@ -1,0 +1,33 @@
+# QIIP inference proxy gateway service (RPM install).
+#
+# RPM layout (different from the git-checkout unit at systemd/inference-proxy.service):
+#   /usr/share/qiip            node-side engine bundles (read-only)
+#   /etc/qiip/conf             INFERENCE_PROXY_* YAML config (copied from *.example)
+#   /etc/qiip/qiip.env         INFERENCE_PROXY_* environment overrides
+#   /var/lib/qiip              writable SQLite data
+#
+# The gateway listens on port 5000; nginx terminates TLS and proxies to it.
+# Runs as root like the stage deployment (provisioning SSH keys live under
+# /root/.ssh); tighten this if the deployment does not provision nodes.
+
+[Unit]
+Description=QIIP inference proxy gateway
+Documentation=https://github.com/quadsproject/qiip
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/share/qiip
+# `-` prefix: a missing env file is not fatal (systemd).
+EnvironmentFile=-/etc/qiip/qiip.env
+Environment=INFERENCE_PROXY_CONF_DIR=/etc/qiip/conf
+Environment=INFERENCE_PROXY_PROVISIONING__LOG_DB_PATH=/var/lib/qiip/provisioning-logs.sqlite3
+Environment=INFERENCE_PROXY_AUTH__DB_PATH=/var/lib/qiip/qiip.db
+ExecStart=/usr/bin/python3 -m uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 5000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
