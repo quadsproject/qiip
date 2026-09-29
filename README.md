@@ -80,6 +80,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Use with the OpenAI Python SDK](#use-with-the-openai-python-sdk)
   - [Chat playground](#chat-playground)
 - [RPM installation](#rpm-installation)
+  - [Development RPM (`qiip-dev`)](#development-rpm-qiip-dev)
 - [API Endpoints](#api-endpoints)
   - [Claude Code and Codex](#claude-code-and-codex)
   - [Administrative access](#administrative-access)
@@ -311,10 +312,23 @@ installed together:
 | `qiip` | Stable (`main`) | `quadsdev/qiip` |
 | `qiip-dev` | Development (`development`) | `quadsdev/qiip` |
 
-`qiip-dev` conflicts with `qiip`: from the same `quadsdev/qiip` COPR repo,
-`dnf install qiip-dev` when you want the development branch. See
-[releases](docs/releases.md) for the versioning, changelog, and badge
+`qiip-dev` conflicts with `qiip`; see [Development RPM](#development-rpm-qiip-dev)
+below or [releases](docs/releases.md) for the versioning, changelog, and badge
 details.
+
+### Development RPM (`qiip-dev`)
+
+Install the development train from the same `quadsdev/qiip` COPR repo:
+
+```bash
+sudo dnf copr enable quadsdev/qiip
+sudo dnf install qiip-dev
+```
+
+`qiip-dev` tracks the `development` branch and is rebuilt on every code
+change, so expect frequent updates (`sudo dnf upgrade qiip-dev`). It
+conflicts with `qiip`; only one train can be installed at a time, and
+`dnf` replaces the other package when you switch trains.
 
 Configure and start:
 
