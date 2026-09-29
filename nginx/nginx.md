@@ -102,7 +102,7 @@ upstream stays `127.0.0.1:5000` for bare-metal nginx.
 ```bash
 FQDN=$(hostname -f)
 
-if rpm -q qiip >/dev/null 2>&1; then
+if [ -f /usr/share/qiip/nginx/nginx.conf ]; then
   sudo cp /usr/share/qiip/nginx/nginx.conf /etc/nginx/nginx.conf
 else
   sudo curl -fsSL -o /etc/nginx/nginx.conf \
@@ -280,7 +280,7 @@ deployment, install it manually (single source is `nginx/gen-cert.sh`):
 
 ```bash
 # RPM install: script already present as /usr/share/qiip/nginx/gen-cert.sh
-if ! rpm -q qiip >/dev/null 2>&1; then
+if [ ! -f /usr/share/qiip/nginx/gen-cert.sh ]; then
   sudo curl -fsSL -o /usr/local/sbin/gen-cert.sh \
     https://raw.githubusercontent.com/quadsproject/qiip/main/nginx/gen-cert.sh
   sudo chmod 0555 /usr/local/sbin/gen-cert.sh
@@ -298,7 +298,7 @@ the script regenerates both and preserves the surviving file as `<name>.stale`.
 ```bash
 FQDN=$(hostname -f)
 CERTGEN=/usr/local/sbin/gen-cert.sh
-if rpm -q qiip >/dev/null 2>&1; then CERTGEN=/usr/share/qiip/nginx/gen-cert.sh; fi
+if [ -f /usr/share/qiip/nginx/gen-cert.sh ]; then CERTGEN=/usr/share/qiip/nginx/gen-cert.sh; fi
 sudo env QIIP_FQDN="$FQDN" CERTS_DIR=/etc/pki/tls/certs "$CERTGEN"
 openssl x509 -in /etc/pki/tls/certs/$FQDN.pem -noout -subject -enddate
 # subject=CN = <fqdn>; notAfter = 10 years out
@@ -399,7 +399,9 @@ systemctl --user restart qiip-nginx
 
 # RPM
 sudo rm /etc/pki/tls/certs/$FQDN.pem /etc/pki/tls/certs/$FQDN.key
-sudo env QIIP_FQDN="$FQDN" CERTS_DIR=/etc/pki/tls/certs /usr/local/sbin/gen-cert.sh
+CERTGEN=/usr/local/sbin/gen-cert.sh
+if [ -f /usr/share/qiip/nginx/gen-cert.sh ]; then CERTGEN=/usr/share/qiip/nginx/gen-cert.sh; fi
+sudo env QIIP_FQDN="$FQDN" CERTS_DIR=/etc/pki/tls/certs "$CERTGEN"
 sudo systemctl reload nginx
 ```
 
