@@ -55,6 +55,7 @@ def test_model_tooltips_do_not_change_selection(tmp_path: Path) -> None:
 window.matchMedia = () => ({matches: true});
 const token = {name: 'Laptop', models: ['org/qwen-GGUF'], exportable: true, created_at: '2026-09-22T00:00:00Z'};
 const state = {user: {email: 'test@example.com'}, token, models: ['org/qwen-GGUF', 'org/gemma-GGUF', 'custom'],
+  model_names: {'org/qwen-GGUF': 'Qwen label from API', 'org/gemma-GGUF': 'gemma'},
   model_details: {'org/qwen-GGUF': {context_tokens: 262144, input_modalities: ['text']},
     'org/gemma-GGUF': {context_tokens: 131072, input_modalities: ['text']}},
   harnesses: [{id: 'opencode', label: 'OpenCode', available: true, multi_model: true}]};
@@ -79,11 +80,8 @@ async function step(name) {
 }
 (async () => {
   await step('home');
-  check(document.querySelector('button[data-model="org/qwen-GGUF"]').textContent === 'qwen', 'Home label is cleaned, ID is unchanged');
-  check(window.QiipModelInfo.displayName('unsloth/Qwen3.8-27B-GGUF') === 'Qwen3.8-27B', 'Qwen name');
-  check(window.QiipModelInfo.displayName('unsloth/Qwen3.6-35B-A3B-MTP-GGUF') === 'Qwen3.6-35B-A3B', 'MTP packaging suffix');
-  check(window.QiipModelInfo.displayName('unsloth/Muse-Glimmer-30B-GGUF') === 'Muse-Glimmer-30B', 'Muse name');
-  check(window.QiipModelInfo.displayName('unsloth/gemma-4-31B-it-GGUF') === 'gemma-4-31B-it', 'Gemma variant retained');
+  check(document.querySelector('button[data-model="org/qwen-GGUF"]').textContent === 'Qwen label from API', 'Home label comes from API, ID is unchanged');
+  check(document.querySelector('button[data-model="custom"]').textContent === 'custom', 'Home falls back to raw ID');
   const tip = document.getElementById('ob-model-tooltip');
   let info = document.querySelector('.ob-model-info');
   check(document.querySelectorAll('.ob-model-info').length === 2, 'Unknown model has no tooltip');
@@ -106,7 +104,8 @@ async function step(name) {
   await step('harness');
   document.querySelector('.ob-choice').click();
   await step('models');
-  check(document.querySelector('button[data-model="org/qwen-GGUF"] .ob-choice-label').textContent === 'qwen', 'Wizard label is cleaned');
+  check(document.querySelector('button[data-model="org/qwen-GGUF"] .ob-choice-label').textContent === 'Qwen label from API', 'Wizard label comes from API');
+  check(document.querySelector('button[data-model="custom"] .ob-choice-label').textContent === 'custom', 'Wizard falls back to raw ID');
   check(token.models.includes('org/gemma-GGUF'), 'Saved API scope uses original ID');
   check(selected() === 'org/gemma-GGUF,org/qwen-GGUF', 'Wizard retains both selections');
   info = document.querySelectorAll('.ob-model-info')[1];

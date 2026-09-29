@@ -35,11 +35,6 @@
   window.addEventListener("resize", close);
   window.addEventListener("scroll", close, true);
 
-  function displayName(model) {
-    // Publisher and GGUF packaging are not part of the user-facing name.
-    return model.split("/").pop().replace(/(?:-MTP)?-GGUF$/i, "") || model;
-  }
-
   function wrap(button, model, details) {
     if (!details) return button;
     var row = document.createElement("div");
@@ -48,7 +43,7 @@
     info.type = "button";
     info.className = "ob-model-info";
     info.textContent = "ⓘ";
-    info.setAttribute("aria-label", "Information about " + displayName(model));
+    info.setAttribute("aria-label", "Information about " + model);
     function open() {
       clearTimeout(timer);
       if (active !== info) close();
@@ -86,5 +81,5 @@
     });
     grid.style.setProperty("--ob-model-width", Math.ceil(width) + "px");
   }
-  window.QiipModelInfo = { wrap: wrap, close: close, displayName: displayName, sizeChoices: sizeChoices };
+  window.QiipModelInfo = { wrap: wrap, close: close, sizeChoices: sizeChoices };
 })();
