@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.1.0-dev.4 (2026-09-29)
+
+### Bug Fixes
+
+- Use consistent readable model labels
+  ([`e7678c5`](https://github.com/quadsproject/qiip/commit/e7678c5fe5de612f84f69e0e8717b6ac68c40098))
+
+
 ## v0.1.0-dev.3 (2026-09-29)
 
 ### Bug Fixes
