@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v0.1.0-dev.3 (2026-09-29)
+
+### Bug Fixes
+
+- Preflight COPR dependency RPMs in release
+  ([`1866c74`](https://github.com/quadsproject/qiip/commit/1866c7410c95b49efb3ef96fcbeeb236db5eef34))
+
+- Refresh uv.lock after each semantic release
+  ([`03a70a0`](https://github.com/quadsproject/qiip/commit/03a70a029791cd64dc6095805b9427fd747ca9ba))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`436190e`](https://github.com/quadsproject/qiip/commit/436190ececbd1adfd813eb45630261a22d9cbba6))
+
+
 ## v0.1.0-dev.2 (2026-09-29)
 
 ### Bug Fixes
