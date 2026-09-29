@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.1.0-dev.5 (2026-09-29)
+
+### Bug Fixes
+
+- Strip hf-xet from huggingface-hub build deps
+  ([`7fe8250`](https://github.com/quadsproject/qiip/commit/7fe82508e74ae6c026b5c028e2d2f4a362f8413b))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`57a1c1e`](https://github.com/quadsproject/qiip/commit/57a1c1ea226d7762e5b2754f8821405aff5afbf3))
+
+
 ## v0.1.0-dev.4 (2026-09-29)
 
 ### Bug Fixes
