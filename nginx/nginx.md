@@ -12,8 +12,10 @@ Two deployment methods are documented here, both using the same
 2. **Podman container** - rootless systemd user service (Quadlet), pasta
    networking, first-run self-signed certificate generation.
 
-This is strictly optional. The gateway runs fine without it, and the two
-methods are alternatives on one host (both bind 80/443).
+With an RPM install nginx is a hard dependency and is managed by the
+package; for a git-checkout deployment it is optional (the gateway runs
+fine without it). The two methods are alternatives on one host (both bind
+80/443).
 
 ## Table of contents
 
@@ -40,18 +42,17 @@ methods are alternatives on one host (both bind 80/443).
 
 ## Prerequisites
 
-- Gateway running and healthy on port 5000. Start it with exactly
+- Gateway running and healthy on port 5000. With an RPM install the
+  `inference-proxy.service` systemd unit starts it; with a git checkout
+  start it with exactly
   `uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 5000`
-  (the README Quick Start now uses this port), then check
+  (the README Quick Start uses this port), then check
   `curl -s http://localhost:5000/health` returns `{"status": "ok", ...}`.
   Method 2 needs `--host 0.0.0.0`: a loopback-only listener cannot be reached
   from the pasta container.
-- Fedora 40+ host for both methods (the container image is Fedora-based), or
-  a Rocky/RHEL 9.6+ host for Method 1 only, with **nginx >= 1.25.1** (the
-  config uses `http2 on;`, which older nginx rejects). Fedora ships nginx
-  1.28+ by default. EL9's stock nginx is 1.20 and only the `nginx:1.26`
-  module stream (available since 9.6) supports `http2 on;`; enable it before
-  installing (see [Method 1](#method-1-rpm-install)). IPv6 is
+- Fedora 40+ host for both methods (the container image is Fedora-based),
+  with **nginx >= 1.25.1** (the config uses `http2 on;`, which older nginx
+  rejects). Fedora ships nginx 1.28+ by default. EL9 is not supported. IPv6 is
   optional: on an IPv4-only host, remove the two `listen [::]:...` lines
   from the config (see [Troubleshooting](#troubleshooting)) - nginx fails
   to start with "Address family not supported" otherwise.
@@ -65,37 +66,43 @@ hosts that already run nginx as a system service, and the path where the
 [ansible-sslcerts](#rpm-ansible-sslcerts) playbook's normal handler
 (restart of the system `nginx` unit) works unchanged.
 
-Steps for RPM install (sections below, in order).
+The RPM install automates every step below at install time; only a
+git-checkout deployment needs to work through them in order.
 
 ### Install nginx
 
-The qiip RPM bundles nginx support: it `Requires: nginx` (and `openssl`),
-ships the config at `/usr/share/qiip/nginx/nginx.conf`, the cert generator
-at `/usr/share/qiip/nginx/gen-cert.sh`, and creates `/var/cache/nginx` on
-install. Installing `qiip` (or `qiip-dev`) therefore skips the manual steps
-below; only the cert pair is still needed (see
-[Certificates](#certificates)).
+QUADS-style: nginx is a hard dependency of the qiip RPM and is managed by
+it. The package requires `nginx` (plus `openssl` and `policycoreutils`),
+ships the config at `/usr/share/qiip/nginx/nginx.conf` and the cert
+generator at `/usr/share/qiip/nginx/gen-cert.sh`, and on install deploys
+the config to `/etc/nginx/nginx.conf` (with `{FQDN}` replaced by the FQDN)
+when the stock file is unmodified per the nginx-core rpmdb (`rpm -V`),
+so an operator-edited config is never clobbered. It also starts the
+gateway on first install,
+generates a self-signed pair if none exists, sets
+`httpd_can_network_connect`, creates `/var/cache/nginx`, and enables and
+starts `nginx` when it passes `nginx -t`.
+
+A git-checkout deployment needs the manual steps below:
 
 ```bash
-# Manual install (git-checkout deployment) or EL9:
-# EL9 (Rocky/RHEL 9.6+) only: the stock nginx is 1.20, which rejects
-# `http2 on;`. If a different nginx stream is already enabled, run
-# `sudo dnf module reset -y nginx` first.
-sudo dnf module enable -y nginx:1.26
 sudo dnf install -y nginx openssl
 # nginx needs its temp dirs; the package does not create /var/cache/nginx.
 sudo install -d -o nginx -g nginx /var/cache/nginx
 # SELinux: label it with the packaged context (httpd_cache_t) or nginx cannot
 # create its temp dirs/files under it.
 sudo restorecon -R /var/cache/nginx
+sudo setsebool -P httpd_can_network_connect on
 ```
 
 ### Deploy the config
 
-Fetch the repo config (or copy it from a checkout, or use the bundled copy
-when the qiip RPM is installed), substitute the FQDN, and drop any packaged
-vhosts under `conf.d/`/`default.d/` - a defensive no-op on Fedora and EL9,
-which ship none (their stock `listen 80` server lives inline in
+With the RPM install this happens automatically (see above); only a
+git-checkout deployment needs the steps below. Fetch the repo config (or
+copy it from a checkout, or use the bundled copy), substitute the FQDN,
+and drop any packaged vhosts under `conf.d/`/`default.d/` - a defensive
+no-op on Fedora,
+which ships none (its stock `listen 80` server lives inline in
 `/etc/nginx/nginx.conf`, which this deploy replaces wholesale). The
 upstream stays `127.0.0.1:5000` for bare-metal nginx.
 
@@ -116,8 +123,12 @@ sudo rm -f /etc/nginx/conf.d/*.conf /etc/nginx/default.d/*.conf
 ### SELinux and firewall
 
 nginx is confined to `httpd_t`; proxying to the gateway port needs the
-network-connect boolean. Open 80/443 and keep 5000 closed externally (the
-`/v1/*` inference endpoints are unauthenticated).
+network-connect boolean. The RPM sets it on install; run it manually for a
+git checkout. The boolean allows all httpd outbound connections host-wide
+(it is the QUADS-style choice); a narrower alternative is
+`semanage port -a -t http_port_t -p tcp 5000`, which permits the connection
+by port label without the boolean. Open 80/443 and keep 5000 closed
+externally (the `/v1/*` inference endpoints are unauthenticated).
 
 ```bash
 sudo setsebool -P httpd_can_network_connect on
@@ -129,8 +140,12 @@ sudo firewall-cmd --reload
 
 ### Install and start
 
-The cert pair must already exist (generate it first, see
-[Certificates](#certificates)); otherwise `nginx -t` fails with
+The RPM install starts nginx itself (`systemctl enable --now nginx`, after
+`nginx -t` passes) and ships the gateway unit `inference-proxy.service`;
+manage the uvicorn processes with
+`sudo systemctl restart/status inference-proxy`. For a git checkout, the
+cert pair must exist (generate it via
+[Certificates](#certificates)) first; otherwise `nginx -t` fails with
 `cannot load certificate ... BIO_new_file() failed`.
 
 ```bash
@@ -418,6 +433,20 @@ years so this is a lifetime away).
 
 ## Teardown
 
+RPM method: the package intentionally leaves state behind on uninstall (the
+same as QUADS): the deployed `/etc/nginx/nginx.conf`, any generated
+cert pair in `/etc/pki/tls/certs`, the `httpd_can_network_connect` boolean,
+and nginx itself stay enabled and running with a proxy to nothing. Remove a
+stale install explicitly:
+
+```bash
+sudo dnf remove qiip
+sudo systemctl disable --now nginx
+sudo setsebool -P httpd_can_network_connect off
+sudo rm -f /etc/nginx/nginx.conf /etc/pki/tls/certs/"$(hostname -f)".pem \
+  /etc/pki/tls/certs/"$(hostname -f)".key
+```
+
 Container method:
 
 ```bash
@@ -435,7 +464,7 @@ RPM method:
 
 ```bash
 sudo systemctl disable --now nginx
-# Fedora and EL9 both split nginx: the meta package owns only the unit/html,
+# Fedora splits nginx: the meta package owns only the unit/html,
 # nginx-core owns /etc/nginx. Delete ours first, then reinstall nginx-core
 # for the stock files (reinstalling `nginx` alone restores nothing under).
 sudo rm -f /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf /etc/nginx/default.d/*.conf

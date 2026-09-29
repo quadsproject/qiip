@@ -981,6 +981,31 @@ class PluginSettings(BaseModel):
     )
 
 
+class ServerSettings(BaseModel):
+    """ASGI worker farm tuning (used by ``python -m inference_proxy.serve``).
+
+    One worker is the safe default: the gateway runs per-process daemon
+    threads (etcd watcher, health and QUADS pollers, schedule enforcer) and
+    keeps its registry in memory, so values above 1 are unsupported.
+    """
+
+    host: str = "0.0.0.0"
+    port: int = Field(default=5000, ge=1, le=65535)
+    workers: int = Field(default=1, ge=1)
+    limit_concurrency: int = Field(default=150, ge=1)
+    max_requests: int = Field(default=5000, ge=1)
+    max_requests_jitter: int = Field(default=500, ge=0)
+    log_level: Literal["critical", "error", "warning", "info", "debug", "trace"] = (
+        "info"
+    )
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _normalize_log_level(cls, value: object) -> object:
+        """Accept any case; uvicorn lowercases it anyway."""
+        return value.lower() if isinstance(value, str) else value
+
+
 class Settings(BaseSettings):
     """Root application settings.
 
@@ -1033,6 +1058,7 @@ class Settings(BaseSettings):
     proxy: ProxySettings = ProxySettings()
     resilience: ResilienceSettings = ResilienceSettings()
     logging: LoggingSettings = LoggingSettings()
+    server: ServerSettings = ServerSettings()
     admin: AdminSettings
     dashboard: DashboardSettings = DashboardSettings()
     pricing: PricingSettings = PricingSettings()

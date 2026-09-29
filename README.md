@@ -277,6 +277,32 @@ sudo dnf install qiip
 > RPM installs use the system Python 3.14 (the Fedora 43/44 default). The
 > packages require `python3 >= 3.12` and `< 3.15`.
 
+QUADS-style serving: the package requires and manages nginx (TLS
+termination) alongside the gateway. On install it deploys the bundled
+`nginx.conf` (FQDN substituted) when the stock file is unmodified per the
+nginx-core rpmdb, so an operator-edited config is never clobbered; it
+generates a self-signed cert if none exists, sets
+`httpd_can_network_connect`, then enables and starts `nginx`. The gateway
+runs under `inference-proxy.service` as an explicitly tuned uvicorn
+process farm (uvicorn's native multi-worker; its bundled gunicorn worker
+is deprecated upstream, so we do not use it), tuned like every other QIIP setting through the
+`server:` YAML block (or `INFERENCE_PROXY_SERVER__*` overrides):
+
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| `workers` | `1` | uvicorn worker processes; only 1 is supported (each worker runs its own background jobs and registry) |
+| `limit_concurrency` | `150` | max concurrent connections per worker |
+| `max_requests` | `5000` | recycle a worker after N requests (memory guard) |
+| `max_requests_jitter` | `500` | +/- random walk around the recycle threshold |
+| `log_level` | `info` | uvicorn log level (lowercase) |
+
+Workers recycle every `max_requests +/- jitter` requests, the same memory
+guard QUADS uses with gunicorn. The gateway runs per-process daemon
+threads (etcd watcher, health and QUADS pollers, schedule enforcer) with
+an in-memory registry, so one worker is the only supported value. A fresh
+install starts both units; upgrades only re-enable them. Manage both
+units after install: `sudo systemctl status inference-proxy nginx`.
+
 Two packages, one train each; they ship the same files and cannot be
 installed together:
 
