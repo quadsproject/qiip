@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v0.1.0-dev.8 (2026-09-29)
+
+### Bug Fixes
+
+- Disable uv cache in semantic release job
+  ([`9190735`](https://github.com/quadsproject/qiip/commit/9190735fb3fc2fc5bb58acdcde918e321a4899ad))
+
+### Chores
+
+- Enable copr-deps dispatch from main
+  ([`e37765a`](https://github.com/quadsproject/qiip/commit/e37765a18a77d5eba1074b8bbf642cd37582eeb9))
+
+- Refresh uv.lock after version bump
+  ([`02d3037`](https://github.com/quadsproject/qiip/commit/02d3037224f6449a84a645dbc4e386842033ebc1))
+
+
 ## v0.1.0-dev.7 (2026-09-29)
 
 ### Chores
