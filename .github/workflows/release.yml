@@ -121,5 +121,5 @@ jobs:
             echo "No .src.rpm found after 'make srpm'" >&2
             exit 1
           fi
-          echo "Submitting $srpm_file to quadsdev/$PROJECT"
-          copr build "quadsdev/$PROJECT" "$srpm_file"
+          echo "Submitting $srpm_file to quadsdev/qiip"
+          copr build quadsdev/qiip "$srpm_file"

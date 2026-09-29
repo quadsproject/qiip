@@ -775,8 +775,8 @@ To move an existing gateway to the RPM install:
    and `.../data/provisioning-logs.sqlite3` (new location defaults).
 4. Move settings: copy `INFERENCE_PROXY_*` values from
    `/opt/inference-proxy/.env` into `/etc/qiip/qiip.env`.
-5. `sudo dnf install qiip` (after `dnf copr enable quadsdev/qiip-deps` and
-   `quadsdev/qiip`), copy the config examples, then
+5. `sudo dnf install qiip` (after `dnf copr enable quadsdev/qiip`), copy
+   the config examples, then
    `sudo systemctl enable --now inference-proxy`.
 
 The old `/opt/inference-proxy` checkout is no longer needed by the service;

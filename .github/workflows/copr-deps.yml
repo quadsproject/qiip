@@ -1,9 +1,9 @@
 name: COPR dependencies
 
 # Dependency RPMs are pinned (see copr-deps/README.md) and published to
-# quadsdev/qiip-deps once, not per qiip release. Run this on demand only
-# when a dependency version is bumped; the qiip/qiip-dev COPR builds reuse
-# the published RPMs as-is.
+# quadsdev/qiip once, not per qiip release. Run this on demand only when a
+# dependency version is bumped; qiip and qiip-dev builds share the same
+# dependency RPMs, published in the same COPR project.
 on:
   workflow_dispatch:
 
@@ -54,6 +54,6 @@ jobs:
             rpmbuild -bs --define "_sourcedir $PWD" --define "_srcrpmdir $PWD" "$spec"
           done
           for srpm in *.src.rpm; do
-            echo "Submitting $srpm to quadsdev/qiip-deps"
-            copr build quadsdev/qiip-deps "$srpm"
+            echo "Submitting $srpm to quadsdev/qiip"
+            copr build quadsdev/qiip "$srpm"
           done

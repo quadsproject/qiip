@@ -2,10 +2,11 @@
 
 System packages only: the qiip RPM must never install Python dependencies via
 pip or uv. Most runtime dependencies are packaged in Fedora 43/44; the
-specs here cover the three that are not (or are below the versions QIIP
-needs), built into the COPR project `quadsdev/qiip-deps` and enabled as an
-additional repository in the `quadsdev/qiip` and `quadsdev/qiip-dev`
-projects.
+specs here cover the six that are not (or are below the versions QIIP
+needs), built into the same COPR project as the QIIP RPMs, `quadsdev/qiip`.
+Package names are unique, so one project holds qiip, qiip-dev, and the
+dependency RPMs; builds in a project see its own repository, so nothing
+else has to be enabled.
 
 | Spec | Why |
 |------|------|
@@ -33,10 +34,11 @@ when upstream packaging catches up.
 
 ## Publish once, bump on demand
 
-The six versions here are pinned and published to `quadsdev/qiip-deps`
-once; users never build anything, they only enable the repo (`dnf copr
-enable quadsdev/qiip-deps`). The qiip/qiip-dev COPR builds consume these
-RPMs as-is; they are not rebuilt per qiip release.
+The six versions here are pinned and published to `quadsdev/qiip` once;
+users never build anything, they only enable that one repository (`dnf
+copr enable quadsdev/qiip`). The qiip/qiip-dev COPR builds consume these
+RPMs from the same project's repository; they are not rebuilt per qiip
+release.
 
 To publish (initial or after bumping a pinned version), use the `COPR
 dependencies` workflow manually (`.github/workflows/copr-deps.yml`,
@@ -58,35 +60,34 @@ for spec in *.spec; do
     rpmbuild -bs --define "_sourcedir $PWD" --define "_srcrpmdir $PWD" "$spec"
 done
 
-# submit to the dependency project
+# submit to the qiip project
 for srpm in *.src.rpm; do
-    copr build quadsdev/qiip-deps "$srpm"
+    copr build quadsdev/qiip "$srpm"
 done
 ```
 
 The sdist sources are downloaded from PyPI and embedded in the SRPMs; no
 sources are kept in git.
 
-## Enable for the qiip projects
+## COPR project configuration
 
-In the COPR project settings for `quadsdev/qiip` and `quadsdev/qiip-dev`:
+`quadsdev/qiip` is the only project. Keep its Fedora 43/44 chroots and
+remove the `epel-10-x86_64`, `almalinux-10-x86_64_v2`, and `fedora-45`
+chroots (not supported, see above). No additional repository has to be
+added: COPR build chroots include the project's own repository, so qiip
+and qiip-dev builds resolve the dependency RPMs automatically.
 
-1. Add the qiip-deps repository to the fedora-43/44 chroots:
-   `https://download.copr.fedorainfracloud.org/results/quadsdev/qiip-deps/fedora-$releasever-$basearch/`
-2. Remove the `epel-10-x86_64` and `almalinux-10-x86_64_v2` chroots (not
-   supported, see above).
-
-Users installing the RPMs need the same two repos enabled:
+Users installing the RPMs enable the single repository:
 
 ```bash
-sudo dnf copr enable quadsdev/qiip-deps
 sudo dnf copr enable quadsdev/qiip
-# or: sudo dnf copr enable quadsdev/qiip-dev (development train)
 sudo dnf install qiip
+# development train (same repository; conflicts with the stable RPM):
+sudo dnf install qiip-dev
 ```
 
 ## Updating
 
 When a dependency needs a newer version (e.g. structlog 26.x lands fixes),
 bump `Version:` in the spec, rebuild, and submit again to
-`quadsdev/qiip-deps`; the qiip builds then pick it up through the repo.
+`quadsdev/qiip`; the qiip builds then pick it up through the repo.
