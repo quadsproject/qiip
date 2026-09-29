@@ -110,6 +110,24 @@ jobs:
           mkdir -p "$HOME/.config"
           echo "$API_TOKEN_CONTENT" > "$HOME/.config/copr"
 
+      - name: Check dependency RPMs are published
+        run: |
+          python3 - <<'EOF'
+          import json, sys, urllib.request
+          url = ("https://copr.fedorainfracloud.org/api_3/package/list"
+                 "?ownername=quadsdev&projectname=qiip")
+          names = {p["name"] for p in json.load(urllib.request.urlopen(url))["items"]}
+          need = {"python3-click", "python3-etcd3gw", "python3-fastapi",
+                  "python3-huggingface-hub", "python3-structlog", "python3-uvicorn"}
+          missing = sorted(need - names)
+          if missing:
+              print("COPR dependency RPMs not published yet:", ", ".join(missing))
+              print("Publish copr-deps once (COPR dependencies workflow or "
+                    "copr-deps/README.md) before the first qiip/qiip-dev build.")
+              sys.exit(1)
+          print("dependency RPMs present in quadsdev/qiip")
+          EOF
+
       - name: Build SRPM and submit to COPR
         env:
           PROJECT: ${{ github.ref_name == 'main' && 'qiip' || 'qiip-dev' }}
