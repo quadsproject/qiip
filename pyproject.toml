@@ -1,6 +1,6 @@
 [project]
 name = "inference-proxy"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 description = "QUADS LLM Inference Proxy - routes requests to vLLM nodes"
 requires-python = ">=3.12,<3.15"
 dependencies = [
