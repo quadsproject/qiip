@@ -47,8 +47,7 @@ jobs:
             echo "code_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          changed="$(git diff --name-only "$last_tag" HEAD -- . \
-            ':(exclude)*.md' ':(exclude)docs/**' ':(exclude)assets/**')"
+          changed="$(git diff --name-only "$last_tag" HEAD -- . ':(exclude)*.md' ':(exclude)docs/**' ':(exclude)assets/**')"
           if [[ -n "$changed" ]]; then
             echo "code_changed=true" >> "$GITHUB_OUTPUT"
           else
@@ -93,8 +92,7 @@ jobs:
       contents: read
     steps:
       - name: Install tooling
-        run: dnf -y install git @development-tools @rpm-development-tools \
-          copr-cli make python3-devel pyproject-rpm-macros
+        run: dnf -y install git @development-tools @rpm-development-tools copr-cli make python3-devel pyproject-rpm-macros
 
       - name: Check out release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
