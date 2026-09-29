@@ -119,9 +119,27 @@ jobs:
             echo "uv.lock already up to date"
             exit 0
           fi
+          # The runner has no git identity by default; set one before commit.
+          git config user.name "qiip release"
+          git config user.email "noreply@github.com"
           git add uv.lock
           git commit -m "chore: refresh uv.lock after version bump"
-          git push origin "HEAD:$GITHUB_REF_NAME"
+          # Survive a concurrent merge landing between PSR's push and ours:
+          # re-fetch, regenerate against the new head, and retry.
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:$GITHUB_REF_NAME"; then
+              exit 0
+            fi
+            git fetch origin "$GITHUB_REF_NAME"
+            git reset --hard "origin/$GITHUB_REF_NAME"
+            uv lock
+            if git diff --quiet -- uv.lock; then
+              echo "uv.lock already up to date"
+              exit 0
+            fi
+            git add uv.lock
+            git commit -m "chore: refresh uv.lock after version bump"
+          done
 
   copr_build:
     name: COPR build
