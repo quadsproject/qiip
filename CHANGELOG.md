@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.1.0-dev.6 (2026-09-29)
+
+### Bug Fixes
+
+- Commit uv.lock refresh with git identity
+  ([`ad04fd0`](https://github.com/quadsproject/qiip/commit/ad04fd0f5cb9af49f4797422c7cefbbb700d00fe))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`21c307c`](https://github.com/quadsproject/qiip/commit/21c307c288184b399a560edb33bc8060824de073))
+
+
 ## v0.1.0-dev.5 (2026-09-29)
 
 ### Bug Fixes
