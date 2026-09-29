@@ -133,6 +133,7 @@ def test_model_information_does_not_expose_private_profiles(
     )
     state = user_client.get("/onboarding/state").json()
     assert profile.target.repo_id not in state["models"]
+    assert profile.target.repo_id not in state["model_names"]
     assert state["model_details"] == {}
 
 
@@ -197,6 +198,10 @@ class TestStartPage:
         state = user_client.get("/onboarding/state").json()
         assert state["token"] is None
         assert state["models"] == [MODEL_A, MODEL_B]
+        assert state["model_names"] == {
+            MODEL_A: MODEL_A.rsplit("/", 1)[-1],
+            MODEL_B: MODEL_B.rsplit("/", 1)[-1],
+        }
         harnesses = {h["id"]: h for h in state["harnesses"]}
         assert harnesses["opencode"]["available"] is True
         assert harnesses["opencode"]["multi_model"] is True
@@ -239,6 +244,18 @@ class TestStartPage:
             MODEL_A,
             MODEL_B,
         ]
+
+    def test_offline_token_models_keep_display_names(
+        self, user_client: TestClient, test_registry: NodeRegistry
+    ) -> None:
+        model = "publisher/offline-MTP-GGUF"
+        test_registry.add(_node("offline-host", model))
+        _mint(user_client, [model])
+        test_registry.remove("offline-host")
+        state = user_client.get("/onboarding/state").json()
+        assert model not in state["models"]
+        assert state["model_names"][model] == "offline"
+        assert state["token"]["models"] == [model]
 
 
 class TestSingleToken:
@@ -607,7 +624,7 @@ class TestSetupScripts:
         )
         assert not (tmp_path / "pwned").exists()
         written = json.loads((tmp_path / harness.config_path).read_text())
-        assert written["providers"]["qiip"]["models"] == [{"id": evil}]
+        assert written["providers"]["qiip"]["models"] == [{"id": evil, "name": evil}]
 
 
 class TestReviewRegressions:

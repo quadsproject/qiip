@@ -410,7 +410,7 @@
         var card = el("button", "ob-choice is-mono" + (multi ? " is-multi" : ""));
         card.type = "button";
         card.dataset.model = model;
-        card.appendChild(el("span", "ob-choice-label", window.QiipModelInfo.displayName(model)));
+        card.appendChild(el("span", "ob-choice-label", (data.model_names || {})[model] || model));
         card.addEventListener("click", function () {
           var at = choice.models.indexOf(model);
           if (!multi) choice.models = [model];
@@ -418,7 +418,7 @@
           else choice.models.splice(at, 1);
           sync();
         });
-        grid.appendChild(window.QiipModelInfo.wrap(card, model, (data.model_details || {})[model]));
+        grid.appendChild(window.QiipModelInfo.wrap(card, (data.model_names || {})[model] || model, (data.model_details || {})[model]));
       });
       sync();
 
@@ -679,7 +679,7 @@
       };
       all.forEach(function (model) {
         var offline = data.models.indexOf(model) === -1;
-        var name = window.QiipModelInfo.displayName(model);
+        var name = (data.model_names || {})[model] || model;
         var chip = el("button", "ob-model", offline ? name + " (offline)" : name);
         chip.type = "button";
         chip.dataset.model = model;
@@ -713,7 +713,7 @@
             }
           });
         });
-        chips.appendChild(window.QiipModelInfo.wrap(chip, model, (data.model_details || {})[model]));
+        chips.appendChild(window.QiipModelInfo.wrap(chip, name, (data.model_details || {})[model]));
       });
       paint();
       card.append(row, facts, labelRow, chips);
