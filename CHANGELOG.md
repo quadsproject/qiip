@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.1.0-dev.7 (2026-09-29)
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`ea52ab6`](https://github.com/quadsproject/qiip/commit/ea52ab6841d01d8277c95a5dce70d379bb0ab503))
+
+### Features
+
+- QUADS-style nginx and uvicorn tuning in RPM service
+  ([`cc7394d`](https://github.com/quadsproject/qiip/commit/cc7394d213123455b29ed85b56e773acb6220759))
+
+
 ## v0.1.0-dev.6 (2026-09-29)
 
 ### Bug Fixes
