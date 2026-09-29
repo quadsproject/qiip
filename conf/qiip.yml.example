@@ -32,6 +32,19 @@ routing:
   allowed_endpoint_ports:
     - 8000
 
+# ASGI worker farm tuning (QUADS-style). The gateway runs per-process daemon
+# threads (etcd watcher, health and QUADS pollers, schedule enforcer) and
+# keeps its registry in memory, so keep workers at 1 unless the background
+# jobs running once per worker are acceptable.
+server:
+  host: 0.0.0.0
+  port: 5000
+  workers: 1
+  limit_concurrency: 150
+  max_requests: 5000
+  max_requests_jitter: 500
+  log_level: info
+
 proxy:
   # httpx client timeouts, tuned for LLM inference.
   connect_timeout: 5.0

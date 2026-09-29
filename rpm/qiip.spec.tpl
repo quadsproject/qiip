@@ -24,10 +24,12 @@ BuildRequires:  pyproject-rpm-macros
 BuildRequires:  systemd-rpm-macros
 
 Requires:       python3 >= 3.12
-# Bundled nginx stack: nginx.conf uses `http2 on;` (nginx >= 1.25.1);
-# gen-cert.sh shells out to openssl.
+# QUADS-style serving: nginx terminates TLS (nginx.conf uses `http2 on;`,
+# nginx >= 1.25.1; gen-cert.sh shells out to openssl), uvicorn serves the
+# app with explicit worker tuning, and setsebool lives in policycoreutils.
 Requires:       nginx >= 1.25.1
 Requires:       openssl
+Requires:       policycoreutils
 @CONFLICTS@
 
 %description
@@ -50,7 +52,8 @@ Requires:       openssl
 # gateway; resolved relative to the working directory at runtime).
 install -d -m 0755 %{buildroot}%{_datadir}/qiip
 cp -a auto-vllm auto-llamacpp common conf nginx %{buildroot}%{_datadir}/qiip/
-chmod 0755 %{buildroot}%{_datadir}/qiip/nginx/gen-cert.sh
+chmod 0755 %{buildroot}%{_datadir}/qiip/nginx/gen-cert.sh \
+    %{buildroot}%{_datadir}/qiip/nginx/nginx-deploy-conf.sh
 
 install -d -m 0755 %{buildroot}%{_unitdir}
 install -m 0644 rpm/inference-proxy.service %{buildroot}%{_unitdir}/inference-proxy.service
@@ -58,11 +61,16 @@ install -m 0644 rpm/inference-proxy.service %{buildroot}%{_unitdir}/inference-pr
 # Writable runtime data location (matches the shipped unit's overrides).
 install -d -m 0755 %{buildroot}%{_localstatedir}/lib/qiip
 # Admin config: examples are never loaded (the loader matches .yml/.yaml),
-# and qiip.env is the secrets file the unit reads.
+# and qiip.env is the secrets file the unit reads. Server tuning lives in
+# the server: YAML block (or INFERENCE_PROXY_SERVER__* overrides here).
 install -d -m 0755 %{buildroot}%{_sysconfdir}/qiip/conf
 install -m 0644 conf/qiip.yml.example conf/auth.yml.example conf/plugins.yml.example \
     %{buildroot}%{_sysconfdir}/qiip/conf/
-: > %{buildroot}%{_sysconfdir}/qiip/qiip.env
+cat > %{buildroot}%{_sysconfdir}/qiip/qiip.env <<'EOF'
+# Secrets and INFERENCE_PROXY_* overrides go here. Server tuning is set in
+# the server: YAML block; override per host with e.g.
+# INFERENCE_PROXY_SERVER__WORKERS=1
+EOF
 
 %check
 # The full suite runs in CI (Node 24 + pinned dev deps); %check is empty so
@@ -87,12 +95,48 @@ install -m 0644 conf/qiip.yml.example conf/auth.yml.example conf/plugins.yml.exa
 %config(noreplace) %{_sysconfdir}/qiip/qiip.env
 
 %post
+# QUADS-style nginx integration: nginx is a hard dependency and is managed
+# here. Deploy the bundled config once (do not clobber a user's edited
+# /etc/nginx/nginx.conf on upgrade), generate a cert if none exists, allow
+# nginx to proxy to the gateway over SELinux, then enable and start it.
+FQDN="$(hostname -f 2>/dev/null || hostname)"
+# The nginx package ships /etc/nginx/nginx.conf (%config noreplace). rpm -V
+# flags it only when the operator edited it, so deploy the bundled config when
+# the stock file is unmodified (or absent); a user-modified config is never
+# clobbered. nginx.conf.default is the upstream sample, not the pristine
+# distro file, so it is not a usable comparison target.
+if [ -f /usr/share/qiip/nginx/nginx.conf ] && \
+   /usr/share/qiip/nginx/nginx-deploy-conf.sh; then
+    sed -e "s/{FQDN}/$FQDN/g" /usr/share/qiip/nginx/nginx.conf > /etc/nginx/nginx.conf
+fi
+QIIP_FQDN="$FQDN" /usr/share/qiip/nginx/gen-cert.sh >/dev/null 2>&1 || \
+    echo "qiip: cert generation failed; install a pair in /etc/pki/tls/certs before starting nginx" >&2
+setsebool httpd_can_network_connect 1 -P 2>/dev/null || :
 # nginx needs its temp dirs; the nginx package does not create them.
 if [ ! -d /var/cache/nginx ]; then
     install -d -o nginx -g nginx -m 0755 /var/cache/nginx
 fi
 restorecon -R /var/cache/nginx 2>/dev/null || :
+if /usr/sbin/nginx -t >/dev/null 2>&1; then
+    # Start on first install only; upgrades just (re)enable, never restart a
+    # stopped nginx behind the operator's back.
+    if [ "${1:-1}" -eq 1 ]; then
+        systemctl enable --now nginx >/dev/null 2>&1 || :
+    else
+        systemctl enable nginx >/dev/null 2>&1 || :
+        systemctl is-active --quiet nginx 2>/dev/null || \
+            echo "qiip: nginx is enabled but not running; start it with systemctl start nginx" >&2
+    fi
+else
+    echo "qiip: nginx -t failed; fix /etc/nginx/nginx.conf then run systemctl enable --now nginx" >&2
+fi
 %systemd_post inference-proxy.service
+# First install: also start the gateway (the macro above only enables), so
+# nginx does not sit on a dead upstream. Upgrades leave the running state alone.
+if [ "${1:-1}" -eq 1 ] && systemctl is-enabled --quiet inference-proxy.service 2>/dev/null; then
+    systemctl start inference-proxy.service >/dev/null 2>&1 || \
+        echo "qiip: inference-proxy failed to start; check systemctl status inference-proxy" >&2
+fi
 
 %preun
 %systemd_preun inference-proxy.service

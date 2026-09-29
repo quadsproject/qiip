@@ -140,6 +140,36 @@ plugins:
         assert settings.quads.base_url is None
         assert settings.quads.timeout == 10.0
 
+    def test_server_section_overrides(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        conf = _conf_dir(tmp_path, qiip="server:\n  workers: 4\n  log_level: debug\n")
+        monkeypatch.setenv(CONF_DIR_ENV, str(conf))
+
+        settings = Settings(_env_file=None)
+
+        assert settings.server.workers == 4
+        assert settings.server.log_level == "debug"
+
+    def test_server_log_level_is_case_insensitive(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        conf = _conf_dir(tmp_path, qiip="server:\n  log_level: INFO\n")
+        monkeypatch.setenv(CONF_DIR_ENV, str(conf))
+
+        settings = Settings(_env_file=None)
+
+        assert settings.server.log_level == "info"
+
+    def test_server_log_level_rejects_unknown(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        conf = _conf_dir(tmp_path, qiip="server:\n  log_level: verbose\n")
+        monkeypatch.setenv(CONF_DIR_ENV, str(conf))
+
+        with pytest.raises(ValidationError, match="log_level"):
+            Settings(_env_file=None)
+
     def test_missing_conf_dir_falls_back_to_defaults(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
