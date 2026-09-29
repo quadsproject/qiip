@@ -10,9 +10,17 @@ import re
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from inference_proxy.huggingface.artifacts import GGUFArtifact, GGUFDownloadSpec
+from inference_proxy.models.display import model_display_name
 from inference_proxy.models.llmfit import ModelRecommendation, SystemInfo
 from inference_proxy.models.node import (
     InferenceEngine,
@@ -75,6 +83,12 @@ class AdminNodeResponse(BaseModel):
     error: str | None = None
     placement_blocker: str | None = None
     owner: str = ""
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def model_display_name(self) -> str:
+        """Label shared by dashboard config downloads and onboarding."""
+        return model_display_name(self.model)
 
 
 class AdminMetricsResponse(BaseModel):

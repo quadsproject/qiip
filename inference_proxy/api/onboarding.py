@@ -46,6 +46,7 @@ from inference_proxy.config.dependencies import (
 )
 from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.models.display import model_display_name
 from inference_proxy.models.node import InferenceEngine, NodeStatus
 from inference_proxy.onboarding.harness import HARNESSES, Harness, get_harness
 from inference_proxy.onboarding.script import (
@@ -282,6 +283,7 @@ async def onboarding_state(
     token = await asyncio.to_thread(store.get_active_token, user.id)
     served = _served_routes()
     models = _available_models(user, settings, registry)
+    named_models = set(models) | set((token.model_scope or []) if token else [])
     return {
         "user": {
             "name": user.name,
@@ -291,6 +293,9 @@ async def onboarding_state(
         },
         "token": _token_view(token),
         "models": models,
+        "model_names": {
+            model: model_display_name(model) for model in sorted(named_models)
+        },
         "model_details": _model_details(user, settings, registry, models),
         "harnesses": [_harness_view(harness, served) for harness in HARNESSES],
     }

@@ -14,6 +14,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
+from inference_proxy.models.display import model_display_name
+
 MergeMode = Literal["json", "codex-toml", "replace"]
 
 # Markers that fence the lines QIIP manages inside a user's config.toml.
@@ -53,7 +55,9 @@ def _render_opencode(base_url: str, token: str, models: list[str]) -> str:
                     "npm": "@ai-sdk/openai-compatible",
                     "name": "qiip inference proxy",
                     "options": {"baseURL": f"{base_url}/v1", "apiKey": token},
-                    "models": {model: {"name": model} for model in models},
+                    "models": {
+                        model: {"name": model_display_name(model)} for model in models
+                    },
                 }
             },
             "model": f"qiip/{models[0]}",
@@ -73,7 +77,10 @@ def _render_pi(base_url: str, token: str, models: list[str]) -> str:
                         "supportsDeveloperRole": False,
                         "supportsReasoningEffort": False,
                     },
-                    "models": [{"id": model} for model in models],
+                    "models": [
+                        {"id": model, "name": model_display_name(model)}
+                        for model in models
+                    ],
                 }
             }
         }
@@ -97,7 +104,7 @@ def _render_omp(base_url: str, token: str, models: list[str]) -> str:
     ]
     for model in models:
         lines.append(f"      - id: {_yaml_scalar(model)}")
-        lines.append(f"        name: {_yaml_scalar(model + ' (qiip)')}")
+        lines.append(f"        name: {_yaml_scalar(model_display_name(model))}")
     return "\n".join(lines) + "\n"
 
 
