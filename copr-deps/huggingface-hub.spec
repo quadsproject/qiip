@@ -18,7 +18,9 @@ BuildRequires:  pyproject-rpm-macros
 # extension, unconditional on x86_64 upstream) is deliberately filtered out:
 # no Fedora provider, and QIIP only downloads models, for which
 # huggingface_hub falls back to plain HTTPS with a warning when hf_xet is
-# absent. The Xet upload path is not used by QIIP.
+# absent. The Xet upload path is not used by QIIP. It must be stripped from
+# the sdist too: %pyproject_buildrequires turns it into a BuildRequires,
+# which __requires_exclude does not cover.
 %global __requires_exclude ^python3(\.\d+)?dist\(hf-xet\)
 
 %description
@@ -27,6 +29,11 @@ models, datasets, and spaces on the Hugging Face Hub.
 
 %prep
 %autosetup -n %{project}-%{version}
+# hf-xet has no Fedora provider; strip it from setup.py so it becomes
+# neither a build nor a runtime requirement (QIIP only downloads models).
+# HF_XET_VERSION is referenced by install_requires and extras, so drop every
+# line that uses the variable, not just the assignment.
+sed -i '/HF_XET_VERSION/d' setup.py
 
 %generate_buildrequires
 %pyproject_buildrequires
