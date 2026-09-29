@@ -777,7 +777,12 @@ To move an existing gateway to the RPM install:
    `/opt/inference-proxy/.env` into `/etc/qiip/qiip.env`.
 5. `sudo dnf install qiip` (after `dnf copr enable quadsdev/qiip`), copy
    the config examples, then
-   `sudo systemctl enable --now inference-proxy`.
+   `sudo systemctl enable --now inference-proxy`. The package now also
+   requires and starts nginx (deploys the bundled config when the stock
+   file is unmodified per the nginx-core rpmdb, so an operator-edited
+   `/etc/nginx/nginx.conf` is left untouched) and
+   serves the gateway as a tuned uvicorn process farm; tune worker counts
+   via the `server:` YAML block or `INFERENCE_PROXY_SERVER__WORKERS`.
 
 The old `/opt/inference-proxy` checkout is no longer needed by the service;
 keep it only for development.

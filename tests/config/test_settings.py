@@ -34,6 +34,49 @@ from inference_proxy.config.settings import (
 )
 
 
+class TestServerSettings:
+    def test_defaults_keep_one_worker(self) -> None:
+        settings = Settings(_env_file=None)
+
+        assert settings.server.workers == 1
+        assert settings.server.limit_concurrency == 150
+        assert settings.server.max_requests == 5000
+        assert settings.server.max_requests_jitter == 500
+        assert settings.server.log_level == "info"
+        assert settings.server.port == 5000
+
+    def test_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("INFERENCE_PROXY_SERVER__WORKERS", "3")
+        monkeypatch.setenv("INFERENCE_PROXY_SERVER__LOG_LEVEL", "debug")
+
+        settings = Settings(_env_file=None)
+
+        assert settings.server.workers == 3
+        assert settings.server.log_level == "debug"
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("PORT", "0"),
+            ("PORT", "70000"),
+            ("WORKERS", "0"),
+            ("LIMIT_CONCURRENCY", "0"),
+            ("MAX_REQUESTS", "0"),
+            ("MAX_REQUESTS_JITTER", "-1"),
+        ],
+    )
+    def test_server_bounds_are_validated(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        value: str,
+    ) -> None:
+        monkeypatch.setenv(f"INFERENCE_PROXY_SERVER__{name}", value)
+
+        with pytest.raises(ValidationError, match="server"):
+            Settings(_env_file=None)
+
+
 class TestAdminSettings:
     def test_admin_credentials_required(
         self,

@@ -3,10 +3,15 @@
 # RPM layout (different from the git-checkout unit at systemd/inference-proxy.service):
 #   /usr/share/qiip            node-side engine bundles (read-only)
 #   /etc/qiip/conf             INFERENCE_PROXY_* YAML config (copied from *.example)
-#   /etc/qiip/qiip.env         INFERENCE_PROXY_* environment overrides
+#   /etc/qiip/qiip.env         INFERENCE_PROXY_* overrides + server tuning knobs
 #   /var/lib/qiip              writable SQLite data
 #
-# The gateway listens on port 5000; nginx terminates TLS and proxies to it.
+# QUADS-style serving: the ASGI app runs as a tuned uvicorn worker farm
+# (uvicorn dropped its bundled gunicorn worker, so gunicorn is not used),
+# and nginx (also pulled in by the RPM) terminates TLS in front of the
+# gateway. Tuning comes from the ``server:`` YAML block (or
+# INFERENCE_PROXY_SERVER__* overrides), like every other QIIP setting.
+#
 # Runs as root like the stage deployment (provisioning SSH keys live under
 # /root/.ssh); tighten this if the deployment does not provision nodes.
 
@@ -25,9 +30,14 @@ EnvironmentFile=-/etc/qiip/qiip.env
 Environment=INFERENCE_PROXY_CONF_DIR=/etc/qiip/conf
 Environment=INFERENCE_PROXY_PROVISIONING__LOG_DB_PATH=/var/lib/qiip/provisioning-logs.sqlite3
 Environment=INFERENCE_PROXY_AUTH__DB_PATH=/var/lib/qiip/qiip.db
-ExecStart=/usr/bin/python3 -m uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 5000
-Restart=on-failure
+# Server tuning is resolved from the config by the launcher below, so the
+# unit needs no tuning values; override with e.g.
+# INFERENCE_PROXY_SERVER__WORKERS=2 in /etc/qiip/qiip.env or the YAML file.
+ExecStart=/usr/bin/python3 -m inference_proxy.serve
+Restart=always
 RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=10
 
 [Install]
 WantedBy=multi-user.target
