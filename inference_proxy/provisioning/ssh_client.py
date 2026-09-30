@@ -179,6 +179,9 @@ class SSHClient:
     ) -> AsyncIterator[tuple[str, str]]:
         """Run *command* on *host*, yielding ``(stream, line)`` tuples.
 
+        Command text travels on stdin so environment assignments never enter
+        the remote shell's process arguments.
+
         *stream* is ``"stdout"`` or ``"stderr"``. Both streams are drained
         concurrently so either remote pipe can exceed asyncssh's receive
         window without deadlocking the other. The total command and
@@ -221,7 +224,8 @@ class SSHClient:
                     connect_timeout=self._connect_timeout,
                 ) as conn,
                 conn.create_process(
-                    command,
+                    "bash -s",
+                    input=command + "\n",
                     encoding=_REMOTE_TEXT_ENCODING,
                     errors=_REMOTE_TEXT_ERRORS,
                 ) as process,
@@ -339,6 +343,7 @@ class SSHClient:
     ) -> tuple[str, str, int]:
         """Run *command* on *host*, return ``(stdout, stderr, exit_status)``.
 
+        Command text travels on stdin, as in ``run_streaming``.
         Timeout via ``asyncio.wait_for`` (D-02).  Raises
         ``SSHConnectionError`` on auth/disconnect/OS errors.  Raises
         ``RemoteCommandError`` on non-zero exit.
@@ -350,7 +355,8 @@ class SSHClient:
             async with self._connect(host) as conn:
                 result = await asyncio.wait_for(
                     conn.run(
-                        command,
+                        "bash -s",
+                        input=command + "\n",
                         encoding=_REMOTE_TEXT_ENCODING,
                         errors=_REMOTE_TEXT_ERRORS,
                     ),

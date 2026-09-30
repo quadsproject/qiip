@@ -6,6 +6,7 @@ import gzip
 import io
 import json
 import runpy
+import shlex
 import signal
 import subprocess
 import sys
@@ -587,3 +588,58 @@ def test_finish_reports_missing_engine_ack_or_output_without_waiting_forever(
         assert "Engine startup log unavailable" in issues
     else:
         assert not issues
+
+
+def test_worker_keeps_secret_environment_out_of_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recorder: dict[str, Any]
+) -> None:
+    store = AttemptLogStore(tmp_path / "logs.sqlite3")
+    attempt = store.create("host1")
+    secret = "hf_private '\" $(touch never)\nsecond line"
+    received = tmp_path / "received.json"
+    script = tmp_path / "script.py"
+    script.write_text(
+        "import json, os, pathlib\n"
+        f"pathlib.Path({str(received)!r}).write_text(json.dumps([os.environ['HF_TOKEN'], os.environ['OTHER_SECRET']]))\n"
+        "print('delivered')\n"
+    )
+    observed = []
+    popen = subprocess.Popen
+
+    def capture(args: list[str], **kwargs: Any) -> Any:
+        observed.append((args, kwargs.get("env", {})))
+        return popen(args, **kwargs)
+
+    worker_globals = recorder["worker"].__globals__
+    monkeypatch.setitem(worker_globals, "open_store", lambda config: store)
+    monkeypatch.setitem(
+        worker_globals,
+        "subprocess",
+        SimpleNamespace(
+            Popen=capture,
+            PIPE=subprocess.PIPE,
+            TimeoutExpired=subprocess.TimeoutExpired,
+        ),
+    )
+    recorder["worker"](
+        dict(
+            attempt_id=attempt,
+            phase="setup",
+            stage="setup",
+            timeout=10,
+            max_record_bytes=4096,
+            health_timeout=0,
+            inactivity_timeout=10,
+            command=f"HF_TOKEN={shlex.quote(secret)} OTHER_SECRET='private value' "
+            + shlex.join((sys.executable, str(script))),
+        ),
+    )
+    assert store.get(attempt)["phases"]["setup"]["exit_status"] == 0, store.get(
+        attempt
+    )["issues"]
+    assert any(r["msg"] == "delivered" for r in store.read(attempt)["records"])
+    assert json.loads(received.read_text()) == [secret, "private value"]
+    for args, env in observed:
+        assert "hf_private" not in str(args)
+        assert "private value" not in str(args)
+        assert "hf_private" not in env.get("QIIP_LOG_CONFIG", "")

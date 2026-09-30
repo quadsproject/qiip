@@ -900,7 +900,7 @@ class NodeProvisioner:
         args: tuple[str, ...] = (),
         scripts_dir: str | None = None,
     ) -> str:
-        """Build one uniformly quoted remote script command."""
+        """Build quoted shell input for SSH or the recorder, never shell argv."""
         dir_name = scripts_dir or self._settings.scripts_dir.name
         script_path = str(PurePosixPath(dir_name, script_name))
         command = shlex.join(("bash", script_path, *args))

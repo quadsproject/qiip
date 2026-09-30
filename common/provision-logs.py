@@ -199,7 +199,8 @@ def worker(config):
             # the long-lived engine cannot hold the fence past the launch step.
             environment["QIIP_LOCK_FD"] = str(lock_fd)
         proc = subprocess.Popen(
-            ["bash", "-c", command],
+            ["bash", "-s"],
+            stdin=subprocess.PIPE,
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -208,6 +209,9 @@ def worker(config):
         )
         launched = True
         processes.append(proc)
+        # Keep environment assignments off the node's process command lines.
+        proc.stdin.write((command + "\n").encode("utf-8"))
+        proc.stdin.close()
         for source, pipe in (
             (stage + ".stdout", proc.stdout),
             (stage + ".stderr", proc.stderr),
