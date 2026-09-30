@@ -49,6 +49,7 @@ from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import (
     get_registry,
     get_settings,
+    session_user_has_full_access,
     viewer_role,
 )
 from inference_proxy.config.settings import Settings
@@ -90,7 +91,9 @@ async def profile_page(
     Signed-in normal users are sent to their own page (``/start``); the
     profile stays for admins and for anonymous sign-in error display.
     """
-    if viewer_role(request, settings) == "user":
+    if viewer_role(request, settings) == "user" and not session_user_has_full_access(
+        request, settings
+    ):
         return user_home_redirect()
     return templates.TemplateResponse(
         request=request,

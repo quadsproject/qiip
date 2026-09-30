@@ -27,6 +27,9 @@ def uvicorn_kwargs() -> dict[str, Any]:
         "limit_max_requests": server.max_requests,
         "limit_max_requests_jitter": server.max_requests_jitter,
         "log_level": server.log_level,
+        # The app logs every request itself, with setup-link ids redacted
+        # (RequestLoggingMiddleware). Uvicorn's access log would record them.
+        "access_log": False,
     }
 
 

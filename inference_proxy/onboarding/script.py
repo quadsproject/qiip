@@ -40,7 +40,7 @@ main() {
 """
 
 _JSON_MERGE = r"""    if command -v python3 >/dev/null 2>&1; then
-      python3 - "$target" "$fresh" <<'QIIP_PY_EOF'
+      if python3 - "$target" "$fresh" <<'QIIP_PY_EOF'
 import json, sys
 
 target, fresh = sys.argv[1:3]
@@ -57,18 +57,26 @@ def merge(old, new):
 
 try:
     with open(target) as handle:
-        current = json.load(handle)
-except Exception:
-    current = {}
+        text = handle.read()
+    current = json.loads(text) if text.strip() else {}
+except (OSError, ValueError):
+    sys.exit(3)
 if not isinstance(current, dict):
-    current = {}
+    sys.exit(3)
 with open(fresh) as handle:
     merged = merge(current, json.load(handle))
 with open(fresh, "w") as handle:
     json.dump(merged, handle, indent=2)
     handle.write("\n")
 QIIP_PY_EOF
-      ok "Kept your other settings"
+      then
+        ok "Kept your other settings"
+      else
+        # Comments or trailing commas (JSONC) cannot be merged safely.
+        say "Your existing $target is not plain JSON, so it was left unchanged." >&2
+        say "Add the qiip settings by hand, or move it aside and run this again." >&2
+        exit 1
+      fi
     else
       note "python3 not found, so the file was replaced (backup kept)"
     fi
@@ -88,7 +96,13 @@ def _codex_merge() -> str:
       index($0, start) == 1 {{ skip = 1; next }}
       index($0, end) == 1 {{ skip = 0; next }}
       skip {{ next }}
-      /^[[:space:]]*\[/ {{ intable = 1 }}
+      /^[[:space:]]*\[/ {{
+        intable = 1
+        # A qiip provider table written by hand (the manual setup in the
+        # README) is replaced by the managed one; two would not parse.
+        ours = $0 ~ /^[[:space:]]*\[[[:space:]]*model_providers[[:space:]]*\.[[:space:]]*"?qiip"?[[:space:]]*[].]/
+      }}
+      ours {{ next }}
       !intable && /^[[:space:]]*(model|model_provider)[[:space:]]*=/ {{ next }}
       /^[[:space:]]*$/ {{ blank = 1; next }}
       {{ if (seen && blank) print ""; blank = 0; seen = 1; print }}
@@ -105,6 +119,21 @@ def _codex_merge() -> str:
   }} > "$built"
   mv "$built" "$fresh"
   rm -f "$rest"
+  if command -v python3 >/dev/null 2>&1 && ! python3 - "$fresh" <<'QIIP_TOML_EOF'
+import sys
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11: nothing to check with
+    sys.exit(0)
+with open(sys.argv[1], "rb") as handle:
+    tomllib.load(handle)
+QIIP_TOML_EOF
+  then
+    say "Your existing $target could not be combined into valid TOML, so it was left unchanged." >&2
+    say "Add the qiip settings by hand, or move it aside and run this again." >&2
+    exit 1
+  fi
 """
 
 

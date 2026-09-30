@@ -22,6 +22,7 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, Request
 
 from inference_proxy.auth.models import User
+from inference_proxy.auth.scopes import is_full_access
 from inference_proxy.auth.session import get_local_admin_session, get_session_user_id
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.huggingface.catalog import ModelCatalogService
@@ -105,6 +106,23 @@ def _viewer_from_session(request: Request) -> str | None:
     if user is None:
         return None
     return "admin" if user.is_admin else "user"
+
+
+def session_user_has_full_access(request: Request, settings: Settings) -> bool:
+    """Whether the signed-in user is on the full-access trust list.
+
+    Such a user is not an admin, but like an admin keeps a portfolio of
+    pinned and unscoped tokens on /profile. The /start flow keeps exactly one
+    token and revokes the rest on mint, so it must not run for them.
+    """
+    user_id = get_session_user_id(request)
+    if user_id is None:
+        return False
+    store = getattr(request.app.state, "auth_store", None)
+    if store is None:
+        return False
+    user = store.get_user(user_id)
+    return user is not None and is_full_access(user.email, settings)
 
 
 def viewer_role(request: Request, settings: Settings) -> str | None:

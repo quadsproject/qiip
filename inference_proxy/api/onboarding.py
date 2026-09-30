@@ -37,11 +37,12 @@ from inference_proxy.auth.dependencies import (
     require_profile_user,
 )
 from inference_proxy.auth.models import ApiToken, User
-from inference_proxy.auth.scopes import pickable_endpoints
+from inference_proxy.auth.scopes import has_admin_access, pickable_endpoints
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import (
     get_registry,
     get_settings,
+    session_user_has_full_access,
     viewer_role,
 )
 from inference_proxy.config.settings import Settings
@@ -87,14 +88,16 @@ class SetupLinkRequest(BaseModel):
 
 async def require_normal_user(
     user: Annotated[User, Depends(require_profile_user)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> User:
-    """Require a signed-in non-admin user.
+    """Require a signed-in user without admin token access.
 
     The onboarding flow enforces one token per user by revoking every other
-    token on mint. Admins keep a portfolio of pinned and agent-config tokens
-    on /profile, so the flow must never run for them.
+    token on mint. Admins and the full-access trust list keep a portfolio of
+    pinned and agent-config tokens on /profile, so the flow must never run
+    for them.
     """
-    if user.is_admin:
+    if has_admin_access(user.email, settings, is_admin=user.is_admin):
         raise HTTPException(
             status_code=403, detail="Admins manage tokens from the profile page"
         )
@@ -124,8 +127,14 @@ def public_base_url(request: Request, settings: Settings) -> str:
         allowed.add(parts.hostname.lower())
     host = request.url.hostname
     if host and host.lower() in allowed:
-        scheme = "https" if parts.scheme == "https" else request.url.scheme
-        return f"{scheme}://{request.url.netloc}"
+        if parts.scheme == "https" and request.url.scheme != "https":
+            # A plain-HTTP request, for example straight to the gateway port,
+            # keeps its name but takes the configured https origin's port:
+            # its own port serves plain HTTP.
+            name = f"[{host}]" if ":" in host else host
+            port = f":{parts.port}" if parts.port else ""
+            return f"https://{name}{port}"
+        return f"{request.url.scheme}://{request.url.netloc}"
     return f"{parts.scheme}://{parts.netloc}"
 
 
@@ -263,6 +272,8 @@ async def start_page(
     role = viewer_role(request, settings)
     if role == "admin":
         return RedirectResponse("/dashboard", status_code=302)
+    if role == "user" and session_user_has_full_access(request, settings):
+        return RedirectResponse("/profile", status_code=302)
     if role is None:
         return signin_response(
             request,

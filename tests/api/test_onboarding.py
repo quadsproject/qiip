@@ -626,6 +626,106 @@ class TestSetupScripts:
         written = json.loads((tmp_path / harness.config_path).read_text())
         assert written["providers"]["qiip"]["models"] == [{"id": evil, "name": evil}]
 
+    def test_codex_merge_replaces_a_hand_written_provider_table(
+        self, tmp_path: Path
+    ) -> None:
+        """The README's manual Codex setup must not leave two qiip tables."""
+        import tomllib
+
+        harness = get_harness("codex")
+        assert harness is not None
+        target = tmp_path / harness.config_path
+        target.parent.mkdir(parents=True)
+        target.write_text(
+            'model = "old"\nmodel_provider = "qiip"\n\n'
+            '[model_providers.qiip]\nname = "qiip"\n'
+            'base_url = "https://old.example/v1"\nenv_key = "QIIP_API_KEY"\n\n'
+            '[model_providers.qiip.http_headers]\nX-Old = "1"\n\n'
+            '[model_providers.other]\nname = "other"\n'
+        )
+        script = render_setup_script(
+            harness, base_url="https://q", token="qiip_t", models=[MODEL_A]
+        )
+        result = subprocess.run(
+            ["bash"],
+            input=script,
+            text=True,
+            env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr
+        parsed = tomllib.loads(target.read_text())
+        assert parsed["model_providers"]["qiip"]["base_url"] == "https://q/v1"
+        assert "http_headers" not in parsed["model_providers"]["qiip"]
+        assert parsed["model_providers"]["other"] == {"name": "other"}
+
+    def test_codex_merge_that_cannot_parse_leaves_the_config_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        harness = get_harness("codex")
+        assert harness is not None
+        target = tmp_path / harness.config_path
+        target.parent.mkdir(parents=True)
+        broken = 'approval_policy = "never"\n[tui]\nx = 1\n[tui]\ny = 2\n'
+        target.write_text(broken)
+        script = render_setup_script(
+            harness, base_url="https://q", token="qiip_t", models=[MODEL_A]
+        )
+        result = subprocess.run(
+            ["bash"],
+            input=script,
+            text=True,
+            env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
+            capture_output=True,
+        )
+        assert result.returncode == 1
+        assert "left unchanged" in result.stderr
+        assert target.read_text() == broken
+        leftovers = [p.name for p in target.parent.iterdir() if ".qiip." in p.name]
+        assert leftovers == []
+
+    def test_json_merge_refuses_a_config_it_cannot_parse(self, tmp_path: Path) -> None:
+        """OpenCode accepts JSONC; replacing it would silently drop settings."""
+        harness = get_harness("opencode")
+        assert harness is not None
+        target = tmp_path / harness.config_path
+        target.parent.mkdir(parents=True)
+        jsonc = '{\n  // my theme\n  "theme": "dark",\n}\n'
+        target.write_text(jsonc)
+        script = render_setup_script(
+            harness, base_url="https://q", token="qiip_t", models=[MODEL_A]
+        )
+        result = subprocess.run(
+            ["bash"],
+            input=script,
+            text=True,
+            env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
+            capture_output=True,
+        )
+        assert result.returncode == 1
+        assert "Kept your other settings" not in result.stdout
+        assert "left unchanged" in result.stderr
+        assert target.read_text() == jsonc
+
+    def test_json_merge_treats_an_empty_config_as_empty(self, tmp_path: Path) -> None:
+        harness = get_harness("claude")
+        assert harness is not None
+        target = tmp_path / harness.config_path
+        target.parent.mkdir(parents=True)
+        target.write_text("\n")
+        script = render_setup_script(
+            harness, base_url="https://q", token="qiip_t", models=[MODEL_A]
+        )
+        subprocess.run(
+            ["bash"],
+            input=script,
+            text=True,
+            env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
+            check=True,
+            capture_output=True,
+        )
+        assert json.loads(target.read_text())["env"]["ANTHROPIC_MODEL"] == MODEL_A
+
 
 class TestReviewRegressions:
     """Findings from the independent reviews of the onboarding flow."""
@@ -818,6 +918,27 @@ class TestPublicBaseUrl:
                 "http://evil.example/x",
                 "https://qiip.example",
             ),
+            # Plain http straight to the gateway port: its port serves
+            # plain http, so the configured https origin's port is used.
+            (
+                "https://qiip.example/auth/callback",
+                [],
+                "http://qiip.example:5000/x",
+                "https://qiip.example",
+            ),
+            (
+                "https://qiip.example:8443/auth/callback",
+                ["alt.example"],
+                "http://alt.example:5000/x",
+                "https://alt.example:8443",
+            ),
+            # A request that really arrived over https keeps its own port.
+            (
+                "https://qiip.example/auth/callback",
+                ["alt.example"],
+                "https://alt.example:9443/x",
+                "https://alt.example:9443",
+            ),
             # Plain-http dev setups are left alone.
             (
                 "http://localhost:5000/auth/callback",
@@ -856,3 +977,31 @@ class TestPublicBaseUrl:
         )
         settings = self._settings(test_settings, redirect_uri, hosts)
         assert public_base_url(request, settings) == expected
+
+
+def test_trust_listed_users_keep_their_tokens_on_the_profile_page(
+    user_client: TestClient, test_settings: Settings
+) -> None:
+    """Minting on /start revokes every other token, so it is not their page."""
+    email = user_client.get("/onboarding/state").json()["user"]["email"]
+    test_settings.auth.admin_only_tokens_full_access.append(email)
+
+    start = user_client.get("/start", follow_redirects=False)
+    assert (start.status_code, start.headers["location"]) == (302, "/profile")
+    assert user_client.get("/profile", follow_redirects=False).status_code == 200
+    assert user_client.get("/onboarding/state").status_code == 403
+    assert (
+        user_client.post("/onboarding/token", json={"models": [MODEL_A]}).status_code
+        == 403
+    )
+
+
+def test_the_full_access_check_needs_a_signed_in_user(
+    app: FastAPI, test_settings: Settings
+) -> None:
+    from starlette.requests import Request
+
+    from inference_proxy.config.dependencies import session_user_has_full_access
+
+    anonymous = Request({"type": "http", "headers": [], "app": app})
+    assert session_user_has_full_access(anonymous, test_settings) is False

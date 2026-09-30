@@ -22,6 +22,8 @@ def test_uvicorn_kwargs_use_server_defaults() -> None:
     assert kwargs["limit_max_requests"] == 5000
     assert kwargs["limit_max_requests_jitter"] == 500
     assert kwargs["log_level"] == "info"
+    # The app's own request log redacts setup-link ids; uvicorn's would not.
+    assert kwargs["access_log"] is False
 
 
 def test_uvicorn_kwargs_follow_env_override(
