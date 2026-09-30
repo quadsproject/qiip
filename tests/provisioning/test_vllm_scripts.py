@@ -19,6 +19,13 @@ START_SCRIPT = SCRIPT_ROOT / "auto-vllm" / "start-vllm.sh"
 STOP_SCRIPT = SCRIPT_ROOT / "auto-vllm" / "stop-vllm.sh"
 
 
+@pytest.fixture(autouse=True)
+def isolated_process_table(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    monkeypatch.setenv("AUTOVLLM_PROC_ROOT", str(proc_root))
+
+
 def _write_executable(path: Path, content: str) -> None:
     path.write_text(content)
     path.chmod(0o755)
@@ -46,6 +53,14 @@ def _script_environment(
 ) -> dict[str, str]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
+    proc_root = os.environ.get("AUTOVLLM_PROC_ROOT")
+    # Keep real cmdline/lifetime semantics in this module's isolated table.
+    # Embed the path because the launcher filters its environment.
+    if proc_root and vllm_bin.exists():
+        shebang, body = vllm_bin.read_text().split("\n", 1)
+        vllm_bin.write_text(
+            f"{shebang}\nln -sfn /proc/$$ {shlex.quote(str(proc_root))}/$$\n{body}"
+        )
     nvidia_smi = bin_dir / "nvidia-smi"
     _write_executable(
         nvidia_smi,
@@ -183,6 +198,27 @@ fi
     return env
 
 
+def test_stop_fixture_does_not_scan_host_processes(tmp_path: Path) -> None:
+    vllm_bin = tmp_path / "fake-vllm"
+    _write_executable(vllm_bin, "#!/bin/bash\nexit 0\n")
+    env = _script_environment(
+        tmp_path, vllm_bin=vllm_bin, process_log=tmp_path / "events"
+    )
+    host_read = tmp_path / "host-process-read"
+    _write_executable(
+        tmp_path / "bin" / "tr",
+        "#!/bin/bash\n"
+        'case "$(readlink /proc/self/fd/0)" in /proc/*) '
+        f"touch {shlex.quote(str(host_read))} ;; esac\n"
+        'exec /usr/bin/tr "$@"\n',
+    )
+    result = subprocess.run(
+        ["bash", str(STOP_SCRIPT)], env=env, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    assert not host_read.exists(), "stop scanned the host process table"
+
+
 def _configured_profile(
     *,
     profile_bucket: str,
@@ -268,6 +304,9 @@ while true; do sleep 1; done
     )
     old_vllm = _start_fake_vllm(vllm_bin, "old-model", env)
     unrelated = subprocess.Popen(["sleep", "30"])
+    (Path(env["AUTOVLLM_PROC_ROOT"]) / str(unrelated.pid)).symlink_to(
+        f"/proc/{unrelated.pid}"
+    )
     pid_file = Path(env["AUTOVLLM_PID_FILE"])
 
     try:
@@ -372,6 +411,9 @@ def test_stop_vllm_stale_pid_does_not_kill_unrelated_process(
         process_log=process_log,
     )
     unrelated = subprocess.Popen(["sleep", "30"])
+    (Path(env["AUTOVLLM_PROC_ROOT"]) / str(unrelated.pid)).symlink_to(
+        f"/proc/{unrelated.pid}"
+    )
     pid_file = Path(env["AUTOVLLM_PID_FILE"])
     pid_file.write_text(str(unrelated.pid))
 
