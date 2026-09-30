@@ -1511,8 +1511,8 @@ uv run --frozen pytest tests/api/test_routes.py -v
 ```
 
 Coverage is measured over `inference_proxy` with branch tracking enabled. CI
-enforces a 92% combined statement-and-branch floor, raised from 91.5% when the
-exact-artifact work brought the measured total to 92.08%. The total may move as
+enforces a 93% combined statement-and-branch floor, raised from 92% once the
+measured total stayed near 94%. The total may move as
 code is added or removed. The floor prevents new untested code from materially
 reducing coverage; it does not prove that covered behavior is asserted
 correctly.

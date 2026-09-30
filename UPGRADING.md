@@ -552,8 +552,12 @@ Google users.
   `/dashboard`, node detail pages, `/models`, `/chat`, `/profile`, and the
   token and admin pages all redirect them there. The read-only fleet and node
   views they had before are gone. Admin-role users and the local admin keep
-  every page and are redirected away from `/start`.
-- **`POST /profile/tokens` is admin-only.** Normal users get `403`, including
+  every page and are redirected away from `/start`. Users on the
+  `auth.admin_only_tokens_full_access` trust list are sent to `/profile`
+  instead, where they keep minting pinned and unscoped tokens; the `/start`
+  flow refuses them because its mint would revoke those tokens.
+- **`POST /profile/tokens` is admin-only** (admin role or the full-access
+  trust list). Other normal users get `403`, including
   for `name: agent-config`. Scripts that minted tokens as a normal user must
   move to `/start`, or the user needs the admin role.
 - **Existing tokens keep working until the user mints a new one.** A user who
@@ -581,8 +585,19 @@ Google users.
   example the rootless Podman nginx), where the request scheme alone would
   read as `http`.
 - **Treat proxy access logs as sensitive.** `/s/{id}` links are credentials
-  for 15 minutes. The gateway redacts them in its own request log; nginx
-  still records them in `access.log` unless its `log_format` is changed.
+  for 15 minutes. The gateway redacts them in its own request log, and the
+  launchers turn off uvicorn's access log (`python -m inference_proxy.serve`,
+  and `--no-access-log` in `systemd/inference-proxy.service`); add
+  `--no-access-log` to any other uvicorn command line. The bundled
+  `nginx/nginx.conf` redacts them through a `map` on `$request`. An
+  `/etc/nginx/nginx.conf` that was edited by hand is never replaced, so copy
+  that `map` and the `log_format` change into it.
+- **Setup scripts leave configs they cannot merge untouched.** A JSON config
+  with comments or trailing commas (OpenCode accepts JSONC), or a Codex
+  `config.toml` that would not parse after the merge, is left as it was and
+  the script exits `1` with a message. A hand-written
+  `[model_providers.qiip]` table (the manual Codex setup in the README) is
+  replaced by the managed one.
 - **`auth.session_secret` now protects tokens too.** Onboarding tokens are
   derived from it, so the secret plus the auth database is enough to recover
   them. Rotating it keeps existing tokens valid on `/v1` but blocks
@@ -647,6 +662,22 @@ using only the catalog models and their pinned configurations. Set
   naming the cause, and nothing is written. Repeat it when the operation
   finishes. Scripts that assumed this call always succeeds on a registered
   node need to handle `409`.
+- **QUADS GPU matching uses the product name.** A host is an L4 when its
+  QUADS GPU model contains `AD104GL [L4]`, and an A30 when it contains
+  `GA100GL [A30`. The chip code alone also matched other cards (for example
+  the RTX 4000 Ada). Check `GET /admin/placement` after upgrading: hosts whose
+  inventory string lacks the bracketed name are no longer candidates.
+- **Placement reads the host's node record from etcd before a launch.** A
+  record the in-memory registry has not loaded yet (for example right after
+  starting while etcd was down) or cannot parse blocks the host, reported as
+  `blocked: ...` under skipped hosts, instead of being treated as free.
+- **A placed node that fails later is retried.** An active claim whose node
+  became `failed` (for example after a failed teardown and a resume) turns
+  into a failed claim with a fresh attempt budget and is retried after
+  `placement.retry_backoff_seconds`.
+- **`GET /admin/placement` no longer answers `503`** when suspensions cannot
+  be read. It returns the rest of the status with the problem in `error` and
+  an empty `suspended_hosts`.
 - **`placement.max_attempts` counts attempts since the last success.** An
   attempt interrupted by a gateway restart is counted, a limit lowered between
   restarts applies to existing claims, and a successful provision resets the
