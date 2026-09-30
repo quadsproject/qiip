@@ -12,11 +12,12 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 
 from inference_proxy.auth import store as store_module
 from inference_proxy.auth.dependencies import get_auth_plugin
 from inference_proxy.auth.store import AuthStore
-from inference_proxy.config.settings import Settings
+from inference_proxy.config.settings import OAuthSettings, Settings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.onboarding.harness import HARNESSES, get_harness
@@ -43,9 +44,17 @@ def _node(node_id: str, model: str, **extra: object) -> Node:
 
 @pytest.fixture
 def user_client(
-    app: FastAPI, auth_store: AuthStore, test_registry: NodeRegistry
+    app: FastAPI,
+    auth_store: AuthStore,
+    test_registry: NodeRegistry,
+    test_settings: Settings,
 ) -> TestClient:
     """A signed-in normal user with two healthy models on the fleet."""
+    test_settings.oauth = OAuthSettings(
+        client_id="test-client",
+        client_secret=SecretStr("test-secret"),
+        redirect_uri="http://testserver/auth/callback",
+    )
     test_registry.add(_node("gpu01", MODEL_A))
     test_registry.add(_node("gpu02", MODEL_B))
     app.dependency_overrides[get_auth_plugin] = lambda: FakeAuthPlugin()
@@ -881,102 +890,29 @@ class TestReviewRegressions:
             )
 
 
-class TestPublicBaseUrl:
-    """The curl line and the written configs must not downgrade to http."""
+@pytest.mark.parametrize(
+    ("redirect_uri", "expected"),
+    [
+        ("https://qiip.example/auth/callback", "https://qiip.example"),
+        (
+            "https://qiip.example:8443/auth/callback?param=value",
+            "https://qiip.example:8443",
+        ),
+        ("http://localhost:5000/auth/callback", "http://localhost:5000"),
+        ("https://[2001:db8::1]:8443/auth/callback", "https://[2001:db8::1]:8443"),
+    ],
+)
+def test_public_base_url_uses_configured_scheme_host_and_port(
+    test_settings: Settings, redirect_uri: str, expected: str
+) -> None:
+    from inference_proxy.api.onboarding import public_base_url
 
-    @staticmethod
-    def _settings(
-        test_settings: Settings, redirect_uri: str | None, hosts: list[str]
-    ) -> Settings:
-        oauth = test_settings.oauth.model_copy(
-            update={"redirect_uri": redirect_uri, "allowed_redirect_hosts": hosts}
-        )
-        return test_settings.model_copy(update={"oauth": oauth})
-
-    @pytest.mark.parametrize(
-        ("redirect_uri", "hosts", "request_url", "expected"),
-        [
-            (None, [], "http://qiip.example:5000/x", "http://qiip.example:5000"),
-            # Untrusted proxy hop degraded the scheme: configured https wins.
-            (
-                "https://qiip.example/auth/callback",
-                [],
-                "http://qiip.example/x",
-                "https://qiip.example",
-            ),
-            # Allowlisted alternate name keeps its own host.
-            (
-                "https://qiip.example/auth/callback",
-                ["alt.example"],
-                "http://alt.example/x",
-                "https://alt.example",
-            ),
-            # A never-trusted Host header cannot steer the command.
-            (
-                "https://qiip.example/auth/callback",
-                [],
-                "http://evil.example/x",
-                "https://qiip.example",
-            ),
-            # Plain http straight to the gateway port: its port serves
-            # plain http, so the configured https origin's port is used.
-            (
-                "https://qiip.example/auth/callback",
-                [],
-                "http://qiip.example:5000/x",
-                "https://qiip.example",
-            ),
-            (
-                "https://qiip.example:8443/auth/callback",
-                ["alt.example"],
-                "http://alt.example:5000/x",
-                "https://alt.example:8443",
-            ),
-            # A request that really arrived over https keeps its own port.
-            (
-                "https://qiip.example/auth/callback",
-                ["alt.example"],
-                "https://alt.example:9443/x",
-                "https://alt.example:9443",
-            ),
-            # Plain-http dev setups are left alone.
-            (
-                "http://localhost:5000/auth/callback",
-                [],
-                "http://localhost:5000/x",
-                "http://localhost:5000",
-            ),
-        ],
+    test_settings.oauth = OAuthSettings(
+        client_id="test-client",
+        client_secret=SecretStr("test-secret"),
+        redirect_uri=redirect_uri,
     )
-    def test_public_base_url(
-        self,
-        test_settings: Settings,
-        redirect_uri: str | None,
-        hosts: list[str],
-        request_url: str,
-        expected: str,
-    ) -> None:
-        from urllib.parse import urlsplit
-
-        from starlette.requests import Request
-
-        from inference_proxy.api.onboarding import public_base_url
-
-        parts = urlsplit(request_url)
-        port = parts.port or (443 if parts.scheme == "https" else 80)
-        request = Request(
-            {
-                "type": "http",
-                "method": "GET",
-                "scheme": parts.scheme,
-                "path": parts.path,
-                "query_string": b"",
-                "headers": [(b"host", parts.netloc.encode())],
-                "server": (parts.hostname, port),
-            }
-        )
-        settings = self._settings(test_settings, redirect_uri, hosts)
-        assert public_base_url(request, settings) == expected
+    assert public_base_url(test_settings) == expected
 
 
 def test_trust_listed_users_keep_their_tokens_on_the_profile_page(
@@ -1005,3 +941,113 @@ def test_the_full_access_check_needs_a_signed_in_user(
 
     anonymous = Request({"type": "http", "headers": [], "app": app})
     assert session_user_has_full_access(anonymous, test_settings) is False
+
+
+def test_setup_link_requires_configured_origin_before_widening_scope(
+    user_client: TestClient, test_settings: Settings
+) -> None:
+    _mint(user_client, [MODEL_A])
+    test_settings.oauth = OAuthSettings()
+    response = user_client.post(
+        "/onboarding/setup-link",
+        headers={"host": "attacker.example:5000"},
+        json={"harness": "pi", "models": [MODEL_B]},
+    )
+    assert response.status_code == 503
+    assert "oauth.redirect_uri" in response.json()["detail"]
+    assert response.headers["cache-control"] == "no-store"
+    assert user_client.get("/onboarding/state").json()["token"]["models"] == [MODEL_A]
+
+
+@pytest.mark.parametrize(
+    ("scheme", "headers"),
+    [
+        ("http", {"host": "attacker.example:5000"}),
+        ("https", {"host": "alias.example:9443"}),
+        ("https", {"host": "qiip.example:9443"}),
+        ("https", {"host": "attacker.example@qiip.example:9443"}),
+        (
+            "http",
+            {
+                "host": "qiip.example:5000",
+                "forwarded": "host=attacker.example;proto=https",
+                "x-forwarded-host": "attacker.example",
+                "x-forwarded-proto": "https",
+                "x-forwarded-port": "9443",
+            },
+        ),
+    ],
+)
+def test_setup_url_and_written_config_use_only_the_configured_origin(
+    user_client: TestClient,
+    test_settings: Settings,
+    auth_store: AuthStore,
+    tmp_path: Path,
+    scheme: str,
+    headers: dict[str, str],
+) -> None:
+    test_settings.oauth = OAuthSettings(
+        client_id="test-client",
+        client_secret=SecretStr("test-secret"),
+        redirect_uri="https://qiip.example:8443/auth/callback",
+        allowed_redirect_hosts=["alias.example"],
+    )
+    token = _mint(user_client, [MODEL_A])
+    response = user_client.post(
+        f"{scheme}://testserver/onboarding/setup-link",
+        headers=headers,
+        json={"harness": "claude", "models": [MODEL_A]},
+    )
+    assert response.status_code == 201, response.text
+    link = response.json()
+    assert link["url"].startswith("https://qiip.example:8443/s/")
+    assert link["command"] == f"curl -sSL {link['url']} | bash"
+    link_id = link["url"].rsplit("/", 1)[1]
+    script = TestClient(user_client.app).get(
+        f"{scheme}://testserver/s/{link_id}", headers=headers
+    )
+    assert script.status_code == 200
+    assert script.headers["cache-control"] == "no-store"
+    result = subprocess.run(
+        ["bash"],
+        input=script.text,
+        text=True,
+        capture_output=True,
+        env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    config = json.loads((tmp_path / ".claude/settings.json").read_text())
+    assert config["env"]["ANTHROPIC_BASE_URL"] == "https://qiip.example:8443"
+    resolved = auth_store.resolve_token(config["env"]["ANTHROPIC_AUTH_TOKEN"])
+    assert resolved is not None
+    assert resolved.token.id == token["id"]
+    assert "attacker.example" not in script.text
+
+
+def test_existing_setup_script_refuses_unconfigured_origin(
+    user_client: TestClient, test_settings: Settings, tmp_path: Path
+) -> None:
+    _mint(user_client, [MODEL_A])
+    link = _link(user_client, "claude", [MODEL_A])
+    link_id = link["url"].rsplit("/", 1)[1]
+    valid_script = user_client.get(f"/s/{link_id}")
+    raw = _script_token(valid_script.text)
+    test_settings.oauth = OAuthSettings()
+    response = TestClient(user_client.app).get(
+        f"/s/{link_id}", headers={"host": "attacker.example:5000"}
+    )
+    assert response.status_code == 503
+    assert "oauth.redirect_uri" in response.json()["detail"]
+    assert response.headers["cache-control"] == "no-store"
+    assert raw not in response.text
+    result = subprocess.run(
+        ["bash"],
+        input=response.text,
+        text=True,
+        capture_output=True,
+        env={"HOME": str(tmp_path), "PATH": os.environ["PATH"]},
+        check=False,
+    )
+    assert result.returncode != 0
+    assert not (tmp_path / ".claude/settings.json").exists()

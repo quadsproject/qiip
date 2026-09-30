@@ -1123,10 +1123,13 @@ Rules and guardrails:
   the session secret is enough to recover tokens: protect the secret like a
   credential. Rotating it leaves existing tokens working on `/v1` but makes
   them impossible to export again; the page then asks the user for a new token.
-- **Public origin.** The command and the written configs use the origin of
-  `oauth.redirect_uri` (or an `oauth.allowed_redirect_hosts` name when the
-  request came in on one), never a bare `Host` header, and never downgrade a
-  configured `https` origin to `http` behind a proxy hop uvicorn does not trust.
+- **Public origin.** Setup commands and written configs always use the scheme,
+  hostname, and port of `oauth.redirect_uri`. Configure the externally reachable
+  HTTPS callback URL, for example `https://qiip.example/auth/callback`. Host and
+  forwarded headers cannot change that origin, even on direct gateway requests.
+  `oauth.allowed_redirect_hosts` affects OAuth callbacks only, not setup URLs.
+  Without `oauth.redirect_uri`, creating a setup link or downloading a valid
+  link returns `503` without exporting a token; existing links are not a bypass.
 
 ### etcd
 

@@ -104,37 +104,16 @@ async def require_normal_user(
     return user
 
 
-def public_base_url(request: Request, settings: Settings) -> str:
-    """Return the origin users and their tools should reach qiip on.
-
-    ``request.base_url`` is only as good as the proxy headers uvicorn trusts:
-    behind a reverse proxy it does not trust (e.g. the rootless Podman nginx)
-    the scheme degrades to ``http``. The configured OAuth ``redirect_uri`` is
-    the one origin the operator has declared, so it anchors the result the
-    same way ``_oauth_redirect_uri`` does: an allowlisted request host keeps
-    its own name (multi-name deployments) but never downgrades a configured
-    https origin, and any other host falls back to the configured origin.
-    """
-    fallback = str(request.base_url).rstrip("/")
+def public_base_url(settings: Settings) -> str:
+    """Use only the operator's configured origin for credential-bearing setup."""
     configured = settings.oauth.redirect_uri
     if not configured:
-        return fallback
+        raise HTTPException(
+            status_code=503,
+            detail="Setup links require oauth.redirect_uri to be configured",
+            headers={"Cache-Control": "no-store"},
+        )
     parts = urlsplit(configured)
-    if not parts.scheme or not parts.netloc:
-        return fallback
-    allowed = {host.lower() for host in settings.oauth.allowed_redirect_hosts}
-    if parts.hostname:
-        allowed.add(parts.hostname.lower())
-    host = request.url.hostname
-    if host and host.lower() in allowed:
-        if parts.scheme == "https" and request.url.scheme != "https":
-            # A plain-HTTP request, for example straight to the gateway port,
-            # keeps its name but takes the configured https origin's port:
-            # its own port serves plain HTTP.
-            name = f"[{host}]" if ":" in host else host
-            port = f":{parts.port}" if parts.port else ""
-            return f"https://{name}{port}"
-        return f"{request.url.scheme}://{request.url.netloc}"
     return f"{parts.scheme}://{parts.netloc}"
 
 
@@ -374,7 +353,6 @@ async def update_token_models(
 
 @onboarding_router.post("/onboarding/setup-link", status_code=201)
 async def create_setup_link(
-    request: Request,
     body: SetupLinkRequest,
     user: Annotated[User, Depends(require_normal_user)],
     store: Annotated[AuthStore, Depends(get_auth_store)],
@@ -414,6 +392,7 @@ async def create_setup_link(
             status_code=409,
             detail="This token can no longer be exported. Create a new token first.",
         )
+    base_url = public_base_url(settings)
     if token.model_scope is not None:
         widened = list(dict.fromkeys([*token.model_scope, *models]))
         if widened != token.model_scope:
@@ -426,7 +405,7 @@ async def create_setup_link(
         models,
         SETUP_LINK_TTL_SECONDS,
     )
-    url = f"{public_base_url(request, settings)}/s/{link_id}"
+    url = f"{base_url}/s/{link_id}"
     return {
         "url": url,
         # No -f: an expired link must still pipe its explanation into bash.
@@ -439,7 +418,6 @@ async def create_setup_link(
 
 @onboarding_router.get("/s/{link_id}", response_class=PlainTextResponse)
 async def setup_script(
-    request: Request,
     link_id: str,
     store: Annotated[AuthStore, Depends(get_auth_store)],
     settings: Annotated[Settings, Depends(get_settings)],
@@ -462,6 +440,7 @@ async def setup_script(
     harness = get_harness(link.harness) if link is not None else None
     if link is None or harness is None:
         return expired
+    base_url = public_base_url(settings)
     raw = await asyncio.to_thread(
         store.reveal_personal_token, link.token_id, secret.get_secret_value()
     )
@@ -470,7 +449,7 @@ async def setup_script(
     try:
         script = render_setup_script(
             harness,
-            base_url=public_base_url(request, settings),
+            base_url=base_url,
             token=raw,
             models=link.models,
         )

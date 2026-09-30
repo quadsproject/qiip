@@ -580,11 +580,16 @@ Google users.
   `setup_links` table, and a unique index allowing one active onboarding token
   per user. Existing rows are untouched. Back the file up first; a downgraded
   build ignores the new columns.
-- **Set `oauth.redirect_uri` to the public https origin.** The setup command
-  and the configs it writes take their origin from it. This matters most
-  behind a reverse proxy uvicorn does not trust for forwarded headers (for
-  example the rootless Podman nginx), where the request scheme alone would
-  read as `http`.
+- **Set `oauth.redirect_uri` to the public HTTPS callback URL.** Setup links
+  and the configs they write use exactly its scheme, hostname, and port, such as
+  `https://qiip.example` from `https://qiip.example/auth/callback`. Host and
+  forwarded headers cannot select a different origin, including when a client
+  reaches the gateway directly. Alternate `oauth.allowed_redirect_hosts` names
+  still work for OAuth callbacks, but setup always uses the configured origin.
+  Ensure that origin is reachable by every setup client. When the setting is
+  absent, setup-link creation and downloads of valid links return `503` without
+  exporting credentials or widening token scope. Old links cannot bypass this
+  requirement. The OAuth credential triple must still be configured together.
 - **Treat proxy access logs as sensitive.** `/s/{id}` links are credentials
   for 15 minutes. The gateway redacts them in its own request log, and the
   launchers turn off uvicorn's access log (`python -m inference_proxy.serve`,
