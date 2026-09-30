@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from typing import cast
+from collections.abc import Coroutine
+from datetime import timedelta
+from typing import Any, cast
 
 import pytest
 
@@ -1288,7 +1290,12 @@ async def test_a_record_that_changes_during_the_probe_is_not_replaced(
 async def test_a_record_that_changes_before_the_lease_is_not_probed_or_replaced() -> (
     None
 ):
-    """The pass planned from a snapshot; an operator adopted the host since."""
+    """The pass planned from a snapshot; an operator adopted the host since.
+
+    The readiness probe only reads and runs without the lease, so it probes
+    once. The launch takes the lease, sees the adoption, and neither probes
+    again nor replaces the record.
+    """
     rig = Rig(_l4s(1))
     reserve = rig.provisioner.try_reserve_host
 
@@ -1299,6 +1306,278 @@ async def test_a_record_that_changes_before_the_lease_is_not_probed_or_replaced(
     rig.provisioner.try_reserve_host = adopt_then_reserve  # type: ignore[method-assign]
     await rig.run()
 
-    assert rig.provisioner.calls == [] and rig.provisioner.remote_checks == []
+    assert rig.provisioner.calls == [] and rig.provisioner.remote_checks == ["l4-00"]
     assert await rig.claims() == {}
     assert not rig.provisioner.lifecycle.is_busy("l4-00")
+
+
+def _lose_first_reply(rig: Rig) -> None:
+    """Make etcd apply the next claim write but fail its reply, like a timeout."""
+    original = rig.etcd.replace_if_revision
+    lost = {"done": False}
+
+    def apply_then_fail(
+        key: str, value: str | bytes, *, expected_mod_revision: int, lease_id: int
+    ) -> int | None:
+        result = original(
+            key, value, expected_mod_revision=expected_mod_revision, lease_id=lease_id
+        )
+        if not lost["done"]:
+            lost["done"] = True
+            raise TimeoutError("the reply was lost after the write was applied")
+        return result
+
+    rig.etcd.replace_if_revision = apply_then_fail  # type: ignore[method-assign]
+
+
+def _fail_next_read(rig: Rig) -> None:
+    original = rig.etcd.get_record
+    failed = {"done": False}
+
+    def fail_once(key: str) -> object:
+        if not failed["done"]:
+            failed["done"] = True
+            raise ConnectionError("etcd is unreachable")
+        return original(key)
+
+    rig.etcd.get_record = fail_once  # type: ignore[method-assign,assignment]
+
+
+@pytest.mark.asyncio
+async def test_a_heartbeat_behind_its_own_write_catches_up() -> None:
+    rig = Rig(_l4s(1))
+    rig.provisioner.hold = True
+    await rig.reconciler.reconcile_once()
+    await asyncio.sleep(0)
+    owned = rig.reconciler._owned["l4-00"]
+    task = rig.provisioner.tasks["l4-00"]
+
+    _lose_first_reply(rig)
+    _fail_next_read(rig)
+    rig.clock.advance(30)
+    await rig.reconciler._heartbeat_once(owned, task)  # behind, cannot tell yet
+    rig.clock.advance(30)
+    await rig.reconciler._heartbeat_once(owned, task)  # adopts its own revision
+    rig.clock.advance(30)
+    await rig.reconciler._heartbeat_once(owned, task)  # and refreshes on it
+
+    assert not owned.lost and rig.provisioner.fenced == []
+    assert (await rig.claims())["l4-00"].heartbeat_at == rig.clock.now
+    rig.provisioner.gates["l4-00"].set()
+    await rig.provisioner.drain()
+
+
+@pytest.mark.asyncio
+async def test_a_claim_deleted_during_provisioning_is_lost() -> None:
+    rig = Rig(_l4s(1))
+    rig.provisioner.hold = True
+    await rig.reconciler.reconcile_once()
+    await asyncio.sleep(0)
+    owned = rig.reconciler._owned["l4-00"]
+    task = rig.provisioner.tasks["l4-00"]
+    del rig.etcd.data["/placement/claims/l4-00"]
+
+    await rig.reconciler._heartbeat_once(owned, task)
+    await rig.provisioner.drain()
+
+    assert owned.lost and rig.provisioner.fenced == ["l4-00"]
+    assert await rig.claims() == {}
+
+
+@pytest.mark.asyncio
+async def test_a_heartbeat_whose_reply_was_lost_keeps_the_claim() -> None:
+    rig = Rig(_l4s(1))
+    rig.provisioner.hold = True
+    await rig.reconciler.reconcile_once()
+    await asyncio.sleep(0)
+    owned = rig.reconciler._owned["l4-00"]
+    task = rig.provisioner.tasks["l4-00"]
+
+    _lose_first_reply(rig)
+    rig.clock.advance(30)
+    await rig.reconciler._heartbeat_once(owned, task)
+    rig.clock.advance(30)
+    await rig.reconciler._heartbeat_once(owned, task)
+
+    # Its own applied write is not a takeover: nothing is fenced.
+    assert not owned.lost and rig.provisioner.fenced == []
+    assert (await rig.claims())["l4-00"].heartbeat_at == rig.clock.now
+    rig.provisioner.gates["l4-00"].set()
+    await rig.provisioner.drain()
+    assert (await rig.claims())["l4-00"].state is ClaimState.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_a_final_write_after_a_lost_heartbeat_reply_is_kept() -> None:
+    rig = Rig(_l4s(1), retry_backoff_seconds=600)
+    rig.provisioner.hold = True
+    rig.provisioner.failures["l4-00"] = ["the real error"]
+    await rig.reconciler.reconcile_once()
+    await asyncio.sleep(0)
+    owned = rig.reconciler._owned["l4-00"]
+
+    _lose_first_reply(rig)
+    _fail_next_read(rig)  # the re-read fails too, so the gateway stays behind
+    rig.clock.advance(30)
+    await rig.reconciler._heartbeat_once(owned, rig.provisioner.tasks["l4-00"])
+    assert owned.stored.claim.heartbeat_at < rig.clock.now
+
+    rig.provisioner.gates["l4-00"].set()
+    await rig.provisioner.drain()
+
+    claim = (await rig.claims())["l4-00"]
+    assert (claim.state, claim.last_error) == (ClaimState.FAILED, "the real error")
+    assert claim.retry_at == rig.clock.now + timedelta(seconds=600)
+    assert not owned.lost
+
+
+@pytest.mark.asyncio
+async def test_a_pass_during_the_final_write_keeps_the_backoff_and_error() -> None:
+    rig = Rig(_l4s(1), retry_backoff_seconds=600)
+    rig.provisioner.hold = True
+    rig.provisioner.failures["l4-00"] = ["the real error"]
+    await rig.reconciler.reconcile_once()
+    await asyncio.sleep(0)
+
+    release = asyncio.Event()
+    finish = rig.reconciler._finish
+
+    async def slow_finish(owned: object, **kwargs: object) -> None:
+        await release.wait()
+        await finish(owned, **kwargs)  # type: ignore[arg-type]
+
+    rig.reconciler._finish = slow_finish  # type: ignore[method-assign]
+    rig.provisioner.gates["l4-00"].set()
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+    await rig.reconciler.reconcile_once()  # the provision ended; its write has not
+    release.set()
+    await rig.provisioner.drain()
+
+    assert len(rig.provisioner.calls) == 1
+    claim = (await rig.claims())["l4-00"]
+    assert (claim.state, claim.last_error) == (ClaimState.FAILED, "the real error")
+    assert "l4-00" not in rig.reconciler._owned
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record", ["manual", "unparseable", "unreadable"])
+async def test_a_node_record_the_registry_has_not_loaded_blocks_placement(
+    record: str,
+) -> None:
+    """After an etcd outage at startup the registry can be empty for a while."""
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    if record == "manual":
+        rig.provisioner.stored_nodes["l4-00"] = node("l4-00", NodeStatus.HEALTHY)
+    elif record == "unparseable":
+        rig.provisioner.stored_nodes["l4-00"] = None
+    else:
+        rig.provisioner.stored_node_error = ConnectionError("etcd is down")
+
+    await rig.run()
+
+    assert rig.provisioner.calls == [] and await rig.claims() == {}
+    reason = _skips(rig)["l4-00"]
+    assert reason.startswith("blocked: ")
+    expected = {
+        "manual": "etcd holds a healthy node record",
+        "unparseable": "cannot be parsed",
+        "unreadable": "etcd is down",
+    }[record]
+    assert expected in reason
+
+
+@pytest.mark.asyncio
+async def test_a_record_that_appears_in_etcd_under_the_lease_is_not_replaced() -> None:
+    rig = Rig(_l4s(1))
+    reserve = rig.provisioner.try_reserve_host
+
+    async def appear_then_reserve(hostname: str) -> HostLifecycleLease | None:
+        rig.provisioner.stored_nodes[hostname] = node(hostname, NodeStatus.HEALTHY)
+        return await reserve(hostname)
+
+    rig.provisioner.try_reserve_host = appear_then_reserve  # type: ignore[method-assign]
+    await rig.run()
+
+    assert rig.provisioner.calls == [] and await rig.claims() == {}
+    assert not rig.provisioner.lifecycle.is_busy("l4-00")
+
+
+@pytest.mark.asyncio
+async def test_a_placed_node_that_failed_later_is_retried_and_resettable() -> None:
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    await rig.run()
+    placed = rig.registry.get("l4-00")
+    assert placed is not None and placed.placement is not None
+    # A teardown that failed marks the node FAILED; the claim is still ACTIVE.
+    rig.registry.add(node("l4-00", NodeStatus.FAILED, placement=placed.placement))
+
+    await rig.run()
+    claim = (await rig.claims())["l4-00"]
+    assert (claim.state, claim.attempts, claim.last_error) == (
+        ClaimState.FAILED,
+        0,
+        "the placed node failed",
+    )
+    assert claim.counts_toward_ratio  # still owed to its profile while retrying
+
+    rig.clock.advance(61)
+    await rig.run()
+    assert len(rig.provisioner.calls) == 2 and rig.provisioner.cleaned == ["l4-00"]
+    assert (await rig.claims())["l4-00"].state is ClaimState.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_the_readiness_probe_does_not_hold_the_lifecycle_lease() -> None:
+    rig = Rig(_l4s(1))
+    during: list[bool] = []
+
+    async def operator_acts(hostname: str) -> None:
+        lease = await rig.provisioner.try_reserve_host(hostname)
+        during.append(lease is not None)
+        if lease is not None:
+            lease.release()
+
+    rig.provisioner.during_remote_check = operator_acts
+    await rig.run()
+
+    # The readiness probe leaves the host free; only the launch's own check,
+    # made under the launch lease, would refuse a manual action.
+    assert during[0] is True
+
+
+@pytest.mark.asyncio
+async def test_a_placement_task_cancelled_before_it_starts_releases_the_host() -> None:
+    rig = Rig(_l4s(1))
+    fire = rig.provisioner.fire_background
+
+    def fire_then_cancel(
+        coro: Coroutine[object, object, None], **kwargs: Any
+    ) -> asyncio.Task[None]:
+        task = fire(coro, **kwargs)
+        task.cancel()  # before its first step, as a shutdown can do
+        return task
+
+    rig.provisioner.fire_background = fire_then_cancel  # type: ignore[method-assign]
+    await rig.reconciler.reconcile_once()
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert rig.provisioner.calls == []
+    assert not rig.provisioner.lifecycle.is_busy("l4-00")
+    assert "l4-00" not in rig.reconciler._owned
+
+
+@pytest.mark.asyncio
+async def test_a_card_sharing_the_l4_chip_code_is_not_an_l4() -> None:
+    ada = QUADSHost(
+        hostname="ada-00",
+        gpu_vendor="NVIDIA",
+        gpu_model="AD104GL [RTX 4000 Ada Generation]",
+        gpu_count=1,
+    )
+    rig = Rig([ada, l4_host("l4-00"), a30_host("a30-00")])
+    await rig.run()
+
+    assert set(_placed(rig)) == {"l4-00", "a30-00"}

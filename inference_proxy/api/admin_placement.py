@@ -166,12 +166,14 @@ async def get_placement_status(
 ) -> PlacementStatusResponse:
     """Return placement targets, claims, missing files and model demand."""
     usage = _usage(request_metrics, store)
+    # Degrade like the claim read below: an etcd problem is exactly when the
+    # reconciler's cached status and error are worth seeing.
+    suspension_error = ""
     try:
         suspended_hosts = tuple(sorted(await suspensions.list()))
     except Exception as exc:
-        raise HTTPException(
-            status_code=503, detail="Could not read placement suspensions"
-        ) from exc
+        suspended_hosts = ()
+        suspension_error = f"could not read placement suspensions: {exc}"
     if reconciler is None:
         return PlacementStatusResponse(
             suspended_hosts=suspended_hosts,
@@ -179,7 +181,14 @@ async def get_placement_status(
             enabled=settings.placement.enabled,
             catalog_version=CATALOG_VERSION,
             last_run_at=None,
-            error="automatic placement needs QUADS (quads.base_url)",
+            error="; ".join(
+                part
+                for part in (
+                    "automatic placement needs QUADS (quads.base_url)",
+                    suspension_error,
+                )
+                if part
+            ),
             profiles=(),
             missing_artifacts=(),
             claims=(),
@@ -190,7 +199,7 @@ async def get_placement_status(
         )
     status = reconciler.status
     missing = status.missing_artifacts
-    error = status.error
+    error = status.error or suspension_error
     if status.last_run_at is None:
         # Placement is disabled, or its first pass has not run: the catalog can
         # still be checked against the cache so missing files are visible.

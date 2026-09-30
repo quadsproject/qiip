@@ -3752,3 +3752,31 @@ def test_start_env_omits_export_when_gateway_has_none() -> None:
         None, InferenceEngine.LLAMA_CPP, _artifact()
     )
     assert "AUTOVLLM_NFS_EXPORT" not in llama_env
+
+
+@pytest.mark.asyncio
+async def test_stored_node_reads_etcd_rather_than_the_registry() -> None:
+    """Placement asks etcd itself: the registry may not have loaded a record."""
+    from inference_proxy.discovery.etcd_client import EtcdRecord
+    from inference_proxy.discovery.serializer import node_to_etcd
+
+    etcd = MagicMock()
+    etcd.prefix = "/nodes/"
+    provisioner = _make_provisioner(etcd_client=etcd, registry=NodeRegistry())
+    node = Node(
+        node_id="gpu01",
+        endpoint="host1:8000",
+        status=NodeStatus.HEALTHY,
+        managed=True,
+    )
+    key, value = node_to_etcd(node, "/nodes/")
+    records = {
+        "/nodes/gpu01": EtcdRecord(key.encode(), value, 7),
+        "/nodes/bad": EtcdRecord(b"/nodes/bad", b"{not json", 8),
+    }
+    etcd.get_record.side_effect = records.get
+
+    exists, stored = await provisioner.stored_node("gpu01")
+    assert exists and stored is not None and stored.status is NodeStatus.HEALTHY
+    assert await provisioner.stored_node("bad") == (True, None)
+    assert await provisioner.stored_node("absent") == (False, None)

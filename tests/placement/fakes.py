@@ -53,6 +53,13 @@ class FakeEtcd:
         )
         return EtcdSnapshot(records, self.revision)
 
+    def get_record(self, key: str) -> EtcdRecord | None:
+        self._check()
+        if key not in self.data:
+            return None
+        value, revision = self.data[key]
+        return EtcdRecord(key=key.encode(), value=value, mod_revision=revision)
+
     def replace_if_revision(
         self,
         key: str,
@@ -178,6 +185,10 @@ class FakeProvisioner:
         self.remote_checks: list[str] = []
         self.during_remote_check: Callable[[str], Awaitable[None]] | None = None
         self.fenced: list[str] = []
+        # etcd's node records when they differ from the registry: a node, or
+        # ``None`` for a record that cannot be parsed.
+        self.stored_nodes: dict[str, Node | None] = {}
+        self.stored_node_error: Exception | None = None
 
     async def try_reserve_host(self, hostname: str) -> HostLifecycleLease | None:
         return await self.lifecycle.try_acquire(hostname)
@@ -194,6 +205,14 @@ class FakeProvisioner:
         if hostname in self.remote_check_errors:
             raise self.remote_check_errors[hostname]
         return list(self.remote_processes.get(hostname, []))
+
+    async def stored_node(self, hostname: str) -> tuple[bool, Node | None]:
+        if self.stored_node_error is not None:
+            raise self.stored_node_error
+        if hostname in self.stored_nodes:
+            return True, self.stored_nodes[hostname]
+        node = self.registry.get(hostname)
+        return node is not None, node
 
     async def cancel_active_provision(self, hostname: str) -> None:
         """Explicit cancel: stops the task and, like the real one, the remote worker."""

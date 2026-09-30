@@ -20,7 +20,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from inference_proxy.discovery.etcd_client import EtcdSnapshot
+from inference_proxy.discovery.etcd_client import EtcdRecord, EtcdSnapshot
 
 CLAIM_PREFIX = "/placement/claims/"
 
@@ -72,6 +72,8 @@ class ClaimEtcd(Protocol):
 
     def get_snapshot(self, prefix: str | None = None) -> EtcdSnapshot: ...
 
+    def get_record(self, key: str) -> EtcdRecord | None: ...
+
     def replace_if_revision(
         self,
         key: str,
@@ -115,6 +117,19 @@ class ClaimStore:
                 continue
             claims.append(StoredClaim(claim, record.mod_revision))
         return claims, unreadable
+
+    async def get(self, hostname: str) -> StoredClaim | None:
+        """Read one host's claim. ``None``: absent or unreadable."""
+        record = await asyncio.to_thread(self._etcd.get_record, self.key(hostname))
+        if record is None:
+            return None
+        try:
+            claim = PlacementClaim.model_validate_json(record.value)
+        except ValidationError:
+            return None
+        if claim.hostname != hostname:
+            return None
+        return StoredClaim(claim, record.mod_revision)
 
     async def create(self, claim: PlacementClaim) -> int | None:
         """Create the host's claim only if none exists. ``None``: lost the race."""

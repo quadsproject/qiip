@@ -1278,6 +1278,23 @@ class NodeProvisioner:
             )
         return node
 
+    async def stored_node(self, hostname: str) -> tuple[bool, Node | None]:
+        """Read *hostname*'s node key from etcd itself, not the registry.
+
+        Returns whether the key exists and the parsed node, which is ``None``
+        when the key is absent or its value cannot be parsed.
+        """
+        key = f"{self._etcd_client.prefix}{hostname}"
+        record = await asyncio.to_thread(self._etcd_client.get_record, key)
+        if record is None:
+            return False, None
+        return True, node_from_etcd(
+            record.key,
+            record.value,
+            self._etcd_client.prefix,
+            endpoint_policy=self._endpoint_policy,
+        )
+
     async def _read_node_record(self, hostname: str) -> tuple[EtcdRecord, Node]:
         key = f"{self._etcd_client.prefix}{hostname}"
         record = await asyncio.to_thread(self._etcd_client.get_record, key)

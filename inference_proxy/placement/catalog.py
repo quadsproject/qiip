@@ -59,7 +59,8 @@ class GPUClass(BaseModel):
     """One GPU product a profile may run on.
 
     ``quads_model_token`` is matched against the QUADS inventory string before
-    a host is touched. ``nvidia_smi_name`` and ``min_total_mib`` are checked on
+    a host is touched. It includes the bracketed product name, because a
+    chip code alone is shared (``AD104GL`` is also the RTX 4000 Ada). ``nvidia_smi_name`` and ``min_total_mib`` are checked on
     the node itself, because the inventory string is not evidence of what a
     booted host exposes.
     """
@@ -166,13 +167,13 @@ class ModelProfile(BaseModel):
 
 _L4 = GPUClass(
     key="l4",
-    quads_model_token="AD104GL",
+    quads_model_token="AD104GL [L4]",
     nvidia_smi_name="NVIDIA L4",
     min_total_mib=22_900,
 )
 _A30 = GPUClass(
     key="a30",
-    quads_model_token="GA100GL",
+    quads_model_token="GA100GL [A30",
     nvidia_smi_name="NVIDIA A30",
     min_total_mib=24_000,
 )

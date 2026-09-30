@@ -75,6 +75,7 @@ from inference_proxy.placement.planner import (
     plan_placements,
 )
 from inference_proxy.placement.suspensions import SuspensionStore
+from inference_proxy.provisioning.host_lifecycle import HostLifecycleLease
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     ProvisioningCapacityError,
@@ -142,6 +143,7 @@ class _OwnedClaim:
     stored: StoredClaim
     refreshed_at: datetime
     lost: bool = False
+    started: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -615,6 +617,25 @@ class PlacementReconciler:
                 return await self._drop(stored)
             return stored
 
+        if (
+            claim.state is ClaimState.ACTIVE
+            and node is not None
+            and node.status is NodeStatus.FAILED
+            and _is_own_failed_node(node, claim)
+        ):
+            # The placed server failed afterwards, for example a teardown that
+            # failed while placement was suspended for the host. Nothing else
+            # would ever retry it or let an operator reset it, so it becomes a
+            # failed attempt with a fresh budget, like a vanished node record.
+            return await self._rewrite(
+                stored,
+                state=ClaimState.FAILED,
+                attempts=0,
+                retry_at=now + timedelta(seconds=self._settings.retry_backoff_seconds),
+                last_error="the placed node failed",
+                now=now,
+            )
+
         if claim.state is ClaimState.ACTIVE and node is None:
             # The node's leased key is gone while QUADS still shows the host
             # free. The server may well be running; re-provisioning is
@@ -656,6 +677,37 @@ class PlacementReconciler:
             or (existing is not None and _is_own_failed_node(node, existing.claim))
         )
 
+    async def _launch_blocker(
+        self, hostname: str, existing: StoredClaim | None
+    ) -> str | None:
+        """Why a launch must wait for the host itself, or ``None``."""
+        return await self._remote_work_blocker(
+            hostname
+        ) or await self._stored_node_blocker(hostname, existing)
+
+    async def _stored_node_blocker(
+        self, hostname: str, existing: StoredClaim | None
+    ) -> str | None:
+        """Check the host's node record in etcd, not only the registry's copy.
+
+        The registry can lag etcd (the gateway started while etcd was down and
+        the watch has not delivered its snapshot yet) or leave out a record it
+        cannot parse. Either way "no node" would read as "free" and a person's
+        server could be provisioned over.
+        """
+        try:
+            exists, node = await self._provisioner.stored_node(hostname)
+        except Exception as exc:
+            detail = str(exc) or type(exc).__name__
+            return f"could not read the host's node record from etcd: {detail}"
+        if not exists:
+            return None
+        if node is None:
+            return "the host's node record in etcd cannot be parsed"
+        if self._may_replace(node, existing):
+            return None
+        return f"etcd holds a {node.status.value} node record for the host"
+
     async def _remote_work_blocker(self, hostname: str) -> str | None:
         """Why a launch must wait for the host itself, or ``None``."""
         try:
@@ -675,34 +727,32 @@ class PlacementReconciler:
 
         A failed first launch otherwise leaves its assigned profile missing
         while healthy hosts permanently receive the wrong small-fleet mix.
-        Launch still repeats its check under its own lease to close the gap
-        between this snapshot and the actual mutation.
+        The checks only read, so they run without the lifecycle lease: an
+        operator's setup or teardown is never refused because a probe is in
+        flight. Launch repeats every check under its own lease to close the
+        gap between this snapshot and the actual mutation.
         """
         limit = asyncio.Semaphore(8)
 
         async def check(candidate: Candidate) -> str | None:
             async with limit:
                 hostname = candidate.hostname
-                lease = await self._provisioner.try_reserve_host(hostname)
-                if lease is None:
+                if self._provisioner.host_operation_in_progress(hostname):
                     return "host lifecycle operation in progress"
-                try:
-                    if not self._may_replace(self._registry.get(hostname), None):
-                        return "node changed before readiness check"
-                    blocker = await self._remote_work_blocker(hostname)
-                    if blocker is not None:
-                        reason = f"blocked: {blocker}"
-                        self._deferred[hostname] = (
-                            self._clock()
-                            + timedelta(seconds=self._settings.retry_backoff_seconds),
-                            reason,
-                        )
-                        return reason
-                    if not self._may_replace(self._registry.get(hostname), None):
-                        return "node changed during readiness check"
-                    return None
-                finally:
-                    lease.release()
+                if not self._may_replace(self._registry.get(hostname), None):
+                    return "node changed before readiness check"
+                blocker = await self._launch_blocker(hostname, None)
+                if blocker is not None:
+                    reason = f"blocked: {blocker}"
+                    self._deferred[hostname] = (
+                        self._clock()
+                        + timedelta(seconds=self._settings.retry_backoff_seconds),
+                        reason,
+                    )
+                    return reason
+                if not self._may_replace(self._registry.get(hostname), None):
+                    return "node changed during readiness check"
+                return None
 
         reasons = await asyncio.gather(*(check(candidate) for candidate in candidates))
         ready, skipped = [], []
@@ -785,7 +835,7 @@ class PlacementReconciler:
                     or "the attempt limit was reached",
                 )
                 return False
-            blocker = await self._remote_work_blocker(hostname)
+            blocker = await self._launch_blocker(hostname, existing)
             if blocker is not None:
                 # An earlier attempt may still be running on the host: a
                 # cancelled gateway task does not always stop the remote
@@ -876,7 +926,7 @@ class PlacementReconciler:
 
             background = run()
             try:
-                self._provisioner.fire_background(
+                task = self._provisioner.fire_background(
                     background,
                     provisioning_hostname=hostname,
                     provisioning_identity=ProvisioningIdentity(
@@ -897,6 +947,9 @@ class PlacementReconciler:
                 )
                 raise
             self._owned[hostname] = owned
+            # A task cancelled before its first step never runs ``run``, so its
+            # ``finally`` cannot release the lease or forget the claim.
+            task.add_done_callback(lambda _: self._task_ended(hostname, owned, lease))
             handed_over = True
             logger.info(
                 "placement_started",
@@ -914,6 +967,7 @@ class PlacementReconciler:
     ) -> None:
         """Provision while keeping the claim alive; record how it ended."""
         hostname = owned.stored.claim.hostname
+        owned.started = True
         parent = asyncio.current_task()
         heartbeat = asyncio.create_task(self._heartbeat(owned, parent))
         error: str | None = None
@@ -932,9 +986,59 @@ class PlacementReconciler:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat
-            self._owned.pop(hostname, None)
-            if not owned.lost:
-                await asyncio.shield(self._finish(owned, error=error))
+            if owned.lost:
+                self._forget_owned(hostname, owned)
+            else:
+                # Stay listed as running until the final write lands: a pass
+                # in between would otherwise read the claim as abandoned,
+                # retry at once and overwrite the real error.
+                finish = asyncio.ensure_future(self._finish(owned, error=error))
+                finish.add_done_callback(lambda _: self._forget_owned(hostname, owned))
+                await asyncio.shield(finish)
+
+    def _forget_owned(self, hostname: str, owned: _OwnedClaim) -> None:
+        """Drop *owned*, but never a newer launch's entry for the same host."""
+        if self._owned.get(hostname) is owned:
+            del self._owned[hostname]
+
+    def _task_ended(
+        self, hostname: str, owned: _OwnedClaim, lease: HostLifecycleLease
+    ) -> None:
+        lease.release()
+        if not owned.started:
+            self._forget_owned(hostname, owned)
+
+    async def _own_current(
+        self, owned: _OwnedClaim, written: PlacementClaim
+    ) -> StoredClaim | None:
+        """Re-read the claim after a failed write; ``None`` unless still ours.
+
+        etcd can apply a write and still fail the reply (a client timeout).
+        This gateway then holds an old revision, and its next compare-and-swap
+        fails against its own write, which is not a takeover. The stored claim
+        is still ours when it is exactly *written*, or what was last recorded
+        with only the heartbeat timestamps moved on.
+        """
+        try:
+            current = await self._claims.get(owned.stored.claim.hostname)
+        except Exception:
+            logger.warning(
+                "placement_claim_reread_failed",
+                hostname=owned.stored.claim.hostname,
+                exc_info=True,
+            )
+            return None
+        if current is None:
+            return None
+        if current.claim == written:
+            return current
+        expected = owned.stored.claim.model_copy(
+            update={
+                "heartbeat_at": current.claim.heartbeat_at,
+                "updated_at": current.claim.updated_at,
+            }
+        )
+        return current if current.claim == expected else None
 
     async def _heartbeat(
         self, owned: _OwnedClaim, parent: asyncio.Task[object] | None
@@ -961,7 +1065,7 @@ class PlacementReconciler:
             claim = owned.stored.claim.model_copy(
                 update={"heartbeat_at": now, "updated_at": now}
             )
-            reason: str | None = None
+            failure: Exception | None = None
             try:
                 revision = await self._claims.update(owned.stored, claim)
             except Exception as exc:
@@ -970,15 +1074,28 @@ class PlacementReconciler:
                     hostname=claim.hostname,
                     exc_info=True,
                 )
+                failure = exc
+                revision = None
+            if revision is None:
+                current = await self._own_current(owned, claim)
+                if current is not None:
+                    owned.stored = current
+                    if current.claim == claim:
+                        revision = current.mod_revision
+                    elif failure is None:
+                        # An earlier write landed unseen. The next beat
+                        # refreshes on the right revision.
+                        return
+            if revision is not None:
+                owned.stored = StoredClaim(claim, revision)
+                owned.refreshed_at = now
+                return
+            if failure is not None:
                 limit = timedelta(seconds=self._settings.claim_stale_seconds / 2)
                 if now - owned.refreshed_at < limit:
                     return
-                reason = f"the claim could not be refreshed for {limit}: {exc}"
+                reason = f"the claim could not be refreshed for {limit}: {failure}"
             else:
-                if revision is not None:
-                    owned.stored = StoredClaim(claim, revision)
-                    owned.refreshed_at = now
-                    return
                 reason = "another gateway took the claim over"
             owned.lost = True
             logger.error("placement_claim_lost", hostname=claim.hostname, reason=reason)
@@ -1040,6 +1157,7 @@ class PlacementReconciler:
             updated = claim.model_copy(
                 update={**changes, "attempts": attempts, "updated_at": now}
             )
+            write_failed = False
             try:
                 revision = await self._claims.update(owned.stored, updated)
             except Exception:
@@ -1048,7 +1166,20 @@ class PlacementReconciler:
                     hostname=claim.hostname,
                     exc_info=True,
                 )
-                return
+                write_failed = True
+                revision = None
+            if revision is None:
+                current = await self._own_current(owned, updated)
+                if current is not None and current.claim == updated:
+                    revision = current.mod_revision
+                elif current is not None:
+                    # An earlier heartbeat landed unseen: write on its revision.
+                    try:
+                        revision = await self._claims.update(current, updated)
+                    except Exception:
+                        write_failed = True
+            if revision is None and write_failed:
+                return  # The next pass repairs the claim from what etcd holds.
             if revision is None:
                 owned.lost = True
                 logger.error("placement_claim_lost", hostname=claim.hostname)

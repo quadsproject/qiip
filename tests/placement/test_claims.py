@@ -83,3 +83,22 @@ def test_only_an_exhausted_claim_stops_counting_toward_the_ratio() -> None:
     assert _claim(state=ClaimState.FAILED).counts_toward_ratio
     assert _claim(state=ClaimState.ACTIVE).counts_toward_ratio
     assert not _claim(state=ClaimState.EXHAUSTED).counts_toward_ratio
+
+
+@pytest.mark.asyncio
+async def test_get_reads_one_hosts_claim_and_skips_what_it_cannot_trust() -> None:
+    etcd = FakeEtcd()
+    store = ClaimStore(etcd)
+    revision = await store.create(_claim())
+    assert revision is not None
+
+    stored = await store.get("l4-01")
+    assert stored is not None and stored.claim == _claim()
+    assert stored.mod_revision == revision
+    assert await store.get("l4-02") is None  # absent
+
+    etcd.data[CLAIM_PREFIX + "l4-03"] = (b"not json", 99)
+    assert await store.get("l4-03") is None  # unparseable
+
+    etcd.data[CLAIM_PREFIX + "l4-04"] = (_claim("l4-05").model_dump_json().encode(), 99)
+    assert await store.get("l4-04") is None  # stored under another host's key

@@ -99,7 +99,12 @@ def test_resume_storage_failure_is_not_reported_as_success(
     asyncio.run(app.state.placement_suspensions.suspend("l4-00"))
     app.state.placement_suspensions._etcd.fail = True
     assert client.delete("/admin/placement/suspensions/l4-00").status_code == 503
-    assert client.get("/admin/placement").status_code == 503
+    # The status card degrades instead of failing: the error is shown with
+    # whatever else is known.
+    degraded = client.get("/admin/placement")
+    assert degraded.status_code == 200
+    assert degraded.json()["suspended_hosts"] == []
+    assert "could not read placement suspensions" in degraded.json()["error"]
     app.state.placement_suspensions._etcd.fail = False
     assert client.get("/admin/placement").json()["suspended_hosts"] == ["l4-00"]
 
