@@ -224,15 +224,25 @@ install_llamacpp() {
 
     verify_fit_params_patch_identity
 
-    local compute_capabilities build_identity install_dir marker
+    local compute_capabilities build_identity install_dir marker cuda_toolkit nvcc_version
+    if ! nvcc_version=$("$CUDA_NVCC" --version); then
+        echo "FATAL: could not determine CUDA toolkit version from ${CUDA_NVCC}" >&2
+        return 1
+    fi
+    cuda_toolkit=$(printf '%s\n' "$nvcc_version" | sed -n 's/.*release [0-9.]*, V\([0-9][0-9.]*\).*/\1/p')
+    if [[ ! "$cuda_toolkit" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "FATAL: could not determine CUDA toolkit version from ${CUDA_NVCC}" >&2
+        return 1
+    fi
     compute_capabilities=$(cuda_compute_capabilities) || return
-    marker=$(printf 'version=%s\nsource_sha256=%s\nbuild_profile=%s\nfit_cli_patch_sha256=%s\ncompute_capabilities=%s\ncmake_cuda_architectures=%s\n' \
+    marker=$(printf 'version=%s\nsource_sha256=%s\nbuild_profile=%s\nfit_cli_patch_sha256=%s\ncompute_capabilities=%s\ncmake_cuda_architectures=%s\ncuda_toolkit=%s\n' \
         "$LLAMACPP_VERSION" \
         "$LLAMACPP_SHA256" \
         "$LLAMACPP_BUILD_PROFILE" \
         "$LLAMACPP_FIT_PATCH_SHA256" \
         "${compute_capabilities//$'\n'/,}" \
-        "$LLAMACPP_CUDA_ARCHITECTURES")
+        "$LLAMACPP_CUDA_ARCHITECTURES" \
+        "$cuda_toolkit")
     build_identity=$(printf '%s' "$marker" | sha256sum | cut -c1-16)
     install_dir="${LLAMACPP_INSTALL_ROOT%/}/${LLAMACPP_VERSION}-${build_identity}"
 

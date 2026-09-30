@@ -963,7 +963,10 @@ EOF
 fi
 """,
     )
-    _write_executable(fake_bin / "nvcc", "#!/bin/bash\nexit 0\n")
+    _write_executable(
+        fake_bin / "nvcc",
+        "#!/bin/bash\necho 'Cuda compilation tools, release 13.0, V13.0.88'\n",
+    )
     _write_executable(
         fake_bin / "nvidia-smi",
         """#!/bin/bash
@@ -1188,6 +1191,56 @@ def test_install_is_idempotent_for_source_and_gpu_identity(tmp_path: Path) -> No
         sum(line.startswith("wget") for line in operation_log.read_text().splitlines())
         == 1
     )
+
+
+@pytest.mark.parametrize("next_version", ["13.0.88", "12.9.87"])
+def test_install_rebuilds_when_resolved_cuda_toolkit_changes(
+    tmp_path: Path, next_version: str
+) -> None:
+    env, operation_log, link_dir = _build_fixture(tmp_path)
+    nvcc = Path(env["AUTOLLAMACPP_NVCC"])
+    _write_executable(
+        nvcc, "#!/bin/bash\necho 'Cuda compilation tools, release 12.9, V12.9.86'\n"
+    )
+    first = _run_shell(_source_setup("install_llamacpp"), env=env)
+    assert first.returncode == 0, first.stderr
+    old_binary = (link_dir / "llama-server").resolve()
+
+    _write_executable(
+        nvcc,
+        f"#!/bin/bash\necho 'Cuda compilation tools, release {next_version.rsplit('.', 1)[0]}, V{next_version}'\n",
+    )
+    second = _run_shell(_source_setup("install_llamacpp"), env=env)
+    assert second.returncode == 0, second.stderr
+    new_binary = (link_dir / "llama-server").resolve()
+    assert new_binary != old_binary
+    assert (
+        f"cuda_toolkit={next_version}"
+        in (new_binary.parents[1] / "BUILD-INFO").read_text()
+    )
+    third = _run_shell(_source_setup("install_llamacpp"), env=env)
+    assert third.returncode == 0, third.stderr
+    assert (link_dir / "llama-server").resolve() == new_binary
+    assert (
+        sum(line.startswith("wget") for line in operation_log.read_text().splitlines())
+        == 2
+    )
+
+
+@pytest.mark.parametrize("nvcc_body", ["exit 1", "echo unknown"])
+def test_install_rejects_unverifiable_cuda_toolkit(
+    tmp_path: Path, nvcc_body: str
+) -> None:
+    env, operation_log, link_dir = _build_fixture(tmp_path)
+    _write_executable(Path(env["AUTOLLAMACPP_NVCC"]), f"#!/bin/bash\n{nvcc_body}\n")
+    result = _run_shell(_source_setup("install_llamacpp"), env=env)
+    assert result.returncode != 0
+    assert (
+        f"FATAL: could not determine CUDA toolkit version from {env['AUTOLLAMACPP_NVCC']}"
+        in result.stderr
+    )
+    assert not link_dir.exists()
+    assert not operation_log.exists()
 
 
 def test_build_tag_pins_build_number_and_rejects_other_version(

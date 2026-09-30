@@ -15,6 +15,7 @@ The guide separates three kinds of change:
 - [Durable provisioning attempt logs](#26-durable-provisioning-attempt-logs)
 - [Self-service onboarding](#27-self-service-onboarding-moves-normal-users-to-start)
 - [Catalog profiles and automatic placement](#28-catalog-profiles-and-automatic-model-placement)
+- [Node command transport and CUDA build identity](#29-node-command-transport-and-cuda-build-identity)
 - [Artifact sources and mirror policy](#artifact-sources-and-mirror-policy)
 - [Client-visible compatibility changes](#client-visible-compatibility-changes)
 - [RPM install migration](#rpm-install-migration)
@@ -689,6 +690,19 @@ using only the catalog models and their pinned configurations. Set
   that must stay out in `placement.exclude_hosts`, and leave
   `placement.require_qualified_gpu` on so a profile only lands on GPU products
   it has been validated on.
+
+### 29. Node command transport and CUDA build identity
+
+Managed node commands now travel through SSH and recorder stdin. Environment
+values, including `HF_TOKEN`, no longer appear in the launching shell's process
+arguments. Manual script environment variables and managed relaunch settings are
+unchanged, and provisioning log redaction still applies.
+
+llama.cpp `BUILD-INFO` now records `cuda_toolkit`, the full version reported by the
+resolved `nvcc`. Setup rebuilds when that version changes, including a toolkit
+patch update. Existing installations without this marker rebuild once on their
+next setup. An unreadable compiler version stops setup before a cached build can
+be reused.
 
 ## Artifact Sources and Mirror Policy
 
