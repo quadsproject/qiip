@@ -30,6 +30,12 @@ Requires:       python3 >= 3.12
 Requires:       nginx >= 1.25.1
 Requires:       openssl
 Requires:       policycoreutils
+# etcd is the discovery/registry backend (inference_proxy/discovery/).
+# etcd3gw (the thin client) declares no server floor, so name the supported
+# branch here: 3.5 is the maintained line (3.4 is EOL) and the current docs
+# pin 3.5.21. Installed but not started/required at runtime for a remote
+# cluster, matching the "gateway starts during an etcd outage" contract.
+Requires:       etcd >= 3.5.0
 @CONFLICTS@
 
 %description
