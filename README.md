@@ -132,8 +132,17 @@ start with an empty registry.
 
 ### Running etcd
 
-The gateway expects etcd on `localhost:2379` by default. Run a single-node
-instance with Podman:
+The gateway expects etcd on `localhost:2379` by default.
+
+RPM installs (`qiip` / `qiip-dev`) pull the `etcd` package as a dependency, so
+no container runtime is needed. Enable and start the packaged single-node
+service (its default config already listens on `localhost:2379`):
+
+```bash
+sudo systemctl enable --now etcd
+```
+
+For git-checkout installs (or to run etcd in a container), use Podman:
 
 ```bash
 podman run -d --name etcd -p 2379:2379 \
