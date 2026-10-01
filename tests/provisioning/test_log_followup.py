@@ -28,6 +28,61 @@ from tests.provisioning.test_attempt_logs import harness as harness
 
 
 @pytest.mark.asyncio
+async def test_run_resends_launch_lost_before_execution(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    """A launch request that dies before the node sees it is re-sent once."""
+    provisioner, ssh, store = harness
+    provisioner._begin_log("host1", InferenceEngine.VLLM)
+    collector = provisioner._remote_logs
+    assert collector is not None
+    ssh.lose_launch_before_run = True
+
+    lines: list[str] = []
+    async for _stream, line in collector.run(
+        "host1", "echo hello; echo done", stage="setup"
+    ):
+        lines.append(line)
+
+    assert "hello" in lines
+    assert "done" in lines
+    # The first launch died before execution; the idempotent resend ran it.
+    assert ssh.launches == 1
+    assert ssh.launch_faults_injected == 1
+    attempt = provisioner.log_buffer.attempts["host1"]
+    phases = store.get(attempt).get("remote_phases") or {}
+    assert list(phases.values())[-1]["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_run_resends_launch_when_phase_missing_on_node(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    """A read showing no phase for the attempt resends the launch once."""
+    provisioner, ssh, store = harness
+    provisioner._begin_log("host1", InferenceEngine.VLLM)
+    collector = provisioner._remote_logs
+    assert collector is not None
+    # Seed the node with the attempt so the follow-up read succeeds.
+    async for _ in collector.run("host1", "echo first; echo done", stage="setup"):
+        pass
+    # Drop the second launch before the node sees it; the attempt exists on the
+    # node, so the read succeeds but the new phase is absent and launch resends.
+    ssh.lose_launch_before_run = True
+    lines: list[str] = []
+    async for _stream, line in collector.run(
+        "host1", "echo second; echo done", stage="setup"
+    ):
+        lines.append(line)
+
+    assert "second" in lines
+    assert ssh.launch_faults_injected == 1
+    attempt = provisioner.log_buffer.attempts["host1"]
+    phases = store.get(attempt).get("remote_phases") or {}
+    assert list(phases.values())[-1]["status"] == "complete"
+
+
+@pytest.mark.asyncio
 async def test_shutdown_leaves_detached_command_running(
     harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
 ) -> None:
