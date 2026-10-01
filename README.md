@@ -309,9 +309,10 @@ is deprecated upstream, so we do not use it), tuned like every other QIIP settin
 Workers recycle every `max_requests +/- jitter` requests, the same memory
 guard QUADS uses with gunicorn. The gateway runs per-process daemon
 threads (etcd watcher, health and QUADS pollers, schedule enforcer) with
-an in-memory registry, so one worker is the only supported value. A fresh
-install starts both units; upgrades only re-enable them. Manage both
-units after install: `sudo systemctl status inference-proxy nginx`.
+an in-memory registry, so one worker is the only supported value. After
+install, enable and start the gateway with
+`sudo systemctl enable --now inference-proxy`; nginx is started by the
+package. Manage both units: `sudo systemctl status inference-proxy nginx`.
 
 Two packages, one train each; they ship the same files and cannot be
 installed together:
@@ -336,8 +337,10 @@ sudo dnf install qiip-dev
 
 `qiip-dev` tracks the `development` branch and is rebuilt on every code
 change, so expect frequent updates (`sudo dnf upgrade qiip-dev`). It
-conflicts with `qiip`; only one train can be installed at a time, and
-`dnf` replaces the other package when you switch trains.
+conflicts with `qiip` and declares no `Obsoletes`, so switch trains with
+`sudo dnf swap qiip-dev qiip` (or `--allowerasing`). A swap disables and
+stops the gateway, so re-enable it afterwards:
+`sudo systemctl enable --now inference-proxy`.
 
 Configure and start:
 
