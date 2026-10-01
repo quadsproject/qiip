@@ -101,6 +101,10 @@ DEFAULT_LLAMACPP_SOURCE_URL = (
     "https://github.com/ggml-org/llama.cpp/archive/refs/tags/{version}.tar.gz"
 )
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+# Minimum node engine-log tail budget so the leading ``qiip_fit_plan:`` line
+# (printed first by start-llamacpp.sh) survives raw-tail rotation and runtime
+# verification succeeds.
+_ENGINE_LOG_TAIL_MIN_BYTES = 262_144
 
 
 def _validate_sha256(value: str, *, setting: str) -> str:
@@ -361,6 +365,24 @@ class ProvisioningSettings(BaseModel):
         if self.log_remote_attempt_max_bytes > self.log_remote_max_bytes // 2:
             raise ValueError(
                 "log_remote_max_bytes must be >= 2 * log_remote_attempt_max_bytes"
+            )
+        # The node engine-log tail is capped at the smaller of the per-attempt
+        # budget and max_bytes // (2 * max_attempts). Verification cats that raw
+        # tail for the leading qiip_fit_plan line, so the budget must be large
+        # enough for the line to survive rotation.
+        if self.log_remote_attempt_max_bytes < _ENGINE_LOG_TAIL_MIN_BYTES:
+            raise ValueError(
+                "log_remote_attempt_max_bytes must be >= "
+                f"{_ENGINE_LOG_TAIL_MIN_BYTES} so the node engine-log tail can "
+                "keep the leading fit_plan line"
+            )
+        if self.log_remote_max_bytes < (
+            2 * self.log_remote_max_attempts * _ENGINE_LOG_TAIL_MIN_BYTES
+        ):
+            raise ValueError(
+                "log_remote_max_bytes must be >= 2 * log_remote_max_attempts * "
+                f"{_ENGINE_LOG_TAIL_MIN_BYTES} so every attempt's engine-log tail "
+                "can keep the fit_plan line"
             )
         return self
 

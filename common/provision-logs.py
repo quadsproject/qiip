@@ -181,7 +181,7 @@ def worker(config):
             engine_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock_fd, lock_available = _acquire_host_lock(config.get("root"))
         if lock_available and lock_fd is None:
-            holder = store.latest_running(attempt, exclude=attempt)
+            holder = store.latest_running(config["hostname"], exclude=attempt)
             message = "Host busy with another provisioning operation"
             if holder:
                 message += f" (attempt {holder})"

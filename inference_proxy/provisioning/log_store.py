@@ -395,7 +395,8 @@ class AttemptLogStore:
 
         Reconciliation candidates: the newest attempt per host is still
         running, was interrupted, or failed without mirrored terminal remote
-        phases. Relaunch operations are excluded (owned by relaunch recovery).
+        phases. Relaunch operations are included, as the reconcile path owns
+        recovery for them too.
         """
         with self._db() as db:
             rows = db.execute(

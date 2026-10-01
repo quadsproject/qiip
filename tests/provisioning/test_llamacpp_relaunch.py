@@ -709,3 +709,39 @@ def test_profile_override_requires_ownership_and_rejects_profile_requests(
             provisioner.validate_llamacpp_relaunch(node, _request())
     with pytest.raises(RelaunchPreconditionError, match="automatic placement"):
         provisioner.validate_llamacpp_relaunch(node, request)
+
+
+@pytest.mark.asyncio
+async def test_relaunch_finalizes_remote_logs() -> None:
+    provisioner, _registry, _etcd, _state, _writes = _provisioner()
+    provisioner._launch_llamacpp_runtime.return_value = (  # type: ignore[attr-defined]
+        "org/model-GGUF",
+        _runtime(),
+    )
+    provisioner._finish_remote_logs = AsyncMock()  # type: ignore[method-assign]
+
+    await asyncio.wait_for(
+        provisioner.relaunch_llamacpp("host1", _request()),
+        timeout=1,
+    )
+
+    provisioner._finish_remote_logs.assert_awaited_once_with("host1", cancel=False)
+
+
+@pytest.mark.asyncio
+async def test_relaunch_finalizes_remote_logs_after_rollback() -> None:
+    previous = _node()
+    provisioner, _registry, _etcd, _state, _writes = _provisioner(previous)
+    provisioner._launch_llamacpp_runtime.side_effect = [  # type: ignore[attr-defined]
+        ProvisioningError("requested configuration does not fit"),
+        ("org/model-GGUF", previous.llamacpp_runtime),
+    ]
+    provisioner._finish_remote_logs = AsyncMock()  # type: ignore[method-assign]
+
+    with pytest.raises(ProvisioningError, match="does not fit"):
+        await asyncio.wait_for(
+            provisioner.relaunch_llamacpp("host1", _request()),
+            timeout=1,
+        )
+
+    provisioner._finish_remote_logs.assert_awaited_once_with("host1", cancel=False)
