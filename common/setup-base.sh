@@ -713,6 +713,31 @@ verify_nfs_storage() {
     actual_fstype=$(printf '%s\n' "$line" | awk '{print $3}')
     actual_opts=$(printf '%s\n' "$line" | awk '{print $4}')
 
+    # An autofs-managed mount point carries an `autofs` placeholder in
+    # /proc/mounts while the export is idled out (past the autofs timeout).
+    # Nothing touches the path on an idle node, so the placeholder is the last
+    # match and the source check below would reject a healthy mount. Trigger
+    # the automount and re-read before judging the source/type/options.
+    if [ "$actual_fstype" = "autofs" ]; then
+        echo "${NFS_MOUNT_POINT} is an autofs placeholder; triggering the automount"
+        timeout 5 stat "${NFS_MOUNT_POINT}/." >/dev/null 2>&1 || true
+        line=$(awk -v mp="${NFS_MOUNT_POINT}" -v rmp="$real_mp" '
+            function d(s){ gsub(/\\040/," ",s); gsub(/\\011/,"\t",s); gsub(/\\134/,"\\",s); return s }
+            d($2) == mp || (rmp != "" && d($2) == rmp) {got = $0}
+            END {if (got != "") print got}
+        ' "$mounts_file")
+        if [ -z "$line" ]; then
+            echo "FATAL: ${NFS_MOUNT_POINT} not found in ${mounts_file}; NFS storage is not mounted" >&2
+            return 1
+        fi
+        actual_source=$(printf '%s\n' "$line" | awk '
+            function d(s){ gsub(/\\040/," ",s); gsub(/\\011/,"\t",s); gsub(/\\134/,"\\",s); return s }
+            {print d($1)}
+        ')
+        actual_fstype=$(printf '%s\n' "$line" | awk '{print $3}')
+        actual_opts=$(printf '%s\n' "$line" | awk '{print $4}')
+    fi
+
     local expected
     expected=$(_normalize_nfs_source "$NFS_EXPORT")
     if [ "$(_normalize_nfs_source "$actual_source")" != "$expected" ]; then
@@ -810,6 +835,20 @@ check_install_capacity() {
         "$vllm_root" \
         "${LLAMACPP_INSTALL_ROOT:-/opt/llama.cpp}" \
         "$llmfit_root"
+}
+
+# Wraps check_install_capacity for a setup step: a proven shortage (rc 1) is
+# fatal; a probe that cannot size a filesystem (rc 2) is a warning, matching
+# the pre-existing tolerance in mount_nfs_cache.
+check_install_capacity_or_warn() {
+    check_install_capacity || {
+        local rc=$?
+        if [ "$rc" -eq 2 ]; then
+            echo "WARNING: install capacity could not be fully verified (continuing)" >&2
+            return 0
+        fi
+        return "$rc"
+    }
 }
 
 ensure_nfs_persistence() {

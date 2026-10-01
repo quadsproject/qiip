@@ -516,6 +516,23 @@ persist_vllm_env() {
     {
         echo "AUTOVLLM_TENSOR_PARALLEL=${TENSOR_PARALLEL}"
         echo "AUTOVLLM_MODEL=${MODEL}"
+        echo "AUTOVLLM_GPU_MEM_UTIL=${GPU_MEM_UTIL}"
+        echo "AUTOVLLM_MAX_MODEL_LEN=${MAX_MODEL_LEN}"
+        echo "AUTOVLLM_MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS}"
+        # Optional effective overrides: only persist when set, so an empty
+        # value never forces a different default on a manual systemctl start.
+        if [ -n "$TOOL_CALL_PARSER_OVERRIDE" ]; then
+            echo "AUTOVLLM_TOOL_CALL_PARSER=${TOOL_CALL_PARSER_OVERRIDE}"
+        fi
+        if [ -n "$REASONING_PARSER_OVERRIDE" ]; then
+            echo "AUTOVLLM_REASONING_PARSER=${REASONING_PARSER_OVERRIDE}"
+        fi
+        if [ -n "$EFFECTIVE_DTYPE" ]; then
+            echo "AUTOVLLM_DTYPE=${EFFECTIVE_DTYPE}"
+        fi
+        if [ -n "$EXTRA_ARGS" ]; then
+            echo "AUTOVLLM_EXTRA_ARGS=${EXTRA_ARGS}"
+        fi
         if [ -n "$GPU_DEVICES_OVERRIDE" ]; then
             echo "AUTOVLLM_GPU_DEVICES=${GPU_DEVICES_OVERRIDE}"
         fi

@@ -1159,6 +1159,49 @@ def test_verify_nfs_storage_accepts_ipv6_bracketed_export(tmp_path: Path) -> Non
     assert result.returncode == 0, result.stderr
 
 
+def _autofs_placeholder(mp: str) -> str:
+    return (
+        f"/etc/auto.nfs {mp} autofs "
+        "rw,relatime,fd=6,pgrp=1,timeout=300,minproto=5,maxproto=5,indirect,pipe=8 0 0"
+    )
+
+
+def test_verify_nfs_storage_autofs_trigger_resolves_to_nfs(tmp_path: Path) -> None:
+    """An idle autofs placeholder must trigger the automount; the re-read then
+    sees the stacked NFS mount and verifies it."""
+    env, _log = _nfs_env(tmp_path)
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    Path(env["AUTOVLLM_MOUNTS_FILE"]).write_text(_autofs_placeholder(mp) + "\n")
+    bin_dir = Path(env["PATH"].split(":")[0])
+    _write_executable(
+        bin_dir / "stat",
+        f"""#!/bin/bash
+echo "storage.example:/exports/huggingface {mp} nfs {NFS_OPTS} 0 0" >> "$AUTOVLLM_MOUNTS_FILE"
+exit 0
+""",
+    )
+    result = _run_shell(_source_and("verify_nfs_storage"), env=env)
+    assert result.returncode == 0, result.stderr
+    assert "is an autofs placeholder; triggering the automount" in result.stdout
+    assert "verified" in result.stdout
+
+
+def test_verify_nfs_storage_autofs_stays_placeholder_fails_source(
+    tmp_path: Path,
+) -> None:
+    """When the automount does not fire (server down, still an autofs
+    placeholder), the source check rejects rather than touching the mount."""
+    env, _log = _nfs_env(tmp_path)
+    mp = env["AUTOVLLM_NFS_MOUNT_POINT"]
+    Path(env["AUTOVLLM_MOUNTS_FILE"]).write_text(_autofs_placeholder(mp) + "\n")
+    bin_dir = Path(env["PATH"].split(":")[0])
+    _write_executable(bin_dir / "stat", "#!/bin/bash\nexit 0\n")
+    result = _run_shell(_source_and("verify_nfs_storage"), env=env)
+    assert result.returncode == 2
+    assert "is an autofs placeholder; triggering the automount" in result.stdout
+    assert "is not the expected export" in result.stderr
+
+
 def test_ensure_persistence_write_failure_is_fatal(tmp_path: Path) -> None:
     env, log = _nfs_env(tmp_path)
     bin_dir = Path(env["PATH"].split(":")[0])

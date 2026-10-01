@@ -642,6 +642,17 @@ check_persistence_mode() {
 run_preflight() {
     echo "vLLM preflight checks"
     echo "─────────────────────"
+    # The standalone --check-only path never runs start-vllm.sh main, so
+    # PROFILE_BUCKET is absent and profile_tensor_parallel would fall back to
+    # the legacy marketing-name list (H200/L20 TP=1 here vs TP=all at launch).
+    # Resolve the measured profile so TP/the device subset is validated against
+    # the same allocation the launcher uses; start-vllm.sh already set it.
+    if [ -z "${PROFILE_BUCKET:-}" ]; then
+        select_runtime_profile vllm || {
+            echo "[REJECT:unsupported_hardware] no runtime profile for this node; the launch would not proceed" >&2
+            exit 1
+        }
+    fi
     check_driver
     check_fabric
     check_cuda_devices
