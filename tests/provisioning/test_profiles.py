@@ -114,6 +114,7 @@ def _source_and_call(
         ("8.0", 81920, "ampere-a100"),
         ("8.0", 24576, "ampere-a30"),
         ("8.6", 49152, "ga102-dc"),
+        ("8.6", 46068, "ga102-dc"),
         ("8.6", 24576, "consumer-ampere"),
         ("8.9", 12288, "consumer-ada"),
         ("7.5", 16384, "turing"),
@@ -209,6 +210,7 @@ def test_insufficient_vram_for_hopper_is_rejected(tmp_path: Path) -> None:
     [
         ("rhel", "9.5", "x86_64", "2.34", "vllm", 0),
         ("rhel", "8.10", "x86_64", "2.34", "vllm", 3),
+        ("rhel", "10.0", "x86_64", "2.34", "vllm", 3),
         ("centos", "9.0", "x86_64", "2.34", "vllm", 3),
         ("rhel", "9.5", "aarch64", "2.34", "vllm", 3),
         ("rhel", "9.5", "x86_64", "2.28", "vllm", 3),
@@ -614,6 +616,27 @@ def test_vllm_setup_selects_profile_before_toolkit(tmp_path: Path) -> None:
     fabric_at = lines.index("STEP:fabric_manager")
     proof_at = lines.index("STEP:cuda_proof")
     assert profile_at < toolkit_at < fabric_at < proof_at
+
+
+def test_setup_checks_install_capacity_before_large_installs(
+    tmp_path: Path,
+) -> None:
+    """The local install capacity gate runs before the large CUDA/vLLM installs,
+    not after them, so a disk-full node never starts a doomed install."""
+    env = os.environ.copy()
+    env["AUTOVLLM_SCRIPT_DIR"] = str(SCRIPT_ROOT / "auto-vllm")
+    lines = _setup_main_order(VLLM_SETUP, "vllm", env)
+    assert (
+        lines.index("STEP:check_install_capacity")
+        < lines.index("STEP:cuda_toolkit")
+        < lines.index("STEP:vllm_install")
+    )
+    llamacpp_lines = _setup_main_order(LLAMACPP_SETUP, "llamacpp", env)
+    assert (
+        llamacpp_lines.index("STEP:check_install_capacity")
+        < llamacpp_lines.index("STEP:cuda_toolkit")
+        < llamacpp_lines.index("STEP:llamacpp_install")
+    )
 
 
 def test_llamacpp_setup_selects_profile_and_prepares_fabric(tmp_path: Path) -> None:

@@ -1193,6 +1193,9 @@ def _run_preflight_command(
     gpu_devices: str | None = None,
     tensor_parallel: str | None = None,
     local_model_dir: Path | None = None,
+    gpu_model: str = "NVIDIA A100",
+    gpu_compute_cap: str = "8.0",
+    gpu_vram_mb: int = 81920,
 ) -> subprocess.CompletedProcess[str]:
     env = _script_environment(
         tmp_path,
@@ -1200,6 +1203,9 @@ def _run_preflight_command(
         process_log=tmp_path / "process.log",
         gpu_count=gpu_count,
         device_count=device_count,
+        gpu_model=gpu_model,
+        gpu_compute_cap=gpu_compute_cap,
+        gpu_vram_mb=gpu_vram_mb,
     )
     env["AUTOVLLM_MODEL"] = (
         str(local_model_dir) if local_model_dir is not None else model
@@ -1979,6 +1985,23 @@ def test_preflight_defaults_tp_to_selected_subset(tmp_path: Path) -> None:
     assert "physical=4 (nvidia-smi), CUDA-visible=2, allocated=2" in result.stdout
 
 
+def test_preflight_derives_profile_tensor_parallel_for_hopper(tmp_path: Path) -> None:
+    """A reviewed card (H200) must get the profile-derived TP=all in the
+    standalone --check-only path, not the legacy marketing-name fallback."""
+    result = _run_preflight_command(
+        tmp_path,
+        model="org/model",
+        gpu_model="NVIDIA H200",
+        gpu_compute_cap="9.0",
+        gpu_vram_mb=141000,
+        gpu_count=4,
+        device_count=4,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "physical=4 (nvidia-smi), CUDA-visible=4, allocated=4" in result.stdout
+
+
 def test_failed_launch_preserves_previous_env_file(tmp_path: Path) -> None:
     """A replacement that exits during startup must not replace the saved
     working settings; a later restart keeps the working configuration."""
@@ -2115,6 +2138,69 @@ persist_vllm_env
 
     assert result.returncode == 0, result.stderr
     assert "AUTOVLLM_GPU_DEVICES" not in env_file.read_text()
+
+
+def test_persist_vllm_env_writes_all_effective_overrides(tmp_path: Path) -> None:
+    """The vllm.service EnvironmentFile must reproduce every effective setting,
+    not just TP/model/devices, or a manual systemctl start serves a different
+    configuration."""
+    env_file = tmp_path / "vllm.env"
+    env = _script_environment(
+        tmp_path,
+        vllm_bin=tmp_path / "fake-vllm",
+        process_log=tmp_path / "process.log",
+        gpu_count=2,
+        device_count=2,
+    )
+    env.update(
+        {
+            "AUTOVLLM_MODEL": "example/model",
+            "AUTOVLLM_GPU_DEVICES": "1",
+            "AUTOVLLM_GPU_MEM_UTIL": "0.85",
+            "AUTOVLLM_MAX_MODEL_LEN": "8192",
+            "AUTOVLLM_MAX_BATCHED_TOKENS": "4096",
+            "AUTOVLLM_TOOL_CALL_PARSER": "hermes",
+            "AUTOVLLM_REASONING_PARSER": "deepseek-r1",
+            "AUTOVLLM_DTYPE": "bfloat16",
+            "AUTOVLLM_EXTRA_ARGS": "--enforce-eager",
+            "AUTOVLLM_ENV_FILE": str(env_file),
+        }
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"""
+source <(sed '/^main$/d' {START_SCRIPT!s})
+PROFILE_BUCKET='ampere-a100'
+GPU_MODEL='NVIDIA A100'
+GPU_COUNT=2
+GPU_DEVICE_COUNT=2
+GPU_VRAM_GB=80
+configure_vllm_params
+persist_vllm_env
+""",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    content = env_file.read_text()
+    assert "AUTOVLLM_TENSOR_PARALLEL=2" in content
+    assert "AUTOVLLM_MODEL=example/model" in content
+    assert "AUTOVLLM_GPU_MEM_UTIL=0.85" in content
+    assert "AUTOVLLM_MAX_MODEL_LEN=8192" in content
+    assert "AUTOVLLM_MAX_BATCHED_TOKENS=4096" in content
+    assert "AUTOVLLM_TOOL_CALL_PARSER=hermes" in content
+    assert "AUTOVLLM_REASONING_PARSER=deepseek-r1" in content
+    assert "AUTOVLLM_DTYPE=bfloat16" in content
+    assert "AUTOVLLM_EXTRA_ARGS=--enforce-eager" in content
+    assert "AUTOVLLM_GPU_DEVICES=1" in content
 
 
 def test_main_rechecks_topology_after_download(tmp_path: Path) -> None:

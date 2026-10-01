@@ -63,9 +63,13 @@ check_os_abi() {
         echo "OS ${OS_ID:-unknown} is not supported (requires ${PROFILE_OS_ID}${PROFILE_OS_MAJOR_MIN}+)" >&2
         return 1
     fi
+    # Support range is a pin, not a floor: setup hardcodes the RHEL9 CUDA
+    # repository and python3.12, so reject both below and above the verified
+    # major (e.g. RHEL 10) instead of assuming a newer major is compatible.
     if ! [[ "$OS_VERSION_ID" =~ ^[0-9]+ ]] \
-        || [ "${OS_VERSION_ID%%.*}" -lt "$PROFILE_OS_MAJOR_MIN" ]; then
-        echo "OS version ${OS_VERSION_ID:-invalid} is not supported (requires ${PROFILE_OS_ID}${PROFILE_OS_MAJOR_MIN}+)" >&2
+        || [ "${OS_VERSION_ID%%.*}" -lt "$PROFILE_OS_MAJOR_MIN" ] \
+        || [ "${OS_VERSION_ID%%.*}" -gt "$PROFILE_OS_MAJOR_MIN" ]; then
+        echo "OS version ${OS_VERSION_ID:-invalid} is not supported (this bundle supports ${PROFILE_OS_ID}${PROFILE_OS_MAJOR_MIN} only)" >&2
         return 1
     fi
     if [ "$OS_ARCH" != "$PROFILE_ARCH" ]; then
@@ -115,7 +119,10 @@ select_runtime_profile() {
         bucket="ampere-a100"
     elif [ "$sm" -eq 80 ] && [ "$GPU_VRAM_GB" -ge 24 ]; then
         bucket="ampere-a30"
-    elif [ "$sm" -eq 86 ] && [ "$GPU_VRAM_GB" -ge 48 ]; then
+    # A40 with ECC reports 46068 MiB (44.98 GiB), which rounds to 45 GB and
+    # would miss a 48 GB cutoff; key on reported MiB (44 GiB floor) so the
+    # data-center GA102 card stays on the tuned arm (mirrors the turing cutoff).
+    elif [ "$sm" -eq 86 ] && [ "$GPU_VRAM_MB" -ge 45056 ]; then
         bucket="ga102-dc"
     elif [ "$sm" -eq 86 ]; then
         bucket="consumer-ampere"

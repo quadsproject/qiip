@@ -360,6 +360,7 @@ main() {
     step system_update run_system_update
     step nvidia_driver install_nvidia_driver
     select_runtime_profile llamacpp || exit $?
+    step check_install_capacity check_install_capacity_or_warn
     step cuda_toolkit install_cuda_toolkit
     step fabric_manager ensure_fabric_manager
     step cuda_proof verify_cuda_execution

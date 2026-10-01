@@ -23,7 +23,7 @@ for production, run the fleet validation procedure below and record the result.
 | hopper | vllm, llamacpp | 9.0 | 80 GB | 580.126.09 | 13.0 | FlashInfer (vllm) | rhel9+, x86_64, glibc 2.34+ | when NVSwitch present | candidate |
 | ampere-a100 | vllm, llamacpp | 8.0 | 40 GB | 580.126.09 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | when NVSwitch present | candidate |
 | ampere-a30 | vllm, llamacpp | 8.0 | 24 GB | 580.126.09 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | when NVSwitch present | candidate |
-| ga102-dc | vllm, llamacpp | 8.6 | 48 GB | 580.126.09 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | when NVSwitch present | candidate |
+| ga102-dc | vllm, llamacpp | 8.6 | 48 GB (reported ≥44 GiB) | 580.126.09 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | when NVSwitch present | candidate |
 | consumer-ada | vllm, llamacpp | 8.9 | any (below DC cutoff) | 580.126.09 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | not required | candidate |
 | consumer-ampere | vllm, llamacpp | 8.6 | any (below DC cutoff) | 580.126.09 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | not required | candidate |
 | turing | vllm, llamacpp | 7.5 | 16 GB (reported ≥14 GiB) | 580.126.09 | 13.0 | default (vllm) | rhel9+, x86_64, glibc 2.34+ | not required | candidate |
@@ -65,6 +65,10 @@ regression:
   with the marketing figure; the turing cutoff therefore keys on reported
   MiB (≥ 14 GiB) so a real T4 stays on the turing arm instead of
   consumer-turing.
+- SM 8.6 cutoff: an A40 with ECC reports 46,068 MiB (44.98 GiB), which rounds
+  to 45 GB and would miss a 48 GB cutoff; the ga102-dc cutoff therefore keys
+  on reported MiB (≥ 44 GiB) so a data-center GA102 card stays on the tuned
+  arm instead of consumer-ampere, mirroring the turing cutoff.
 
 These follow from measured SM and VRAM; two cards that differ only by name
 are indistinguishable to the profile, so the data-center arm wins for 48 GB
