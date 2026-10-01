@@ -345,7 +345,7 @@ stops the gateway, so re-enable it afterwards:
 Configure and start:
 
 ```bash
-sudo cp /etc/qiip/conf/qiip.yml.example /etc/qiip/conf/qiip.yml
+sudo install -m 0600 /etc/qiip/conf/qiip.yml.example /etc/qiip/conf/qiip.yml
 # edit qiip.yml (admin credentials, huggingface.cache_dir), then:
 sudo systemctl enable --now inference-proxy
 ```

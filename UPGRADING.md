@@ -824,7 +824,10 @@ To move an existing gateway to the RPM install:
    stock file is unmodified per the nginx-core rpmdb, so an operator-edited
    `/etc/nginx/nginx.conf` is left untouched) and serves the gateway as a
    tuned uvicorn process farm; only one worker is supported, so tune the
-   other `server:` settings rather than the worker count.
+   other `server:` settings rather than the worker count. Copy the config
+   examples with
+   `sudo install -m 0600 /etc/qiip/conf/qiip.yml.example /etc/qiip/conf/qiip.yml`
+   (and the other `*.example` files you need).
 3. Copy writable data (create the destination directories first; the
    package also creates them on install):
    `sudo mkdir -p /var/lib/qiip /etc/qiip/conf`, then

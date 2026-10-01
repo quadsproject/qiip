@@ -4,11 +4,13 @@ PYTHON := python3
 NAME ?= qiip
 
 # python-semantic-release writes the version into pyproject.toml; dev train
-# versions use the PEP 440 prerelease form 0.2.0-dev.1.
+# versions are semver snapshots like 0.2.0-dev.1.
 # The Makefile lives in rpm/; version is read from the repo-root pyproject.
 GIT_VERSION := $(shell $(PYTHON) -c "import tomllib; print(tomllib.load(open('../pyproject.toml','rb'))['project']['version'])")
-# RPM Version fields cannot contain hyphens.
-VERSION := $(subst -,.,$(GIT_VERSION))
+# RPM Version fields cannot contain hyphens. Map `-` to `~` (not `.`): the
+# tilde sorts below everything in rpm vercmp, so a dev snapshot (0.2.0~dev.1)
+# is older than the final 0.2.0 release per Fedora prerelease guidelines.
+VERSION := $(subst -,~,$(GIT_VERSION))
 RELEASE := 1
 DATE := $(shell date +'%a %b %d %Y')
 TARBALL := v$(GIT_VERSION).tar.gz

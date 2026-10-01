@@ -30,6 +30,8 @@ Requires:       python3 >= 3.12
 Requires:       nginx >= 1.25.1
 Requires:       openssl
 Requires:       policycoreutils
+# %post derives the server FQDN with `hostname -f` (gen-cert.sh, nginx.conf).
+Requires:       hostname
 # etcd is the discovery/registry backend (inference_proxy/discovery/).
 # etcd3gw (the thin client) declares no server floor, so name the supported
 # branch here: 3.5 is the maintained line (3.4 is EOL) and the current docs
@@ -77,6 +79,9 @@ cat > %{buildroot}%{_sysconfdir}/qiip/qiip.env <<'EOF'
 # the server: YAML block; override per host with e.g.
 # INFERENCE_PROXY_SERVER__WORKERS=1
 EOF
+# qiip.env holds secrets (admin credentials, API keys); never ship it
+# world-readable.
+chmod 0600 %{buildroot}%{_sysconfdir}/qiip/qiip.env
 
 %check
 # The full suite runs in CI (Node 24 + pinned dev deps); %check is empty so
@@ -94,11 +99,11 @@ EOF
 %{_unitdir}/inference-proxy.service
 %dir %{_localstatedir}/lib/qiip
 %dir %{_sysconfdir}/qiip
-%dir %{_sysconfdir}/qiip/conf
+%attr(0750,root,root) %dir %{_sysconfdir}/qiip/conf
 %config(noreplace) %{_sysconfdir}/qiip/conf/qiip.yml.example
 %config(noreplace) %{_sysconfdir}/qiip/conf/auth.yml.example
 %config(noreplace) %{_sysconfdir}/qiip/conf/plugins.yml.example
-%config(noreplace) %{_sysconfdir}/qiip/qiip.env
+%attr(0600,root,root) %config(noreplace) %{_sysconfdir}/qiip/qiip.env
 
 %post
 # QUADS-style nginx integration: nginx is a hard dependency and is managed
@@ -106,18 +111,26 @@ EOF
 # /etc/nginx/nginx.conf on upgrade), generate a cert if none exists, allow
 # nginx to proxy to the gateway over SELinux, then enable and start it.
 FQDN="$(hostname -f 2>/dev/null || hostname)"
-# The nginx package ships /etc/nginx/nginx.conf (%config noreplace). rpm -V
-# flags it only when the operator edited it, so deploy the bundled config when
-# the stock file is unmodified (or absent); a user-modified config is never
-# clobbered. nginx.conf.default is the upstream sample, not the pristine
-# distro file, so it is not a usable comparison target.
-if [ -f /usr/share/qiip/nginx/nginx.conf ] && \
-   /usr/share/qiip/nginx/nginx-deploy-conf.sh; then
-    sed -e "s/{FQDN}/$FQDN/g" /usr/share/qiip/nginx/nginx.conf > /etc/nginx/nginx.conf
+if [ -z "$FQDN" ]; then
+    echo "qiip: no hostname found; skipped nginx config deploy and cert generation (set the cert pair in /etc/pki/tls/certs before starting nginx)" >&2
+else
+    # The nginx package ships /etc/nginx/nginx.conf (%config noreplace). rpm -V
+    # flags it only when the operator edited it, so deploy the bundled config when
+    # the stock file is unmodified (or absent); a user-modified config is never
+    # clobbered. nginx.conf.default is the upstream sample, not the pristine
+    # distro file, so it is not a usable comparison target.
+    if [ -f /usr/share/qiip/nginx/nginx.conf ] && \
+       /usr/share/qiip/nginx/nginx-deploy-conf.sh; then
+        sed -e "s/{FQDN}/$FQDN/g" /usr/share/qiip/nginx/nginx.conf > /etc/nginx/nginx.conf
+    fi
+    QIIP_FQDN="$FQDN" /usr/share/qiip/nginx/gen-cert.sh >/dev/null 2>&1 || \
+        echo "qiip: cert generation failed; install a pair in /etc/pki/tls/certs before starting nginx" >&2
 fi
-QIIP_FQDN="$FQDN" /usr/share/qiip/nginx/gen-cert.sh >/dev/null 2>&1 || \
-    echo "qiip: cert generation failed; install a pair in /etc/pki/tls/certs before starting nginx" >&2
 setsebool httpd_can_network_connect 1 -P 2>/dev/null || :
+# Enforce secret file permissions on upgrades too: a %config(noreplace)
+# file modified by the operator keeps its old mode across package updates.
+chmod 0600 %{_sysconfdir}/qiip/qiip.env 2>/dev/null || :
+chmod 0750 %{_sysconfdir}/qiip/conf 2>/dev/null || :
 # nginx needs its temp dirs; the nginx package does not create them.
 if [ ! -d /var/cache/nginx ]; then
     install -d -o nginx -g nginx -m 0755 /var/cache/nginx
@@ -148,7 +161,9 @@ fi
 %systemd_preun inference-proxy.service
 
 %postun
-%systemd_postun inference-proxy.service
+# Restart (not just re-enable) on upgrade so a dnf upgrade replaces the
+# running process instead of leaving the old one alive.
+%systemd_postun_with_restart inference-proxy.service
 
 %changelog
 * @DATE@ quads project maintainers <noreply@github.com> - @VERSION@-@RELEASE@
