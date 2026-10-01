@@ -17,20 +17,28 @@ from inference_proxy.config.dependencies import get_settings
 def uvicorn_kwargs() -> dict[str, Any]:
     """Return uvicorn.run() arguments from the resolved application settings."""
     server = get_settings().server
-    return {
+    kwargs: dict[str, Any] = {
         "app": "inference_proxy.main:create_app",
         "factory": True,
         "host": server.host,
         "port": server.port,
         "workers": server.workers,
         "limit_concurrency": server.limit_concurrency,
-        "limit_max_requests": server.max_requests,
-        "limit_max_requests_jitter": server.max_requests_jitter,
         "log_level": server.log_level,
+        # Give in-flight requests (long SSE streams) time to finish on
+        # shutdown instead of dropping them when the process restarts.
+        "timeout_graceful_shutdown": 30,
         # The app logs every request itself, with setup-link ids redacted
         # (RequestLoggingMiddleware). Uvicorn's access log would record them.
         "access_log": False,
     }
+    # A single worker runs without a supervisor, so enforcing the request
+    # limit would terminate the process (outage) instead of recycling.
+    # Only recycle when more than one worker is run.
+    if server.workers > 1:
+        kwargs["limit_max_requests"] = server.max_requests
+        kwargs["limit_max_requests_jitter"] = server.max_requests_jitter
+    return kwargs
 
 
 def main() -> None:

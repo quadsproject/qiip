@@ -993,7 +993,7 @@ class ServerSettings(BaseModel):
     port: int = Field(default=5000, ge=1, le=65535)
     workers: int = Field(default=1, ge=1)
     limit_concurrency: int = Field(default=150, ge=1)
-    max_requests: int = Field(default=5000, ge=1)
+    max_requests: int | None = Field(default=None, ge=1)
     max_requests_jitter: int = Field(default=500, ge=0)
     log_level: Literal["critical", "error", "warning", "info", "debug", "trace"] = (
         "info"
