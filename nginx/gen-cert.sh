@@ -12,7 +12,11 @@
 # If only one file of the pair exists, both are regenerated and the surviving
 # file is preserved as <name>.stale instead of being clobbered.
 set -eu
-FQDN="${QIIP_FQDN:?set QIIP_FQDN (<fqdn>)}"
+FQDN="${QIIP_FQDN:-}"
+if [ -z "$FQDN" ]; then
+    echo "QIIP_FQDN is unset or empty; cannot generate a certificate" >&2
+    exit 1
+fi
 case "$FQDN" in
     *REPLACE_*) echo "QIIP_FQDN is still the placeholder '$FQDN' - set it to the real hostname" >&2; exit 1 ;;
 esac
