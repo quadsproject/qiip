@@ -281,7 +281,9 @@ async def test_node_flock_blocks_second_worker(
             break
         await asyncio.sleep(0.05)
     assert manifest_b["attempt"]["status"] == "failed"
-    assert "Host busy" in json.dumps(manifest_b["attempt"]["issues"])
+    issues = json.dumps(manifest_b["attempt"]["issues"])
+    assert "Host busy" in issues
+    assert f"attempt {first}" in issues
     phase = list(manifest_b["attempt"]["phases"].values())[-1]
     assert phase["exit_status"] == 126
 

@@ -21,8 +21,12 @@ from inference_proxy.config.settings import ProvisioningSettings, SSHSettings
 from inference_proxy.models.node import InferenceEngine
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
 from inference_proxy.provisioning.log_store import AttemptLogStore
-from inference_proxy.provisioning.provisioner import NodeProvisioner
-from inference_proxy.provisioning.ssh_client import SSHClient, SSHConnectionError
+from inference_proxy.provisioning.provisioner import NodeProvisioner, PreflightError
+from inference_proxy.provisioning.ssh_client import (
+    SSHClient,
+    SSHCommandTimeoutError,
+    SSHConnectionError,
+)
 from tests.provisioning.test_attempt_logs import LocalNodeSSH
 from tests.provisioning.test_attempt_logs import harness as harness
 
@@ -352,6 +356,132 @@ def test_log_budgets_cover_one_attempt() -> None:
     assert ProvisioningSettings(
         log_storage_max_bytes=65536,
         log_attempt_max_bytes=65536,
-        log_remote_max_bytes=65536,
-        log_remote_attempt_max_bytes=32768,
+        log_remote_max_bytes=33554432,
+        log_remote_attempt_max_bytes=16777216,
     )
+
+
+def test_engine_log_tail_budget_requires_room_for_fit_plan() -> None:
+    # A per-attempt tail budget under 262144 bytes drops the leading
+    # qiip_fit_plan: line, so runtime verification always fails on launch.
+    with pytest.raises(ValidationError, match="log_remote_attempt_max_bytes"):
+        ProvisioningSettings(
+            log_remote_max_bytes=134217728,
+            log_remote_attempt_max_bytes=262143,
+        )
+    with pytest.raises(ValidationError, match="log_remote_max_bytes"):
+        ProvisioningSettings(
+            log_remote_max_bytes=16777215,
+            log_remote_attempt_max_bytes=262144,
+        )
+    # Defaults (128 MiB / 32 attempts) stay valid.
+    assert ProvisioningSettings(
+        log_remote_max_bytes=134217728,
+        log_remote_attempt_max_bytes=16777216,
+        log_remote_max_attempts=32,
+    )
+
+
+@pytest.mark.asyncio
+async def test_preflight_ssh_timeout_collected_not_left_running(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provisioner, _ssh, store = harness
+
+    async def fake_open_connection(host: str, port: int) -> tuple[None, object]:
+        class _Writer:
+            def close(self) -> None:
+                pass
+
+            async def wait_closed(self) -> None:
+                pass
+
+        return None, _Writer()
+
+    monkeypatch.setattr(
+        "inference_proxy.provisioning.provisioner.asyncio.open_connection",
+        fake_open_connection,
+    )
+
+    async def timeout_diagnostic(*args: object, **kwargs: object) -> str:
+        raise SSHCommandTimeoutError(
+            "host1", "df --output=avail / | tail -1", 10, deadline="inactivity"
+        )
+
+    monkeypatch.setattr(provisioner, "_ssh_run_command", timeout_diagnostic)
+    with pytest.raises(PreflightError, match="SSH diagnostic failed"):
+        await provisioner.provision("host1", model="org/model")
+    attempt = store.history("host1")["attempts"][0]
+    assert attempt["status"] != "running"
+    assert attempt["status"] in {"failed", "complete"}
+
+
+@pytest.mark.asyncio
+async def test_shutdown_preserves_recorded_failure(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    provisioner, _ssh, store = harness
+    provisioner.log_buffer.create("host1")
+    attempt = provisioner.log_buffer.attempts["host1"]
+    store.update(
+        attempt,
+        status="failed",
+        failure_summary="setup: driver install failed",
+        failure={"failed_stage": "setup", "original_error": "driver install failed"},
+    )
+
+    async def finalize() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            provisioner._mark_log_complete("host1")
+
+    task = asyncio.create_task(finalize())
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    got = store.get(attempt)
+    assert got["status"] == "failed"
+    assert got["failure_summary"] == "setup: driver install failed"
+    assert any("Gateway collection interrupted" in issue for issue in got["issues"])
+
+
+@pytest.mark.asyncio
+async def test_cancellation_preserves_recorded_failure(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provisioner, ssh, store = harness
+    monkeypatch.setattr(provisioner, "preflight", AsyncMock())
+    monkeypatch.setattr(provisioner, "_upload_scripts", AsyncMock())
+    (ssh.root / "auto-vllm/setup.sh").write_text(
+        "echo '[STEP:nvidia_driver:START]'\n"
+        "echo 'driver rejected by kernel' >&2\n"
+        "echo '[STEP:nvidia_driver:FAIL]'\nexit 7\n"
+    )
+    captured = asyncio.Event()
+
+    async def stuck_capture(*_args: object, **_kwargs: object) -> None:
+        captured.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(provisioner, "_capture_failure", stuck_capture)
+    task = asyncio.create_task(provisioner.provision("host1", model="org/model"))
+    await asyncio.wait_for(captured.wait(), timeout=3)
+    # The real _capture_failure records the structured failure before its
+    # diagnostics await; mirror that evidence so the cancellation handler can
+    # tell a genuine failure from the interruption handoff.
+    store.update(
+        provisioner._log_buffer.attempts["host1"],
+        failure={
+            "failed_stage": "setup",
+            "original_error": "driver rejected by kernel",
+        },
+    )
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    attempt = store.history("host1")["attempts"][0]
+    assert attempt["status"] == "failed"

@@ -592,13 +592,23 @@ class NodeProvisioner:
                 and task not in self._explicit_cancel_tasks
                 and store
                 and attempt_id
-                and store.get(attempt_id)["status"] != "complete"
             ):
-                store.update(
-                    attempt_id,
-                    status="interrupted",
-                    failure_summary="Gateway collection interrupted; remote command left running",
-                )
+                stored = store.get(attempt_id)
+                status = stored["status"]
+                # A genuinely recorded failure (structured failure object set
+                # by record_failure before diagnostics) must survive shutdown,
+                # with the interrupted collection recorded as a separate issue.
+                if status == "failed" and stored.get("failure"):
+                    store.issue(
+                        attempt_id,
+                        "Gateway collection interrupted; remote command left running",
+                    )
+                elif status != "complete":
+                    store.update(
+                        attempt_id,
+                        status="interrupted",
+                        failure_summary="Gateway collection interrupted; remote command left running",
+                    )
         except Exception:
             logger.warning(
                 "log_interrupt_status_failed", hostname=hostname, exc_info=True
@@ -1208,7 +1218,7 @@ class NodeProvisioner:
                 failures.append(
                     f"Insufficient disk: {gb:.1f}GB available, {self._settings.min_disk_gb}GB required"
                 )
-        except (SSHConnectionError, RemoteCommandError) as exc:
+        except (SSHConnectionError, RemoteCommandError, TimeoutError) as exc:
             failures.append(f"SSH diagnostic failed: {exc}")
         except (ValueError, IndexError) as exc:
             failures.append(
@@ -1794,6 +1804,9 @@ class NodeProvisioner:
                 keepalive.cancel()
                 with suppress(asyncio.CancelledError):
                     await keepalive
+            await self._finish_remote_logs(
+                hostname, cancel=asyncio.current_task() in self._explicit_cancel_tasks
+            )
             self._log_buffer.mark_complete(hostname)
 
     async def register_available(
@@ -2159,6 +2172,11 @@ class NodeProvisioner:
                 and attempt.get("stage") == "complete"
             ):
                 # Cancellation during final log retrieval cannot undo registration.
+                self._mark_log_complete(hostname)
+                raise
+            if attempt.get("status") == "failed":
+                # A failure recorded before cancellation must survive; never
+                # rewrite it to the interrupted-collection state.
                 self._mark_log_complete(hostname)
                 raise
             explicit = asyncio.current_task() in self._explicit_cancel_tasks
