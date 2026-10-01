@@ -302,17 +302,27 @@ is deprecated upstream, so we do not use it), tuned like every other QIIP settin
 |---------|---------|--------------|
 | `workers` | `1` | uvicorn worker processes; only 1 is supported (each worker runs its own background jobs and registry) |
 | `limit_concurrency` | `150` | max concurrent connections per worker |
-| `max_requests` | `5000` | recycle a worker after N requests (memory guard) |
+| `max_requests` | unset (disabled) | recycle a worker after N requests; used only when `workers` > 1 |
 | `max_requests_jitter` | `500` | +/- random walk around the recycle threshold |
 | `log_level` | `info` | uvicorn log level (lowercase) |
 
-Workers recycle every `max_requests +/- jitter` requests, the same memory
-guard QUADS uses with gunicorn. The gateway runs per-process daemon
-threads (etcd watcher, health and QUADS pollers, schedule enforcer) with
-an in-memory registry, so one worker is the only supported value. After
-install, enable and start the gateway with
+A single worker runs without a supervisor, so enforcing `max_requests`
+there would terminate the process (an outage each time the limit is hit)
+rather than recycle it. It stays disabled by default with the one supported
+worker; set it explicitly (and run more than one worker) to use the recycle,
+which is the memory guard QUADS uses with gunicorn. The gateway runs
+per-process daemon threads (etcd watcher, health and QUADS pollers, schedule
+enforcer) with an in-memory registry, so one worker is the only supported
+value. After install, enable and start the gateway with
 `sudo systemctl enable --now inference-proxy`; nginx is started by the
 package. Manage both units: `sudo systemctl status inference-proxy nginx`.
+
+The RPM gateway binds **loopback only** (`127.0.0.1:5000`); nginx (on the
+same host) terminates TLS and proxies to it. Keep port 5000 closed
+externally: the `/v1/*` endpoints are unauthenticated, the app has no body
+limit of its own, and requests travel cleartext outside nginx/TLS. A
+git-checkout or container deployment that needs direct access must set
+`INFERENCE_PROXY_SERVER__HOST` (or open port 5000) explicitly.
 
 Two packages, one train each; they ship the same files and cannot be
 installed together:

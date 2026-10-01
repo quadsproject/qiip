@@ -41,7 +41,9 @@ server:
   port: 5000
   workers: 1
   limit_concurrency: 150
-  max_requests: 5000
+  # Recycle threshold, used only when workers > 1; null is disabled (the
+  # single-worker default, where the limit would stop the gateway).
+  max_requests: null
   max_requests_jitter: 500
   log_level: info
 

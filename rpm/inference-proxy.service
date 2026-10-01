@@ -33,6 +33,8 @@ Environment=INFERENCE_PROXY_AUTH__DB_PATH=/var/lib/qiip/qiip.db
 # Server tuning is resolved from the config by the launcher below, so the
 # unit needs no tuning values; override with e.g.
 # INFERENCE_PROXY_SERVER__WORKERS=2 in /etc/qiip/qiip.env or the YAML file.
+# Bind loopback only: nginx (same host) terminates TLS and proxies to it.
+Environment=INFERENCE_PROXY_SERVER__HOST=127.0.0.1
 ExecStart=/usr/bin/python3 -m inference_proxy.serve
 Restart=always
 RestartSec=5

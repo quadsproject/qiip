@@ -40,7 +40,7 @@ class TestServerSettings:
 
         assert settings.server.workers == 1
         assert settings.server.limit_concurrency == 150
-        assert settings.server.max_requests == 5000
+        assert settings.server.max_requests is None
         assert settings.server.max_requests_jitter == 500
         assert settings.server.log_level == "info"
         assert settings.server.port == 5000
