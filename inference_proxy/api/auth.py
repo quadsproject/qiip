@@ -26,6 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse, Response
 from pydantic import BaseModel, ValidationError
 
+from inference_proxy.api.templating import USER_HOME
 from inference_proxy.auth.allowlist import (
     AllowlistUnavailableError,
     SSOAllowlist,
@@ -47,7 +48,11 @@ from inference_proxy.auth.session import (
     set_session_user,
 )
 from inference_proxy.auth.store import AuthStore
-from inference_proxy.config.dependencies import _credentials_match, get_settings
+from inference_proxy.config.dependencies import (
+    _credentials_match,
+    get_settings,
+    viewer_role,
+)
 from inference_proxy.config.settings import Settings
 from inference_proxy.plugins.interfaces.auth import AuthCallbackError, AuthPlugin
 
@@ -171,7 +176,8 @@ async def oauth_login(
     page instead of forcing a re-authentication round-trip.
     """
     if get_session_user_id(request) is not None:
-        return RedirectResponse(_PROFILE_HOME, status_code=302)
+        home = _PROFILE_HOME if viewer_role(request, settings) == "admin" else USER_HOME
+        return RedirectResponse(home, status_code=302)
     redirect_uri = _oauth_redirect_uri(request, settings)
     if redirect_uri is None:
         raise HTTPException(
@@ -241,7 +247,8 @@ async def oauth_callback(
     )
     set_session_user(request, user.id, settings.auth.session_ttl_seconds)
     logger.info("user signed in", user_id=user.id, email=email)
-    return RedirectResponse(_PROFILE_HOME, status_code=302)
+    home = _PROFILE_HOME if user.is_admin else USER_HOME
+    return RedirectResponse(home, status_code=302)
 
 
 @auth_router.post("/logout")

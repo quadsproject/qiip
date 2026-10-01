@@ -1,0 +1,270 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+      - development
+
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize runs on the same branch, but never cancel: python-semantic-
+  # release pushes use GITHUB_TOKEN (which does not re-trigger workflows),
+  # and cancelling a running release run would drop its COPR submission.
+  group: release-${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  # Only run release machinery when code (not docs/markdown/assets) changed
+  # since the last release. Message-level gating (fix:/feat: vs docs:/chore:)
+  # is python-semantic-release's job; this gate covers markdown-only commits.
+  gate:
+    name: Code-change gate
+    runs-on: ubuntu-latest
+    outputs:
+      code_changed: ${{ steps.gate.outputs.code_changed }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Detect code changes since last release
+        id: gate
+        run: |
+          # On main, ignore vX.Y.Z-dev.N prerelease tags from the development
+          # train so the first development->main merge is treated as a release
+          # (its tree equals the dev-tagged tree). On development, dev tags are
+          # the right base and are used as-is.
+          case "$GITHUB_REF_NAME" in
+            main) extra="--exclude=*-dev.*";;
+            *) extra="";;
+          esac
+          last_tag="$(git describe --tags --abbrev=0 $extra 2>/dev/null || true)"
+          if [[ -z "$last_tag" ]]; then
+            # First release: treat everything as code until the first tag.
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$last_tag" HEAD -- . ':(exclude)*.md' ':(exclude)docs/**' ':(exclude)assets/**')"
+          if [[ -n "$changed" ]]; then
+            echo "code_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Only docs/markdown/assets changed since $last_tag; skipping release"
+            echo "code_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  semantic:
+    name: Semantic release
+    needs: gate
+    if: >-
+      needs.gate.outputs.code_changed == 'true' &&
+      github.repository == 'quadsproject/qiip'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # `gh pr create` (stable release PR) needs it; with an explicit
+      # permissions block every other scope is none.
+      pull-requests: write
+    outputs:
+      released: ${{ steps.psr.outputs.released }}
+      tag: ${{ steps.psr.outputs.tag }}
+      version: ${{ steps.psr.outputs.version }}
+      release_notes: ${{ steps.psr.outputs.release_notes }}
+      finalized: ${{ steps.psr.outputs.released == 'true' && github.ref_name == 'development' || steps.stable.outputs.finalized }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Python semantic release
+        id: psr
+        uses: python-semantic-release/python-semantic-release@9a026e9303981c866c3425723009becb2437c757 # v10.6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # main is protected (strict Quality and Python 3.13 checks, no
+          # bypass), so PSR's direct push of a fresh bot commit would be
+          # rejected and the release would never happen. On main, PSR only
+          # prepares the version commit and tag locally; the stable step
+          # below opens a release PR that carries the required checks, and
+          # the tag/release/COPR build are finalized after it merges.
+          # development is not protected and keeps the direct push.
+          push: ${{ github.ref_name == 'development' }}
+          vcs_release: ${{ github.ref_name == 'development' }}
+
+      # python-semantic-release bumps project.version in pyproject.toml but
+      # never regenerates uv.lock, leaving every branch off development red on
+      # `uv sync --locked`. Refresh it right after a release lands. The token
+      # push below does not re-trigger workflows, and PSR's own commit-message
+      # gating means the follow-up run releases nothing.
+      - name: Resolve pinned uv version
+        id: uv_pin
+        shell: bash
+        run: |
+          version="$(<auto-vllm/.uv-version)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error file=auto-vllm/.uv-version::Expected a semantic version, got '$version'"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          # The semantic job never installs dependencies (`uv lock` is the only
+          # uv call, and conditional), so the empty cache save fails the job's
+          # post step. Setup-uv defaults to "auto", which still enables it.
+          enable-cache: false
+          python-version: "3.12"
+          version: ${{ steps.uv_pin.outputs.version }}
+
+      - name: Refresh uv.lock after version bump (development)
+        # python-semantic-release bumps project.version in pyproject.toml but
+        # never regenerates uv.lock, leaving every branch off development red
+        # on `uv sync --locked`. Refresh it right after a release lands. The
+        # token push below does not re-trigger workflows, and PSR's own
+        # commit-message gating means the follow-up run releases nothing.
+        # Best-effort: a failed refresh never drops the COPR submission (see
+        # the concurrency note above); a stale lock just goes red in CI.
+        if: steps.psr.outputs.released == 'true' && github.ref_name == 'development'
+        continue-on-error: true
+        run: |
+          set -euxo pipefail
+          # PSR pushes the version bump but leaves the checkout at the
+          # pre-release commit; sync to the branch it just pushed.
+          git fetch origin "$GITHUB_REF_NAME"
+          git reset --hard "origin/$GITHUB_REF_NAME"
+          uv lock
+          if git diff --quiet -- uv.lock; then
+            echo "uv.lock already up to date"
+            exit 0
+          fi
+          # The runner has no git identity by default; set one before commit.
+          git config user.name "qiip release"
+          git config user.email "noreply@github.com"
+          git add uv.lock
+          git commit -m "chore: refresh uv.lock after version bump"
+          # Survive a concurrent merge landing between PSR's push and ours:
+          # re-fetch, regenerate against the new head, and retry.
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:$GITHUB_REF_NAME"; then
+              exit 0
+            fi
+            git fetch origin "$GITHUB_REF_NAME"
+            git reset --hard "origin/$GITHUB_REF_NAME"
+            uv lock
+            if git diff --quiet -- uv.lock; then
+              echo "uv.lock already up to date"
+              exit 0
+            fi
+            git add uv.lock
+            git commit -m "chore: refresh uv.lock after version bump"
+          done
+
+      - name: Prepare stable release
+        id: stable
+        if: steps.psr.outputs.released == 'true' && github.ref_name == 'main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_NOTES: ${{ steps.psr.outputs.release_notes }}
+        run: |
+          set -euxo pipefail
+          version="${{ steps.psr.outputs.version }}"
+          tag="${{ steps.psr.outputs.tag }}"
+          current="$(git show "origin/$GITHUB_REF_NAME:pyproject.toml" \
+            | sed -n 's/^version = "\(.*\)"/\1/p')"
+          if [[ "$current" == "$version" ]]; then
+            # The release PR merged: the version commit is already on main and
+            # PSR tagged this head. Publish the tag, GitHub release, and let
+            # the COPR job below build from the tag.
+            [[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/$GITHUB_REF_NAME")" ]] \
+              || { echo "post-merge release run produced extra commits; aborting" >&2; exit 1; }
+            git tag -f "$tag" HEAD
+            git push origin "$tag"
+            gh release create "$tag" --title "$tag" --notes "$RELEASE_NOTES" \
+              || gh release view "$tag" --repo "$GITHUB_REPOSITORY"
+            echo "finalized=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # First pass: PSR left the version commit locally. Refresh uv.lock,
+          # push a release branch, and open the PR whose checks gate the merge.
+          uv lock
+          if ! git diff --quiet -- uv.lock; then
+            git config user.name "qiip release"
+            git config user.email "noreply@github.com"
+            git add uv.lock
+            git commit -m "chore: refresh uv.lock after version bump"
+          fi
+          branch="release-$version"
+          git checkout -b "$branch"
+          git push -u origin "$branch"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base "$GITHUB_REF_NAME" \
+            --head "$branch" --title "chore: release $version" \
+            --body "Automated release PR. Merging publishes tag $tag, the GitHub release, and the COPR build from it." \
+            || gh pr view --repo "$GITHUB_REPOSITORY" --head "$branch" >/dev/null
+          echo "finalized=false" >> "$GITHUB_OUTPUT"
+
+  copr_build:
+    name: COPR build
+    needs: semantic
+    if: >-
+      needs.semantic.outputs.released == 'true' &&
+      needs.semantic.outputs.finalized == 'true' &&
+      github.repository == 'quadsproject/qiip'
+    runs-on: ubuntu-latest
+    container: fedora:43
+    permissions:
+      contents: read
+    steps:
+      - name: Install tooling
+        run: dnf -y install git @development-tools @rpm-development-tools copr-cli make python3-devel pyproject-rpm-macros
+
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.semantic.outputs.tag }}
+
+      - name: Work around GHA permission issue
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Setup COPR config
+        env:
+          API_TOKEN_CONTENT: ${{ secrets.COPR_API_TOKEN }}
+        run: |
+          umask 077
+          mkdir -p "$HOME/.config"
+          echo "$API_TOKEN_CONTENT" > "$HOME/.config/copr"
+
+      - name: Check dependency RPMs are published
+        run: |
+          python3 - <<'EOF'
+          import json, sys, urllib.request
+          url = ("https://copr.fedorainfracloud.org/api_3/package/list"
+                 "?ownername=quadsdev&projectname=qiip")
+          names = {p["name"] for p in json.load(urllib.request.urlopen(url))["items"]}
+          need = {"python3-click", "python3-etcd3gw", "python3-fastapi",
+                  "python3-huggingface-hub", "python3-structlog", "python3-uvicorn"}
+          missing = sorted(need - names)
+          if missing:
+              print("COPR dependency RPMs not published yet:", ", ".join(missing))
+              print("Publish copr-deps once (COPR dependencies workflow or "
+                    "copr-deps/README.md) before the first qiip/qiip-dev build.")
+              sys.exit(1)
+          print("dependency RPMs present in quadsdev/qiip")
+          EOF
+
+      - name: Build SRPM and submit to COPR
+        env:
+          PROJECT: ${{ github.ref_name == 'main' && 'qiip' || 'qiip-dev' }}
+        run: |
+          cd rpm
+          make srpm NAME="$PROJECT"
+          srpm_file="$(find . -name '*.src.rpm' -type f | head -n 1)"
+          if [[ -z "$srpm_file" ]]; then
+            echo "No .src.rpm found after 'make srpm'" >&2
+            exit 1
+          fi
+          echo "Submitting $srpm_file to quadsdev/qiip"
+          copr build quadsdev/qiip "$srpm_file"

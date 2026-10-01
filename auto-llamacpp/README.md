@@ -18,7 +18,7 @@ deployment target.
 
 ## Verified source build
 
-Linux CUDA archives are not published for the pinned `b10242` release.
+Linux CUDA archives are not published for the pinned `v0.4.1` release.
 `setup.sh` therefore downloads the pinned GitHub tag source archive, verifies
 its committed SHA-256 before extraction, applies one digest-pinned CLI
 allowlist transformation, and compiles `llama-server`, `llama-fit-params`, and
@@ -44,19 +44,21 @@ still applies, so build output remains a liveness signal.
 
 ### Bumping the llama.cpp version
 
-1. Pick a `b<number>` tag from <https://github.com/ggml-org/llama.cpp/releases>.
+1. Pick a `v<major>.<minor>.<patch>` release tag from
+   <https://github.com/ggml-org/llama.cpp/releases>. Nightly `b<number>` build
+   tags (published as prereleases) are also accepted.
 2. Download the tag source archive and compute its SHA-256:
 
    ```bash
-   curl -fSL -o llama.cpp-b12345.tar.gz \
-     "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b12345.tar.gz"
-   sha256sum llama.cpp-b12345.tar.gz
+   curl -fSL -o llama.cpp-v1.2.3.tar.gz \
+     "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v1.2.3.tar.gz"
+   sha256sum llama.cpp-v1.2.3.tar.gz
    ```
 
 3. Configure the matching version and digest:
 
    ```dotenv
-   INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION=b12345
+   INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION=v1.2.3
    INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256=<hash-from-step-2>
    ```
 
@@ -70,10 +72,17 @@ still applies, so build output remains a liveness signal.
 
 ## Shared setup infrastructure
 
-Shared setup functions (NVIDIA driver, CUDA toolkit, NFS mount, firewall,
-llmfit) live in `common/setup-base.sh`. Both `auto-vllm/setup.sh` and
-`auto-llamacpp/setup.sh` source this file. Do not duplicate shared logic
-in engine-specific scripts.
+Shared setup functions (NVIDIA driver, CUDA toolkit, Fabric Manager, NFS
+mount, firewall, llmfit) live in `common/setup-base.sh`. Both
+`auto-vllm/setup.sh` and `auto-llamacpp/setup.sh` source this file. Do not
+duplicate shared logic in engine-specific scripts.
+
+Both engines select a measured runtime profile (`common/profiles.sh`), install
+the profile's exact CUDA toolkit, verify real CUDA execution, and prepare
+Fabric Manager on NVSwitch hosts (`ensure_fabric_manager` plus a readiness
+gate at start). Unsupported combinations are rejected with
+`[REJECT:unsupported_hardware:...]` and exit code 3. See
+`common/PROFILES.md` for the compatibility matrix and its validation status.
 
 ## Setup
 
@@ -97,6 +106,12 @@ AUTOLLAMACPP_GGUF_PATH=hub/models--org--model-GGUF/snapshots/<commit-sha>/model-
 AUTOLLAMACPP_MODEL_ALIAS=org/model \
   ./start-llamacpp.sh
 ```
+
+Before launch the script verifies the NFS mount source, filesystem type
+(NFSv3; NFSv4 mounts are unsupported, QIIP provisions NFSv3), and required
+options when `AUTOVLLM_NFS_EXPORT` is set, and verifies
+every shard of a split-family GGUF (presence, readability, non-empty) so a
+missing shard fails before llama-server loads it.
 
 llama-server runs as a background process. PID is written to
 `/var/run/llamacpp.pid`, logs to `/var/log/llamacpp-serve.log`.
@@ -154,12 +169,50 @@ a configuration that was previously verified on the real node.
 The managed planner first estimates F16 for both K and V. If that policy cannot
 fully offload one request at the 4,096-token floor while preserving the reserve,
 it retries the complete plan with Q8_0 for both K and V. Q8_0 V requires Flash
-Attention in b10242, so the fallback passes `--flash-attn on` to both the
-estimator and server; the F16 policy retains `auto`. QIIP does not automatically
-select Q4 or mixed cache types. If Q8_0 cannot meet the minimum plan, setup fails
+Attention in llama.cpp, so the fallback passes `--flash-attn on` to both the
+estimator and server; the F16 policy retains `auto`. The planner never selects
+Q4 or mixed cache types (a catalog profile may fix `q4_0`; see below). If Q8_0 cannot meet the minimum plan, setup fails
 instead of accepting lower KV precision or CPU layer spill. Q8_0 can change
 generation relative to F16, which is why it is a capacity fallback rather than
 the default for every model.
+
+### Catalog profiles
+
+A catalog profile (`inference_proxy/placement/catalog.py`) is a third sizing
+policy, `profile`, beside `auto` and `custom`. It launches one measured
+configuration instead of planning one: a fixed context, one slot, a fixed KV
+cache type (`q4_0` is available here and only here), a fixed micro-batch and
+speculative decoding (`draft-mtp` from the target file, `draft-dflash` with a
+second GGUF from the shared cache, or `draft-mtp-assistant`: an MTP head shipped
+as its own GGUF, as Gemma 4 does, which reads the target's KV cache and has none
+of its own; llama-server is still started with `--spec-type draft-mtp`).
+
+`llama-fit-params` cannot estimate a speculative draft, so a profile does not
+call the planner's estimator. The managed invariants still hold, and are all
+verified from the server's own startup log and `nvidia-smi`, never from the
+profile label:
+
+- the host exposes exactly one GPU, it is the GPU product the profile was planned
+  for (its `nvidia-smi` name, with at least that product's total memory), and the
+  launch ran on the inventoried UUID. The QUADS inventory string only nominates a
+  host; it is never evidence of what the booted host exposes;
+- the context does not exceed the model's training context;
+- free VRAM before the launch covers the profile's measured requirement plus the
+  reserve (`AUTOLLAMACPP_FIT_TARGET_MIB`). The measured requirement excludes the
+  process's CUDA context while `nvidia-smi` free memory includes it, so the
+  profile adds an explicit CUDA-context allowance;
+- target and draft are verified separately: the target is fully offloaded with
+  the planned cache types, micro-batch and context; the draft is the planned
+  artifact, fully offloaded, with the planned cache type, implementation and
+  draft length;
+- free VRAM after the load is still at least the reserve.
+
+Every profile input is an enumeration, a bounded number or a validated
+cache-relative path. There is no free-form argument channel, and planner sizing
+rejects every `AUTOLLAMACPP_PROFILE_*` input. `setup.sh` checks that the built
+`llama-server` accepts the profile options, so an incompatible pin fails at
+setup rather than after a model has loaded. Nodes running a profile refuse the
+custom relaunch endpoint.
 
 Pure recurrent-state models (Mamba- and RWKV-family architectures) keep no
 attention KV cache: llama.cpp allocates fixed F32 recurrent state and ignores
@@ -205,7 +258,7 @@ teardown-only `relaunch_failed` state. A gateway restart converts any orphaned
 health recovery to bless an unverified server.
 
 With unified KV, llama.cpp internally reports `n_ctx_seq` as the aggregate
-pool. When that exceeds the model training context, b10242 emits its expected
+pool. When that exceeds the model training context, llama.cpp emits its expected
 `possible training context overflow` and slot-capping warnings, then caps each
 request to the training context. QIIP validates those exact records as benign;
 it still rejects `failed to fit params to free device memory`. The provisioning
@@ -213,7 +266,7 @@ record distinguishes `context_per_slot` (capacity guaranteed simultaneously to
 every selected slot), `slot_context_limit` (llama.cpp's maximum for one
 request), and `aggregate_context` (the unified pool).
 
-The pinned b10242 estimator already implements unified-KV memory accounting but
+The pinned estimator already implements unified-KV memory accounting but
 does not expose that option in the `llama-fit-params` CLI allowlist. The
 versioned `cuda-portable-cpu-v2-fit-concurrency` build profile exposes the
 existing option so estimation and serving use the same KV mode. Its exact

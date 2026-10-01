@@ -93,14 +93,18 @@ DEFAULT_LLMFIT_VERSION = "1.1.6"
 DEFAULT_LLMFIT_SHA256 = (
     "1e09232a128455596a2d348ab5893741d04b94aa6d924f1253462dc13304f7c6"
 )
-DEFAULT_LLAMACPP_VERSION = "b10242"
+DEFAULT_LLAMACPP_VERSION = "v0.4.1"
 DEFAULT_LLAMACPP_SHA256 = (
-    "b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3"
+    "ef3d5b1907a391500ae11b5e61a8e2022e0deaac9790899cad9c4e02f03bfb9a"
 )
 DEFAULT_LLAMACPP_SOURCE_URL = (
     "https://github.com/ggml-org/llama.cpp/archive/refs/tags/{version}.tar.gz"
 )
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+# Minimum node engine-log tail budget so the leading ``qiip_fit_plan:`` line
+# (printed first by start-llamacpp.sh) survives raw-tail rotation and runtime
+# verification succeeds.
+_ENGINE_LOG_TAIL_MIN_BYTES = 262_144
 
 
 def _validate_sha256(value: str, *, setting: str) -> str:
@@ -316,6 +320,21 @@ class ProvisioningSettings(BaseModel):
     log_max_bytes_per_host: int = Field(default=1_048_576, ge=1)
     log_max_entry_bytes: int = Field(default=16_384, ge=16)
     log_max_completed_hosts: int = Field(default=64, ge=1)
+    log_db_path: Path = Path("data/provisioning-logs.sqlite3")
+    log_retention_days: float = Field(default=30, gt=0)
+    log_storage_max_bytes: int = Field(default=268_435_456, ge=65_536)
+    log_attempt_max_bytes: int = Field(default=33_554_432, ge=16_384)
+    log_max_attempts: int = Field(default=1000, ge=1)
+    log_remote_root: str = "/var/lib/qiip/provisioning-logs"
+    log_remote_retention_days: float = Field(default=7, gt=0)
+    log_remote_max_bytes: int = Field(default=134_217_728, ge=65_536)
+    log_remote_attempt_max_bytes: int = Field(default=16_777_216, ge=16_384)
+    log_remote_max_attempts: int = Field(default=32, ge=1)
+    log_reconnect_attempts: int = Field(default=3, ge=0, le=20)
+    log_poll_interval: float = Field(default=1, gt=0)
+    diagnostics_source_timeout: float = Field(default=3, gt=0, le=60)
+    diagnostics_timeout: float = Field(default=25, gt=0, le=300)
+    diagnostics_source_max_bytes: int = Field(default=16_384, ge=256, le=65_536)
     nfs_mount_point: str = "/srv/hf-cache"
     nvidia_driver_version: str = DEFAULT_NVIDIA_DRIVER_VERSION
     nvidia_driver_sha256: str = DEFAULT_NVIDIA_DRIVER_SHA256
@@ -325,6 +344,48 @@ class ProvisioningSettings(BaseModel):
     llamacpp_setup_timeout: float = Field(default=7200.0, gt=0)
     llamacpp_fit_target_mib: int = Field(default=512, ge=1)
 
+    @field_validator("log_remote_root")
+    @classmethod
+    def log_root_is_absolute(cls, value: str) -> str:
+        if (
+            not value.startswith("/")
+            or len(Path(value).parts) < 2
+            or ".." in Path(value).parts
+            or any(ord(c) < 32 for c in value)
+        ):
+            raise ValueError(
+                "provisioning.log_remote_root must be a dedicated absolute directory without traversal"
+            )
+        return value.rstrip("/") or "/"
+
+    @model_validator(mode="after")
+    def log_budgets_cover_one_attempt(self) -> Self:
+        if self.log_attempt_max_bytes > self.log_storage_max_bytes:
+            raise ValueError("log_storage_max_bytes must be >= log_attempt_max_bytes")
+        if self.log_remote_attempt_max_bytes > self.log_remote_max_bytes // 2:
+            raise ValueError(
+                "log_remote_max_bytes must be >= 2 * log_remote_attempt_max_bytes"
+            )
+        # The node engine-log tail is capped at the smaller of the per-attempt
+        # budget and max_bytes // (2 * max_attempts). Verification cats that raw
+        # tail for the leading qiip_fit_plan line, so the budget must be large
+        # enough for the line to survive rotation.
+        if self.log_remote_attempt_max_bytes < _ENGINE_LOG_TAIL_MIN_BYTES:
+            raise ValueError(
+                "log_remote_attempt_max_bytes must be >= "
+                f"{_ENGINE_LOG_TAIL_MIN_BYTES} so the node engine-log tail can "
+                "keep the leading fit_plan line"
+            )
+        if self.log_remote_max_bytes < (
+            2 * self.log_remote_max_attempts * _ENGINE_LOG_TAIL_MIN_BYTES
+        ):
+            raise ValueError(
+                "log_remote_max_bytes must be >= 2 * log_remote_max_attempts * "
+                f"{_ENGINE_LOG_TAIL_MIN_BYTES} so every attempt's engine-log tail "
+                "can keep the fit_plan line"
+            )
+        return self
+
     @field_validator("nvidia_driver_sha256")
     @classmethod
     def nvidia_driver_digest_is_sha256(cls, value: str) -> str:
@@ -333,11 +394,12 @@ class ProvisioningSettings(BaseModel):
 
     @field_validator("llamacpp_version")
     @classmethod
-    def llamacpp_version_is_build_tag(cls, value: str) -> str:
-        """Accept the upstream ``b<number>`` build-tag format only."""
-        if re.fullmatch(r"b[1-9][0-9]*", value) is None:
+    def llamacpp_version_is_upstream_tag(cls, value: str) -> str:
+        """Accept upstream ``v<major>.<minor>.<patch>`` and ``b<number>`` tags only."""
+        if re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+|b[1-9][0-9]*", value) is None:
             raise ValueError(
-                "provisioning.llamacpp_version must use the b<number> build-tag format"
+                "provisioning.llamacpp_version must use the v<major>.<minor>.<patch> "
+                "release-tag or b<number> build-tag format"
             )
         return value
 
@@ -386,7 +448,7 @@ class ProvisioningSettings(BaseModel):
         return value
 
     def llamacpp_source_download_url(self) -> str:
-        """Render the validated source URL for the selected build tag."""
+        """Render the validated source URL for the selected upstream tag."""
         return self.llamacpp_source_url.format(version=self.llamacpp_version)
 
     @model_validator(mode="after")
@@ -458,6 +520,68 @@ class QUADSSettings(BaseModel):
                     f"{self.server_timezone!r}"
                 ) from exc
         return self
+
+
+class PlacementSettings(BaseModel):
+    """Automatic fixed-ratio placement of catalog profiles on free GPUs.
+
+    Enabled by default. It needs QUADS, because a host is only
+    placed while QUADS shows it free for the whole scheduling window.
+    ``ratios`` maps a catalog profile id to a relative weight; profiles left
+    out, or given zero, are never placed automatically.
+    """
+
+    enabled: bool = True
+    interval_seconds: int = Field(default=300, ge=30)
+    # 60% Qwen3.8-27B; the other 40% split equally three ways.
+    ratios: dict[str, int] = {
+        "qwen3.8-27b-24g": 9,
+        "qwen3.6-35b-a3b-24g": 2,
+        "muse-glimmer-30b-24g": 2,
+        "gemma-4-31b-24g": 2,
+    }
+    # Free VRAM kept beyond a profile's own measured requirement, both before
+    # the launch and after the model has loaded.
+    reserve_mib: int = Field(default=256, ge=1)
+    # Attempts since the last successful provision, the one in flight included.
+    max_attempts: int = Field(default=3, ge=1, le=20)
+    # Base retry backoff. Also how long an unclaimed host whose launch was
+    # blocked by remote work is left out of planning.
+    retry_backoff_seconds: int = Field(default=900, ge=30)
+    # A provisioning claim whose holder stopped refreshing it for this long is
+    # treated as abandoned (for example after a gateway restart).
+    claim_stale_seconds: int = Field(default=300, ge=60)
+    max_concurrent: int = Field(default=2, ge=1, le=32)
+    # Place a profile only on GPU products it has been run on for real.
+    require_qualified_gpu: bool = True
+    # Hosts automatic placement never touches, even when they are eligible.
+    exclude_hosts: list[str] = []
+    # When not empty, the only hosts automatic placement may touch. For staged
+    # rollout: unlike an exclusion list, it also keeps out hosts that join later.
+    only_hosts: list[str] = []
+
+    @field_validator("ratios")
+    @classmethod
+    def ratios_are_usable(cls, value: dict[str, int]) -> dict[str, int]:
+        from inference_proxy.placement.catalog import BUILTIN_PROFILES
+
+        known = {profile.profile_id for profile in BUILTIN_PROFILES}
+        unknown = sorted(set(value) - known)
+        if unknown:
+            raise ValueError(
+                f"placement.ratios names unknown catalog profiles: {unknown}; "
+                f"known: {sorted(known)}"
+            )
+        if any(weight < 0 for weight in value.values()):
+            raise ValueError("placement.ratios weights must not be negative")
+        if not any(weight > 0 for weight in value.values()):
+            raise ValueError("placement.ratios needs at least one positive weight")
+        return value
+
+    @field_validator("exclude_hosts", "only_hosts")
+    @classmethod
+    def exclude_hosts_are_canonical(cls, value: list[str]) -> list[str]:
+        return sorted({host.strip().lower().rstrip(".") for host in value if host})
 
 
 class LLMFitSettings(BaseModel):
@@ -879,6 +1003,31 @@ class PluginSettings(BaseModel):
     )
 
 
+class ServerSettings(BaseModel):
+    """ASGI worker farm tuning (used by ``python -m inference_proxy.serve``).
+
+    One worker is the safe default: the gateway runs per-process daemon
+    threads (etcd watcher, health and QUADS pollers, schedule enforcer) and
+    keeps its registry in memory, so values above 1 are unsupported.
+    """
+
+    host: str = "0.0.0.0"
+    port: int = Field(default=5000, ge=1, le=65535)
+    workers: int = Field(default=1, ge=1)
+    limit_concurrency: int = Field(default=150, ge=1)
+    max_requests: int | None = Field(default=None, ge=1)
+    max_requests_jitter: int = Field(default=500, ge=0)
+    log_level: Literal["critical", "error", "warning", "info", "debug", "trace"] = (
+        "info"
+    )
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _normalize_log_level(cls, value: object) -> object:
+        """Accept any case; uvicorn lowercases it anyway."""
+        return value.lower() if isinstance(value, str) else value
+
+
 class Settings(BaseSettings):
     """Root application settings.
 
@@ -931,12 +1080,14 @@ class Settings(BaseSettings):
     proxy: ProxySettings = ProxySettings()
     resilience: ResilienceSettings = ResilienceSettings()
     logging: LoggingSettings = LoggingSettings()
+    server: ServerSettings = ServerSettings()
     admin: AdminSettings
     dashboard: DashboardSettings = DashboardSettings()
     pricing: PricingSettings = PricingSettings()
     ssh: SSHSettings = SSHSettings()
     provisioning: ProvisioningSettings = ProvisioningSettings()
     quads: QUADSSettings = QUADSSettings()
+    placement: PlacementSettings = PlacementSettings()
     redfish: RedfishSettings = RedfishSettings()
     llmfit: LLMFitSettings = LLMFitSettings()
     huggingface: HuggingFaceSettings

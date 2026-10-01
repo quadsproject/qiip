@@ -21,7 +21,7 @@ The `uv` version is recorded in `.uv-version`. Its checksum comes from Astral's
 published release asset:
 
 ```text
-https://github.com/astral-sh/uv/releases/download/0.12.1/uv-x86_64-unknown-linux-gnu.tar.gz.sha256
+https://github.com/astral-sh/uv/releases/download/0.12.17/uv-x86_64-unknown-linux-gnu.tar.gz.sha256
 ```
 
 Regenerate the node lock from the repository root with that exact `uv` binary:
@@ -92,6 +92,13 @@ An already-installed NVIDIA driver must exactly match
 `AUTOVLLM_NVIDIA_DRIVER_VERSION`; setup refuses to hot-swap a different live
 kernel driver. Custom NVIDIA or LLMFit versions require matching SHA-256 values.
 
+Setup and start select a tested runtime profile from measured hardware
+(compute capability, VRAM, OS/ABI), not GPU marketing names. `setup.sh`
+installs the profile's exact CUDA toolkit and verifies real CUDA execution
+before the engine install. Unsupported combinations are rejected with
+`[REJECT:unsupported_hardware:...]` and exit code 3. See
+`common/PROFILES.md` for the compatibility matrix and its validation status.
+
 ## Run
 
 Start vLLM (auto-detects GPU and selects a model):
@@ -102,12 +109,39 @@ Start vLLM (auto-detects GPU and selects a model):
 
 vLLM runs as a background process. PID is written to `/var/run/vllm.pid`, logs to `/var/log/vllm-serve.log`.
 
+Before launch, when `AUTOVLLM_NFS_EXPORT` is set, the script verifies the NFS
+mount source, filesystem type (NFSv3; NFSv4 mounts are unsupported, QIIP
+provisions NFSv3), and required options
+(`vers=3,hard,proto=tcp,timeo=600,retrans=3`), checks the model snapshot
+completeness through a local-only Hugging Face verification, and confirms free
+space on the FlashInfer cache and on the cache filesystem when a download is
+needed. A complete shared snapshot starts offline (`HF_HUB_OFFLINE=1`) without
+re-downloading; a partial snapshot fails with an actionable message.
+
 Script-specific launch overrides use the `AUTOVLLM_*` namespace, including
 `AUTOVLLM_MODEL`, `AUTOVLLM_API_PORT`, `AUTOVLLM_TENSOR_PARALLEL`,
 `AUTOVLLM_GPU_MEM_UTIL`, `AUTOVLLM_MAX_MODEL_LEN`,
-`AUTOVLLM_MAX_BATCHED_TOKENS`, and `AUTOVLLM_EXTRA_ARGS`. Do not use
+`AUTOVLLM_MAX_BATCHED_TOKENS`, `AUTOVLLM_EXTRA_ARGS`, and
+`AUTOVLLM_GPU_DEVICES`. Storage checks are
+tuned with `AUTOVLLM_NFS_EXPORT`, `AUTOVLLM_NFS_MOUNT_POINT`,
+`AUTOVLLM_PROBE_TIMEOUT` (probe bound, default 10s), and
+`AUTOVLLM_MIN_FREE_GB` (per-filesystem floor, default 20). Do not use
 `VLLM_PORT` for the API port; vLLM reserves that name for internal
 communication.
+
+`AUTOVLLM_GPU_DEVICES` selects an explicit subset of physical GPUs
+(nvidia-smi indices, comma-separated, e.g. `0,2`). The subset is exported as
+`CUDA_VISIBLE_DEVICES`, so preflight and the engine see the same devices.
+Preflight distinguishes physical inventory (nvidia-smi), CUDA-visible
+(torch), and allocated (tensor-parallel) device counts; it allows a
+tensor-parallel size up to the CUDA-visible count, derives the same default
+tensor-parallel size the launcher would pick when none is set explicitly, and
+rejects device indices that are not present, duplicate, or non-numeric. The
+effective device set, tensor-parallel size, and model are written to
+`/etc/vllm/vllm.env` only after a verified engine start; a failed launch
+leaves the previous file in place, so `vllm.service` keeps the last working
+allocation on a restart. Profiles assume a homogeneous GPU family: with a
+subset, model, VRAM, and compute-cap detection use the first selected card.
 
 ## Health check
 

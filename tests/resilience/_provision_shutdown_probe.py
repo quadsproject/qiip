@@ -16,6 +16,7 @@ from pydantic import SecretStr
 from inference_proxy.config.settings import (
     AdminSettings,
     HuggingFaceSettings,
+    ProvisioningSettings,
     Settings,
 )
 from inference_proxy.main import create_app
@@ -42,6 +43,7 @@ async def _main(cache_dir: Path) -> None:
     etcd.put.side_effect = lambda *_args: order.append("state-write")
     etcd.close.side_effect = lambda: order.append("etcd-close")
     settings = Settings(
+        provisioning=ProvisioningSettings(log_db_path=cache_dir / "logs.sqlite3"),
         admin=AdminSettings(
             username="test-admin",
             password=SecretStr("test-password"),
@@ -106,7 +108,12 @@ async def _main(cache_dir: Path) -> None:
         if str(call.args[0]).startswith("/provisioning/")
     ]
     assert state_payloads[-1]["current_step"] == "failed"
-    assert state_payloads[-1]["failed_step"] == "cancelled"
+    assert state_payloads[-1]["failed_step"] == "interrupted"
+    assert "remote command left running" in state_payloads[-1]["error"]
+    store = provisioner.log_buffer.store
+    assert store is not None
+    attempt = provisioner.log_buffer.attempts["localhost"]
+    assert store.get(attempt)["status"] == "interrupted"
 
 
 if __name__ == "__main__":

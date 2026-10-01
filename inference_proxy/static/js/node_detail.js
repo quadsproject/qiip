@@ -19,6 +19,7 @@ function setupActionBody(id, node) {
   };
   if (node && node.state !== "available") {
     var vp = setupSelection.getVllmParams();
+    if (setupSelection.paramsInvalid()) return null;
     if (vp) base.vllm_params = vp;
     return base;
   }
@@ -53,7 +54,7 @@ var ACTION_CONFIG = {
   teardown: {
     method: "DELETE", url: function (id) { return "/admin/nodes/" + id; },
     body: null, confirm: true, danger: true,
-    confirmMsg: function (id) { return "Teardown " + id + "? This will drain connections and stop the container."; },
+    confirmMsg: function (id) { return "Teardown " + id + "? This will drain connections, stop inference, and suspend automatic placement until resumed."; },
     label: "Teardown", pendingLabel: "Tearing down…", css: "btn-danger",
     successMsg: function (id) { return "Teardown started for " + id; },
   },
@@ -68,14 +69,14 @@ var ACTION_CONFIG = {
   cancel: {
     method: "DELETE", url: function (id) { return "/admin/nodes/" + id; },
     body: null, confirm: true, danger: true,
-    confirmMsg: function (id) { return "Cancel provisioning for " + id + "?"; },
+    confirmMsg: function (id) { return "Cancel provisioning for " + id + "? Automatic placement will stay suspended until resumed."; },
     label: "Cancel", pendingLabel: "Cancelling…", css: "btn-danger",
     successMsg: function (id) { return "Cancelled provisioning for " + id; },
   },
   force_teardown: {
     method: "DELETE", url: function (id) { return "/admin/nodes/" + id + "?force=true"; },
     body: null, confirm: true, danger: true,
-    confirmMsg: function (id) { return "Force teardown " + id + "? This will immediately stop the container without draining."; },
+    confirmMsg: function (id) { return "Force teardown " + id + "? This will immediately stop inference without draining and suspend automatic placement until resumed."; },
     label: "Force Teardown", pendingLabel: "Forcing…", css: "btn-danger",
     successMsg: function (id) { return "Teardown started for " + id; },
   },
@@ -630,7 +631,9 @@ async function refreshDetail() {
       var tdEn = document.createElement("td"); tdEn.textContent = formatInferenceEngine(node.engine); tr.appendChild(tdEn);
 
       var tdSt = document.createElement("td");
-      var sb = document.createElement("span"); sb.className = "badge badge-" + node.state; sb.textContent = node.state;
+      var displayState = node.placement_blocker ? "blocked" : node.state;
+      var sb = document.createElement("span"); sb.className = "badge badge-" + displayState; sb.textContent = displayState;
+      if (node.placement_blocker) sb.title = node.placement_blocker;
       tdSt.appendChild(sb); tr.appendChild(tdSt);
 
       var tdCo = document.createElement("td"); tdCo.className = "num"; tdCo.textContent = node.state === "available" ? "—" : node.active_connections; tr.appendChild(tdCo);
@@ -733,9 +736,11 @@ var logReconnectAttempts = 0;
 var logReconnectStartedAt = null;
 var logSeenEntries = new Set();
 var logStreamStarted = false;
+var logResumeCursor = null;
 var LOG_RECONNECT_BASE_MS = 1000;
 var LOG_RECONNECT_MAX_DELAY_MS = 30000;
 var LOG_RECONNECT_MAX_ELAPSED_MS = 5 * 60 * 1000;
+var LOG_SEEN_ENTRY_LIMIT = 1000;
 
 function isTerminalTask(task) {
   return ["complete", "failed", "teardown_complete"].indexOf(task.current_step) !== -1;
@@ -792,6 +797,7 @@ function resetLogStreamState() {
   logReconnectAttempts = 0;
   logReconnectStartedAt = null;
   logSeenEntries = new Set();
+  logResumeCursor = null;
   logStreamStarted = false;
 }
 
@@ -834,6 +840,9 @@ function connectLogStream() {
   var logUrl = READ_ONLY
     ? "/fleet/nodes/" + encodeURIComponent(NODE_ID) + "/logs"
     : "/admin/provisioning/" + encodeURIComponent(NODE_ID) + "/logs";
+  if (!READ_ONLY && logResumeCursor) {
+    logUrl += "?attempt_id=" + encodeURIComponent(logResumeCursor.attempt) + "&after=" + logResumeCursor.after;
+  }
   var es = new EventSource(logUrl);
   logSource = es;
   logStreamStarted = true;
@@ -845,9 +854,18 @@ function connectLogStream() {
   es.addEventListener("message", function (ev) {
     try {
       var entry = JSON.parse(ev.data);
-      var entryKey = JSON.stringify(entry);
-      if (logSeenEntries.has(entryKey)) return;
-      logSeenEntries.add(entryKey);
+      if (entry.attempt_id && Number.isInteger(entry.seq)) {
+        if (logResumeCursor && logResumeCursor.attempt === entry.attempt_id && entry.seq < logResumeCursor.after) return;
+        logResumeCursor = { attempt: entry.attempt_id, after: entry.seq + 1 };
+      } else {
+        // Legacy streams and retention warnings have no durable sequence.
+        var entryKey = JSON.stringify(entry);
+        if (logSeenEntries.has(entryKey)) return;
+        logSeenEntries.add(entryKey);
+        if (logSeenEntries.size > LOG_SEEN_ENTRY_LIMIT) {
+          logSeenEntries.delete(logSeenEntries.values().next().value);
+        }
+      }
       logReceivedAny = true;
       var line = document.createElement("div");
       line.className = "log-line";
@@ -870,6 +888,12 @@ function connectLogStream() {
     } catch (_) {}
   });
 
+  es.addEventListener("complete", function () {
+    finishLogStream("ended", "badge badge-complete");
+  });
+  es.addEventListener("unavailable", function () {
+    finishLogStream("logs evicted by retention", "badge badge-failed");
+  });
   es.addEventListener("error", function () {
     es.close();
     logSource = null;

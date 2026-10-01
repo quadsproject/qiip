@@ -126,6 +126,11 @@ install_vllm() {
 install_vllm_unit() {
     sudo install -m 755 "${SCRIPT_DIR}/wait-fabric.sh" /usr/local/bin/wait-nvswitch-fabric
     sudo install -m 755 "${SCRIPT_DIR}/preflight.sh" /usr/local/bin/vllm-preflight
+    sudo install -m 755 "${SCRIPT_DIR}/../common/setup-base.sh" /usr/local/bin/qiip-setup-base.sh
+    sudo install -m 755 "${SCRIPT_DIR}/../common/profiles.sh" /usr/local/bin/qiip-profiles.sh
+    # A previous provisioning may have left a selection here; re-setup starts
+    # from defaults and start-vllm.sh rewrites the file on first success.
+    sudo rm -f /etc/vllm/vllm.env
     cat <<UNIT | sudo tee /etc/systemd/system/vllm.service > /dev/null
 [Unit]
 Description=vLLM inference server
@@ -134,6 +139,10 @@ Wants=network-online.target
 
 [Service]
 Type=exec
+Environment="AUTOVLLM_NFS_EXPORT=${NFS_EXPORT}"
+Environment="AUTOVLLM_NFS_MOUNT_POINT=${NFS_MOUNT_POINT}"
+Environment="AUTOVLLM_MIN_FREE_GB=${AUTOVLLM_MIN_FREE_GB:-20}"
+EnvironmentFile=-/etc/vllm/vllm.env
 ExecStartPre=/usr/local/bin/wait-nvswitch-fabric
 ExecStartPre=/usr/local/bin/vllm-preflight --check-only
 ExecStart=${SCRIPT_DIR}/start-vllm.sh
@@ -159,8 +168,11 @@ main() {
         "AUTOVLLM_LLMFIT_SHA256"
     step system_update run_system_update
     step nvidia_driver install_nvidia_driver
+    select_runtime_profile vllm || exit $?
+    step check_install_capacity check_install_capacity_or_warn
     step cuda_toolkit install_cuda_toolkit
     step fabric_manager ensure_fabric_manager
+    step cuda_proof verify_cuda_execution
     step vllm_install install_vllm
     step vllm_unit install_vllm_unit
     step nfs_mount mount_nfs_cache

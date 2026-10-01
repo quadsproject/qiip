@@ -44,7 +44,8 @@ auth:
 oauth:
   # Google OAuth (set all three credentials to enable; any partial set fails
   # startup). Redirect URI must be registered at Google's console and match
-  # this value exactly.
+  # this value exactly. Its origin is also required for setup links and the
+  # token-bearing configs they generate; use the externally reachable URL.
   client_id: null
   client_secret: null
   redirect_uri: null

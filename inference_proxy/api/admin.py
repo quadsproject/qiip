@@ -8,12 +8,16 @@ and circuit breaker state for the operations dashboard.
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import AsyncIterator
+import zlib
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Annotated, Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
@@ -21,6 +25,7 @@ from inference_proxy.config.dependencies import (
     get_catalog_service,
     get_download_service,
     get_llmfit_runner,
+    get_placement_suspensions,
     get_provisioner,
     get_quads_client,
     get_quads_poller,
@@ -67,16 +72,20 @@ from inference_proxy.models.node import (
     NodeStatus,
     VllmParams,
 )
+from inference_proxy.placement.suspensions import SuspensionStore
+from inference_proxy.provisioning.log_store import AttemptLogStore
 from inference_proxy.provisioning.provisioner import (
     BackgroundOperation,
     NodeProvisioner,
     ProvisioningCapacityError,
     ProvisioningError,
     ProvisioningIdentity,
+    ProvisioningOperationChangedError,
     RelaunchPreconditionError,
     RelaunchValidationError,
     SelfSetupError,
 )
+from inference_proxy.provisioning.reliability import GroupBy, build_report
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
     SSHConnectionError,
@@ -810,31 +819,237 @@ async def list_provisioning_tasks(
     return tasks
 
 
+def _attempt_store(provisioner: NodeProvisioner) -> AttemptLogStore:
+    store = provisioner.log_buffer.store
+    if store is None:
+        raise HTTPException(
+            status_code=503, detail="Durable provisioning logs unavailable"
+        )
+    return store
+
+
+@admin_router.get("/provisioning/reliability", response_model=None)
+async def provisioning_reliability(
+    since: datetime | None = None,
+    until: datetime | None = None,
+    group_by: GroupBy = "signature",
+    hostname: Annotated[list[str] | None, Query(max_length=100)] = None,
+    download: bool = False,
+    provisioner: NodeProvisioner = Depends(get_provisioner),
+) -> dict[str, Any] | JSONResponse:
+    """Export the same retained cohort and evidence shown in the fleet view."""
+    if any(value is not None and value.tzinfo is None for value in (since, until)):
+        raise HTTPException(
+            status_code=422, detail="Report timestamps require a timezone"
+        )
+    if since and until and since >= until:
+        raise HTTPException(status_code=422, detail="since must be earlier than until")
+    report = await asyncio.to_thread(
+        build_report,
+        _attempt_store(provisioner),
+        since=since,
+        until=until,
+        group_by=group_by,
+        hostnames=[_validated_hostname(host) for host in hostname or []],
+    )
+    if download:
+        return JSONResponse(
+            report,
+            headers={
+                "Content-Disposition": 'attachment; filename="fleet-reliability.json"'
+            },
+        )
+    return report
+
+
+def _owned_attempt(
+    store: AttemptLogStore, hostname: str, attempt_id: str
+) -> dict[str, Any]:
+    hostname = _validated_hostname(hostname)
+    try:
+        manifest = store.get(attempt_id)
+        if manifest["hostname"] == hostname:
+            return manifest
+    except KeyError:
+        pass
+    raise HTTPException(
+        status_code=404, detail="Attempt unavailable or evicted by retention"
+    )
+
+
+@admin_router.get("/provisioning/{hostname}/attempts")
+async def provisioning_attempts(
+    hostname: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    provisioner: NodeProvisioner = Depends(get_provisioner),
+) -> dict[str, object]:
+    return await asyncio.to_thread(
+        _attempt_store(provisioner).history,
+        _validated_hostname(hostname),
+        limit=limit,
+        offset=offset,
+    )
+
+
+@admin_router.get("/provisioning/{hostname}/attempts/{attempt_id}/logs")
+async def attempt_logs(
+    hostname: str,
+    attempt_id: str,
+    after: int = Query(default=0, ge=0),
+    q: str = Query(default="", max_length=500),
+    source: str = Query(default="", max_length=100),
+    limit: int = Query(default=500, ge=1, le=1000),
+    provisioner: NodeProvisioner = Depends(get_provisioner),
+) -> dict[str, object]:
+    store = _attempt_store(provisioner)
+    _owned_attempt(store, hostname, attempt_id)
+    try:
+        return await asyncio.to_thread(
+            store.read, attempt_id, after=after, query=q, source=source, limit=limit
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=404, detail="Attempt unavailable or evicted by retention"
+        ) from None
+
+
+@admin_router.post("/provisioning/{hostname}/attempts/{attempt_id}/collect")
+async def collect_attempt_logs(
+    hostname: str,
+    attempt_id: str,
+    provisioner: NodeProvisioner = Depends(get_provisioner),
+) -> dict[str, object]:
+    hostname = _validated_hostname(hostname)
+    _owned_attempt(_attempt_store(provisioner), hostname, attempt_id)
+    try:
+        return await provisioner.collect_logs(hostname, attempt_id)
+    except KeyError:
+        raise HTTPException(
+            status_code=404, detail="Attempt unavailable or evicted by retention"
+        ) from None
+
+
+@admin_router.get("/provisioning/{hostname}/attempts/{attempt_id}/bundle")
+async def download_attempt_logs(
+    hostname: str,
+    attempt_id: str,
+    provisioner: NodeProvisioner = Depends(get_provisioner),
+) -> StreamingResponse:
+    store = _attempt_store(provisioner)
+    manifest = _owned_attempt(store, hostname, attempt_id)
+
+    def generate() -> Iterator[bytes]:
+        compressor = zlib.compressobj(wbits=31)
+        yield compressor.compress((json.dumps({"manifest": manifest}) + "\n").encode())
+        after = 0
+        exported = 0
+        while after < manifest["next_seq"]:
+            try:
+                page = store.read(attempt_id, after=after)
+            except KeyError:
+                break  # The export footer reports eviction during download.
+            for record in page["records"]:
+                if record["seq"] < manifest["next_seq"]:
+                    exported += 1
+                    yield compressor.compress((json.dumps(record) + "\n").encode())
+            after = page["next_offset"]
+            if not page["has_more"]:
+                break
+        expected = manifest["next_seq"] - manifest["dropped_records"]
+        footer = {
+            "export": {
+                "exported_records": exported,
+                "expected_records": expected,
+                "incomplete": exported != expected,
+                "warning": "Records rotated during export"
+                if exported != expected
+                else None,
+            }
+        }
+        yield compressor.compress((json.dumps(footer) + "\n").encode())
+        yield compressor.flush()
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/gzip",
+        headers={
+            "Content-Disposition": f'attachment; filename="provisioning-{manifest["attempt_id"]}.jsonl.gz"',
+        },
+    )
+
+
 @admin_router.get("/provisioning/{hostname}/logs")
 async def stream_provisioning_logs(
     hostname: str,
+    attempt_id: str | None = None,
+    after: int = Query(default=0, ge=0),
+    last_event_id: str | None = Header(default=None),
     provisioner: NodeProvisioner = Depends(get_provisioner),
 ) -> StreamingResponse:
-    """Stream provisioning log entries as SSE events.
-
-    If provisioning is in progress, keeps the connection open and
-    streams live.  If complete/failed, dumps all entries and closes.
-    Returns 404 if no log exists for the hostname.
-    """
+    """Stream one attempt with stable IDs, including after a gateway restart."""
     hostname = _validated_hostname(hostname)
     buf = provisioner.log_buffer
+    if buf.store is not None:
+        store = buf.store
+        if last_event_id:
+            try:
+                resumed_attempt, position = last_event_id.rsplit(":", 1)
+                if attempt_id is not None and attempt_id != resumed_attempt:
+                    raise ValueError("attempt mismatch")
+                attempt_id, after = resumed_attempt, max(after, int(position) + 1)
+            except ValueError:
+                raise HTTPException(
+                    status_code=400, detail="Invalid Last-Event-ID"
+                ) from None
+        if attempt_id is None:
+            history = (await asyncio.to_thread(store.history, hostname, limit=1))[
+                "attempts"
+            ]
+            if not history:
+                raise HTTPException(
+                    status_code=404, detail=f"No provisioning log for '{hostname}'"
+                )
+            attempt_id = history[0]["attempt_id"]
+        assert attempt_id is not None
+        _owned_attempt(store, hostname, attempt_id)
+
+        async def durable() -> AsyncIterator[str]:
+            cursor = after
+            while True:
+                try:
+                    page = await asyncio.to_thread(store.read, attempt_id, after=cursor)
+                except KeyError:
+                    yield 'event: unavailable\ndata: {"reason":"Attempt evicted by retention"}\n\n'
+                    return
+                for entry in page["records"]:
+                    if entry["seq"] > cursor:
+                        gap = buf._gap_entry(entry["seq"] - cursor)
+                        yield f"data: {json.dumps(gap)}\n\n"
+                    yield f"id: {attempt_id}:{entry['seq']}\ndata: {json.dumps(entry)}\n\n"
+                    cursor = entry["seq"] + 1
+                if not page["has_more"]:
+                    if cursor < page["next_offset"]:
+                        yield f"data: {json.dumps(buf._gap_entry(page['next_offset'] - cursor))}\n\n"
+                    cursor = page["next_offset"]
+                    if page["attempt"]["status"] != "running":
+                        yield "event: complete\ndata: {}\n\n"
+                        return
+                    yield ": keepalive\n\n"
+                    await asyncio.sleep(1)
+
+        return StreamingResponse(durable(), media_type="text/event-stream")
+
     if not buf.has(hostname):
         raise HTTPException(
-            status_code=404,
-            detail=f"No provisioning log for '{hostname}'",
+            status_code=404, detail=f"No provisioning log for '{hostname}'"
         )
 
-    async def _generate() -> AsyncIterator[str]:
-        async for _pos, entry in buf.iter_from(hostname):
-            data = json.dumps(entry)
-            yield f"data: {data}\n\n"
+    async def memory() -> AsyncIterator[str]:
+        async for _pos, entry in buf.iter_from(hostname, after):
+            yield f"data: {json.dumps(entry)}\n\n"
 
-    return StreamingResponse(_generate(), media_type="text/event-stream")
+    return StreamingResponse(memory(), media_type="text/event-stream")
 
 
 @admin_router.delete("/nodes/{node_id}", status_code=202)
@@ -844,6 +1059,7 @@ async def teardown_node(
     recovery_engine: InferenceEngine | None = None,
     registry: NodeRegistry = Depends(get_registry),
     provisioner: NodeProvisioner = Depends(get_provisioner),
+    suspensions: SuspensionStore = Depends(get_placement_suspensions),
 ) -> TeardownResponse:
     """Trigger teardown of a node (runs in background)."""
     node_id = canonical_hostname(node_id)
@@ -857,6 +1073,21 @@ async def teardown_node(
                 "remove it from the fleet instead of tearing it down"
             ),
         )
+
+    async def persist_suspension() -> None:
+        try:
+            await suspensions.suspend(node_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("placement_suspend_failed", hostname=node_id)
+            raise HTTPException(
+                status_code=503,
+                detail="Could not suspend automatic placement; teardown was not started",
+            ) from exc
+
+    suspended_before_cancel = False
+    suspended_detail = "automatic placement is suspended; retry teardown or resume"
 
     if recovery_engine is not None:
         if not force:
@@ -883,21 +1114,39 @@ async def teardown_node(
                 detail=f"Host lifecycle operation already in progress for '{node_id}'",
             )
     else:
-        cancelled_identity = await provisioner.cancel_active_provision(node_id)
-        lease = await provisioner.try_reserve_host(node_id)
+        active = provisioner.active_provision(node_id)
+        if existing is None and active is None:
+            raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+        if active is not None:
+            # This task holds the lifecycle lease. Persist before cancelling it;
+            # a store failure must leave active provisioning completely untouched.
+            await persist_suspension()
+            suspended_before_cancel = True
+            try:
+                cancelled_identity = await provisioner.cancel_provision(node_id, active)
+            except ProvisioningOperationChangedError as exc:
+                raise HTTPException(
+                    status_code=409, detail=f"{exc}; {suspended_detail}"
+                ) from exc
+            except Exception as exc:
+                logger.exception("teardown_cancel_failed", hostname=node_id)
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Could not cancel provisioning; {suspended_detail}",
+                ) from exc
+        try:
+            lease = await provisioner.try_reserve_host(node_id)
+        except Exception as exc:
+            detail = "Could not reserve host for teardown"
+            if suspended_before_cancel:
+                detail += f"; {suspended_detail}"
+            raise HTTPException(status_code=503, detail=detail) from exc
         if lease is None:
-            if cancelled_identity is not None:
-                detail = (
-                    f"Host '{node_id}' was re-reserved after provisioning "
-                    "cancellation; wait for the current operation to finish and "
-                    "retry teardown"
-                )
+            if suspended_before_cancel:
+                detail = f"Host '{node_id}' was re-reserved after provisioning cancellation; {suspended_detail}"
             else:
                 detail = f"Host lifecycle operation already in progress for '{node_id}'"
-            raise HTTPException(
-                status_code=409,
-                detail=detail,
-            )
+            raise HTTPException(status_code=409, detail=detail)
 
     transferred = False
     try:
@@ -924,6 +1173,26 @@ async def teardown_node(
             and recovery_engine is None
         ):
             raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+
+        if suspended_before_cancel:
+            # Resume can win the gap between cancelling the old task and taking
+            # its lease. Respect that choice rather than writing another opt-out.
+            try:
+                still_suspended = node_id in await suspensions.list()
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Could not verify automatic placement suspension; retry teardown or resume",
+                ) from exc
+            if not still_suspended:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Automatic placement was resumed during teardown; retry teardown if still intended",
+                )
+        else:
+            # Registered nodes and force recovery are validated under the lease
+            # before persisting anything. Rejected requests leave no opt-out.
+            await persist_suspension()
 
         async def _teardown_and_cleanup() -> None:
             try:

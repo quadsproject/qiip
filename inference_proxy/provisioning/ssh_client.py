@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -66,11 +68,18 @@ class RemoteCommandError(Exception):
     """Raised when a remote command exits with non-zero status."""
 
     def __init__(
-        self, host: str, command: str, exit_status: int, stderr: str = ""
+        self,
+        host: str,
+        command: str,
+        exit_status: int,
+        stderr: str = "",
+        *,
+        exit_signal: str | None = None,
     ) -> None:
         self.host = host
         self.command = command
         self.exit_status = exit_status
+        self.exit_signal = exit_signal
         self.stderr = stderr
         tail = _stderr_tail(stderr) if stderr else ""
         msg = f"Command '{command}' on {host} exited with status {exit_status}"
@@ -119,6 +128,47 @@ class SSHClient:
         self._connect_timeout = settings.connect_timeout
         self._streaming_command_timeout = settings.streaming_command_timeout
         self._streaming_inactivity_timeout = settings.streaming_inactivity_timeout
+        self._session: ContextVar[tuple[str, asyncssh.SSHClientConnection] | None] = (
+            ContextVar("ssh_session", default=None)
+        )
+
+    @asynccontextmanager
+    async def _connect(self, host: str) -> AsyncIterator[asyncssh.SSHClientConnection]:
+        session = self._session.get()
+        if session is not None and session[0] == host:
+            yield session[1]
+            return
+        async with asyncssh.connect(
+            host,
+            username=self._username,
+            client_keys=[str(self._key_path)],
+            known_hosts=None,
+            connect_timeout=self._connect_timeout,
+        ) as conn:
+            yield conn
+
+    @asynccontextmanager
+    async def connection(self, host: str) -> AsyncIterator[None]:
+        """Reuse one connection for commands in this task; close on context exit."""
+        try:
+            async with self._connect(host) as conn:
+                token = self._session.set((host, conn))
+                try:
+                    yield
+                finally:
+                    self._session.reset(token)
+        except TimeoutError:
+            raise
+        except (*_ASYNCSSH_CONNECTION_ERRORS, OSError) as exc:
+            raise SSHConnectionError(host, str(exc)) from exc
+
+    @property
+    def command_timeout(self) -> float:
+        return self._streaming_command_timeout
+
+    @property
+    def inactivity_timeout(self) -> float:
+        return self._streaming_inactivity_timeout
 
     async def run_streaming(
         self,
@@ -128,6 +178,9 @@ class SSHClient:
         total_timeout: float | None = None,
     ) -> AsyncIterator[tuple[str, str]]:
         """Run *command* on *host*, yielding ``(stream, line)`` tuples.
+
+        Command text travels on stdin so environment assignments never enter
+        the remote shell's process arguments.
 
         *stream* is ``"stdout"`` or ``"stderr"``. Both streams are drained
         concurrently so either remote pipe can exceed asyncssh's receive
@@ -171,7 +224,8 @@ class SSHClient:
                     connect_timeout=self._connect_timeout,
                 ) as conn,
                 conn.create_process(
-                    command,
+                    "bash -s",
+                    input=command + "\n",
                     encoding=_REMOTE_TEXT_ENCODING,
                     errors=_REMOTE_TEXT_ERRORS,
                 ) as process,
@@ -213,6 +267,9 @@ class SSHClient:
                         command,
                         process.exit_status,
                         stderr=stderr_output,
+                        exit_signal=process.exit_signal[0]
+                        if process.exit_signal
+                        else None,
                     )
 
         async def supervise() -> None:
@@ -281,27 +338,25 @@ class SSHClient:
         host: str,
         command: str,
         timeout: float = 60.0,
+        *,
+        log_label: str | None = None,
     ) -> tuple[str, str, int]:
         """Run *command* on *host*, return ``(stdout, stderr, exit_status)``.
 
+        Command text travels on stdin, as in ``run_streaming``.
         Timeout via ``asyncio.wait_for`` (D-02).  Raises
         ``SSHConnectionError`` on auth/disconnect/OS errors.  Raises
         ``RemoteCommandError`` on non-zero exit.
         ``asyncio.TimeoutError`` bubbles to caller.
         """
-        log = logger.bind(host=host, command=command)
+        log = logger.bind(host=host, command=log_label or command)
         log.debug("ssh_run_start")
         try:
-            async with asyncssh.connect(
-                host,
-                username=self._username,
-                client_keys=[str(self._key_path)],
-                known_hosts=None,
-                connect_timeout=self._connect_timeout,
-            ) as conn:
+            async with self._connect(host) as conn:
                 result = await asyncio.wait_for(
                     conn.run(
-                        command,
+                        "bash -s",
+                        input=command + "\n",
                         encoding=_REMOTE_TEXT_ENCODING,
                         errors=_REMOTE_TEXT_ERRORS,
                     ),
@@ -319,6 +374,9 @@ class SSHClient:
                         command,
                         exit_status,
                         stderr=stderr,
+                        exit_signal=result.exit_signal[0]
+                        if result.exit_signal
+                        else None,
                     )
 
                 log.debug("ssh_run_complete", exit_status=exit_status)

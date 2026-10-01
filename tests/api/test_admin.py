@@ -198,6 +198,7 @@ class TestAdminNodesPopulated:
             "name",
             "endpoint",
             "model",
+            "model_display_name",
             "status",
             "active_connections",
             "circuit_breaker_state",
@@ -214,6 +215,7 @@ class TestAdminNodesPopulated:
             "admin_only",
             "failed_step",
             "error",
+            "placement_blocker",
             "owner",
         }
         assert set(node.keys()) == expected
@@ -315,6 +317,7 @@ class TestAdminNodesPopulated:
                 "node_id": "gpu01",
                 "endpoint": "10.0.1.100:8000",
                 "model": "llama-3",
+                "model_display_name": "llama-3",
                 "status": "failed",
                 "active_connections": 0,
                 "circuit_breaker_state": "closed",
@@ -333,6 +336,7 @@ class TestAdminNodesPopulated:
                 "name": "",
                 "failed_step": None,
                 "error": None,
+                "placement_blocker": None,
             }
         ]
         assert any(
@@ -1661,7 +1665,7 @@ class TestTeardownEndpoint:
 
         assert response.status_code == 409
         assert "operation already in progress" in response.json()["detail"]
-        mock_provisioner.cancel_active_provision.assert_awaited_once_with("gpu01")
+        mock_provisioner.cancel_provision.assert_not_awaited()
         mock_provisioner.fire_background.assert_not_called()
 
     def test_cancel_handoff_reports_when_host_is_re_reserved(
@@ -1673,7 +1677,7 @@ class TestTeardownEndpoint:
         test_registry.add(_make_node(node_id="gpu01"))
         call_order: list[str] = []
 
-        async def cancel(_hostname: str) -> MagicMock:
+        async def cancel(_hostname: str, _record: object) -> MagicMock:
             call_order.append("cancel")
             return MagicMock()
 
@@ -1681,7 +1685,8 @@ class TestTeardownEndpoint:
             call_order.append("reserve")
             return None
 
-        mock_provisioner.cancel_active_provision.side_effect = cancel
+        mock_provisioner.active_provision.return_value = MagicMock()
+        mock_provisioner.cancel_provision.side_effect = cancel
         mock_provisioner.try_reserve_host.side_effect = reserve
 
         response = client.delete("/admin/nodes/gpu01")
@@ -3224,6 +3229,25 @@ class TestUpdateNodeOwner:
         )
 
         assert response.status_code == 404
+
+    def test_patch_owner_busy_host_409(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """A host held by setup, relaunch, teardown or placement says so."""
+        mock_provisioner.update_node_owner = AsyncMock(
+            side_effect=ProvisioningError(
+                "Node 'gpu01' has a lifecycle operation in progress"
+            )
+        )
+
+        response = client.patch(
+            "/admin/nodes/gpu01/owner", json={"owner": "alice@example.com"}
+        )
+
+        assert response.status_code == 409
+        assert "lifecycle operation in progress" in response.json()["detail"]
 
     def test_patch_owner_invalid_email_422(
         self,

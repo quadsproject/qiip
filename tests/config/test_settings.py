@@ -34,6 +34,49 @@ from inference_proxy.config.settings import (
 )
 
 
+class TestServerSettings:
+    def test_defaults_keep_one_worker(self) -> None:
+        settings = Settings(_env_file=None)
+
+        assert settings.server.workers == 1
+        assert settings.server.limit_concurrency == 150
+        assert settings.server.max_requests is None
+        assert settings.server.max_requests_jitter == 500
+        assert settings.server.log_level == "info"
+        assert settings.server.port == 5000
+
+    def test_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("INFERENCE_PROXY_SERVER__WORKERS", "3")
+        monkeypatch.setenv("INFERENCE_PROXY_SERVER__LOG_LEVEL", "debug")
+
+        settings = Settings(_env_file=None)
+
+        assert settings.server.workers == 3
+        assert settings.server.log_level == "debug"
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("PORT", "0"),
+            ("PORT", "70000"),
+            ("WORKERS", "0"),
+            ("LIMIT_CONCURRENCY", "0"),
+            ("MAX_REQUESTS", "0"),
+            ("MAX_REQUESTS_JITTER", "-1"),
+        ],
+    )
+    def test_server_bounds_are_validated(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        value: str,
+    ) -> None:
+        monkeypatch.setenv(f"INFERENCE_PROXY_SERVER__{name}", value)
+
+        with pytest.raises(ValidationError, match="server"):
+            Settings(_env_file=None)
+
+
 class TestAdminSettings:
     def test_admin_credentials_required(
         self,
@@ -381,7 +424,7 @@ class TestArtifactDigestSettings:
         assert provisioning.llamacpp_source_url == DEFAULT_LLAMACPP_SOURCE_URL
         assert provisioning.llamacpp_fit_target_mib == 512
         assert provisioning.llamacpp_source_download_url() == (
-            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b10242.tar.gz"
+            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v0.4.1.tar.gz"
         )
         assert llmfit.version == "1.1.6"
         assert llmfit.sha256 == (
@@ -428,13 +471,25 @@ class TestArtifactDigestSettings:
         )
         assert configured.llamacpp_sha256 == "b" * 64
 
-    @pytest.mark.parametrize("version", ["10242", "v10242", "b0", "b1.2", "latest"])
-    def test_llamacpp_version_requires_build_tag(self, version: str) -> None:
+    @pytest.mark.parametrize(
+        "version",
+        ["10242", "v10242", "v0.4", "0.4.1", "v0.4.1-dev", "b0", "b1.2", "latest"],
+    )
+    def test_llamacpp_version_requires_upstream_tag(self, version: str) -> None:
         with pytest.raises(ValidationError, match=r"b<number>"):
             ProvisioningSettings(
                 llamacpp_version=version,
                 llamacpp_sha256="b" * 64,
             )
+
+    @pytest.mark.parametrize("version", ["v0.5.0", "v1.10.2", "b11052"])
+    def test_llamacpp_version_accepts_release_and_build_tags(
+        self, version: str
+    ) -> None:
+        configured = ProvisioningSettings(
+            llamacpp_version=version, llamacpp_sha256="b" * 64
+        )
+        assert configured.llamacpp_version == version
 
     @pytest.mark.parametrize(
         "url",
@@ -461,7 +516,7 @@ class TestArtifactDigestSettings:
             )
         )
         assert settings.llamacpp_source_download_url() == (
-            f"{scheme}://mirror.example/llama/b10242/source.tar.gz"
+            f"{scheme}://mirror.example/llama/v0.4.1/source.tar.gz"
         )
 
     @pytest.mark.parametrize(
@@ -1233,3 +1288,19 @@ class TestPricingSettings:
 
     def test_is_base_model_not_base_settings(self) -> None:
         assert not issubclass(PricingSettings, BaseSettings)
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"), [(None, True), ("false", False), ("true", True)]
+)
+def test_automatic_placement_default_and_environment_opt_out(
+    monkeypatch: pytest.MonkeyPatch, override: str | None, expected: bool
+) -> None:
+    monkeypatch.delenv("INFERENCE_PROXY_PLACEMENT", raising=False)
+    monkeypatch.delenv("INFERENCE_PROXY_PLACEMENT__ENABLED", raising=False)
+    if override is not None:
+        monkeypatch.setenv("INFERENCE_PROXY_PLACEMENT__ENABLED", override)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.placement.enabled is expected

@@ -8,6 +8,10 @@
 [![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/sadsfae/188b760b19592c8913101f598f7cb382/raw/qiip-coverage.json)](https://github.com/quadsproject/qiip/actions/workflows/ci.yml)
 [![vLLM](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/sadsfae/188b760b19592c8913101f598f7cb382/raw/qiip-vllm.json)](https://docs.vllm.ai/)
 [![llama.cpp](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/sadsfae/188b760b19592c8913101f598f7cb382/raw/qiip-llamacpp.json)](https://github.com/ggml-org/llama.cpp)
+[![Release](https://img.shields.io/github/v/release/quadsproject/qiip)](https://github.com/quadsproject/qiip/releases)
+[![Dev release](https://img.shields.io/github/v/release/quadsproject/qiip?include_prereleases&sort=semver)](https://github.com/quadsproject/qiip/releases)
+[![COPR qiip](https://copr.fedorainfracloud.org/coprs/quadsdev/qiip/package/qiip/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/quadsdev/qiip/package/qiip/)
+[![COPR qiip-dev](https://copr.fedorainfracloud.org/coprs/quadsdev/qiip/package/qiip-dev/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/quadsdev/qiip/package/qiip-dev/)
 
 A QUADS-native inference abstraction framework that automates installation,
 drivers, setup, and presentation of disparate, free or idle NVIDIA GPU systems
@@ -30,6 +34,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 ## Features
 
 - **OpenAI-compatible API** -- drop-in replacement for `/v1/chat/completions`, `/v1/completions`, and `/v1/models`
+- **Claude Code and Codex** -- the Anthropic Messages API (`/v1/messages`) and the OpenAI Responses API (`/v1/responses`) are forwarded to vLLM and llama.cpp nodes, which implement them natively, with the same token auth, routing, failover, and usage tracking as chat completions
 - **Streaming support** -- Server-Sent Events (SSE) for real-time token generation
 - **Chat playground** -- browser-based chat UI at `/chat` with markdown rendering and model selection
 - **Service discovery** -- watches etcd for node registration/deregistration in real time
@@ -55,10 +60,12 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Admin roles** -- the HTTP Basic admin user (bootstrap authority) can grant or revoke the admin role to Google-authenticated users on the token dashboard (`/dashboard/tokens`); role admins then reach the admin surface through their session and see admin-only servers
 - **Admin-only inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). At `/v1` they are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with an `admin_only` badge in the admin fleet view. Token usage from admin-only servers is tracked on the token summary pages exactly like any other node
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
-- **User API tokens** -- each user can mint `qiip_...` bearer tokens on their profile page to call `/v1/chat/completions` and `/v1/completions`; tokens are stored as SHA-256 digests and can be revoked at any time
+- **Self-service onboarding** -- signed-in normal users land on `/start`: one question per screen (name a token, pick a coding tool, pick models) ending in a short-lived `curl ... | bash` line that writes the tool's config; returning users see their single token and its models. See [Self-service onboarding](#self-service-onboarding-start)
+- **Per-token model scope** -- a token minted by the onboarding flow may only request the models chosen for it; other models are refused on `/v1` with `403 model_not_permitted`, and `/v1/models` lists only the token's models
+- **User API tokens** -- admin-role users can mint `qiip_...` bearer tokens on their profile page to call the `/v1` inference API; normal users own exactly one token, managed on `/start`. Tokens are stored as SHA-256 digests and can be revoked at any time
 - **Stable agent-config token** -- one derived per-user key (`agent-config`) is shared by every config download across servers and browsers; its raw value is derived from `auth.session_secret` + user + generation and never stored, so revoking it rotates the key embedded in already-downloaded configs (configuration downloads for admin-only servers require the Google session that can mint it)
 - **Config-gated inference auth** -- a valid `qiip_...` bearer token is always accepted on `/v1`; requiring a token for every `/v1` request (`auth.enforce_api_tokens`) is optional and off by default, so existing public deployments keep serving anonymous requests unchanged
-- **Token usage tracking** -- token-authenticated requests record OpenAI token usage per token/model for reporting on the profile page
+- **Token usage tracking** -- token-authenticated requests record token usage per token/model for reporting on the profile page
 - **Backend endpoint allowlist** -- configurable hostname wildcard, CIDR network, and port allowlists; rejects non-matching registrations with loopback-only defaults
 - **Client config downloads** -- one-click download of OpenCode CLI and Pi coding agent configuration files from the dashboard and node detail pages; dashboard configs point at the proxy for load-balanced access, node detail configs point at individual backend endpoints
 
@@ -72,7 +79,10 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Send a request](#send-a-request)
   - [Use with the OpenAI Python SDK](#use-with-the-openai-python-sdk)
   - [Chat playground](#chat-playground)
+- [RPM installation](#rpm-installation)
+  - [Development RPM (`qiip-dev`)](#development-rpm-qiip-dev)
 - [API Endpoints](#api-endpoints)
+  - [Claude Code and Codex](#claude-code-and-codex)
   - [Administrative access](#administrative-access)
   - [Node inventory identity](#node-inventory-identity)
   - [Relaunch managed llama.cpp sizing](#relaunch-managed-llamacpp-sizing)
@@ -83,6 +93,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Server launch](#server-launch)
   - [Admin authentication](#admin-authentication)
   - [User authentication (Google OAuth)](#user-authentication-google-oauth)
+  - [Self-service onboarding (`/start`)](#self-service-onboarding-start)
   - [etcd](#etcd)
   - [Routing](#routing)
   - [SSH and provisioning commands](#ssh-and-provisioning-commands)
@@ -99,12 +110,16 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Run tests](#run-tests)
   - [Lint and format](#lint-and-format)
   - [Type check](#type-check)
+- [Releases (stable and development trains)](docs/releases.md)
+- [Durable provisioning evidence](#durable-provisioning-evidence)
+- [Troubleshooting](#troubleshooting)
+  - [Reading provisioning logs offline](#reading-provisioning-logs-offline)
 - [Technology Stack](#technology-stack)
 - [License](#license)
 
 ## Requirements
 
-- Python 3.12 or 3.13
+- Python 3.12, 3.13, or 3.14
 - [uv](https://github.com/astral-sh/uv) (package manager)
 - Node.js for the frontend behavioral tests (CI uses version 24; not required
   at runtime)
@@ -117,8 +132,17 @@ start with an empty registry.
 
 ### Running etcd
 
-The gateway expects etcd on `localhost:2379` by default. Run a single-node
-instance with Podman:
+The gateway expects etcd on `localhost:2379` by default.
+
+RPM installs (`qiip` / `qiip-dev`) pull the `etcd` package as a dependency, so
+no container runtime is needed. Enable and start the packaged single-node
+service (its default config already listens on `localhost:2379`):
+
+```bash
+sudo systemctl enable --now etcd
+```
+
+For git-checkout installs (or to run etcd in a container), use Podman:
 
 ```bash
 podman run -d --name etcd -p 2379:2379 \
@@ -172,8 +196,8 @@ sends base64-encoded credentials --not encryption --on every request. A trusted
 work LAN may use HTTP; use a TLS terminator whenever that network path is not
 trusted.
 
-Optional TLS termination (rootless Podman container or RPM nginx, self-signed
-certificate bootstrap): see [nginx/nginx.md](nginx/nginx.md).
+> [!TIP]
+> For production deployments it's best to use a reverse proxy, see our [nginx setup](nginx/nginx.md).
 
 ### Verify it's running
 
@@ -222,8 +246,9 @@ print(response.choices[0].message.content)
 
 ### Deploy with systemd
 
-A production deployment ships a systemd unit (`systemd/inference-proxy.service`)
-matching the stage/dev convention: repo checkout at `/opt/inference-proxy`
+For RPM installs see [RPM installation](#rpm-installation). A git-checkout
+deployment (stage/dev convention) uses
+`systemd/inference-proxy.service`: repo checkout at `/opt/inference-proxy`
 (uv-synced), settings in `/opt/inference-proxy/.env`, the service listening on
 port **5000**, and nginx terminating TLS and proxying to it
 (`nginx/nginx.conf`). Install it with:
@@ -249,6 +274,106 @@ System Prompt and retry. Failed turns are not retained in the next request's
 history; partial assistant text already shown after a connection failure is
 retained so the visible transcript and future context stay aligned.
 
+## RPM installation
+
+Published on COPR for Fedora 43/44. Install the stable train:
+
+```bash
+sudo dnf copr enable quadsdev/qiip
+sudo dnf install qiip
+```
+
+> [!NOTE]
+> RPM installs use the system Python 3.14 (the Fedora 43/44 default). The
+> packages require `python3 >= 3.12` and `< 3.15`.
+
+QUADS-style serving: the package requires and manages nginx (TLS
+termination) alongside the gateway. On install it deploys the bundled
+`nginx.conf` (FQDN substituted) when the stock file is unmodified per the
+nginx-core rpmdb, so an operator-edited config is never clobbered; it
+generates a self-signed cert if none exists, sets
+`httpd_can_network_connect`, then enables and starts `nginx`. The gateway
+runs under `inference-proxy.service` as an explicitly tuned uvicorn
+process farm (uvicorn's native multi-worker; its bundled gunicorn worker
+is deprecated upstream, so we do not use it), tuned like every other QIIP setting through the
+`server:` YAML block (or `INFERENCE_PROXY_SERVER__*` overrides):
+
+| Setting | Default | What it does |
+|---------|---------|--------------|
+| `workers` | `1` | uvicorn worker processes; only 1 is supported (each worker runs its own background jobs and registry) |
+| `limit_concurrency` | `150` | max concurrent connections per worker |
+| `max_requests` | unset (disabled) | recycle a worker after N requests; used only when `workers` > 1 |
+| `max_requests_jitter` | `500` | +/- random walk around the recycle threshold |
+| `log_level` | `info` | uvicorn log level (lowercase) |
+
+A single worker runs without a supervisor, so enforcing `max_requests`
+there would terminate the process (an outage each time the limit is hit)
+rather than recycle it. It stays disabled by default with the one supported
+worker; set it explicitly (and run more than one worker) to use the recycle,
+which is the memory guard QUADS uses with gunicorn. The gateway runs
+per-process daemon threads (etcd watcher, health and QUADS pollers, schedule
+enforcer) with an in-memory registry, so one worker is the only supported
+value. After install, enable and start the gateway with
+`sudo systemctl enable --now inference-proxy`; nginx is started by the
+package. Manage both units: `sudo systemctl status inference-proxy nginx`.
+
+The RPM gateway binds **loopback only** (`127.0.0.1:5000`); nginx (on the
+same host) terminates TLS and proxies to it. Keep port 5000 closed
+externally: the `/v1/*` endpoints are unauthenticated, the app has no body
+limit of its own, and requests travel cleartext outside nginx/TLS. A
+git-checkout or container deployment that needs direct access must set
+`INFERENCE_PROXY_SERVER__HOST` (or open port 5000) explicitly.
+
+Two packages, one train each; they ship the same files and cannot be
+installed together:
+
+| Package | Train | COPR project |
+|---------|-------|--------------|
+| `qiip` | Stable (`main`) | `quadsdev/qiip` |
+| `qiip-dev` | Development (`development`) | `quadsdev/qiip` |
+
+`qiip-dev` conflicts with `qiip`; see [Development RPM](#development-rpm-qiip-dev)
+below or [releases](docs/releases.md) for the versioning, changelog, and badge
+details.
+
+### Development RPM (`qiip-dev`)
+
+Install the development train from the same `quadsdev/qiip` COPR repo:
+
+```bash
+sudo dnf copr enable quadsdev/qiip
+sudo dnf install qiip-dev
+```
+
+`qiip-dev` tracks the `development` branch and is rebuilt on every code
+change, so expect frequent updates (`sudo dnf upgrade qiip-dev`). It
+conflicts with `qiip` and declares no `Obsoletes`, so switch trains with
+`sudo dnf swap qiip-dev qiip` (or `--allowerasing`). A swap disables and
+stops the gateway, so re-enable it afterwards:
+`sudo systemctl enable --now inference-proxy`.
+
+Configure and start:
+
+```bash
+sudo install -m 0600 /etc/qiip/conf/qiip.yml.example /etc/qiip/conf/qiip.yml
+# edit qiip.yml (admin credentials, huggingface.cache_dir), then:
+sudo systemctl enable --now inference-proxy
+```
+
+The package ships nginx support (`nginx.conf` and `gen-cert.sh` under
+`/usr/share/qiip/nginx`; see [nginx.md](nginx/nginx.md) Method 1), the node
+engine bundles under `/usr/share/qiip`, and writes data to `/var/lib/qiip`.
+
+> [!NOTE]
+> The `Release` workflow needs one COPR project before its first run:
+> `quadsdev/qiip`. It holds `qiip`, `qiip-dev`, and the pinned dependency
+> RPMs (see [copr-deps/README.md](copr-deps/README.md)); unique names, one
+> repository, no extra repo to enable. Keep the `COPR_API_TOKEN` repository
+> secret set, publish the dependency RPMs once via the `COPR dependencies`
+> workflow, and give `quadsdev/qiip` Fedora 43/44 chroots only. Fedora 45
+> is not yet covered (its default python3 is 3.15, above the supported
+> `<3.15` range).
+
 ## API Endpoints
 
 Public endpoints:
@@ -258,9 +383,14 @@ Public endpoints:
 | `GET` | `/health` | Gateway health check (returns node count) |
 | `POST` | `/v1/chat/completions` | Chat completion (OpenAI-compatible) |
 | `POST` | `/v1/completions` | Text completion (OpenAI-compatible) |
+| `POST` | `/v1/messages` | Anthropic Messages API (Claude Code) |
+| `POST` | `/v1/messages/count_tokens` | Anthropic token counting |
+| `POST` | `/v1/responses` | OpenAI Responses API (Codex) |
 | `GET` | `/v1/models` | List models available across healthy nodes |
 | `GET` | `/chat` | Browser chat playground |
-| `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage |
+| `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage (signed-in normal users are redirected to `/start`) |
+| `GET` | `/start` | Onboarding wizard and token home for signed-in normal users; anonymous visitors get the sign-in page, admins are redirected to `/dashboard` |
+| `GET` | `/s/{id}` | Setup script for a live onboarding link. The id is the credential: 15 minute life, not logged. A dead link returns a script that explains and exits 1 |
 | `GET` | `/auth/login` | Start Google OAuth sign-in (302 to Google) |
 | `GET` | `/auth/callback` | Google redirect target; signs the session cookie |
 | `GET` | `/auth/local-admin` | Local admin login page entry (302 to `/dashboard`; the sign-in form POSTs here) |
@@ -272,7 +402,7 @@ Fleet (any signed-in user, or HTTP Basic local admin):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/fleet/nodes` | Fleet view for non-admin viewers: registered nodes without admin-only servers or operational actions |
+| `GET` | `/fleet/nodes` | Fleet JSON for non-admin viewers: registered nodes without admin-only servers or operational actions (no page renders it for them any more; normal users live on `/start`) |
 
 User-session-protected profile endpoints (require `auth.session_secret` and a
 signed-in session):
@@ -281,10 +411,19 @@ signed-in session):
 |--------|------|-------------|
 | `GET` | `/profile/me` | Public identity of the signed-in user |
 | `GET` | `/profile/tokens` | List the user's API tokens (prefix only) |
-| `POST` | `/profile/tokens` | Mint a token; accepts an optional `endpoints` pin (hostnames); returns the raw secret exactly once (except `name: agent-config`, the reusable derived config key) |
+| `POST` | `/profile/tokens` | Admin-role users only (403 for normal users, who use `/start`). Mint a token; accepts an optional `endpoints` pin (hostnames); returns the raw secret exactly once (except `name: agent-config`, the reusable derived config key) |
 | `DELETE` | `/profile/tokens/{id}` | Revoke a token |
 | `GET` | `/profile/usage` | Aggregated usage per token/model plus headline totals |
 | `GET` | `/profile/endpoints` | Registered nodes the user may pin (unowned nodes plus nodes they own) |
+
+Onboarding endpoints (signed-in normal users only; admin-role sessions get 403):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/onboarding/state` | Identity, the user's current token (never the raw secret), models online right now, and the supported coding tools |
+| `POST` | `/onboarding/token` | Mint the user's single token with a name and a model list; revokes every other token the user has |
+| `PUT` | `/onboarding/token/models` | Replace the token's model list (409 for tokens minted before this flow) |
+| `POST` | `/onboarding/setup-link` | Create a `/s/{id}` link for one coding tool; returns the ready-to-paste command and its expiry |
 
 Admin-authenticated endpoints (HTTP Basic or admin-role session):
 
@@ -305,6 +444,7 @@ Admin-authenticated endpoints (HTTP Basic or admin-role session):
 | `DELETE` | `/admin/users/{user_id}/admin` | Revoke the admin role (204) |
 | `GET` | `/admin/provisioning/tasks` | List provisioning task states |
 | `GET` | `/admin/provisioning/{hostname}/logs` | Stream provisioning logs over SSE |
+| `GET` | `/admin/provisioning/reliability` | Fleet outcomes, explicit metric denominators, recurring failures, and JSON export (admin only) |
 | `GET` | `/admin/quads/status` | QUADS integration and cache status |
 | `GET` | `/admin/nodes/{hostname}/power` | Read Redfish power state |
 | `POST` | `/admin/nodes/{hostname}/power` | Execute an allowed Redfish power action |
@@ -312,6 +452,70 @@ Admin-authenticated endpoints (HTTP Basic or admin-role session):
 | `GET` | `/dashboard` | Authenticated operations dashboard; anonymous visitors get the sign-in page |
 | `GET` | `/dashboard/nodes/{node_id}` | Authenticated node detail page |
 | `GET` | `/dashboard/admin` | Admin page: manage admin-only inference servers (admin-role management lives on `/dashboard/tokens`) |
+
+### Claude Code and Codex
+
+Claude Code speaks the Anthropic Messages API and Codex speaks the OpenAI
+Responses API. vLLM and llama.cpp both implement these APIs natively, so qiip
+forwards requests without converting between formats. The one change it makes
+is the system-message rewrite described below. Point the tools at the gateway
+with a `qiip_...` token and a served model name:
+
+```bash
+# Claude Code (ANTHROPIC_API_KEY, sent as x-api-key, also works)
+export ANTHROPIC_BASE_URL=https://inference-proxy.example.com
+export ANTHROPIC_AUTH_TOKEN=qiip_...
+export ANTHROPIC_MODEL=Qwen/Qwen3-14B-AWQ
+export ANTHROPIC_DEFAULT_OPUS_MODEL=$ANTHROPIC_MODEL
+export ANTHROPIC_DEFAULT_SONNET_MODEL=$ANTHROPIC_MODEL
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=$ANTHROPIC_MODEL
+```
+
+```toml
+# Codex (~/.codex/config.toml), with `export QIIP_API_KEY=qiip_...`
+model = "Qwen/Qwen3-14B-AWQ"
+model_provider = "qiip"
+
+[model_providers.qiip]
+name = "qiip"
+base_url = "https://inference-proxy.example.com/v1"
+wire_api = "responses"
+env_key = "QIIP_API_KEY"
+```
+
+- **Same gateway behavior.** Requests go through the same token
+  authentication, node selection, failover, and per-token usage tracking as
+  chat completions. Anthropic reports cached prompt tokens separately; qiip
+  counts them as prompt tokens.
+- **Streams are relayed event by event** with their SSE event names, which
+  the Anthropic SDK requires. These formats do not end with `[DONE]`.
+- **System messages inside the conversation.** Claude Code sends system
+  messages between turns, and Codex sends a developer message. Some chat
+  templates (Qwen 3.x, for example) accept a system message only as the first
+  message. qiip therefore merges system and developer messages that come before
+  the conversation into the system prompt (Codex: `instructions`), and turns
+  every later one into a user message at the same position, wrapped in
+  `<system-reminder>` tags. Moving the later ones to the front instead would
+  change the start of the prompt every turn and defeat the backend's prompt
+  cache. This applies on every node. Templates that require strict
+  user/assistant alternation (Gemma-style) are still not supported, because
+  the rewrite can place two user messages in a row.
+- **Stateless Responses API.** Send the whole conversation each turn, as Codex
+  does with `store: false`. `previous_response_id` and stored-response
+  retrieval are not supported.
+- **Context size.** Neither tool knows a local model's context window. Claude
+  Code assumes 200,000 tokens for unknown models; set
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` to the
+  served model's limits. For Codex, set `model_context_window` and
+  `model_auto_compact_token_limit`.
+- **Long prompts on llama.cpp.** llama.cpp sends no response headers until
+  the first token, so processing a long uncached prompt counts against the
+  streaming handshake deadline, `routing.timeout` (default 30 seconds). If
+  agents resume large contexts on llama.cpp nodes, raise it above the longest
+  prompt processing time you expect.
+- **Backend support.** Managed nodes at the pinned vLLM and llama.cpp versions
+  serve both APIs. An adopted server that does not implement them returns its
+  own 404, which qiip passes through.
 
 ### Administrative access
 
@@ -334,10 +538,13 @@ anonymous visitors receive a sign-in page with **Local Admin**
 creating a signed admin session; the browser native Basic prompt is no longer
 used, though HTTP Basic requests and SSE still pass through unchanged) and
 **Google Auth** (the same flow as the profile page).
-Signed-in non-admin users see the fleet with admin-only servers removed, no
-operational actions, and nodes owned by another user excluded (ownership is
-private: `/v1/models` and the endpoint picker treat it the same way); node
-detail, model catalog, token dashboards, and the admin page remain admin-only.
+Signed-in non-admin users do not see the fleet pages at all: every operations
+page redirects them to `/start` (see
+[Self-service onboarding](#self-service-onboarding-start)). The
+`/fleet/nodes` JSON API still answers for them with admin-only servers
+removed, no operational actions, and nodes owned by another user excluded
+(ownership is private: `/v1/models` and the endpoint picker treat it the same
+way).
 
 On a trusted work LAN, the administrative surface may run over HTTP. Anyone able
 to observe that traffic can recover the reusable credential, so deploy a
@@ -440,6 +647,73 @@ A custom `port` is rejected for a plain pool registration (without
 launch. The dashboard's manual-setup form shows the port field only when the
 "Existing OpenAI-compatible server" option is enabled.
 
+### Automatic model placement
+
+Automatic placement is enabled by default. With QUADS configured, QIIP provisions prescribed
+llama.cpp profiles onto free GPU hosts by itself, in fixed, configurable ratios
+(`placement.ratios`, by default 9:2:2:2 for Qwen3.8-27B, Qwen3.6-35B-A3B, Muse
+Glimmer 30B and Gemma 4 31B: 60% Qwen3.8-27B, the rest split equally). Set `placement.enabled: false` to disable it. Automatic placement uses
+only the approved catalog models and their pinned configurations; it does not
+select arbitrary downloaded models.
+
+- **Scope.** Only hosts with exactly one GPU whose QUADS inventory names a GPU
+  product in the profile catalog (currently L4 and A30, 24 GB). Hosts with more
+  than one GPU are refused, not half-supported. There is no 16 GB policy and no
+  demand-based scaling.
+- **Ratios.** The denominator is the hosts automation already holds plus the
+  eligible free hosts. Rounding is largest remainder with catalog order breaking
+  ties, and every weighted profile gets one host once there are as many hosts as
+  profiles. A smaller fleet is served in catalog order: Qwen3.8-27B, Qwen3.6-35B-A3B,
+  Muse Glimmer 30B, then Gemma 4 31B. Eight hosts give 5/1/1/1 and fifteen give
+  9/2/2/2. Qwen3.8-27B takes A30 hosts first. A profile is placed only on GPU
+  products it has been run on for real (`placement.require_qualified_gpu`); Gemma 4
+  31B is currently validated on the L4 only.
+- **What it never touches.** Nodes a person set up, owns, adopted
+  (`self_setup`) or is operating on, hosts in `placement.exclude_hosts`, and,
+  when `placement.only_hosts` is set, every host not listed there.
+  Assigning an owner to an automatically placed node takes it out of automation.
+  `PATCH /admin/nodes/{host}/owner` takes the same per-host reservation as
+  setup, relaunch, teardown and automatic placement, on every node. While one
+  of those is in progress it answers `409` without waiting; repeat the request
+  when the operation finishes. A takeover that returned `200` is never undone
+  by automation.
+  Healthy placements are never moved to rebalance. A retry is decided by the same
+  rules as a fresh placement, as they stand at the time: a host that has since
+  been excluded, reweighted to zero, lost its GPU qualification or changed
+  inventory is released, not retried.
+- **QUADS.** A host is placed only while QUADS shows it free for the whole
+  `quads.schedule_lookahead_hours` window, the same rule manual setup applies.
+- **Durability.** Each placement is a persistent etcd claim at
+  `/placement/claims/<host>`, written with compare-and-swap and refreshed by a
+  heartbeat, so a gateway restart or an expired node lease does not hand a host
+  out twice. Before every launch, first or retry, the host itself is asked
+  whether an earlier setup or start command is still running; if it is, or the
+  host cannot be asked, the launch is blocked and reported instead of started
+  on top. Resetting a claim does not skip that check. A blocked host that has
+  no claim yet is listed under skipped hosts and left out of planning for
+  `placement.retry_backoff_seconds`, so its share goes to another free host.
+  Failures retry with backoff up to `placement.max_attempts`, then stop until
+  an operator resets the claim. The limit counts attempts since the last
+  successful provision, including one a gateway restart interrupted; a success
+  starts the count again, so a healthy node that later loses its record is
+  rebuilt rather than exhausted. QIIP is a single-gateway service: the claim's compare-and-swap is a
+  safeguard against an accidental second gateway, not support for running two.
+- **Files.** Profiles reference exact Hugging Face revisions. Download them with
+  the existing `POST /admin/models/download`. A missing file is reported and
+  only blocks its own profile; it never stops the gateway from starting.
+- **Validation gate.** With `placement.require_qualified_gpu` (the default), a
+  profile is placed only on GPU products listed in its `qualified_gpus`, which
+  is filled in as each profile is validated on real hardware.
+
+`GET /admin/placement` (and the "Automatic Model Placement" card on the admin
+page) reports, per profile, the target and the hosts serving, pending and
+failed; claims with their last error; missing files; and hosts that were skipped
+and why. Claims are read live, so they stay visible while placement is disabled.
+It also shows served requests and tokens per model. Those are a lower bound on
+demand: refused, unroutable and failed requests are not counted, the request
+counter resets on restart, and tokens are neither GPU time nor queue depth. `DELETE
+/admin/placement/claims/{hostname}` resets a failed or exhausted claim.
+
 ### Relaunch managed llama.cpp sizing
 
 The relaunch endpoint accepts the same typed automatic or custom policy stored
@@ -519,8 +793,11 @@ background, with progress available from the normal provisioning log stream.
 
 ### Error responses
 
-Inference-proxy errors follow the OpenAI error format. Upstream 4xx responses
-are passed through without changing their JSON shape.
+Inference-proxy errors follow the OpenAI error format, except on
+`/v1/messages` and `/v1/messages/count_tokens`, where they use Anthropic's
+`{"type": "error", "error": {"type": ..., "message": ...}}` envelope with
+the same qiip code in `error.code`. Upstream 4xx responses are passed through
+without changing their JSON shape.
 
 | Code | Meaning |
 |------|---------|
@@ -795,6 +1072,78 @@ Token management dashboards (admin and per-user):
 The defaults track published Claude Opus-class 1M-context pricing; override
 them when the reference model or your accounting changes.
 
+### Self-service onboarding (`/start`)
+
+Normal (non-admin) users get one page. After Google sign-in they land on
+`/start`, and every operations page (`/dashboard`, node detail, `/models`,
+`/chat`, `/profile`, the token and admin pages) redirects them back to it.
+Admins are unaffected and are redirected away from `/start`.
+
+A user without a token walks through one question per screen:
+
+1. a name for the token,
+2. the coding tool they use,
+3. the models they want (one model for single-model tools, any number otherwise).
+
+The last screen shows one line to paste into a terminal:
+
+```bash
+curl -sSL https://gateway.example.com/s/k7m2x9qd4tpa | bash
+```
+
+The script only writes that tool's config file, already pointed at the gateway
+with the user's token and models. It backs up an existing file first (the first
+backup is kept across reruns), merges into existing JSON and TOML configs
+instead of replacing them, and leaves the file readable only by the user. It
+needs `bash`; `python3` is used for JSON merges when present.
+
+A user who already has a token sees only that token, the models it may use
+(tap to change), and buttons to set up another tool or replace the token.
+
+| Coding tool | Config written | Models | Needs |
+|-------------|----------------|--------|-------|
+| OpenCode | `~/.config/opencode/opencode.json` | many | `/v1/chat/completions` |
+| Pi | `~/.pi/agent/models.json` | many | `/v1/chat/completions` |
+| Oh My Pi | `~/.omp/agent/models.yml` (replaced, not merged) | many | `/v1/chat/completions` |
+| Claude Code | `~/.claude/settings.json` | one | `/v1/messages` |
+| Codex | `~/.codex/config.toml` | one | `/v1/responses` |
+
+A tool is offered only when the gateway serves the API route it speaks, so
+Claude Code and Codex are available through `/v1/messages` and
+`/v1/responses`. The models offered are the models healthy nodes are serving
+at that moment, limited to nodes the user may reach (never admin-only servers or nodes
+owned by someone else).
+
+Rules and guardrails:
+
+- **One token per user.** Minting on `/start` revokes every other token the
+  user has. `POST /profile/tokens` is admin-only so the rule cannot be bypassed.
+- **Model scope.** The token may only request its chosen models. Anything else
+  is refused with `403 model_not_permitted`. Asking for a setup command that
+  includes a new model adds it to the token. Scope binds tokens, so it has teeth
+  only with `auth.enforce_api_tokens=true`; with the default `false`, requests
+  without a token are anonymous and unrestricted.
+- **Setup links.** `/s/{id}` needs no session because the id is the credential.
+  It lives for 15 minutes, can be fetched again inside that window (a failed
+  first run can simply be retried), and dies when the token is replaced. Only a
+  SHA-256 of the id is stored, the gateway logs the path as `/s/[redacted]`,
+  and responses are `no-store`, `noindex`, and `no-referrer`. A reverse proxy in
+  front still logs request paths unless its log format is changed, so treat
+  proxy access logs as sensitive for 15 minutes after a link is made.
+- **No stored secret.** The token is derived from `auth.session_secret`, the
+  user id, and a random per-token value, and only its digest is stored. That is
+  what lets a user set up a second tool later. It also means the database plus
+  the session secret is enough to recover tokens: protect the secret like a
+  credential. Rotating it leaves existing tokens working on `/v1` but makes
+  them impossible to export again; the page then asks the user for a new token.
+- **Public origin.** Setup commands and written configs always use the scheme,
+  hostname, and port of `oauth.redirect_uri`. Configure the externally reachable
+  HTTPS callback URL, for example `https://qiip.example/auth/callback`. Host and
+  forwarded headers cannot change that origin, even on direct gateway requests.
+  `oauth.allowed_redirect_hosts` affects OAuth callbacks only, not setup URLs.
+  Without `oauth.redirect_uri`, creating a setup link or downloading a valid
+  link returns `503` without exporting a token; existing links are not a bypass.
+
 ### etcd
 
 | Variable | Default | Description |
@@ -872,13 +1221,25 @@ Provisioning resource and retention controls:
 | `INFERENCE_PROXY_PROVISIONING__LOG_MAX_BYTES_PER_HOST` | `1048576` | Retained message bytes per host operation |
 | `INFERENCE_PROXY_PROVISIONING__LOG_MAX_ENTRY_BYTES` | `16384` | Maximum bytes in one retained log message |
 | `INFERENCE_PROXY_PROVISIONING__LOG_MAX_COMPLETED_HOSTS` | `64` | Completed host-operation buffers retained, oldest first |
+| `INFERENCE_PROXY_PROVISIONING__LOG_DB_PATH` | `data/provisioning-logs.sqlite3` | Durable gateway attempt database; use persistent local storage |
+| `INFERENCE_PROXY_PROVISIONING__LOG_RETENTION_DAYS` | `30` | Retention of gateway attempt history |
+| `INFERENCE_PROXY_PROVISIONING__LOG_STORAGE_MAX_BYTES` | `268435456` | Gateway retained record payload budget |
+| `INFERENCE_PROXY_PROVISIONING__LOG_ATTEMPT_MAX_BYTES` | `33554432` | Gateway record payload budget per attempt |
+| `INFERENCE_PROXY_PROVISIONING__LOG_MAX_ATTEMPTS` | `1000` | Gateway attempt manifests retained |
+| `INFERENCE_PROXY_PROVISIONING__LOG_REMOTE_ROOT` | `/var/lib/qiip/provisioning-logs` | Node database and bounded engine tails |
+| `INFERENCE_PROXY_PROVISIONING__LOG_REMOTE_RETENTION_DAYS` | `7` | Node attempt retention |
+| `INFERENCE_PROXY_PROVISIONING__LOG_REMOTE_MAX_BYTES` | `134217728` | Node payload budget, half for records and half for raw tails |
+| `INFERENCE_PROXY_PROVISIONING__LOG_REMOTE_ATTEMPT_MAX_BYTES` | `16777216` | Node record and raw-tail limit per attempt, subject to total budgets |
+| `INFERENCE_PROXY_PROVISIONING__LOG_REMOTE_MAX_ATTEMPTS` | `32` | Node attempt manifests and raw tails retained |
+| `INFERENCE_PROXY_PROVISIONING__LOG_RECONNECT_ATTEMPTS` | `3` | Consecutive automatic retrieval retries after SSH errors |
+| `INFERENCE_PROXY_PROVISIONING__LOG_POLL_INTERVAL` | `1` | Seconds between node log retrieval requests |
 
 Managed llama.cpp provisioning builds a verified source tag with CUDA enabled
 for the NVIDIA GPU attached to the node. It has five gateway settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION` | `b10242` | Pinned llama.cpp build tag |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION` | `v0.4.1` | Pinned llama.cpp release tag (`v<major>.<minor>.<patch>`, or a nightly `b<number>` build tag) |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256` | committed digest | SHA-256 of the source archive selected by the version |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` | GitHub tag archive | Validated HTTP(S) URL template containing exactly one `{version}` placeholder |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT` | `7200` | Total wall-clock deadline for the llama.cpp setup command, including the CUDA source build (seconds) |
@@ -1166,8 +1527,8 @@ uv run --frozen pytest tests/api/test_routes.py -v
 ```
 
 Coverage is measured over `inference_proxy` with branch tracking enabled. CI
-enforces a 92% combined statement-and-branch floor, raised from 91.5% when the
-exact-artifact work brought the measured total to 92.08%. The total may move as
+enforces a 93% combined statement-and-branch floor, raised from 92% once the
+measured total stayed near 94%. The total may move as
 code is added or removed. The floor prevents new untested code from materially
 reducing coverage; it does not prove that covered behavior is asserted
 correctly.
@@ -1175,7 +1536,11 @@ correctly.
 ### CI badges
 
 After `Quality` passes on `main`, a separate non-blocking job publishes the
-coverage, vLLM, and llama.cpp badges to the configured Gist. `GIST_SECRET` must
+coverage, vLLM, and llama.cpp badges to the configured Gist. The release and
+COPR badges at the top of this README are live: the GitHub release badges come
+from the `Release` workflow (stable releases on `main`, dev prereleases on
+`development`), and the COPR badges reflect the last build of the
+`qiip` and `qiip-dev` packages in `quadsdev/qiip`. `GIST_SECRET` must
 be a fine-grained personal access token with only the **Gists: write** user
 permission. Prefer a service identity, record the token's expiration, and
 replace the repository secret before it expires. To change the publishing
@@ -1201,6 +1566,211 @@ uv run --frozen ruff format .
 ```bash
 uv run --frozen mypy inference_proxy tests
 ```
+
+## Durable provisioning evidence
+
+Each setup, relaunch, and teardown receives a UUID and a SHA-256 identity of its
+setup bundle. Setup stdout/stderr, launch stdout/stderr, engine startup output,
+and available `vllm`, `llamacpp`, and NVIDIA Fabric Manager journal records are
+stored on the node and retrieved into the gateway database. Every record carries
+the hostname, attempt, engine, model selection (null until known for automatic
+selection), bundle version, stage, source, timestamp, and sequence. Node timestamps
+represent capture time; journal JSON also contains the original journal timestamp
+and cursor. Gateway messages use gateway time.
+
+Configure the durable-log settings under `provisioning:` in `conf/qiip.yml`
+(see `conf/qiip.yml.example`). The gateway requires a writable persistent
+`log_db_path`; startup fails if this database cannot be opened, rather than
+silently losing durable history. The gateway payload budget must cover one
+attempt. Half the node budget is reserved for SQLite records, so the node total
+must be at least twice its per-attempt record budget.
+
+The node recorder requires Python 3.9+ with SQLite and write access to the remote
+log root. It is uploaded with the setup bundle. Recording survives loss of the
+SSH connection; reconnects retrieve by sequence and commit the retrieval cursor
+with each record. A lost launch acknowledgement never causes a second setup or
+engine launch. Explicit teardown cancellation signals the detached command group
+and retains its final output. Gateway shutdown stops retrieval and leaves the
+node command and recorder running; the attempt is marked interrupted locally.
+If completion cannot be established within the deadline, the
+attempt fails with an explicit collection warning. Recorded commands retain the
+configured SSH total and inactivity deadlines; llama.cpp setup retains its longer
+setup timeout.
+
+The **Admin > Fleet reliability** page reports first-attempt success, retry
+recovery, readiness time, cancellations, and unsupported-node outcomes from
+retained attempts. It groups failures by signature and environment, links to
+the relevant attempts and diagnostic bundles, and exports the selected cohort.
+See [fleet reliability measurements](docs/fleet-reliability.md) for metric
+definitions, evidence limits, and the baseline/canary procedure.
+
+Failed attempts automatically collect a diagnostic bundle. The original error
+appears first in the attempt history, with the failed stage, command identity,
+available exit code or signal, timestamps, and elapsed time. The bundle includes
+setup and engine log tails, NVIDIA/Fabric Manager service journals, GPU and OOM
+kernel messages, OS/kernel details, GPU inventory and free VRAM, driver/toolkit
+and runtime versions, RAM, disk usage, and the model-cache mount state.
+
+Each source reports `collected`, `unavailable`, `timed_out`, or `truncated`.
+Defaults limit each source to 3 seconds, 200 lines, and 16 KiB, and the overall
+diagnostic collection to 25 seconds. Configure `diagnostics_source_timeout`,
+`diagnostics_timeout`, and `diagnostics_source_max_bytes` under `provisioning`.
+Payloads share the existing attempt retention budgets. A failed collector never
+replaces the provisioning error. Journal queries start at the original attempt
+time and extend through recovered command completion if detached setup continues
+after an SSH failure. A successful empty journal search is complete; collection
+errors and unfinished command windows remain deferred. System snapshots carry
+their collection time, including after reconnect. Retrieval deadlines leave a
+durable warning and mark the bundle incomplete. Diagnostic records preserve whole
+lines when they fit; oversized lines split at UTF-8 character boundaries within
+the record byte limit, so searches spanning those fragments are not supported.
+The attempt API's log manifest and downloadable bundle include these details.
+Use **Retrieve from node** to retry deferred sources; startup reconciliation and
+the next operation on that host also retrieve pending evidence without relaunching
+the failed command. No periodic retry runs solely for diagnostics.
+
+At startup the gateway reconciles every host with an unfinished attempt in the
+background (`reconcile_pending_operations`). Before each provision or relaunch
+on a host, and during teardown, it rechecks that host. Both paths ask the node
+recorder whether any remote process group is still alive on that host.
+
+The node is the authority on its own process groups, and the check is
+host-scoped rather than attempt-scoped. A newer local attempt or a second
+gateway cannot hide a survivor. Reconcile mirrors remaining retained evidence
+into the gateway database, then blocks the host while an operation is running,
+survived cancellation, or the host is unreachable. An interrupted attempt whose
+node-side record is gone or complete is not blocked.
+
+> [!IMPORTANT]
+> Reconcile recovers state; it does not resume an interrupted command or
+> roll back partial setup.
+>
+> A blocked host requires operator teardown and provision or relaunches stay
+> refused until the node reports no live phase.
+
+The recorder holds one host-scoped lock (shared by the vLLM and llama.cpp
+paths) on the node, which rejects concurrent setup from a second controller
+with a "host busy" outcome. A phase that cannot prove its process group
+terminated is marked `survivor`; both markers surface in the attempt history
+and block the next attempt. The current recorder is placed on the node before
+the probe, so a fresh node or one provisioned by an older gateway is not
+misread as unreachable, and the lock is closed at the serving-process handoff
+so a live engine or log sink cannot hold the fence past its launch step.
+
+> [!WARNING]
+> The lock file at the remote log root must never be deleted while a worker
+> could hold it; a deleted lock lets a second controller bypass the fence.
+
+> [!CAUTION]
+> On NFS exports without lock support the fence degrades to best-effort (the
+> recorder logs a warning and continues).
+>
+> Keep the remote log root on local storage when multiple controllers may reach a node.
+
+On the node detail page, **Provisioning history** lists attempts independently of
+the current node state. Select an attempt to search all retained messages, filter
+by source, retrieve missed node output, or download a gzip-compressed JSONL bundle
+containing its manifest, records, and an export summary that reports concurrent
+rotation during download. Failed stages and their output appear in the
+summary; unavailable sources, sequence gaps, and retention losses remain visible.
+The live stream also resumes by attempt and sequence. The engine pipe consumer
+batches output for up to 100 ms or 64 KiB before committing. Catchable recorder
+failures and SIGINT/SIGTERM stop recording and drain the pipe. SIGKILL, an OOM
+kill, or node loss cannot run that drain; those events can interrupt the engine
+and require operator recovery.
+
+Administrative API (existing admin authentication and JSON request requirements):
+
+- `GET /admin/provisioning/{hostname}/attempts?limit=100&offset=0`
+- `GET /admin/provisioning/{hostname}/attempts/{id}/logs?q=error&source=setup.stderr&after=0&limit=500`
+- `POST /admin/provisioning/{hostname}/attempts/{id}/collect` with JSON `{}`
+- `GET /admin/provisioning/{hostname}/attempts/{id}/bundle`
+- `GET /admin/provisioning/{hostname}/logs?attempt_id={id}&after=0` (SSE; supports `Last-Event-ID: {id}:{seq}`)
+
+Offsets are inclusive sequence positions; use `next_offset` for the next page.
+Search is a case-insensitive literal substring match, including `%` and `_`.
+Retrieval reports unavailable sources in the returned manifest while preserving
+previously collected data. Restarted gateway attempts are marked `interrupted`;
+retrieving their evidence does not claim that provisioning succeeded.
+
+Byte limits bound UTF-8 JSON record payloads, plus bounded raw tails on nodes;
+allow extra filesystem space for SQLite pages, indexes, manifests, and the
+SQLite WAL (long-lived readers may delay checkpointing). New stores use full
+auto-vacuum. A pre-existing SQLite file with auto-vacuum disabled requires an
+explicit rebuild to enable page reclamation; this upgrade does not rebuild it
+during startup. Prefix rotation retains monotonic sequence numbers
+and dropped-record counts. Age/count retention runs at store initialization,
+attempt creation, and before history snapshots when expired/excess rows exist.
+History snapshots use read transactions; WAL allows writers to proceed while
+readers inspect a snapshot. Active attempts are protected from manifest
+eviction and do not consume the completed-attempt count budget; their record
+payloads still rotate. Expired manifests are counted in
+`evicted_attempts` (gateway-wide), and requesting an evicted attempt returns 404.
+Raw-tail capacity is divided across the configured node attempt count, keeping
+runtime output bounded after startup collection ends. Existing pre-upgrade logs
+are not imported. Keep the gateway database on one persistent local volume for
+its owning gateway process; separate gateway replicas do not share this history.
+
+Controlled verification lives in `tests/provisioning/test_attempt_logs.py`: it
+runs the uploaded recorder and shipped setup/launch boundaries with fixture
+installers and a fake engine. It exercises lost acknowledgements, stream
+interruption, restart, concurrent readers, retries, record/raw-file rotation, and
+missing remote/journal sources. These checks do not establish success rates or
+failure causes on real fleet hardware.
+
+## Troubleshooting
+
+### Reading provisioning logs offline
+
+When the gateway is down, use the SQLite CLI to read its persistent database.
+The default path is `data/provisioning-logs.sqlite3`; substitute your configured
+`INFERENCE_PROXY_PROVISIONING__LOG_DB_PATH` if different. Open it read-only to
+avoid accidentally creating or modifying a database. First list attempts:
+
+```bash
+sqlite3 -readonly -header -column data/provisioning-logs.sqlite3 \
+  "SELECT id, hostname, json_extract(metadata,'$.started_at') AS started_at,
+          json_extract(metadata,'$.status') AS status,
+          json_extract(metadata,'$.failure_summary') AS failure_summary,
+          dropped AS dropped_records
+   FROM attempts ORDER BY created DESC;"
+```
+
+Replace `ATTEMPT_ID` below with an ID from that list to read one attempt in
+sequence order. Sequence numbers are local to each attempt:
+
+```bash
+sqlite3 -readonly data/provisioning-logs.sqlite3 \
+  "SELECT json_extract(payload,'$.ts') || ' [' ||
+          json_extract(payload,'$.source') || '] ' || json_extract(payload,'$.msg')
+   FROM records WHERE attempt='ATTEMPT_ID' ORDER BY seq;"
+```
+
+For a JSONL export preserving all record metadata, use `SELECT payload` (each
+row is already JSON). The companion manifest includes source availability,
+issues, and retention counters, which distinguish missing evidence from an
+empty log:
+
+```bash
+sqlite3 -readonly data/provisioning-logs.sqlite3 \
+  "SELECT payload FROM records WHERE attempt='ATTEMPT_ID' ORDER BY seq;" \
+  | jq -c . > provisioning-attempt.jsonl
+sqlite3 -readonly data/provisioning-logs.sqlite3 \
+  "SELECT json_object('metadata',json(metadata),'next_seq',next_seq,
+                      'remote_cursor',remote_cursor,'dropped_records',dropped,
+                      'retained_bytes',bytes)
+   FROM attempts WHERE id='ATTEMPT_ID';" \
+  | jq . > provisioning-attempt-manifest.json
+```
+
+`sqlite3 -readonly data/provisioning-logs.sqlite3 .dump` produces a SQL backup,
+not JSONL. These reads do not require the gateway or network access. If only a
+node's evidence is available, run the same queries on
+`/var/lib/qiip/provisioning-logs/attempts.sqlite3` (or the configured
+`INFERENCE_PROXY_PROVISIONING__LOG_REMOTE_ROOT` plus `/attempts.sqlite3`). The
+node also keeps bounded `<attempt-id>.engine.log` raw tails alongside that
+database. Copy the database while its writers are stopped, or use SQLite's
+`.backup` command for a consistent snapshot of a live database.
 
 ## Technology Stack
 

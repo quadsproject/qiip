@@ -9,10 +9,11 @@ Per D-15: Concrete class, no protocol/interface.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import shlex
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -43,11 +44,16 @@ from inference_proxy.models.node import (
     LlamaCppCacheType,
     LlamaCppFlashAttention,
     LlamaCppGPUState,
+    LlamaCppProfileRuntime,
     LlamaCppRuntimeEffective,
     LlamaCppRuntimeRequest,
     LlamaCppRuntimeState,
     LlamaCppSizingMode,
+    LlamaCppSpeculativeEffective,
+    LlamaCppSpeculativeType,
     Node,
+    NodeGPU,
+    NodePlacement,
     NodeStatus,
     VllmParams,
 )
@@ -55,7 +61,15 @@ from inference_proxy.provisioning.host_lifecycle import (
     HostLifecycleCoordinator,
     HostLifecycleLease,
 )
+from inference_proxy.provisioning.llamacpp_profile import (
+    ProfileEvidence,
+    ProfileEvidenceError,
+    latest_launch,
+    parse_profile_evidence,
+    split_profile_sections,
+)
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
+from inference_proxy.provisioning.remote_logs import RemoteLogCollector
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
     SSHClient,
@@ -89,14 +103,14 @@ LLAMACPP_AGGREGATE_CONTEXT_PATTERN = re.compile(
     r"llama_context:\s+n_ctx\s*=\s*(?P<context>\d+)"
 )
 LLAMACPP_PLAN_PATTERN = re.compile(
-    r"qiip_fit_plan: sizing=(?P<sizing>auto|custom) "
+    r"qiip_fit_plan: sizing=(?P<sizing>auto|custom|profile) "
     r"train_context=(?P<train_context>\d+) "
     r"context_per_slot=(?P<context>\d+) "
     r"slots=(?P<slots>\d+) "
     r"aggregate_context=(?P<aggregate>\d+) "
     r"fit_target_mib=(?P<target>\d+) "
-    r"cache_type_k=(?P<cache_type_k>f16|q8_0) "
-    r"cache_type_v=(?P<cache_type_v>f16|q8_0) "
+    r"cache_type_k=(?P<cache_type_k>f16|q8_0|q4_0) "
+    r"cache_type_v=(?P<cache_type_v>f16|q8_0|q4_0) "
     r"flash_attn=(?P<flash_attn>auto|on) "
     r"estimator_overrun_used=(?P<estimator_overrun_used>true|false)"
 )
@@ -115,6 +129,14 @@ LLAMACPP_CONTEXT_OVERFLOW_PATTERN = re.compile(
 LLAMACPP_SLOT_CAP_PATTERN = re.compile(
     r"the slot context \((?P<context>\d+)\) exceeds the training context "
     r"of the model \((?P<train>\d+)\) - capping"
+)
+# qiip's own node-side provisioning commands, as they appear in ``ps`` args:
+# setup, engine start, and the detached command worker. The long-lived
+# ``provision-logs.py engine`` sink belongs to a running server, not to
+# provisioning, and must not match.
+_REMOTE_LIFECYCLE_PATTERN = re.compile(
+    r"(?:auto-(?:llamacpp|vllm)/(?:setup|start-[a-z]+)\.sh"
+    r"|common/provision-logs\.py worker\b)"
 )
 LLAMACPP_FIT_FAILURE_PATTERN = re.compile(r"failed to fit params to free device memory")
 _ENGINE_BUNDLE_FILES = {
@@ -205,6 +227,12 @@ class PreflightError(Exception):
         super().__init__(f"Pre-flight failed on {hostname}: {'; '.join(failures)}")
 
 
+def _plain_decimal(value: float) -> str:
+    """Format a bounded sampling value the way the start script validates it."""
+    text = f"{value:.4f}".rstrip("0")
+    return text + "0" if text.endswith(".") else text
+
+
 @dataclass(frozen=True)
 class ProvisioningIdentity:
     """Engine and immutable artifact selected for one provisioning operation."""
@@ -231,6 +259,7 @@ class LlamaCppRuntimeFit:
     gpu_layers: int
     total_layers: int
     estimator_overrun_used: bool
+    profile: ProfileEvidence | None = None
 
 
 def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
@@ -240,7 +269,22 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
     plans = list(LLAMACPP_PLAN_PATTERN.finditer(log_text))
     if not plans:
         raise ProvisioningError("llama.cpp startup log has no QIIP VRAM plan")
-    contexts = list(LLAMACPP_CONTEXT_PATTERN.finditer(log_text))
+    profile: ProfileEvidence | None = None
+    if plans[-1].group("sizing") == LlamaCppSizingMode.PROFILE.value:
+        # A profile launch also loads a speculative draft, which writes the
+        # same record kinds as the target. Read the target's records from the
+        # target's section only; the draft is verified separately.
+        try:
+            profile = parse_profile_evidence(log_text)
+            launch_text = latest_launch(log_text)
+            target_text = split_profile_sections(launch_text).target
+        except ProfileEvidenceError as exc:
+            raise ProvisioningError(str(exc)) from exc
+        slot_text = launch_text
+        log_text = target_text
+    else:
+        slot_text = log_text
+    contexts = list(LLAMACPP_CONTEXT_PATTERN.finditer(slot_text))
     if not contexts:
         raise ProvisioningError("llama.cpp startup log has no effective context record")
     aggregate_contexts = list(LLAMACPP_AGGREGATE_CONTEXT_PATTERN.finditer(log_text))
@@ -276,7 +320,22 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
         gpu_layers=int(offload["loaded"]),
         total_layers=int(offload["total"]),
         estimator_overrun_used=plan["estimator_overrun_used"] == "true",
+        profile=profile,
     )
+    if profile is None and LlamaCppCacheType.Q4_0.value in (
+        fit.cache_type_k,
+        fit.cache_type_v,
+    ):
+        raise ProvisioningError(
+            "llama.cpp planner sizing does not support a q4_0 KV cache"
+        )
+    if profile is not None and any(
+        record != (fit.cache_type_k, fit.cache_type_v)
+        for record in profile.target_cache_types
+    ):
+        raise ProvisioningError(
+            "llama.cpp runtime KV cache types differ from its VRAM plan"
+        )
     if (
         fit.train_context < 1
         or fit.context_per_slot < 1
@@ -300,7 +359,9 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
         )
     if fit.cache_type_k != fit.cache_type_v:
         raise ProvisioningError("llama.cpp managed startup requires matching K/V types")
-    expected_flash_attn = "auto" if fit.cache_type_k == "f16" else "on"
+    expected_flash_attn = (
+        "auto" if fit.cache_type_k == "f16" and profile is None else "on"
+    )
     if fit.flash_attn != expected_flash_attn:
         raise ProvisioningError(
             "llama.cpp managed cache type has an invalid Flash Attention policy"
@@ -344,8 +405,12 @@ def _parse_llamacpp_runtime_fit(log_text: str) -> LlamaCppRuntimeFit:
     return fit
 
 
+class ProvisioningOperationChangedError(RuntimeError):
+    """The inspected provisioning operation no longer owns the host."""
+
+
 @dataclass
-class _ProvisioningTask:
+class ProvisioningTask:
     task: asyncio.Task[None]
     identity: ProvisioningIdentity
     operation: BackgroundOperation
@@ -407,16 +472,160 @@ class NodeProvisioner:
             max_entry_bytes=settings.log_max_entry_bytes,
             max_completed_hosts=settings.log_max_completed_hosts,
         )
+        self._remote_logs = (
+            RemoteLogCollector(
+                ssh_client, self._log_buffer.store, self._log_buffer, settings
+            )
+            if self._log_buffer.store is not None
+            else None
+        )
         self._lifecycle = lifecycle_coordinator or HostLifecycleCoordinator()
         self._hf_token = hf_token
         self._nfs_export = nfs_export
         self._artifact_index = artifact_index
         self._background_tasks: set[asyncio.Task[None]] = set()
-        self._provisioning_tasks: dict[str, _ProvisioningTask] = {}
+        self._owner_updates: set[asyncio.Task[Node]] = set()
+        self._provisioning_tasks: dict[str, ProvisioningTask] = {}
+        self._explicit_cancel_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def log_buffer(self) -> ProvisioningLogBuffer:
         return self._log_buffer
+
+    def _begin_log(
+        self,
+        hostname: str,
+        engine: InferenceEngine,
+        *,
+        model: str | None = None,
+        operation: str = "provision",
+    ) -> None:
+        digest = hashlib.sha256()
+        files = [
+            *self._engine_scripts_dir(engine).glob("*"),
+            *self._common_scripts_dir().glob("*"),
+            Path(__file__).with_name("log_store.py"),
+            Path(__file__).with_name("diagnostics.py"),
+        ]
+        for path in sorted(files):
+            if path.is_file():
+                digest.update(path.name.encode())
+                digest.update(path.read_bytes())
+        self._log_buffer.create(
+            hostname,
+            engine=engine.value,
+            model=model,
+            operation=operation,
+            bundle_version="sha256:" + digest.hexdigest(),
+        )
+
+    async def collect_logs(self, hostname: str, attempt_id: str) -> dict[str, object]:
+        store = self._log_buffer.store
+        if (
+            store is None
+            or self._remote_logs is None
+            or store.get(attempt_id)["hostname"] != hostname
+        ):
+            raise KeyError(attempt_id)
+        # The durable manifest describes any unavailable source.
+        with suppress(SSHConnectionError, TimeoutError):
+            await self._collect_remote_logs(attempt_id)
+        await self._remote_logs.diagnose(attempt_id)
+        return store.get(attempt_id)
+
+    async def _collect_remote_logs(
+        self, attempt_id: str, *, finish: bool = False, cancel: bool = False
+    ) -> None:
+        assert self._remote_logs is not None
+        try:
+            async with asyncio.timeout(self._settings.diagnostics_timeout):
+                await self._remote_logs.collect(
+                    attempt_id, finish=finish, cancel=cancel
+                )
+        except TimeoutError:
+            # The outer deadline cancels collect(), bypassing its error handler.
+            self._remote_logs.store.issue(
+                attempt_id, "Remote log retrieval deadline exceeded", source="remote"
+            )
+            raise
+
+    async def _capture_failure(
+        self, hostname: str, stage: str, error: BaseException
+    ) -> None:
+        try:
+            attempt_id = self._log_buffer.attempts.get(hostname)
+            if self._remote_logs is not None and attempt_id is not None:
+                self._remote_logs.record_failure(attempt_id, stage, error)
+                await self._remote_logs.diagnose(attempt_id)
+        except Exception:
+            logger.warning(
+                "failure_diagnostics_unavailable", hostname=hostname, exc_info=True
+            )
+
+    async def _finish_remote_logs(self, hostname: str, *, cancel: bool = False) -> None:
+        try:
+            attempt_id = self._log_buffer.attempts.get(hostname)
+            if self._remote_logs is None or attempt_id is None:
+                return
+            manifest = await asyncio.to_thread(self._remote_logs.store.get, attempt_id)
+            if not manifest.get("phases"):
+                return
+            task = asyncio.current_task()
+            # A gateway shutdown stops retrieval, not the detached node worker.
+            interrupted = bool(task and task.cancelling()) and not cancel
+            await self._collect_remote_logs(
+                attempt_id, finish=not interrupted, cancel=cancel
+            )
+        except Exception:
+            logger.warning(
+                "remote_logs_finish_failed", hostname=hostname, exc_info=True
+            )
+
+    def _mark_log_complete(self, hostname: str) -> None:
+        try:
+            task = asyncio.current_task()
+            attempt_id = self._log_buffer.attempts.get(hostname)
+            store = self._log_buffer.store
+            if (
+                task
+                and task.cancelling()
+                and task not in self._explicit_cancel_tasks
+                and store
+                and attempt_id
+            ):
+                stored = store.get(attempt_id)
+                status = stored["status"]
+                # A genuinely recorded failure (structured failure object set
+                # by record_failure before diagnostics) must survive shutdown,
+                # with the interrupted collection recorded as a separate issue.
+                if status == "failed" and stored.get("failure"):
+                    store.issue(
+                        attempt_id,
+                        "Gateway collection interrupted; remote command left running",
+                    )
+                elif status != "complete":
+                    store.update(
+                        attempt_id,
+                        status="interrupted",
+                        failure_summary="Gateway collection interrupted; remote command left running",
+                    )
+        except Exception:
+            logger.warning(
+                "log_interrupt_status_failed", hostname=hostname, exc_info=True
+            )
+        try:
+            self._log_buffer.mark_complete(hostname)
+        except Exception:
+            logger.warning("log_completion_failed", hostname=hostname, exc_info=True)
+
+    def _engine_log_path(self, hostname: str, engine: InferenceEngine) -> str:
+        if self._remote_logs is not None:
+            return f"{self._settings.log_remote_root}/{self._log_buffer.attempts[hostname]}.engine.log"
+        return (
+            "/var/log/llamacpp-serve.log"
+            if engine == InferenceEngine.LLAMA_CPP
+            else "/var/log/vllm-serve.log"
+        )
 
     def validate_endpoint(self, hostname: str, port: int | None = None) -> str:
         """Return the canonical provisioned endpoint or fail with a config hint."""
@@ -513,7 +722,10 @@ class NodeProvisioner:
         required = {
             *(engine_dir / name for name in _ENGINE_BUNDLE_FILES[engine]),
             common_dir / "setup-base.sh",
+            common_dir / "profiles.sh",
         }
+        if self._remote_logs is not None:
+            required.add(common_dir / "provision-logs.py")
         missing = sorted(str(path) for path in required if not path.is_file())
         if missing:
             raise ProvisioningError(
@@ -532,6 +744,7 @@ class NodeProvisioner:
             "AUTOVLLM_NVIDIA_DRIVER_VERSION": self._settings.nvidia_driver_version,
             "AUTOVLLM_NVIDIA_DRIVER_SHA256": self._settings.nvidia_driver_sha256,
             "AUTOVLLM_API_PORT": str(self._settings.vllm_port),
+            "AUTOVLLM_MIN_FREE_GB": str(self._settings.min_disk_gb),
             "AUTOVLLM_LLMFIT_VERSION": self._llmfit_version,
             "AUTOVLLM_LLMFIT_SHA256": self._llmfit_sha256,
         }
@@ -550,6 +763,7 @@ class NodeProvisioner:
         artifact: ResolvedGGUFArtifact | None = None,
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
         vllm_params: VllmParams | None = None,
+        draft_artifact: ResolvedGGUFArtifact | None = None,
     ) -> dict[str, str]:
         """Return the exact environment accepted by the engine start script."""
         if engine == InferenceEngine.LLAMA_CPP:
@@ -580,6 +794,9 @@ class NodeProvisioner:
                 raise ProvisioningError("llama_cpp start requires a GGUF artifact")
             env["AUTOLLAMACPP_GGUF_PATH"] = artifact.node_relative_entrypoint
             env["AUTOLLAMACPP_MODEL_ALIAS"] = artifact.model_alias
+            if self._nfs_export is not None:
+                env["AUTOVLLM_NFS_EXPORT"] = self._nfs_export
+            env.update(self._profile_script_env(request, draft_artifact))
         else:
             if llamacpp_request is not None:
                 raise ProvisioningError(
@@ -588,7 +805,10 @@ class NodeProvisioner:
             env = {
                 "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
                 "AUTOVLLM_API_PORT": str(self._settings.vllm_port),
+                "AUTOVLLM_MIN_FREE_GB": str(self._settings.min_disk_gb),
             }
+            if self._nfs_export is not None:
+                env["AUTOVLLM_NFS_EXPORT"] = self._nfs_export
             if model is not None:
                 env["AUTOVLLM_MODEL"] = model
             if vllm_params is not None:
@@ -612,8 +832,67 @@ class NodeProvisioner:
                     env["AUTOVLLM_REASONING_PARSER"] = vllm_params.reasoning_parser
                 if vllm_params.dtype is not None:
                     env["AUTOVLLM_DTYPE"] = vllm_params.dtype
+                if vllm_params.gpu_devices is not None:
+                    env["AUTOVLLM_GPU_DEVICES"] = ",".join(
+                        str(device) for device in vllm_params.gpu_devices
+                    )
         if self._hf_token:
             env["HF_TOKEN"] = self._hf_token
+        return env
+
+    @staticmethod
+    def _profile_script_env(
+        request: LlamaCppRuntimeRequest,
+        draft_artifact: ResolvedGGUFArtifact | None,
+    ) -> dict[str, str]:
+        """Return the typed profile inputs, or nothing for planner sizing."""
+        profile = request.profile
+        if profile is None:
+            if draft_artifact is not None:
+                raise ProvisioningError(
+                    "a draft artifact is only valid with a llama.cpp profile"
+                )
+            return {}
+        if (profile.draft_artifact_id is None) != (draft_artifact is None) or (
+            draft_artifact is not None
+            and draft_artifact.artifact_id != profile.draft_artifact_id
+        ):
+            raise ProvisioningError(
+                "the resolved draft artifact differs from the llama.cpp profile"
+            )
+        sampling = profile.sampling
+        env = {
+            "AUTOLLAMACPP_PROFILE_ID": profile.profile_id,
+            "AUTOLLAMACPP_PROFILE_VERSION": str(profile.profile_version),
+            "AUTOLLAMACPP_PROFILE_UBATCH": str(profile.ubatch),
+            "AUTOLLAMACPP_PROFILE_REQUIRED_FREE_MIB": str(profile.required_free_mib),
+            "AUTOLLAMACPP_PROFILE_GPU_NAME": profile.gpu_name,
+            "AUTOLLAMACPP_PROFILE_GPU_MIN_TOTAL_MIB": str(profile.gpu_min_total_mib),
+            "AUTOLLAMACPP_PROFILE_SPEC_TYPE": profile.speculative_type.value,
+            "AUTOLLAMACPP_PROFILE_SPEC_DRAFT_N_MAX": str(
+                profile.speculative_draft_n_max
+            ),
+            "AUTOLLAMACPP_PROFILE_TEMPERATURE": _plain_decimal(sampling.temperature),
+            "AUTOLLAMACPP_PROFILE_TOP_P": _plain_decimal(sampling.top_p),
+            "AUTOLLAMACPP_PROFILE_TOP_K": str(sampling.top_k),
+            "AUTOLLAMACPP_PROFILE_DISABLE_CUDA_GRAPHS": (
+                "1" if profile.disable_cuda_graphs else "0"
+            ),
+        }
+        if profile.draft_cache_type is not None:
+            env["AUTOLLAMACPP_PROFILE_DRAFT_CACHE_TYPE"] = (
+                profile.draft_cache_type.value
+            )
+        if draft_artifact is not None:
+            env["AUTOLLAMACPP_PROFILE_DRAFT_GGUF_PATH"] = (
+                draft_artifact.node_relative_entrypoint
+            )
+        if sampling.min_p is not None:
+            env["AUTOLLAMACPP_PROFILE_MIN_P"] = _plain_decimal(sampling.min_p)
+        if sampling.presence_penalty is not None:
+            env["AUTOLLAMACPP_PROFILE_PRESENCE_PENALTY"] = _plain_decimal(
+                sampling.presence_penalty
+            )
         return env
 
     def _default_llamacpp_runtime_request(self) -> LlamaCppRuntimeRequest:
@@ -631,7 +910,7 @@ class NodeProvisioner:
         args: tuple[str, ...] = (),
         scripts_dir: str | None = None,
     ) -> str:
-        """Build one uniformly quoted remote script command."""
+        """Build quoted shell input for SSH or the recorder, never shell argv."""
         dir_name = scripts_dir or self._settings.scripts_dir.name
         script_path = str(PurePosixPath(dir_name, script_name))
         command = shlex.join(("bash", script_path, *args))
@@ -650,6 +929,8 @@ class NodeProvisioner:
         *,
         stream: str | None = None,
     ) -> None:
+        if self._remote_logs is not None and stream is not None:
+            return  # Remote raw output was already committed by its sequence.
         self._log_buffer.append(hostname, level, msg, stream=stream)
 
     async def list_tasks_raw(self) -> list[tuple[bytes, KeyValue]]:
@@ -667,8 +948,32 @@ class NodeProvisioner:
     ) -> None:
         """Write provisioning state to etcd (D-05). Best-effort (Pitfall 3)."""
         now = datetime.now(UTC)
+        store = self._log_buffer.store
+        attempt_id = self._log_buffer.attempts.get(hostname)
+        if not isinstance(attempt_id, str):
+            attempt_id = None
+        if store is not None and attempt_id is not None:
+            fields: dict[str, object] = {"stage": failed_step or step.value}
+            if step == ProvisioningStep.COMPLETE:
+                fields.update(
+                    status="complete",
+                    ready_at=now.isoformat(),
+                    finished_at=now.isoformat(),
+                )
+            if error:
+                failure = store.get(attempt_id).get("failure")
+                fields.update(
+                    status="failed",
+                    failure_summary=(
+                        f"{failure['failed_stage']}: {failure['original_error']}"
+                        if failure
+                        else f"{failed_step or step.value}: {error}"
+                    ),
+                )
+            store.update(attempt_id, **fields)
         state = ProvisioningState(
             hostname=hostname,
+            attempt_id=attempt_id,
             current_step=step,
             started_at=started_at or now,
             updated_at=now,
@@ -689,6 +994,147 @@ class NodeProvisioner:
             if stream == "stdout":
                 lines.append(line)
         return "\n".join(lines)
+
+    async def _reconcile_host(self, hostname: str, *, block: bool = True) -> bool:
+        """Recover evidence and detect live remote work on the node.
+
+        Runs under the host lifecycle lease before any new remote mutation.
+        The node is the authority on its own process groups: a read-only
+        ``active`` probe reports whether any attempt on this host still has a
+        live or surviving phase, so a newer local attempt cannot shadow an
+        older survivor and a second gateway cannot fence-bypass. Fresh or
+        legacy nodes get the compatible recorder placed first so the probe is
+        authoritative. Returns True when a live remote operation blocks a new
+        mutation (block=True) or a live/survivor operation was found so a
+        teardown can warn (block=False). Never re-runs remote setup or engine
+        launch.
+        """
+        store = self._log_buffer.store
+        if store is None or self._remote_logs is None:
+            return False
+        # A fresh node has no recorder yet and a legacy node lacks the
+        # ``active`` action; placing the compatible recorder first makes the
+        # probe authoritative. Uploading never starts a process, so fencing
+        # before setup begins is preserved. Best-effort: an unreachable node
+        # still blocks below through the probe itself.
+        with suppress(Exception):
+            await self._ensure_remote_recorder(hostname)
+        probe = await self._remote_logs.host_active(hostname)
+        if probe.get("unreachable"):
+            history = await asyncio.to_thread(store.history, hostname, limit=1)
+            if history["attempts"]:
+                store.issue(
+                    history["attempts"][0]["attempt_id"],
+                    f"Host unreachable during reconcile: {probe.get('error', '')}",
+                )
+            return block
+        if not probe.get("active"):
+            # A command can finish while the gateway is down; recover its
+            # terminal phase, exit status, and unseen records even when
+            # nothing is live anymore.
+            await self._recover_pending_evidence(hostname)
+            return False
+
+        status = probe.get("status")
+        reason = (
+            "Remote operation is still running on the node; "
+            "wait for it to finish or tear the host down before retrying"
+            if status in {"running", "launching"}
+            else (
+                "Remote process survived cancellation; it must be torn down "
+                "before retrying this host"
+            )
+        )
+        holder = probe.get("holder")
+        match = None
+        if isinstance(holder, str):
+            history = await asyncio.to_thread(store.history, hostname)
+            match = next(
+                (a for a in history["attempts"] if a["attempt_id"] == holder), None
+            )
+        if match is not None:
+            # Mirror remaining evidence for the holder before writing, and
+            # re-check: a phase that completed during the probe is not a block.
+            # A failed collection must retain the block; stale cached phases
+            # are no proof that the probed operation finished.
+            collected = True
+            try:
+                await self._remote_logs.collect(match["attempt_id"])
+            except Exception:
+                collected = False
+            phases = store.get(match["attempt_id"]).get("remote_phases") or {}
+            phase_id = probe.get("phase")
+            probed = phases.get(phase_id) if isinstance(phase_id, str) else None
+            if probed is None and phases:
+                probed = next(reversed(phases.values()))
+            if collected and probed is not None and probed.get("status") == "complete":
+                return False
+        else:
+            history = await asyncio.to_thread(store.history, hostname, limit=1)
+            match = history["attempts"][0] if history["attempts"] else None
+        if match is None:
+            # A live phase exists even if no local attempt row can be matched.
+            # It still blocks a mutation and must warn a teardown.
+            return True
+        survivor = status == "survivor"
+        existing = match.get("failure_summary") or ""
+        summary = (
+            existing
+            if reason in existing
+            else (f"{existing} (reconcile: {reason})" if existing else reason)
+        )
+        store.update(
+            match["attempt_id"],
+            status="interrupted",
+            survivor=survivor,
+            failure_summary=summary,
+        )
+        store.issue(match["attempt_id"], reason + "; conflicting retries blocked")
+        # A live/survivor operation was found: block a mutation (block=True)
+        # and warn a teardown that a remote process may still be running.
+        return True
+
+    async def _recover_pending_evidence(self, hostname: str) -> None:
+        """Mirror remote evidence for unfinished attempts when nothing is live.
+
+        A detached command can finish while the gateway is down; the active
+        probe then reports no live phase, but the terminal phase, exit status,
+        and unseen records still belong in the gateway store before the next
+        mutation is allowed.
+        """
+        store = self._log_buffer.store
+        if store is None or self._remote_logs is None:
+            return
+        history = await asyncio.to_thread(store.history, hostname, limit=5)
+        for attempt in history["attempts"]:
+            if attempt.get("status") not in {"running", "interrupted", "failed"}:
+                continue
+            with suppress(Exception):
+                await self.collect_logs(hostname, attempt["attempt_id"])
+
+    async def reconcile_pending_operations(self) -> None:
+        """Best-effort startup recovery for hosts with unfinished remote work.
+
+        Runs in the background so a slow or unreachable host cannot block
+        startup; the per-mutation ``_reconcile_host`` hook is the safety gate.
+        """
+        store = self._log_buffer.store
+        if store is None or self._remote_logs is None:
+            return
+        hostnames = await asyncio.to_thread(store.pending_hosts)
+        for hostname in hostnames:
+            # Hold the host lifecycle lease so a concurrent placement retry or
+            # user mutation cannot race the probe's write to a new attempt.
+            lease = await self.try_reserve_host(hostname)
+            if lease is None:
+                logger.info("startup_reconcile_skipped", hostname=hostname)
+                continue
+            try:
+                with suppress(Exception):
+                    await self._reconcile_host(hostname)
+            finally:
+                lease.release()
+            logger.info("startup_reconcile_finished", hostname=hostname)
 
     async def _power_on_if_needed(self, hostname: str) -> None:
         """Power on the host via Redfish if configured (D-01, D-06, D-07).
@@ -772,7 +1218,7 @@ class NodeProvisioner:
                 failures.append(
                     f"Insufficient disk: {gb:.1f}GB available, {self._settings.min_disk_gb}GB required"
                 )
-        except (SSHConnectionError, RemoteCommandError) as exc:
+        except (SSHConnectionError, RemoteCommandError, TimeoutError) as exc:
             failures.append(f"SSH diagnostic failed: {exc}")
         except (ValueError, IndexError) as exc:
             failures.append(
@@ -827,6 +1273,21 @@ class NodeProvisioner:
             )
 
         runtime = node.llamacpp_runtime
+        if (
+            request.sizing is LlamaCppSizingMode.PROFILE
+            or node.placement is not None
+            or (
+                runtime.requested.sizing is LlamaCppSizingMode.PROFILE
+                and not node.owner
+            )
+        ):
+            # An admin must take ownership before overriding automation.
+            # The old runtime remains intact until a verified replacement is
+            # committed, so a failed override can restore the exact profile.
+            raise RelaunchPreconditionError(
+                "Catalog-profile nodes are relaunched by automatic placement, "
+                "not with a custom sizing policy"
+            )
         if request.fit_target_mib >= min(gpu.total_mib for gpu in runtime.gpus):
             raise RelaunchValidationError(
                 "fit_target_mib must be smaller than every GPU's total VRAM"
@@ -840,6 +1301,23 @@ class NodeProvisioner:
                 "context_per_slot exceeds the model training context"
             )
         return node
+
+    async def stored_node(self, hostname: str) -> tuple[bool, Node | None]:
+        """Read *hostname*'s node key from etcd itself, not the registry.
+
+        Returns whether the key exists and the parsed node, which is ``None``
+        when the key is absent or its value cannot be parsed.
+        """
+        key = f"{self._etcd_client.prefix}{hostname}"
+        record = await asyncio.to_thread(self._etcd_client.get_record, key)
+        if record is None:
+            return False, None
+        return True, node_from_etcd(
+            record.key,
+            record.value,
+            self._etcd_client.prefix,
+            endpoint_policy=self._endpoint_policy,
+        )
 
     async def _read_node_record(self, hostname: str) -> tuple[EtcdRecord, Node]:
         key = f"{self._etcd_client.prefix}{hostname}"
@@ -957,6 +1435,11 @@ class NodeProvisioner:
             raise ValueError("lifecycle lease does not own this host")
 
         try:
+            if await self._reconcile_host(hostname):
+                raise RelaunchPreconditionError(
+                    "A prior provisioning operation is still active on the node; "
+                    "wait for it to finish or tear the host down before retrying"
+                )
             await self._relaunch_llamacpp(hostname, request)
         finally:
             lease.release()
@@ -968,16 +1451,21 @@ class NodeProvisioner:
         request: LlamaCppRuntimeRequest,
     ) -> tuple[str, LlamaCppRuntimeState]:
         """Launch and verify one exact llama.cpp runtime policy."""
+        draft_artifact = await self._resolve_draft_artifact(request)
+        gpus = await self._read_gpu_inventory(hostname, profile=request.profile)
         model_name = await self._run_start_vllm(
             hostname,
             engine=InferenceEngine.LLAMA_CPP,
             artifact=artifact,
             llamacpp_request=request,
+            draft_artifact=draft_artifact,
         )
         await self._poll_health(hostname, engine=InferenceEngine.LLAMA_CPP)
         runtime = await self._verify_llamacpp_runtime(
             hostname,
             expected_request=request,
+            draft_artifact=draft_artifact,
+            gpus=gpus,
         )
         return model_name, runtime
 
@@ -995,7 +1483,7 @@ class NodeProvisioner:
         request: LlamaCppRuntimeRequest,
     ) -> None:
         started_at = datetime.now(UTC)
-        self._log_buffer.create(hostname)
+        self._begin_log(hostname, InferenceEngine.LLAMA_CPP, operation="relaunch")
         self._log(hostname, "info", "llama.cpp relaunch started")
         await self._update_state(
             hostname,
@@ -1158,6 +1646,13 @@ class NodeProvisioner:
             self._log(hostname, "info", "llama.cpp relaunch complete")
             return
         except BaseException as error:
+            diagnostic_cancel: asyncio.CancelledError | None = None
+            if isinstance(error, Exception):
+                try:
+                    await self._capture_failure(hostname, current_step, error)
+                except asyncio.CancelledError as cancelled:
+                    # Diagnostics are secondary to restoring the stopped engine.
+                    diagnostic_cancel = cancelled
             if (
                 stop_attempted
                 and relaunch_record is not None
@@ -1249,6 +1744,11 @@ class NodeProvisioner:
                         is LlamaCppSizingMode.AUTO
                     ):
                         rollback_message = "Automatic sizing restored"
+                    elif (
+                        previous_node.llamacpp_runtime.requested.sizing
+                        is LlamaCppSizingMode.PROFILE
+                    ):
+                        rollback_message = "Previous catalog profile restored"
                     else:
                         rollback_message = "Previous custom sizing restored"
                     self._log(hostname, "warning", rollback_message)
@@ -1259,6 +1759,8 @@ class NodeProvisioner:
                         error=f"{error}; {rollback_message}",
                         started_at=started_at,
                     )
+                    if diagnostic_cancel is not None:
+                        raise diagnostic_cancel from error
                     raise
 
             if (
@@ -1294,12 +1796,17 @@ class NodeProvisioner:
                 error=str(error),
                 started_at=started_at,
             )
+            if diagnostic_cancel is not None:
+                raise diagnostic_cancel from error
             raise
         finally:
             if keepalive is not None:
                 keepalive.cancel()
                 with suppress(asyncio.CancelledError):
                     await keepalive
+            await self._finish_remote_logs(
+                hostname, cancel=asyncio.current_task() in self._explicit_cancel_tasks
+            )
             self._log_buffer.mark_complete(hostname)
 
     async def register_available(
@@ -1406,9 +1913,42 @@ class NodeProvisioner:
     async def update_node_owner(self, hostname: str, owner: str) -> Node:
         """Set the owner of a registered node, preserving its etcd lease.
 
-        Uses a CAS on the record revision so a concurrent status/liveness
-        write is never clobbered; retries a bounded number of times, then
-        raises ``ProvisioningError``.
+        The change takes the host lifecycle lease, like setup, relaunch and
+        teardown. Those operations decide what to do with a node record and
+        then act on it later, and a provision writes its final record from its
+        own arguments, so an owner written in between would be erased. While
+        one of them holds the host this raises ``ProvisioningError`` at once
+        instead of queueing behind a provision that can take many minutes.
+
+        The write runs in its own task, which releases the lease when it ends.
+        Cancelling the caller (a client that disconnects) therefore cannot
+        free the host while the etcd write may still land.
+        """
+        lease = await self._lifecycle.try_acquire(hostname)
+        if lease is None:
+            raise ProvisioningError(
+                f"Node {hostname!r} has a lifecycle operation in progress "
+                "(setup, relaunch, teardown or automatic placement); change "
+                "its owner when that finishes"
+            )
+        task = asyncio.create_task(self._write_node_owner(hostname, owner))
+
+        def finished(done: asyncio.Task[Node]) -> None:
+            lease.release()
+            self._owner_updates.discard(done)
+            if not done.cancelled():
+                done.exception()  # Retrieved: an abandoned caller never reads it.
+
+        self._owner_updates.add(task)
+        task.add_done_callback(finished)
+        return await asyncio.shield(task)
+
+    async def _write_node_owner(self, hostname: str, owner: str) -> Node:
+        """Revision-checked owner write. The caller holds the lifecycle lease.
+
+        The compare-and-swap keeps a concurrent status or liveness write, which
+        does not take the lease, from being clobbered; it retries a bounded
+        number of times, then raises ``ProvisioningError``.
         """
         key = f"{self._etcd_client.prefix}{hostname}"
         record = await asyncio.to_thread(self._etcd_client.get_record, key)
@@ -1425,7 +1965,15 @@ class NodeProvisioner:
                 raise ProvisioningError(
                     f"Node {hostname!r} has an invalid etcd registration"
                 )
-            replacement = node.model_copy(update={"owner": owner})
+            # Assigning an owner is a person taking the node over: it stops
+            # being an automatic placement, so automation never retries,
+            # clears or counts it again.
+            replacement = node.model_copy(
+                update={
+                    "owner": owner,
+                    "placement": None if owner else node.placement,
+                }
+            )
             _, value = node_to_etcd(replacement, self._etcd_client.prefix)
             new_revision = await asyncio.to_thread(
                 self._etcd_client.replace_if_revision,
@@ -1554,6 +2102,7 @@ class NodeProvisioner:
         vllm_params: VllmParams | None = None,
         lifecycle_lease: HostLifecycleLease | None = None,
         owner: str = "",
+        placement: NodePlacement | None = None,
     ) -> None:
         """Provision *hostname* under the shared host lifecycle coordinator."""
         # Validate before acquiring the lifecycle lease or touching the host.
@@ -1569,6 +2118,21 @@ class NodeProvisioner:
         elif llamacpp_request is not None:
             raise ProvisioningError(
                 "llama.cpp sizing policy is only valid for llama_cpp provisioning"
+            )
+        draft_artifact = await self._resolve_draft_artifact(llamacpp_request)
+        if placement is not None and (
+            not managed
+            or owner
+            or llamacpp_request is None
+            or llamacpp_request.profile is None
+            or (placement.profile_id, placement.profile_version)
+            != (
+                llamacpp_request.profile.profile_id,
+                llamacpp_request.profile.profile_version,
+            )
+        ):
+            raise ProvisioningError(
+                "automatic placement provisions one managed, unowned catalog profile"
             )
         lease = lifecycle_lease
         if lease is None:
@@ -1596,19 +2160,56 @@ class NodeProvisioner:
                     artifact=artifact,
                     llamacpp_request=llamacpp_request,
                     owner=owner,
+                    draft_artifact=draft_artifact,
+                    placement=placement,
                 )
         except asyncio.CancelledError:
-            self._log(hostname, "error", "Provisioning cancelled by teardown")
+            store = self._log_buffer.store
+            attempt_id = self._log_buffer.attempts.get(hostname)
+            attempt = store.get(attempt_id) if store and attempt_id else {}
+            if (
+                attempt.get("status") == "complete"
+                and attempt.get("stage") == "complete"
+            ):
+                # Cancellation during final log retrieval cannot undo registration.
+                self._mark_log_complete(hostname)
+                raise
+            if attempt.get("status") == "failed":
+                # A failure recorded before cancellation must survive; never
+                # rewrite it to the interrupted-collection state.
+                self._mark_log_complete(hostname)
+                raise
+            explicit = asyncio.current_task() in self._explicit_cancel_tasks
+            message = (
+                "Provisioning cancelled by teardown"
+                if explicit
+                else "Gateway collection interrupted; remote command left running"
+            )
+            self._log(hostname, "error", message)
             await self._update_state(
                 hostname,
                 ProvisioningStep.FAILED,
-                failed_step="cancelled",
-                error="Provisioning cancelled by teardown",
+                failed_step="cancelled" if explicit else "interrupted",
+                error=message,
             )
-            self._log_buffer.mark_complete(hostname)
+            self._mark_log_complete(hostname)
             raise
         finally:
             lease.release()
+
+    async def _resolve_draft_artifact(
+        self, request: LlamaCppRuntimeRequest | None
+    ) -> ResolvedGGUFArtifact | None:
+        """Resolve a profile's draft GGUF through the same artifact index."""
+        if (
+            request is None
+            or request.profile is None
+            or request.profile.draft_artifact_id is None
+        ):
+            return None
+        return await self.resolve_artifact_selection(
+            InferenceEngine.LLAMA_CPP, request.profile.draft_artifact_id
+        )
 
     async def _provision(
         self,
@@ -1621,6 +2222,8 @@ class NodeProvisioner:
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
         vllm_params: VllmParams | None = None,
         owner: str = "",
+        draft_artifact: ResolvedGGUFArtifact | None = None,
+        placement: NodePlacement | None = None,
     ) -> None:
         """Run full provisioning sequence on *hostname*.
 
@@ -1635,13 +2238,22 @@ class NodeProvisioner:
             engine=engine,
             vllm_params=vllm_params.model_dump() if vllm_params else None,
         )
-        self._log_buffer.create(hostname)
+        # Reachability first: a powered-off host must reach its BMC power-on
+        # step before the reconcile gate can judge it as unreachable.
+        await self._power_on_if_needed(hostname)
+        if await self._reconcile_host(hostname):
+            raise ProvisioningError(
+                "A prior provisioning operation is still active on the node; "
+                "wait for it to finish or tear the host down before retrying"
+            )
+        self._begin_log(
+            hostname, engine, model=artifact.model_alias if artifact else model
+        )
         self._log(hostname, "info", "Provisioning started")
 
         await self._update_state(
             hostname, ProvisioningStep.PENDING, started_at=provision_started_at
         )
-        await self._power_on_if_needed(hostname)
         await self._update_state(
             hostname, ProvisioningStep.PREFLIGHT, started_at=provision_started_at
         )
@@ -1659,6 +2271,7 @@ class NodeProvisioner:
                 error=str(exc),
                 started_at=provision_started_at,
             )
+            await self._capture_failure(hostname, "preflight", exc)
             self._log_buffer.mark_complete(hostname)
             raise
 
@@ -1678,6 +2291,7 @@ class NodeProvisioner:
                 artifact_id=artifact_id,
                 last_heartbeat=datetime.now(UTC),
                 managed=managed,
+                placement=placement,
             )
             key, value = node_to_etcd(node, self._etcd_client.prefix)
             await asyncio.to_thread(self._etcd_client.put, key, value)
@@ -1695,6 +2309,7 @@ class NodeProvisioner:
                 nonlocal current_step
                 current_step = step
 
+            current_step = "setup"
             await self._run_setup(
                 hostname,
                 started_at=provision_started_at,
@@ -1703,6 +2318,12 @@ class NodeProvisioner:
             )
             current_step = "gpu_verify"
             await self._verify_gpu(hostname)
+            gpus = await self._read_gpu_inventory(
+                hostname,
+                profile=(
+                    llamacpp_request.profile if llamacpp_request is not None else None
+                ),
+            )
             current_step = "starting_engine"
             if engine == InferenceEngine.LLAMA_CPP:
                 starting_step = ProvisioningStep.STARTING_LLAMACPP
@@ -1721,6 +2342,7 @@ class NodeProvisioner:
                 artifact=artifact,
                 llamacpp_request=llamacpp_request,
                 vllm_params=vllm_params,
+                draft_artifact=draft_artifact,
             )
             current_step = "health_poll"
             await self._update_state(
@@ -1736,6 +2358,8 @@ class NodeProvisioner:
                     expected_request=(
                         llamacpp_request or self._default_llamacpp_runtime_request()
                     ),
+                    draft_artifact=draft_artifact,
+                    gpus=gpus,
                 )
             current_step = "registering"
             await self._update_state(
@@ -1750,6 +2374,8 @@ class NodeProvisioner:
                 artifact_id=artifact_id,
                 llamacpp_runtime=llamacpp_runtime,
                 owner=owner,
+                gpus=gpus,
+                placement=placement,
             )
             await self._update_state(
                 hostname, ProvisioningStep.COMPLETE, started_at=provision_started_at
@@ -1775,6 +2401,7 @@ class NodeProvisioner:
                     artifact_id=artifact_id,
                     last_heartbeat=datetime.now(UTC),
                     managed=managed,
+                    placement=placement,
                 )
                 f_key, f_value = node_to_etcd(failed_node, self._etcd_client.prefix)
                 if value is not None:
@@ -1792,19 +2419,43 @@ class NodeProvisioner:
                         )
             except Exception:
                 logger.warning("failed_node_update_failed", hostname=hostname)
+            await self._capture_failure(hostname, current_step, exc)
             raise
         finally:
-            self._log_buffer.mark_complete(hostname)
+            await self._finish_remote_logs(
+                hostname, cancel=asyncio.current_task() in self._explicit_cancel_tasks
+            )
+            self._mark_log_complete(hostname)
 
         logger.info("provisioning_complete", hostname=hostname)
+
+    async def _ensure_remote_recorder(self, hostname: str) -> None:
+        """Idempotently place the node recorder so the active probe is valid.
+
+        Fresh nodes have no ``common/provision-logs.py`` and nodes provisioned
+        by an older gateway lack the ``active`` action; uploading first lets
+        the reconcile gate distinguish "no evidence" from "unreachable".
+        """
+        await self._ssh_client.upload(hostname, self._common_scripts_dir())
+        if self._remote_logs is not None:
+            await self._ssh_client.upload(
+                hostname,
+                Path(__file__).with_name("log_store.py"),
+                "common/log_store.py",
+            )
+            await self._ssh_client.upload(
+                hostname,
+                Path(__file__).with_name("diagnostics.py"),
+                "common/diagnostics.py",
+            )
 
     async def _upload_scripts(
         self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
     ) -> None:
         """Copy provisioning scripts to the remote host via SCP."""
-        scripts_dir, common_dir = self._required_script_bundles(engine)
+        scripts_dir, _common_dir = self._required_script_bundles(engine)
         await self._ssh_client.upload(hostname, scripts_dir)
-        await self._ssh_client.upload(hostname, common_dir)
+        await self._ensure_remote_recorder(hostname)
 
     async def _run_setup(
         self,
@@ -1820,7 +2471,17 @@ class NodeProvisioner:
             env=self._setup_script_env(engine),
             scripts_dir=self._engine_scripts_dir(engine).name,
         )
-        if engine == InferenceEngine.LLAMA_CPP:
+        output: AsyncIterator[tuple[str, str]]
+        if self._remote_logs is not None:
+            output = self._remote_logs.run(
+                hostname,
+                command,
+                stage="setup",
+                timeout=self._settings.llamacpp_setup_timeout
+                if engine == InferenceEngine.LLAMA_CPP
+                else None,
+            )
+        elif engine == InferenceEngine.LLAMA_CPP:
             output = self._ssh_client.run_streaming(
                 hostname,
                 command,
@@ -1874,6 +2535,78 @@ class NodeProvisioner:
             raise ProvisioningError(f"No GPUs detected on {hostname} after setup")
         self._log(hostname, "info", f"Detected {len(gpu_lines)} GPU(s)")
 
+    async def _read_gpu_inventory(
+        self, hostname: str, *, profile: LlamaCppProfileRuntime | None
+    ) -> tuple[NodeGPU, ...]:
+        """Read each GPU's identity from the node itself.
+
+        QUADS reports a product string and a processor count, not which GPUs a
+        booted host exposes. A catalog profile must find exactly the GPU it
+        was planned for: one device, the product's ``nvidia-smi`` name, and at
+        least the product's total memory. For every other setup the inventory
+        is recorded when available and never blocks the setup.
+        """
+        required = profile is not None
+        try:
+            output = await self._ssh_run_command(
+                hostname,
+                "nvidia-smi --query-gpu=index,uuid,name,memory.total "
+                "--format=csv,noheader,nounits",
+            )
+            gpus: list[NodeGPU] = []
+            for line in output.splitlines():
+                if not line.strip():
+                    continue
+                index, uuid, name, total = (part.strip() for part in line.split(","))
+                gpus.append(
+                    NodeGPU(
+                        index=int(index), uuid=uuid, name=name, total_mib=int(total)
+                    )
+                )
+            if not gpus:
+                raise ValueError("nvidia-smi returned no GPUs")
+        except Exception as exc:
+            if required:
+                raise ProvisioningError(
+                    f"could not read the GPU inventory of {hostname}: {exc}"
+                ) from exc
+            self._log(hostname, "warning", f"GPU inventory was not recorded: {exc}")
+            return ()
+        if profile is not None:
+            if len(gpus) != 1:
+                raise ProvisioningError(
+                    "catalog profiles support exactly one GPU per host; "
+                    f"{hostname} has {len(gpus)}"
+                )
+            gpu = gpus[0]
+            if gpu.name != profile.gpu_name:
+                raise ProvisioningError(
+                    f"profile {profile.profile_id} was planned for a "
+                    f"{profile.gpu_name!r}, but {hostname} has a {gpu.name!r}"
+                )
+            if gpu.total_mib < profile.gpu_min_total_mib:
+                raise ProvisioningError(
+                    f"profile {profile.profile_id} needs a GPU with at least "
+                    f"{profile.gpu_min_total_mib} MiB, but {hostname} reports "
+                    f"{gpu.total_mib} MiB"
+                )
+        return tuple(sorted(gpus, key=lambda gpu: gpu.index))
+
+    async def remote_lifecycle_processes(self, hostname: str) -> list[str]:
+        """Return qiip setup/start commands still running on *hostname*.
+
+        Cancelling a gateway task does not always stop its remote command.
+        Anything that is about to start provisioning on a host it did not just
+        provision itself asks the host first. Raises when the host cannot be
+        asked: "unknown" must never be read as "nothing is running".
+        """
+        output = await self._ssh_run_command(hostname, "ps -eo pid=,args=")
+        return [
+            line.strip()
+            for line in output.splitlines()
+            if _REMOTE_LIFECYCLE_PATTERN.search(line)
+        ]
+
     async def _stop_failed_llamacpp_start(self, hostname: str) -> None:
         """Best-effort cleanup after post-health llama.cpp verification fails."""
         command = self._script_command(
@@ -1896,16 +2629,119 @@ class NodeProvisioner:
                 f"also failed: {exc}",
             )
 
+    @staticmethod
+    def _verify_profile_evidence(
+        fit: LlamaCppRuntimeFit,
+        expected_request: LlamaCppRuntimeRequest,
+        draft_artifact: ResolvedGGUFArtifact | None,
+        gpus: tuple[NodeGPU, ...],
+        memory_rows: list[LlamaCppGPUState],
+    ) -> LlamaCppSpeculativeEffective | None:
+        """Compare a profile launch with the requested profile, field by field.
+
+        The profile id in the log is a label the start script echoed back. It
+        proves nothing, so every value the profile fixes is checked against
+        what llama-server itself reported.
+        """
+        profile = expected_request.profile
+        evidence = fit.profile
+        if profile is None:
+            if evidence is not None:
+                raise ProvisioningError(
+                    "llama.cpp launched a catalog profile that was not requested"
+                )
+            return None
+        if evidence is None:
+            raise ProvisioningError(
+                "llama.cpp startup log has no catalog profile evidence"
+            )
+        expected_draft_cache = (
+            profile.draft_cache_type.value
+            if profile.draft_cache_type is not None
+            else None
+        )
+        expected_draft_gguf = (
+            draft_artifact.node_relative_entrypoint
+            if draft_artifact is not None
+            else None
+        )
+        if (
+            evidence.profile_id != profile.profile_id
+            or evidence.profile_version != profile.profile_version
+            or evidence.ubatch != profile.ubatch
+            or evidence.spec_type != profile.speculative_type.value
+            or evidence.spec_draft_n_max != profile.speculative_draft_n_max
+            or evidence.draft_cache_type != expected_draft_cache
+            or evidence.draft_gguf != expected_draft_gguf
+            or evidence.required_free_mib != profile.required_free_mib
+            or evidence.cuda_graphs_disabled != profile.disable_cuda_graphs
+        ):
+            raise ProvisioningError(
+                "llama.cpp runtime differs from its requested catalog profile"
+            )
+        if (profile.draft_artifact_id is None) != (draft_artifact is None):
+            raise ProvisioningError(
+                "the verified draft artifact differs from the catalog profile"
+            )
+        if evidence.gpu_free_mib < profile.required_free_mib + fit.fit_target_mib:
+            raise ProvisioningError(
+                "llama.cpp launched with less free VRAM than the profile requires"
+            )
+        if len(memory_rows) != 1 or len(gpus) != 1:
+            raise ProvisioningError("catalog profiles support exactly one GPU per host")
+        if (
+            gpus[0].name != profile.gpu_name
+            or gpus[0].total_mib < profile.gpu_min_total_mib
+            or memory_rows[0].total_mib < profile.gpu_min_total_mib
+        ):
+            raise ProvisioningError(
+                "llama.cpp launched on a GPU other than the profile's product"
+            )
+        if evidence.gpu_uuid != gpus[0].uuid:
+            raise ProvisioningError(
+                "llama.cpp launched on a GPU other than the inventoried one"
+            )
+        shares_cache = (
+            profile.speculative_type is LlamaCppSpeculativeType.DRAFT_MTP_ASSISTANT
+        )
+        if evidence.draft_shares_target_cache != shares_cache:
+            raise ProvisioningError(
+                "llama.cpp draft cache sharing differs from the catalog profile"
+            )
+        return LlamaCppSpeculativeEffective(
+            type=LlamaCppSpeculativeType(evidence.spec_type),
+            draft_n_max=evidence.spec_draft_n_max,
+            draft_gpu_layers=evidence.draft_gpu_layers,
+            draft_total_layers=evidence.draft_total_layers,
+            draft_cache_type_k=(
+                None
+                if evidence.draft_cache_type_k is None
+                else LlamaCppCacheType(evidence.draft_cache_type_k)
+            ),
+            draft_cache_type_v=(
+                None
+                if evidence.draft_cache_type_v is None
+                else LlamaCppCacheType(evidence.draft_cache_type_v)
+            ),
+            draft_shares_target_cache=shares_cache,
+        )
+
     async def _verify_llamacpp_runtime(
         self,
         hostname: str,
         *,
         expected_request: LlamaCppRuntimeRequest,
+        draft_artifact: ResolvedGGUFArtifact | None = None,
+        gpus: tuple[NodeGPU, ...] = (),
     ) -> LlamaCppRuntimeState:
         """Fail closed unless the healthy server proves the managed fit contract."""
         try:
             log_text = await self._ssh_run_command(
-                hostname, "cat -- /var/log/llamacpp-serve.log"
+                hostname,
+                "cat -- "
+                + shlex.quote(
+                    self._engine_log_path(hostname, InferenceEngine.LLAMA_CPP)
+                ),
             )
             fit = _parse_llamacpp_runtime_fit(log_text)
             memory_text = await self._ssh_run_command(
@@ -1947,7 +2783,10 @@ class NodeProvisioner:
                 raise ProvisioningError(
                     "llama.cpp runtime fit target differs from its requested value"
                 )
-            if expected_request.sizing is LlamaCppSizingMode.CUSTOM:
+            speculative = self._verify_profile_evidence(
+                fit, expected_request, draft_artifact, gpus, memory_rows
+            )
+            if expected_request.sizing is not LlamaCppSizingMode.AUTO:
                 expected_cache_type = expected_request.cache_type
                 assert expected_cache_type is not None
                 if (
@@ -1957,7 +2796,8 @@ class NodeProvisioner:
                     or fit.cache_type_v != expected_cache_type.value
                 ):
                     raise ProvisioningError(
-                        "llama.cpp runtime differs from its requested custom sizing"
+                        "llama.cpp runtime differs from its requested "
+                        f"{expected_request.sizing.value} sizing"
                     )
             if (
                 fit.estimator_overrun_used
@@ -1986,6 +2826,8 @@ class NodeProvisioner:
                     gpu_layers=fit.gpu_layers,
                     total_layers=fit.total_layers,
                     estimator_overrun_used=fit.estimator_overrun_used,
+                    ubatch=fit.profile.ubatch if fit.profile is not None else None,
+                    speculative=speculative,
                 ),
                 gpus=tuple(sorted(memory_rows, key=lambda row: row.index)),
                 observed_at=datetime.now(UTC),
@@ -2025,6 +2867,7 @@ class NodeProvisioner:
         artifact: ResolvedGGUFArtifact | None = None,
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
         vllm_params: VllmParams | None = None,
+        draft_artifact: ResolvedGGUFArtifact | None = None,
     ) -> str:
         """Run the engine start script and extract model name from stdout."""
         if engine == InferenceEngine.LLAMA_CPP:
@@ -2039,11 +2882,26 @@ class NodeProvisioner:
                 artifact,
                 llamacpp_request=llamacpp_request,
                 vllm_params=vllm_params,
+                draft_artifact=draft_artifact,
             ),
             scripts_dir=self._engine_scripts_dir(engine).name,
         )
+        output: AsyncIterator[tuple[str, str]]
+        if self._remote_logs is not None:
+            log_path = self._engine_log_path(hostname, engine)
+            variable = (
+                "AUTOLLAMACPP_LOG_FILE"
+                if engine == InferenceEngine.LLAMA_CPP
+                else "AUTOVLLM_LOG_FILE"
+            )
+            command = f"{variable}={shlex.quote(log_path)} " + command
+            output = self._remote_logs.run(
+                hostname, command, stage="start", engine_log=log_path
+            )
+        else:
+            output = self._ssh_client.run_streaming(hostname, command)
         model_name: str | None = None
-        async for stream, line in self._ssh_client.run_streaming(hostname, command):
+        async for stream, line in output:
             logger.debug(
                 "start_vllm_output", stream=stream, line=line, hostname=hostname
             )
@@ -2052,6 +2910,10 @@ class NodeProvisioner:
                 match = MODEL_PATTERN.search(line)
                 if match:
                     model_name = match.group(1).strip()
+                    if self._log_buffer.store is not None:
+                        self._log_buffer.store.update(
+                            self._log_buffer.attempts[hostname], model=model_name
+                        )
                     self._log(hostname, "info", f"Detected model: {model_name}")
 
         if model_name is None:
@@ -2069,10 +2931,10 @@ class NodeProvisioner:
         self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
     ) -> None:
         """Tail engine log and feed lines into the provisioning log buffer."""
-        if engine == InferenceEngine.LLAMA_CPP:
-            log_path = "/var/log/llamacpp-serve.log"
-        else:
-            log_path = "/var/log/vllm-serve.log"
+        if self._remote_logs is not None:
+            await self._remote_logs.follow(self._log_buffer.attempts[hostname])
+            return
+        log_path = self._engine_log_path(hostname, engine)
         try:
             async for _stream, line in self._ssh_client.run_streaming(
                 hostname, f"tail -n +1 -f {log_path}"
@@ -2138,6 +3000,8 @@ class NodeProvisioner:
         llamacpp_runtime: LlamaCppRuntimeState | None = None,
         self_setup: bool = False,
         owner: str = "",
+        gpus: tuple[NodeGPU, ...] = (),
+        placement: NodePlacement | None = None,
     ) -> None:
         """Register node in etcd with correct fields (D-11, D-12)."""
         node = Node(
@@ -2152,6 +3016,8 @@ class NodeProvisioner:
             managed=managed,
             self_setup=self_setup,
             owner=owner,
+            gpus=gpus,
+            placement=placement,
         )
         key, value = node_to_etcd(node, self._etcd_client.prefix)
         # ponytail: etcd3gw is sync, asyncio.to_thread wraps it (Pitfall 5)
@@ -2235,7 +3101,7 @@ class NodeProvisioner:
             if task_name is None:
                 task_name = f"{operation.value}:{provisioning_hostname}"
 
-        record: _ProvisioningTask | None = None
+        record: ProvisioningTask | None = None
         scheduled_coro = coro
         if provisioning_hostname is not None:
 
@@ -2261,7 +3127,7 @@ class NodeProvisioner:
         if provisioning_hostname is not None:
             if provisioning_identity is None:  # narrowed by the paired check above
                 raise RuntimeError("provisioning identity was not initialized")
-            record = _ProvisioningTask(task, provisioning_identity, operation)
+            record = ProvisioningTask(task, provisioning_identity, operation)
             self._provisioning_tasks[provisioning_hostname] = record
 
         def _task_done(done_task: asyncio.Task[None]) -> None:
@@ -2307,20 +3173,51 @@ class NodeProvisioner:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+    def active_provision(self, hostname: str) -> ProvisioningTask | None:
+        """Inspect the current provisioning operation without mutating it."""
+        record = self._provisioning_tasks.get(hostname)
+        if (
+            record is None
+            or record.task.done()
+            or record.operation is not BackgroundOperation.PROVISION
+        ):
+            return None
+        return record
+
     async def cancel_active_provision(
         self, hostname: str
     ) -> ProvisioningIdentity | None:
-        """Cancel *hostname* provisioning and return its serving identity."""
-        record = self._provisioning_tasks.get(hostname)
-        if record is None or record.task.done():
-            return None
-        if record.operation is not BackgroundOperation.PROVISION:
-            return None
+        """Cancel the current provision for automatic-placement fencing.
 
+        Manual teardown must instead inspect, persist suspension, and then
+        cancel that inspected record through ``cancel_provision``.
+        """
+        record = self.active_provision(hostname)
+        if record is None:
+            return None
+        return await self.cancel_provision(hostname, record)
+
+    async def cancel_provision(
+        self, hostname: str, record: ProvisioningTask
+    ) -> ProvisioningIdentity:
+        """Cancel only the inspected record, never its replacement.
+
+        There is no await between checking identity and cancelling the task.
+        Callers may safely persist operator intent after inspection without
+        risking cancellation of another operation that took its place.
+        """
+        if self.active_provision(hostname) is not record:
+            raise ProvisioningOperationChangedError(
+                f"Provisioning operation for '{hostname}' changed; retry teardown"
+            )
         task = record.task
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+        self._explicit_cancel_tasks.add(task)
+        try:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        finally:
+            self._explicit_cancel_tasks.discard(task)
 
         if not task.cancelled():
             raise RuntimeError(
@@ -2370,6 +3267,15 @@ class NodeProvisioner:
             raise ValueError("lifecycle lease does not own this host")
 
         try:
+            if await self._reconcile_host(hostname, block=False):
+                logger.warning(
+                    "teardown_reconcile_survivor",
+                    hostname=hostname,
+                    reason=(
+                        "a prior remote operation is still active on the node; "
+                        "kill it manually on the host before reprovisioning"
+                    ),
+                )
             engine = self._resolve_teardown_engine(
                 hostname,
                 force=force,
@@ -2435,7 +3341,7 @@ class NodeProvisioner:
         """
         teardown_started_at = datetime.now(UTC)
         logger.info("teardown_start", hostname=hostname, force=force, engine=engine)
-        self._log_buffer.create(hostname)
+        self._begin_log(hostname, engine, operation="teardown")
         self._log(hostname, "info", f"Teardown started (force={force})")
 
         try:
@@ -2535,6 +3441,7 @@ class NodeProvisioner:
                 error=str(exc),
                 started_at=teardown_started_at,
             )
+            await self._capture_failure(hostname, "teardown", exc)
             if self._registry is not None:
                 self._registry.update_status(
                     hostname,
@@ -2545,6 +3452,7 @@ class NodeProvisioner:
                 )
             raise
         finally:
-            self._log_buffer.mark_complete(hostname)
+            await self._finish_remote_logs(hostname)
+            self._mark_log_complete(hostname)
 
         logger.info("teardown_complete", hostname=hostname)

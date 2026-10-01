@@ -12,6 +12,8 @@ TOOL_CALL_PARSER_OVERRIDE="${AUTOVLLM_TOOL_CALL_PARSER:-}"
 REASONING_PARSER_OVERRIDE="${AUTOVLLM_REASONING_PARSER:-}"
 DTYPE_OVERRIDE="${AUTOVLLM_DTYPE:-}"
 EXTRA_ARGS_OVERRIDE="${AUTOVLLM_EXTRA_ARGS:-}"
+GPU_DEVICES_OVERRIDE="${AUTOVLLM_GPU_DEVICES:-}"
+VLLM_ENV_FILE="${AUTOVLLM_ENV_FILE:-/etc/vllm/vllm.env}"
 ATTENTION_BACKEND_OVERRIDE="${AUTOVLLM_ATTENTION_BACKEND:-}"
 FLASHINFER_CACHE="${AUTOVLLM_FLASHINFER_CACHE_DIR:-/var/cache/flashinfer}"
 SCRIPT_DIR="${AUTOVLLM_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
@@ -44,6 +46,8 @@ unset FLASHINFER_DISABLE_JIT FLASHINFER_CACHE_DIR
 source "${SCRIPT_DIR}/vllm-process.sh"
 # shellcheck source=auto-vllm/preflight.sh
 source "${SCRIPT_DIR}/preflight.sh"
+# shellcheck disable=SC1091 source=../common/setup-base.sh
+source "$(cd -- "${SCRIPT_DIR}/.." && pwd)/common/setup-base.sh"
 
 detect_gpu_info() {
     if ! command -v nvidia-smi &>/dev/null; then
@@ -54,25 +58,42 @@ detect_gpu_info() {
         echo "FATAL: nvidia-smi failed. NVIDIA driver may not be loaded." >&2
         exit 1
     fi
-    GPU_MODEL=$(nvidia-smi --query-gpu=name --format=csv,noheader -i 0 | xargs)
     GPU_COUNT=$(nvidia-smi --list-gpus | wc -l)
-    GPU_VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i 0)
+    validate_gpu_devices_list "$GPU_COUNT"
+    # Profile data comes from the first SELECTED device so an explicit subset
+    # is sized against its own cards. GPU_COUNT stays the physical inventory;
+    # nvidia-smi ignores CUDA_VISIBLE_DEVICES, so these queries are physical.
+    local query_index=0
+    GPU_DEVICES_ARRAY=()
+    if [ -n "$GPU_DEVICES_OVERRIDE" ]; then
+        IFS=',' read -r -a GPU_DEVICES_ARRAY <<< "$GPU_DEVICES_OVERRIDE"
+        query_index="${GPU_DEVICES_ARRAY[0]}"
+    fi
+    GPU_DEVICE_COUNT="${#GPU_DEVICES_ARRAY[@]}"
+    [ "$GPU_DEVICE_COUNT" -eq 0 ] && GPU_DEVICE_COUNT="$GPU_COUNT"
+    GPU_MODEL=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$query_index" | xargs)
+    GPU_VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "$query_index")
     GPU_VRAM_GB=$(( (GPU_VRAM_MB + 512) / 1024 ))
-    GPU_COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i 0 | xargs)
+    GPU_COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i "$query_index" | xargs)
 }
 
 configure_vllm_params() {
-    local total_vram=$((GPU_COUNT * GPU_VRAM_GB))
+    [ -z "${GPU_DEVICE_COUNT:-}" ] && GPU_DEVICE_COUNT="$GPU_COUNT"
+    # Size the model by the EFFECTIVE allocation: an explicit tensor-parallel
+    # override below the (selected) device count allocates fewer cards than
+    # the inventory suggests, and the profile model must match that.
+    local sizing_tp="${TENSOR_PARALLEL_OVERRIDE:-$GPU_DEVICE_COUNT}"
+    local total_vram=$((sizing_tp * GPU_VRAM_GB))
 
-    TENSOR_PARALLEL=$GPU_COUNT
+    TENSOR_PARALLEL="$(profile_tensor_parallel)"
     GPU_MEM_UTIL=0.90
     MAX_MODEL_LEN=32768
     MAX_BATCHED_TOKENS=32768
     EXTRA_ARGS=""
     DEFAULT_DTYPE=""
 
-    case "$GPU_MODEL" in
-        *"H100"*|*"A100"*)
+    case "$PROFILE_BUCKET" in
+        hopper|ampere-a100)
             echo "High-end GPU detected: optimizing for throughput"
             # BF16 weights need roughly two bytes per parameter. These
             # thresholds leave additional memory for KV cache and runtime
@@ -90,12 +111,11 @@ configure_vllm_params() {
             GPU_MEM_UTIL=0.90
             ;;
 
-        *"A30"*|*"A40"*)
+        ampere-a30|ga102-dc)
             # Ampere data-center cards (A30 24GB, A40 48GB). Not covered by the
             # A100/H100 branch: that branch assumes >=48GB per card and would
             # pick a model too large to leave any room for the KV cache here.
             echo "Ampere data-center GPU detected: tuning model to available VRAM"
-            TENSOR_PARALLEL=$GPU_COUNT
             GPU_MEM_UTIL=0.90
             MAX_MODEL_LEN=32768
 
@@ -108,9 +128,8 @@ configure_vllm_params() {
             fi
             ;;
 
-        *"T4"*)
+        turing)
             echo "Tesla T4 detected: optimizing for memory efficiency"
-            TENSOR_PARALLEL=1
             MAX_MODEL_LEN=2048
             MAX_BATCHED_TOKENS=2048
             DEFAULT_DTYPE=float16
@@ -124,9 +143,8 @@ configure_vllm_params() {
             fi
             ;;
 
-        *"V100"*)
+        volta)
             echo "Tesla V100 detected: balanced configuration"
-            TENSOR_PARALLEL=$GPU_COUNT
             GPU_MEM_UTIL=0.85
             MAX_MODEL_LEN=8192
             DEFAULT_DTYPE=float16
@@ -138,9 +156,8 @@ configure_vllm_params() {
             fi
             ;;
 
-        *"RTX"*|*"GeForce"*)
+        consumer-ada|consumer-ampere|consumer-turing)
             echo "Consumer GPU detected: conservative settings"
-            TENSOR_PARALLEL=1
             GPU_MEM_UTIL=0.80
             MAX_MODEL_LEN=4096
 
@@ -153,12 +170,8 @@ configure_vllm_params() {
             ;;
 
         *)
-            echo "Unknown GPU: using conservative defaults"
-            TENSOR_PARALLEL=1
-            GPU_MEM_UTIL=0.75
-            MAX_MODEL_LEN=4096
-            MODEL="Qwen/Qwen2.5-7B-Instruct"
-            EXTRA_ARGS="--enforce-eager"
+            echo "FATAL: no runtime profile selected for this hardware; run setup.sh or check select_runtime_profile" >&2
+            return 1
             ;;
     esac
 
@@ -204,6 +217,9 @@ clear_script_environment() {
     unset AUTOVLLM_STARTUP_GRACE_PERIOD AUTOVLLM_STARTUP_LOG_LINES
     unset AUTOVLLM_STOP_TIMEOUT AUTOVLLM_STOP_INTERVAL
     unset AUTOVLLM_ATTENTION_BACKEND AUTOVLLM_FLASHINFER_CACHE_DIR
+    unset AUTOVLLM_NFS_EXPORT
+    unset AUTOVLLM_GPU_DEVICES
+    unset AUTOVLLM_ENV_FILE
 }
 
 configure_attention_backend() {
@@ -302,12 +318,36 @@ prepare_hf_cache() {
 prestage_model_weights() {
     local model="$1"
 
+    # Local directory — already on the node
     if [ -d "$model" ]; then
         return 0
     fi
 
+    # Verify-first: the gateway pre-downloads into the shared export, so a
+    # complete snapshot needs no network and no repeated download. The
+    # local-only verification is idempotent, which is the reusable
+    # verified-completion check. Hub resolves repos under cache_dir, so the
+    # cache root is <mount>/hub, NOT the mount root (HF_HOME=<mount> used for
+    # downloads resolves to the same <mount>/hub).
+    local cache_dir="${NFS_MOUNT_POINT}/hub"
+    local verify_rc=0
+    verify_hf_snapshot "$model" "$cache_dir" || verify_rc=$?
+    if [ "$verify_rc" -eq 0 ]; then
+        echo "Model weights verified complete in shared cache: ${model}"
+        export HF_HUB_OFFLINE=1
+        return 0
+    fi
+    if [ "$verify_rc" -eq 2 ]; then
+        echo "FATAL: cached model ${model} is incomplete; remove ${NFS_MOUNT_POINT}/hub/models--${model//\//'--'} and re-run" >&2
+        return 1
+    fi
+    if [ "$verify_rc" -ne 3 ]; then
+        echo "FATAL: cannot verify cached model ${model} (rc=${verify_rc})" >&2
+        return 1
+    fi
+
     local avail_bytes model_bytes
-    avail_bytes=$(df --output=avail -B1 "$NFS_MOUNT_POINT" 2>/dev/null | tail -1 | xargs) || true
+    avail_bytes=$(timeout --kill-after=2 "${AUTOVLLM_PROBE_TIMEOUT:-10}" df --output=avail -B1 "$NFS_MOUNT_POINT" 2>/dev/null | tail -1 | xargs) || true
     model_bytes=$("$VLLM_PYTHON" -c "
 import sys; from huggingface_hub import model_info
 print(sum(s.size or 0 for s in model_info(sys.argv[1]).siblings))
@@ -321,12 +361,20 @@ print(sum(s.size or 0 for s in model_info(sys.argv[1]).siblings))
         return 1
     fi
 
-    echo "Pre-staging model weights in single process: ${model}"
-    HF_HOME="$NFS_MOUNT_POINT" "$VLLM_PYTHON" -c "
+    echo "Preparing model weights (download to shared cache; progress below): ${model}"
+    if ! HF_HOME="$NFS_MOUNT_POINT" "$VLLM_PYTHON" -c "
 import sys; from huggingface_hub import snapshot_download
 snapshot_download(sys.argv[1])
-" "$model"
-    echo "Model weights staged; vLLM will launch with HF_HUB_OFFLINE=1"
+" "$model"; then
+        echo "FATAL: model ${model} download failed; check network access, cache free space, and that the export is not root_squashed for this node" >&2
+        return 1
+    fi
+
+    if ! verify_hf_snapshot "$model" "$cache_dir"; then
+        echo "FATAL: model ${model} download did not produce a verifiable snapshot" >&2
+        return 1
+    fi
+    echo "Model weights staged and verified; vLLM will launch with HF_HUB_OFFLINE=1"
     export HF_HUB_OFFLINE=1
 }
 
@@ -382,7 +430,9 @@ run_vllm() {
 
 # vLLM Configuration
 # ================================================
-# GPU:                $GPU_COUNT x $GPU_MODEL ($GPU_VRAM_GB GB)
+# GPU (physical):     $GPU_COUNT x $GPU_MODEL ($GPU_VRAM_GB GB)
+# CUDA Visible:       ${CUDA_VISIBLE_DEVICES:-all}
+# Profile:            ${PROFILE_BUCKET:-unknown} (${PROFILE_REASON:-})
 # Model:              $MODEL
 # Tensor Parallel:    $TENSOR_PARALLEL
 # Memory Util:        ${GPU_MEM_UTIL}
@@ -414,6 +464,24 @@ EOF
             "${dtype_args[@]+"${dtype_args[@]}"}"
     fi
 
+    # The recorder unlocks at the serving-process handoff so the long-lived
+    # engine and its log sink cannot hold the host mutation fence after the
+    # launch step completes.
+    if [ -n "${QIIP_LOCK_FD:-}" ] && [[ "${QIIP_LOCK_FD}" =~ ^[0-9]+$ ]] && [ "${QIIP_LOCK_FD}" -ge 3 ]; then
+        eval "exec ${QIIP_LOCK_FD}>&-"
+    fi
+
+    local engine_log_fd
+    if [ -n "${QIIP_LOG_CONFIG:-}" ]; then
+        # "exec" matters: bash 5.1 (RHEL 9) otherwise keeps a wrapper shell alive
+        # for the process substitution, and that shell still holds this script's
+        # stdout and stderr. The gateway's command worker reads those until EOF,
+        # so it would never see the start command finish.
+        exec {engine_log_fd}> >(exec python3 "${SCRIPT_DIR}/../common/provision-logs.py" engine >/dev/null 2>&1)
+    else
+        exec {engine_log_fd}> "$VLLM_LOG_FILE"
+    fi
+
     # EXTRA_ARGS is an intentional word-split shell override.
     # shellcheck disable=SC2086
     "$VLLM_BIN" serve "$MODEL" \
@@ -428,16 +496,54 @@ EOF
         "${reasoning_args[@]+"${reasoning_args[@]}"}" \
         ${EXTRA_ARGS:-} \
         "${dtype_args[@]+"${dtype_args[@]}"}" \
-        > "$VLLM_LOG_FILE" 2>&1 &
+        >&"$engine_log_fd" 2>&1 &
 
     local pid=$!
+    exec {engine_log_fd}>&-
     echo "$pid" > "$PID_FILE"
     verify_vllm_started "$pid"
     echo "vLLM started (PID ${pid})"
 }
 
+# Persist the effective launch settings for vllm.service (EnvironmentFile).
+# Full rewrite, atomic via tmp + mv, so a run without a device selection
+# cannot leave stale AUTOVLLM_GPU_DEVICES behind. The node is the only writer.
+persist_vllm_env() {
+    local env_file="$VLLM_ENV_FILE"
+    local tmp_file
+    mkdir -p "$(dirname "$env_file")" || return 1
+    tmp_file=$(mktemp "${env_file}.XXXXXX") || return 1
+    {
+        echo "AUTOVLLM_TENSOR_PARALLEL=${TENSOR_PARALLEL}"
+        echo "AUTOVLLM_MODEL=${MODEL}"
+        echo "AUTOVLLM_GPU_MEM_UTIL=${GPU_MEM_UTIL}"
+        echo "AUTOVLLM_MAX_MODEL_LEN=${MAX_MODEL_LEN}"
+        echo "AUTOVLLM_MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS}"
+        # Optional effective overrides: only persist when set, so an empty
+        # value never forces a different default on a manual systemctl start.
+        if [ -n "$TOOL_CALL_PARSER_OVERRIDE" ]; then
+            echo "AUTOVLLM_TOOL_CALL_PARSER=${TOOL_CALL_PARSER_OVERRIDE}"
+        fi
+        if [ -n "$REASONING_PARSER_OVERRIDE" ]; then
+            echo "AUTOVLLM_REASONING_PARSER=${REASONING_PARSER_OVERRIDE}"
+        fi
+        if [ -n "$EFFECTIVE_DTYPE" ]; then
+            echo "AUTOVLLM_DTYPE=${EFFECTIVE_DTYPE}"
+        fi
+        if [ -n "$EXTRA_ARGS" ]; then
+            echo "AUTOVLLM_EXTRA_ARGS=${EXTRA_ARGS}"
+        fi
+        if [ -n "$GPU_DEVICES_OVERRIDE" ]; then
+            echo "AUTOVLLM_GPU_DEVICES=${GPU_DEVICES_OVERRIDE}"
+        fi
+    } > "$tmp_file"
+    chmod 0644 "$tmp_file"
+    mv "$tmp_file" "$env_file"
+}
+
 main() {
     detect_gpu_info
+    select_runtime_profile vllm || exit $?
     configure_vllm_params
 
     EXPECTED_GPU_COUNT="$GPU_COUNT"
@@ -447,7 +553,22 @@ main() {
     prepare_hf_cache
     run_preflight
     prestage_model_weights "$MODEL"
+    # Preflight could only WARN when config.json was not cached yet; weights
+    # are local now, so the topology check is conclusive before launch.
+    local topo_rc=0
+    verify_model_topology "$MODEL_PATH" "$EXPECTED_TENSOR_PARALLEL" || topo_rc=$?
+    if [ "$topo_rc" -eq 1 ]; then
+        exit 1
+    elif [ "$topo_rc" -eq 2 ]; then
+        echo "WARNING: model topology not verifiable post-packaging; engine will validate" >&2
+    fi
     run_vllm
+    # Only a verified start persists the settings: a failed stop or a
+    # replacement that exits during startup aborts above, leaving the previous
+    # working file in place so a later restart does not retry a configuration
+    # that never worked. The systemd path execs before verification is
+    # possible and therefore never rewrites the file itself.
+    persist_vllm_env || echo "WARNING: could not persist launch settings to ${VLLM_ENV_FILE}" >&2
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

@@ -728,7 +728,7 @@ def test_managed_start_requires_positive_fit_target(value: str) -> None:
 @pytest.mark.parametrize(
     ("values", "message"),
     [
-        ({"AUTOLLAMACPP_MANAGED_SIZING": "invalid"}, "must be auto or custom"),
+        ({"AUTOLLAMACPP_MANAGED_SIZING": "invalid"}, "must be auto, custom or profile"),
         (
             {
                 "AUTOLLAMACPP_MANAGED_SIZING": "auto",
@@ -932,10 +932,15 @@ if [ "$*" != '--version' ]; then
     printf 'server' >> "$AUTOLLAMACPP_TEST_LOG"
     printf ' <%s>' "$@" >> "$AUTOLLAMACPP_TEST_LOG"
     printf '\n' >> "$AUTOLLAMACPP_TEST_LOG"
-    expected='--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --version'
-    [ "$*" = "$expected" ] || exit 46
+    q8='--cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --version'
+    mtp='--cache-type-k q4_0 --cache-type-v q4_0 --flash-attn on --ubatch-size 256 --spec-type draft-mtp --spec-draft-n-max 2 --cache-type-k-draft f16 --cache-type-v-draft f16 --no-mmproj --jinja --version'
+    dflash='--spec-type draft-dflash --spec-draft-n-max 7 --version'
+    case "$*" in
+        "$q8"|"$mtp"|"$dflash") ;;
+        *) exit 46 ;;
+    esac
 fi
-echo 'version: 10242 (b10242)' >&2
+echo 'version: 0.4.1 (build 0, commit v0.4.1)' >&2
 EOF
     cat > "$build_dir/bin/llama-fit-params" <<'EOF'
 #!/bin/bash
@@ -948,7 +953,7 @@ case "$*" in
     "$metadata"|"$estimate") ;;
     *) exit 45 ;;
 esac
-echo 'version: 10242 (b10242)' >&2
+echo 'version: 0.4.1 (build 0, commit v0.4.1)' >&2
 EOF
     cat > "$build_dir/bin/llama-quantize" <<'EOF'
 #!/bin/bash
@@ -958,7 +963,10 @@ EOF
 fi
 """,
     )
-    _write_executable(fake_bin / "nvcc", "#!/bin/bash\nexit 0\n")
+    _write_executable(
+        fake_bin / "nvcc",
+        "#!/bin/bash\necho 'Cuda compilation tools, release 13.0, V13.0.88'\n",
+    )
     _write_executable(
         fake_bin / "nvidia-smi",
         """#!/bin/bash
@@ -985,10 +993,10 @@ exec "$@"
         **os.environ,
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "AUTOVLLM_TMP_DIR": str(tmp_path),
-        "AUTOLLAMACPP_VERSION": "b10242",
+        "AUTOLLAMACPP_VERSION": "v0.4.1",
         "AUTOLLAMACPP_SHA256": digest,
         "AUTOLLAMACPP_SOURCE_URL": (
-            "https://mirror.example/llama.cpp/b10242/source.tar.gz"
+            "https://mirror.example/llama.cpp/v0.4.1/source.tar.gz"
         ),
         "AUTOLLAMACPP_INSTALL_ROOT": str(install_root),
         "AUTOLLAMACPP_LINK_DIR": str(link_dir),
@@ -1011,7 +1019,7 @@ def test_setup_defaults_match_gateway_source_pair() -> None:
     assert result.stdout.splitlines() == [
         DEFAULT_LLAMACPP_VERSION,
         DEFAULT_LLAMACPP_SHA256,
-        ("https://github.com/ggml-org/llama.cpp/archive/refs/tags/b10242.tar.gz"),
+        ("https://github.com/ggml-org/llama.cpp/archive/refs/tags/v0.4.1.tar.gz"),
     ]
 
 
@@ -1036,8 +1044,9 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     assert "<-DLLAMA_BUILD_EXAMPLES=OFF>" in configure
     assert "<-DLLAMA_BUILD_SERVER=ON>" in configure
     assert "<-DLLAMA_BUILD_UI=OFF>" in configure
-    assert "<-DLLAMA_BUILD_NUMBER=10242>" in configure
-    assert "<-DLLAMA_BUILD_COMMIT=b10242>" in configure
+    assert "<-DLLAMA_BUILD_IS_DEV=OFF>" in configure
+    assert "-DLLAMA_BUILD_NUMBER" not in configure
+    assert "<-DLLAMA_BUILD_COMMIT=v0.4.1>" in configure
     build = next(line for line in operations if line.startswith("cmake <--build>"))
     assert "<llama-server> <llama-fit-params> <llama-quantize>" in build
     assert (
@@ -1065,6 +1074,33 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
         "58917efc78ca760a2a1dd162d84e6cf1930c5b62a8dd9710bb4579ca4f2d69dc"
     ) in marker_text
     assert "compute_capabilities=8.0,9.0" in marker_text
+
+
+def test_install_resolves_nvcc_after_toolkit_install(tmp_path: Path) -> None:
+    # A fresh node has no nvcc when setup.sh is sourced, and the toolkit step
+    # (a subshell) installs it later, so install_llamacpp must resolve nvcc at
+    # build time instead of trusting a value captured before main. Fails if
+    # resolution ever moves back to source time.
+    env, operation_log, _link_dir = _build_fixture(tmp_path)
+    del env["AUTOLLAMACPP_NVCC"]  # fresh node: no nvcc at source time
+    fake_nvcc = Path(env["PATH"].split(":")[0]) / "nvcc"
+    result = _run_shell(
+        _source_setup(
+            f"""
+find_nvcc() {{ echo {shlex.quote(str(fake_nvcc))}; }}
+install_llamacpp
+"""
+        ),
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    configure = next(
+        line
+        for line in operation_log.read_text().splitlines()
+        if line.startswith("cmake <-S>")
+    )
+    assert f"<-DCMAKE_CUDA_COMPILER={fake_nvcc}>" in configure
 
 
 def test_install_does_not_require_ninja(tmp_path: Path) -> None:
@@ -1157,11 +1193,79 @@ def test_install_is_idempotent_for_source_and_gpu_identity(tmp_path: Path) -> No
     )
 
 
+@pytest.mark.parametrize("next_version", ["13.0.88", "12.9.87"])
+def test_install_rebuilds_when_resolved_cuda_toolkit_changes(
+    tmp_path: Path, next_version: str
+) -> None:
+    env, operation_log, link_dir = _build_fixture(tmp_path)
+    nvcc = Path(env["AUTOLLAMACPP_NVCC"])
+    _write_executable(
+        nvcc, "#!/bin/bash\necho 'Cuda compilation tools, release 12.9, V12.9.86'\n"
+    )
+    first = _run_shell(_source_setup("install_llamacpp"), env=env)
+    assert first.returncode == 0, first.stderr
+    old_binary = (link_dir / "llama-server").resolve()
+
+    _write_executable(
+        nvcc,
+        f"#!/bin/bash\necho 'Cuda compilation tools, release {next_version.rsplit('.', 1)[0]}, V{next_version}'\n",
+    )
+    second = _run_shell(_source_setup("install_llamacpp"), env=env)
+    assert second.returncode == 0, second.stderr
+    new_binary = (link_dir / "llama-server").resolve()
+    assert new_binary != old_binary
+    assert (
+        f"cuda_toolkit={next_version}"
+        in (new_binary.parents[1] / "BUILD-INFO").read_text()
+    )
+    third = _run_shell(_source_setup("install_llamacpp"), env=env)
+    assert third.returncode == 0, third.stderr
+    assert (link_dir / "llama-server").resolve() == new_binary
+    assert (
+        sum(line.startswith("wget") for line in operation_log.read_text().splitlines())
+        == 2
+    )
+
+
+@pytest.mark.parametrize("nvcc_body", ["exit 1", "echo unknown"])
+def test_install_rejects_unverifiable_cuda_toolkit(
+    tmp_path: Path, nvcc_body: str
+) -> None:
+    env, operation_log, link_dir = _build_fixture(tmp_path)
+    _write_executable(Path(env["AUTOLLAMACPP_NVCC"]), f"#!/bin/bash\n{nvcc_body}\n")
+    result = _run_shell(_source_setup("install_llamacpp"), env=env)
+    assert result.returncode != 0
+    assert (
+        f"FATAL: could not determine CUDA toolkit version from {env['AUTOLLAMACPP_NVCC']}"
+        in result.stderr
+    )
+    assert not link_dir.exists()
+    assert not operation_log.exists()
+
+
+def test_build_tag_pins_build_number_and_rejects_other_version(
+    tmp_path: Path,
+) -> None:
+    env, operation_log, link_dir = _build_fixture(tmp_path)
+    env["AUTOLLAMACPP_VERSION"] = "b11052"
+
+    result = _run_shell(_source_setup("install_llamacpp"), env=env)
+
+    assert result.returncode != 0
+    assert "built llama-server did not report b11052" in result.stderr
+    operations = operation_log.read_text().splitlines()
+    configure = next(line for line in operations if line.startswith("cmake <-S>"))
+    assert "<-DLLAMA_BUILD_NUMBER=11052>" in configure
+    assert "<-DLLAMA_BUILD_COMMIT=b11052>" in configure
+    assert "-DLLAMA_BUILD_IS_DEV" not in configure
+    assert not link_dir.exists()
+
+
 def test_fit_concurrency_profile_invalidates_v1_build(tmp_path: Path) -> None:
     env, operation_log, link_dir = _build_fixture(tmp_path)
     old_marker = "\n".join(
         (
-            "version=b10242",
+            "version=v0.4.1",
             f"source_sha256={env['AUTOLLAMACPP_SHA256']}",
             "build_profile=cuda-portable-cpu-v1",
             "compute_capabilities=8.0,9.0",
@@ -1169,12 +1273,12 @@ def test_fit_concurrency_profile_invalidates_v1_build(tmp_path: Path) -> None:
         )
     )
     old_identity = hashlib.sha256(old_marker.encode()).hexdigest()[:16]
-    old_install = Path(env["AUTOLLAMACPP_INSTALL_ROOT"]) / f"b10242-{old_identity}"
+    old_install = Path(env["AUTOLLAMACPP_INSTALL_ROOT"]) / f"v0.4.1-{old_identity}"
     old_bin = old_install / "bin"
     old_bin.mkdir(parents=True)
     _write_executable(
         old_bin / "llama-server",
-        "#!/bin/bash\necho 'version: 10242 (b10242)' >&2\n",
+        "#!/bin/bash\necho 'version: 0.4.1 (build 0, commit v0.4.1)' >&2\n",
     )
     _write_executable(old_bin / "llama-quantize", "#!/bin/bash\nexit 0\n")
     (old_install / "BUILD-INFO").write_text(f"{old_marker}\n", encoding="utf-8")
@@ -1229,11 +1333,23 @@ def test_empty_digest_fails_before_download(tmp_path: Path) -> None:
     assert not operation_log.exists()
 
 
-def test_version_parser_reads_real_stderr_shape(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("version: 0.4.1 (build 0, commit v0.4.1)", "v0.4.1\n"),
+        ("version: 0.4.1 (build 10964, commit b29c606)", "v0.4.1\n"),
+        ("version: 0.4.1-dev (build 11052, commit b11052)", "b11052\n"),
+        ("version: 0.4.1-dev (build 0, commit unknown)", ""),
+        ("version: 10242 (fixture)", "b10242\n"),
+    ],
+)
+def test_version_parser_reads_real_stderr_shape(
+    tmp_path: Path, output: str, expected: str
+) -> None:
     binary = tmp_path / "llama-server"
     _write_executable(
         binary,
-        "#!/bin/bash\necho 'version: 10242 (fixture)' >&2\n",
+        f"#!/bin/bash\necho {shlex.quote(output)} >&2\n",
     )
 
     result = _run_shell(
@@ -1241,7 +1357,7 @@ def test_version_parser_reads_real_stderr_shape(tmp_path: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "b10242\n"
+    assert result.stdout == expected
 
 
 def test_managed_start_refuses_missing_nvidia_driver(tmp_path: Path) -> None:
@@ -1406,3 +1522,118 @@ def test_process_identity_survives_managed_binary_relink(tmp_path: Path) -> None
 
     assert before_relink.returncode == 0
     assert after_relink.returncode == 0
+
+
+def _split_artifact(
+    tmp_path: Path, *, shards: int, empty: bool = False
+) -> tuple[Path, Path]:
+    snapshot = tmp_path / "hub" / "models--org--split-model" / "snapshots" / ("a" * 40)
+    blobs = tmp_path / "hub" / "models--org--split-model" / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir(parents=True)
+    paths: list[Path] = []
+    for index in range(1, shards + 1):
+        blob = blobs / hashlib.sha256(str(index).encode()).hexdigest()
+        blob.write_bytes(b"" if empty else f"shard {index}".encode())
+        shard = snapshot / f"model-{index:05d}-of-{shards:05d}.gguf"
+        shard.symlink_to(Path(os.path.relpath(blob, snapshot)))
+        paths.append(shard)
+    return paths[0], paths[-1]
+
+
+def test_split_family_missing_shard_fails(tmp_path: Path) -> None:
+    first, last = _split_artifact(tmp_path, shards=2)
+    last.unlink()
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
+        "AUTOLLAMACPP_GGUF_PATH": str(first.relative_to(tmp_path)),
+        "AUTOLLAMACPP_MODEL_ALIAS": "org/split-model",
+    }
+    result = _run_shell(
+        _source_start("resolve_gguf_artifact"),
+        env=env,
+    )
+    assert result.returncode != 0
+    assert last.as_posix() in result.stderr
+
+
+def test_split_family_empty_shard_fails(tmp_path: Path) -> None:
+    first, _last = _split_artifact(tmp_path, shards=2, empty=True)
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
+        "AUTOLLAMACPP_GGUF_PATH": str(first.relative_to(tmp_path)),
+        "AUTOLLAMACPP_MODEL_ALIAS": "org/split-model",
+    }
+    result = _run_shell(
+        _source_start("resolve_gguf_artifact"),
+        env=env,
+    )
+    assert result.returncode != 0
+    assert "empty" in result.stderr
+
+
+def test_split_family_high_shard_missing_fails(tmp_path: Path) -> None:
+    """A 10-shard family missing shard 10: the padded count must read decimal.
+    Bash would take 00010 as octal eight and never check shards 9 and 10."""
+    first, last = _split_artifact(tmp_path, shards=10)
+    last.unlink()
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
+        "AUTOLLAMACPP_GGUF_PATH": str(first.relative_to(tmp_path)),
+        "AUTOLLAMACPP_MODEL_ALIAS": "org/split-model",
+    }
+    result = _run_shell(
+        _source_start("resolve_gguf_artifact"),
+        env=env,
+    )
+    assert result.returncode != 0
+    assert last.as_posix() in result.stderr
+
+
+def test_split_family_octal_looking_count_is_not_truncated(tmp_path: Path) -> None:
+    """An 8-shard family missing shard 8 must fail, not skip the shard loop."""
+    first, last = _split_artifact(tmp_path, shards=8)
+    last.unlink()
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": str(tmp_path),
+        "AUTOLLAMACPP_GGUF_PATH": str(first.relative_to(tmp_path)),
+        "AUTOLLAMACPP_MODEL_ALIAS": "org/split-model",
+    }
+    result = _run_shell(
+        _source_start("resolve_gguf_artifact"),
+        env=env,
+    )
+    assert result.returncode != 0
+    assert last.as_posix() in result.stderr
+
+
+def test_storage_preflight_verifies_match_or_fails_on_wrong_export(
+    tmp_path: Path,
+) -> None:
+    mounts = tmp_path / "mounts"
+    mount_point = str(tmp_path / "cache")
+    mounts.write_text(
+        f"storage.example:/exports/huggingface {mount_point} nfs "
+        "rw,vers=3,hard,proto=tcp,timeo=600,retrans=3,sec=sys 0 0\n"
+    )
+    env = {
+        **os.environ,
+        "AUTOLLAMACPP_NFS_MOUNT_POINT": mount_point,
+        "AUTOVLLM_NFS_EXPORT": "storage.example:/exports/huggingface",
+        "AUTOVLLM_MOUNTS_FILE": str(mounts),
+    }
+    good = _run_shell(_source_start("run_storage_preflight"), env=env)
+    assert good.returncode == 0, good.stderr
+    assert "NFS storage verified" in good.stdout
+
+    mounts.write_text(
+        f"other.example:/exports/other {mount_point} nfs "
+        "rw,vers=3,hard,proto=tcp,timeo=600,retrans=3 0 0\n"
+    )
+    bad = _run_shell(_source_start("run_storage_preflight"), env=env)
+    assert bad.returncode != 0
+    assert "not the expected export" in bad.stderr

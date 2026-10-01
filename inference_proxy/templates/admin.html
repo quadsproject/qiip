@@ -23,6 +23,7 @@
                 <p id="admin-status">Loading admin data...</p>
             </div>
             <div class="header-right">
+                <a class="btn" href="/dashboard/reliability">Fleet reliability</a>
                 <p id="last-updated"></p>
             </div>
         </header>
@@ -62,6 +63,46 @@
             </section>
 
             <section class="card">
+                <h2 class="card-title">Automatic Model Placement</h2>
+                <p id="placement-status">Loading placement status...</p>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Profile</th>
+                                <th>Weight</th>
+                                <th>Hosts</th>
+                                <th>Files</th>
+                                <th>Validated GPUs</th>
+                                <th>Served requests</th>
+                                <th>Served tokens</th>
+                            </tr>
+                        </thead>
+                        <tbody id="placement-profile-body"></tbody>
+                    </table>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr><th>Needs attention</th><th>Host or profile</th><th>Detail</th></tr>
+                        </thead>
+                        <tbody id="placement-issue-body"></tbody>
+                    </table>
+                </div>
+                <div id="placement-suspensions" hidden>
+                    <h3>Suspended hosts</h3>
+                    <p class="muted-status">Automatic placement stays suspended until you resume it.</p>
+                    <div class="table-wrap">
+                        <table>
+                            <thead><tr><th scope="col">Host</th><th scope="col">Action</th></tr></thead>
+                            <tbody id="placement-suspension-body"></tbody>
+                        </table>
+                    </div>
+                    <p id="placement-resume-status" role="status"></p>
+                </div>
+            </section>
+
+            <section class="card">
                 <h2 class="card-title">Users</h2>
                 <p class="muted-status">Signed-in OAuth users; grant or revoke the admin role per user.</p>
                 <div class="table-wrap">
@@ -92,5 +133,6 @@
     <script>const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};</script>
     <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/admin.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/admin_placement.js') }}"></script>
 </body>
 </html>

@@ -240,6 +240,10 @@ class TestTokenMintWhitelist:
             ).status_code
             == 302
         )
+        # Minting on /profile is admin-only; admins still pass the whitelist.
+        store = app.state.auth_store
+        for user in store.list_users_with_stats():
+            store.set_user_admin(user.id, True)
         app.dependency_overrides[get_sso_allowlist] = lambda: mint_allowlist
         return client
 
@@ -349,17 +353,17 @@ class TestTokenEndpointScope:
         assert response.status_code == 400
 
     def test_mint_other_users_endpoint_rejected(
-        self, profile_client: TestClient, test_registry: NodeRegistry
+        self, normal_profile_client: TestClient, test_registry: NodeRegistry
     ) -> None:
         self._seed_nodes(test_registry)
-        response = profile_client.post(
+        response = normal_profile_client.post(
             "/profile/tokens", json={"name": "x", "endpoints": ["theirs-1"]}
         )
 
         assert response.status_code == 403
 
     def test_non_admin_cannot_pin_admin_only_endpoint(
-        self, profile_client: TestClient, test_registry: NodeRegistry
+        self, normal_profile_client: TestClient, test_registry: NodeRegistry
     ) -> None:
         """Regression (second review): pinning an admin-only server must not
         mint a dead token that ``_in_scope`` rejects on every use."""
@@ -373,7 +377,7 @@ class TestTokenEndpointScope:
                 admin_only=True,
             )
         )
-        response = profile_client.post(
+        response = normal_profile_client.post(
             "/profile/tokens", json={"name": "x", "endpoints": ["private-1"]}
         )
 
@@ -416,10 +420,10 @@ class TestTokenEndpointScope:
         assert response.json()["endpoint_scope"] == ["private-1"]
 
     def test_endpoints_lists_pickable(
-        self, profile_client: TestClient, test_registry: NodeRegistry
+        self, normal_profile_client: TestClient, test_registry: NodeRegistry
     ) -> None:
         self._seed_nodes(test_registry)
-        response = profile_client.get("/profile/endpoints")
+        response = normal_profile_client.get("/profile/endpoints")
 
         assert response.status_code == 200
         assert [e["node_id"] for e in response.json()] == ["mine-1", "shared-1"]

@@ -23,7 +23,7 @@ Type=simple
 User=root
 WorkingDirectory=/opt/inference-proxy
 EnvironmentFile=/opt/inference-proxy/.env
-ExecStart=/opt/inference-proxy/.venv/bin/uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 5000
+ExecStart=/opt/inference-proxy/.venv/bin/uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 5000 --no-access-log
 Restart=on-failure
 RestartSec=5
 

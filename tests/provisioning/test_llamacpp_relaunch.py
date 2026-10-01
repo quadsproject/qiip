@@ -371,6 +371,32 @@ async def test_cancellation_after_stop_rolls_back_before_propagating() -> None:
     assert _node_from_value(state["record"].value) == restored
 
 
+async def test_cancellation_during_failure_diagnostics_still_restores_engine() -> None:
+    previous = _node()
+    provisioner, registry, _etcd, state, writes = _provisioner(previous)
+    entered = asyncio.Event()
+
+    async def stall(*args: Any) -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    provisioner._launch_llamacpp_runtime.side_effect = [  # type: ignore[attr-defined]
+        ProvisioningError("replacement failed"),
+        ("org/model-GGUF", previous.llamacpp_runtime),
+    ]
+    with patch.object(provisioner, "_capture_failure", side_effect=stall):
+        task = asyncio.create_task(provisioner.relaunch_llamacpp("host1", _request()))
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert writes == [(NodeStatus.RELAUNCHING, 7001), (NodeStatus.HEALTHY, 7001)]
+    restored = registry.get("host1")
+    assert restored is not None
+    assert restored.llamacpp_runtime == previous.llamacpp_runtime
+    assert _node_from_value(state["record"].value) == restored
+
+
 @pytest.mark.asyncio
 async def test_failed_request_and_rollback_enter_persistent_terminal_state() -> None:
     provisioner, registry, etcd, state, writes = _provisioner()
@@ -582,3 +608,140 @@ async def test_drain_wait_reports_complete_timeout_and_unavailable() -> None:
         await NodeProvisioner._drain_wait(provisioner, "host1")
         is DrainOutcome.UNAVAILABLE
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True])
+async def test_owned_profile_can_be_overridden_with_verified_rollback(
+    fails: bool,
+) -> None:
+    from inference_proxy.placement.catalog import BUILTIN_PROFILES
+
+    profile_request = BUILTIN_PROFILES[2].runtime_request(
+        reserve_mib=256, draft_artifact_id="c" * 64, gpu_class="l4"
+    )
+    previous = _node(runtime=_runtime(profile_request)).model_copy(
+        update={"owner": "admin@example.com"}
+    )
+    provisioner, registry, _etcd, state, _writes = _provisioner(previous)
+    requested = _request()
+    replacement = _runtime(requested)
+    provisioner._launch_llamacpp_runtime.side_effect = (  # type: ignore[attr-defined]
+        [ProvisioningError("does not fit"), (previous.model, previous.llamacpp_runtime)]
+        if fails
+        else [(previous.model, replacement)]
+    )
+
+    if fails:
+        with pytest.raises(ProvisioningError, match="does not fit"):
+            await provisioner.relaunch_llamacpp("host1", requested)
+        assert (
+            provisioner._launch_llamacpp_runtime.await_args_list[1].args[2]  # type: ignore[attr-defined]
+            == profile_request
+        )
+    else:
+        await provisioner.relaunch_llamacpp("host1", requested)
+    current = registry.get("host1")
+    assert current is not None
+    assert current.owner == previous.owner
+    assert current.placement is None
+    assert current.llamacpp_runtime == (
+        previous.llamacpp_runtime if fails else replacement
+    )
+    assert _node_from_value(state["record"].value) == current
+
+
+@pytest.mark.asyncio
+async def test_profile_rollback_launch_resolves_draft_and_checks_gpu_evidence() -> None:
+    from inference_proxy.placement.catalog import BUILTIN_PROFILES
+
+    request = BUILTIN_PROFILES[2].runtime_request(
+        reserve_mib=256, draft_artifact_id="c" * 64, gpu_class="l4"
+    )
+    provisioner, _registry, _etcd, _state, _writes = _provisioner()
+    draft = _artifact()
+    runtime = _runtime(request)
+    with (
+        patch.object(
+            provisioner, "_resolve_draft_artifact", AsyncMock(return_value=draft)
+        ) as resolve,
+        patch.object(
+            provisioner, "_read_gpu_inventory", AsyncMock(return_value=())
+        ) as inventory,
+        patch.object(
+            provisioner, "_run_start_vllm", AsyncMock(return_value="model")
+        ) as launch,
+        patch.object(provisioner, "_poll_health", AsyncMock()),
+        patch.object(
+            provisioner, "_verify_llamacpp_runtime", AsyncMock(return_value=runtime)
+        ) as verify,
+    ):
+        result = await NodeProvisioner._launch_llamacpp_runtime(
+            provisioner, "host1", _artifact(), request
+        )
+    assert result == ("model", runtime)
+    resolve.assert_awaited_once_with(request)
+    inventory.assert_awaited_once_with("host1", profile=request.profile)
+    assert launch.await_args is not None
+    assert launch.await_args.kwargs["draft_artifact"] == draft
+    verify.assert_awaited_once_with(
+        "host1", expected_request=request, draft_artifact=draft, gpus=()
+    )
+
+
+@pytest.mark.parametrize("owned", [False, True])
+def test_profile_override_requires_ownership_and_rejects_profile_requests(
+    owned: bool,
+) -> None:
+    from inference_proxy.placement.catalog import BUILTIN_PROFILES
+
+    request = BUILTIN_PROFILES[0].runtime_request(
+        reserve_mib=256, draft_artifact_id=None, gpu_class="l4"
+    )
+    node = _node(runtime=_runtime(request)).model_copy(
+        update={"owner": "admin@example.com" if owned else ""}
+    )
+    provisioner, _registry, _etcd, _state, _writes = _provisioner(node)
+    if owned:
+        assert provisioner.validate_llamacpp_relaunch(node, _request()) == node
+    else:
+        with pytest.raises(RelaunchPreconditionError, match="automatic placement"):
+            provisioner.validate_llamacpp_relaunch(node, _request())
+    with pytest.raises(RelaunchPreconditionError, match="automatic placement"):
+        provisioner.validate_llamacpp_relaunch(node, request)
+
+
+@pytest.mark.asyncio
+async def test_relaunch_finalizes_remote_logs() -> None:
+    provisioner, _registry, _etcd, _state, _writes = _provisioner()
+    provisioner._launch_llamacpp_runtime.return_value = (  # type: ignore[attr-defined]
+        "org/model-GGUF",
+        _runtime(),
+    )
+    provisioner._finish_remote_logs = AsyncMock()  # type: ignore[method-assign]
+
+    await asyncio.wait_for(
+        provisioner.relaunch_llamacpp("host1", _request()),
+        timeout=1,
+    )
+
+    provisioner._finish_remote_logs.assert_awaited_once_with("host1", cancel=False)
+
+
+@pytest.mark.asyncio
+async def test_relaunch_finalizes_remote_logs_after_rollback() -> None:
+    previous = _node()
+    provisioner, _registry, _etcd, _state, _writes = _provisioner(previous)
+    provisioner._launch_llamacpp_runtime.side_effect = [  # type: ignore[attr-defined]
+        ProvisioningError("requested configuration does not fit"),
+        ("org/model-GGUF", previous.llamacpp_runtime),
+    ]
+    provisioner._finish_remote_logs = AsyncMock()  # type: ignore[method-assign]
+
+    with pytest.raises(ProvisioningError, match="does not fit"):
+        await asyncio.wait_for(
+            provisioner.relaunch_llamacpp("host1", _request()),
+            timeout=1,
+        )
+
+    provisioner._finish_remote_logs.assert_awaited_once_with("host1", cancel=False)

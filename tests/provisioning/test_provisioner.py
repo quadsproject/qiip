@@ -335,12 +335,15 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_NVIDIA_DRIVER_VERSION": "999.1",
         "AUTOVLLM_NVIDIA_DRIVER_SHA256": "b" * 64,
         "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MIN_FREE_GB": "20",
         "AUTOVLLM_LLMFIT_VERSION": "8.7.6",
         "AUTOVLLM_LLMFIT_SHA256": "c" * 64,
     }
     assert provisioner._start_script_env("org/model") == {
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MIN_FREE_GB": "20",
         "AUTOVLLM_MODEL": "org/model",
         "HF_TOKEN": "hf secret",
     }
@@ -355,7 +358,9 @@ def test_script_env_prefix_exact() -> None:
     )
     assert provisioner._start_script_env("org/model", vllm_params=vllm_params) == {
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MIN_FREE_GB": "20",
         "AUTOVLLM_MODEL": "org/model",
         "AUTOVLLM_TENSOR_PARALLEL": "4",
         "AUTOVLLM_MAX_MODEL_LEN": "8192",
@@ -368,8 +373,23 @@ def test_script_env_prefix_exact() -> None:
     }
     assert provisioner._start_script_env("org/model", vllm_params=VllmParams()) == {
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MIN_FREE_GB": "20",
         "AUTOVLLM_MODEL": "org/model",
+        "HF_TOKEN": "hf secret",
+    }
+    assert provisioner._start_script_env(
+        "org/model",
+        vllm_params=VllmParams(tensor_parallel_size=2, gpu_devices=(0, 2)),
+    ) == {
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
+        "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MIN_FREE_GB": "20",
+        "AUTOVLLM_MODEL": "org/model",
+        "AUTOVLLM_TENSOR_PARALLEL": "2",
+        "AUTOVLLM_GPU_DEVICES": "0,2",
         "HF_TOKEN": "hf secret",
     }
     llama_setup = provisioner._setup_script_env(InferenceEngine.LLAMA_CPP)
@@ -379,19 +399,21 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_NVIDIA_DRIVER_VERSION": "999.1",
         "AUTOVLLM_NVIDIA_DRIVER_SHA256": "b" * 64,
         "AUTOVLLM_API_PORT": "8123",
+        "AUTOVLLM_MIN_FREE_GB": "20",
         "AUTOVLLM_LLMFIT_VERSION": "8.7.6",
         "AUTOVLLM_LLMFIT_SHA256": "c" * 64,
-        "AUTOLLAMACPP_VERSION": "b10242",
+        "AUTOLLAMACPP_VERSION": "v0.4.1",
         "AUTOLLAMACPP_SHA256": (
-            "b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3"
+            "ef3d5b1907a391500ae11b5e61a8e2022e0deaac9790899cad9c4e02f03bfb9a"
         ),
         "AUTOLLAMACPP_SOURCE_URL": (
-            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/b10242.tar.gz"
+            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v0.4.1.tar.gz"
         ),
     }
     artifact = _artifact()
     assert provisioner._start_script_env(None, InferenceEngine.LLAMA_CPP, artifact) == {
         "AUTOLLAMACPP_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOLLAMACPP_PORT": "8123",
         "AUTOLLAMACPP_REQUIRE_CUDA": "1",
         "AUTOLLAMACPP_MANAGED": "1",
@@ -418,6 +440,7 @@ def test_script_env_prefix_exact() -> None:
         ),
     ) == {
         "AUTOLLAMACPP_NFS_MOUNT_POINT": "/srv/hf cache",
+        "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOLLAMACPP_PORT": "8123",
         "AUTOLLAMACPP_REQUIRE_CUDA": "1",
         "AUTOLLAMACPP_MANAGED": "1",
@@ -439,6 +462,7 @@ def test_script_env_prefix_exact() -> None:
         "AUTOVLLM_NVIDIA_DRIVER_VERSION=999.1",
         f"AUTOVLLM_NVIDIA_DRIVER_SHA256={'b' * 64}",
         "AUTOVLLM_API_PORT=8123",
+        "AUTOVLLM_MIN_FREE_GB=20",
         "AUTOVLLM_LLMFIT_VERSION=8.7.6",
         f"AUTOVLLM_LLMFIT_SHA256={'c' * 64}",
         "bash",
@@ -585,6 +609,8 @@ def test_env_prefix_quoting() -> None:
     assert words == [
         "AUTOVLLM_NFS_MOUNT_POINT=/srv/hf-cache",
         "AUTOVLLM_API_PORT=8000",
+        "AUTOVLLM_MIN_FREE_GB=20",
+        "AUTOVLLM_NFS_EXPORT=nfs.example:/exports/huggingface",
         f"AUTOVLLM_MODEL={model}",
         "HF_TOKEN=token '$(touch nope)'",
         "bash",
@@ -898,6 +924,8 @@ async def test_llamacpp_custom_request_reaches_the_provisioning_body() -> None:
         artifact=_artifact(),
         llamacpp_request=request,
         owner="",
+        draft_artifact=None,
+        placement=None,
     )
     lease.release.assert_called_once_with()
 
@@ -2700,7 +2728,7 @@ class TestVerifyGpu:
 
         assert events == ["health", "runtime", "register"]
         verify_runtime.assert_awaited_once_with(
-            "host1", expected_request=_auto_request()
+            "host1", expected_request=_auto_request(), draft_artifact=None, gpus=()
         )
         assert register.await_args is not None
         assert register.await_args.kwargs["llamacpp_runtime"] == runtime
@@ -2835,7 +2863,7 @@ class TestStateTracking:
         last_state = state_writes[-1]
         assert last_state["current_step"] == "failed"
         # D-03: failed_step must be the actual step name, not the exception class name
-        assert last_state["failed_step"] == "uploading_scripts"
+        assert last_state["failed_step"] == "setup"
         assert last_state["failed_step"] != "RemoteCommandError"
         assert last_state["error"] is not None
 
@@ -3713,3 +3741,42 @@ class TestWaitForSsh:
         ):
             # Should not raise -- just returns after timeout
             await provisioner._wait_for_ssh("host1")
+
+
+def test_start_env_omits_export_when_gateway_has_none() -> None:
+    """Proxy-only deployments keep the start contract without an export."""
+    provisioner = _make_provisioner(nfs_export=None)
+    vllm_env = provisioner._start_script_env("org/model")
+    assert "AUTOVLLM_NFS_EXPORT" not in vllm_env
+    llama_env = provisioner._start_script_env(
+        None, InferenceEngine.LLAMA_CPP, _artifact()
+    )
+    assert "AUTOVLLM_NFS_EXPORT" not in llama_env
+
+
+@pytest.mark.asyncio
+async def test_stored_node_reads_etcd_rather_than_the_registry() -> None:
+    """Placement asks etcd itself: the registry may not have loaded a record."""
+    from inference_proxy.discovery.etcd_client import EtcdRecord
+    from inference_proxy.discovery.serializer import node_to_etcd
+
+    etcd = MagicMock()
+    etcd.prefix = "/nodes/"
+    provisioner = _make_provisioner(etcd_client=etcd, registry=NodeRegistry())
+    node = Node(
+        node_id="gpu01",
+        endpoint="host1:8000",
+        status=NodeStatus.HEALTHY,
+        managed=True,
+    )
+    key, value = node_to_etcd(node, "/nodes/")
+    records = {
+        "/nodes/gpu01": EtcdRecord(key.encode(), value, 7),
+        "/nodes/bad": EtcdRecord(b"/nodes/bad", b"{not json", 8),
+    }
+    etcd.get_record.side_effect = records.get
+
+    exists, stored = await provisioner.stored_node("gpu01")
+    assert exists and stored is not None and stored.status is NodeStatus.HEALTHY
+    assert await provisioner.stored_node("bad") == (True, None)
+    assert await provisioner.stored_node("absent") == (False, None)

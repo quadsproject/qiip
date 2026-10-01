@@ -54,6 +54,7 @@ from inference_proxy.config.settings import (
     AuthSettings,
     EtcdSettings,
     HuggingFaceSettings,
+    ProvisioningSettings,
     RoutingSettings,
     Settings,
 )
@@ -82,6 +83,9 @@ def test_settings(tmp_path: Path) -> Settings:
             password=SecretStr(_TEST_ADMIN_PASSWORD),
         ),
         huggingface=HuggingFaceSettings(cache_dir=str(_TEST_HF_CACHE)),
+        provisioning=ProvisioningSettings(
+            log_db_path=tmp_path / "provisioning-logs.sqlite3"
+        ),
         auth=AuthSettings(
             db_path=tmp_path / "qiip-test-auth.db",
             session_secret=SecretStr("test-session-secret"),
@@ -160,6 +164,10 @@ def app(
 ) -> Generator[FastAPI, None, None]:
     """Create a FastAPI app with test settings, registry, and proxy client injected."""
     application = create_app(settings=test_settings)
+    from inference_proxy.placement.suspensions import SuspensionStore
+    from tests.placement.fakes import FakeEtcd
+
+    application.state.placement_suspensions = SuspensionStore(FakeEtcd())
     application.state.registry = test_registry
     application.state.proxy_client = proxy_client
     application.state.node_selector = node_selector
@@ -192,6 +200,8 @@ def app(
     mock_provisioner = MagicMock()
     mock_provisioner._etcd_client = MagicMock()
     mock_provisioner.list_tasks_raw = AsyncMock(return_value=[])
+    mock_provisioner.active_provision = MagicMock(return_value=None)
+    mock_provisioner.cancel_provision = AsyncMock(return_value=None)
     mock_provisioner.cancel_active_provision = AsyncMock(return_value=None)
     mock_provisioner.try_reserve_host = AsyncMock(
         side_effect=lambda hostname: MagicMock(hostname=hostname)

@@ -182,7 +182,7 @@ class TestGenerateOmpConfig:
         assert "    auth: none" in result
         assert "    api: openai-completions" in result
         assert '      - id: "meta-llama/Llama-3-8B"' in result
-        assert '        name: "meta-llama/Llama-3-8B (qiip)"' in result
+        assert '        name: "meta-llama/Llama-3-8B"' in result
 
     def test_base_url_includes_v1(self) -> None:
         result = _run_node_yaml(
@@ -493,3 +493,49 @@ def test_omp_display_name_is_always_yaml_quoted() -> None:
 def test_omp_model_id_is_always_yaml_quoted() -> None:
     output = _run_node_yaml(_name_yaml_harness("plain"))
     assert 'name: "plain"' in output
+
+
+@pytest.mark.parametrize(
+    "func", ["generateOpenCodeConfig", "generatePiConfig", "generateOmpConfig"]
+)
+def test_server_display_name_preserves_model_identity(func: str) -> None:
+    import yaml
+
+    model_id = "publisher/model-MTP-GGUF"
+    label = "Label supplied by server"
+    result = _run_node_raw(
+        _harness_opts(
+            "https://qiip.example",
+            model_id,
+            func,
+            json.dumps({"model_display_name": label}),
+        )
+    )
+    if func == "generateOmpConfig":
+        assert isinstance(result, str)
+        item = yaml.safe_load(result)["providers"]["qiip"]["models"][0]
+    else:
+        assert isinstance(result, dict)
+        if func == "generatePiConfig":
+            item = result["providers"]["qiip"]["models"][0]
+        else:
+            assert result["model"] == "qiip/" + model_id
+            item = {"id": model_id, **result["provider"]["qiip"]["models"][model_id]}
+    assert item == {"id": model_id, "name": label}
+
+
+def test_omp_operator_name_overrides_server_model_label() -> None:
+    import yaml
+
+    opts = {"name": "Operator label", "model_display_name": "Server label"}
+    result = _run_node_yaml(
+        _harness_opts(
+            "https://qiip.example",
+            "publisher/model-GGUF",
+            "generateOmpConfig",
+            json.dumps(opts),
+        )
+    )
+    assert yaml.safe_load(result)["providers"]["qiip"]["models"] == [
+        {"id": "publisher/model-GGUF", "name": "Operator label"}
+    ]

@@ -45,6 +45,18 @@ class NoStoreMiddleware(BaseHTTPMiddleware):
         return response
 
 
+def _loggable_path(path: str) -> str:
+    """Return *path* with capability-URL secrets removed.
+
+    ``/s/{id}`` setup links are bearer credentials for their 15-minute life
+    (the id alone fetches a script containing an API token), so the id must
+    not be persisted in logs.
+    """
+    if path.startswith("/s/"):
+        return "/s/[redacted]"
+    return path
+
+
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     """Log every request with method, path, status, duration, and target node."""
 
@@ -63,7 +75,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         logger.info(
             "request",
             method=request.method,
-            path=request.url.path,
+            path=_loggable_path(request.url.path),
             status_code=response.status_code,
             duration_ms=round(duration_ms, 2),
             target_node=target_node,

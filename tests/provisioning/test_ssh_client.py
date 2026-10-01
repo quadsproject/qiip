@@ -120,7 +120,8 @@ class TestSSHClientTextDecoding:
         _ = [line async for line in client.run_streaming("host1", "cat model.log")]
 
         connection.create_process.assert_called_once_with(
-            "cat model.log",
+            "bash -s",
+            input="cat model.log\n",
             encoding="utf-8",
             errors="replace",
         )
@@ -692,7 +693,8 @@ class TestSSHClientRun:
 
         connection = mock_asyncssh.connect.return_value._value
         connection.run.assert_awaited_once_with(
-            "cat model.log",
+            "bash -s",
+            input="cat model.log\n",
             encoding="utf-8",
             errors="replace",
         )
@@ -752,3 +754,26 @@ class TestSSHClientRunTimeoutBubbles:
 
         with pytest.raises(asyncio.TimeoutError):
             await client.run("host1", "slow-cmd")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@patch("inference_proxy.provisioning.ssh_client.asyncssh")
+async def test_commands_with_secret_env_use_stdin(
+    mock_asyncssh: MagicMock, streaming: bool
+) -> None:
+    command = "HF_TOKEN='hf_private' OTHER_SECRET='private value' bash start.sh"
+    if streaming:
+        connection = _setup_mock_asyncssh(mock_asyncssh)
+        client = SSHClient(_make_settings())
+        _ = [line async for line in client.run_streaming("host1", command)]
+        call = connection.create_process.call_args
+    else:
+        _setup_mock_asyncssh_run(mock_asyncssh)
+        client = SSHClient(_make_settings())
+        await client.run("host1", command)
+        connection = mock_asyncssh.connect.return_value._value
+        call = connection.run.call_args
+    assert "hf_private" not in call.args[0]
+    assert "private value" not in call.args[0]
+    assert call.kwargs["input"] == command + "\n"

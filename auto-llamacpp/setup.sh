@@ -34,8 +34,8 @@ INSTALL_TMP_DIR="${AUTOVLLM_TMP_DIR:-/tmp}"
 
 # llama.cpp-specific. GitHub does not publish a Linux CUDA archive for this
 # release, so managed nodes compile the verified source for their attached GPU.
-DEFAULT_LLAMACPP_VERSION="b10242"
-DEFAULT_LLAMACPP_SHA256="b5c2b0d09d2af9988e47570f7f96e8473b4e07fad2c99f6e2e0745e5b3935fe3"
+DEFAULT_LLAMACPP_VERSION="v0.4.1"
+DEFAULT_LLAMACPP_SHA256="ef3d5b1907a391500ae11b5e61a8e2022e0deaac9790899cad9c4e02f03bfb9a"
 LLAMACPP_VERSION="${AUTOLLAMACPP_VERSION-$DEFAULT_LLAMACPP_VERSION}"
 if [[ -v AUTOLLAMACPP_SHA256 ]]; then
     LLAMACPP_SHA256="$AUTOLLAMACPP_SHA256"
@@ -68,10 +68,16 @@ source "$(cd -- "${SCRIPT_DIR}/.." && pwd)/common/setup-base.sh"
 
 # --- llama.cpp-specific functions ---
 
+# Release tags (v<major>.<minor>.<patch>) report "version: 0.4.1 (build N, commit
+# C)". Nightly b<number> tags report "version: 0.4.1-dev (build 11052, commit C)",
+# or "version: 10242 (C)" before upstream adopted release versions.
 installed_llamacpp_version() {
     local binary="$1"
     "$binary" --version 2>&1 \
-        | sed -nE 's/^version:[[:space:]]*([0-9]+).*/b\1/p' \
+        | sed -nE \
+            -e 's/^version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]+\(build .*/v\1/p' \
+            -e 's/^version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+-dev[[:space:]]+\(build[[:space:]]+([1-9][0-9]*),.*/b\1/p' \
+            -e 's/^version:[[:space:]]*([1-9][0-9]*)[[:space:]].*/b\1/p' \
         | head -n 1
 }
 
@@ -168,13 +174,34 @@ verify_managed_server_cli() {
         echo "FATAL: built llama-server does not accept the managed Q8 KV CLI" >&2
         return 1
     fi
+    # Catalog profiles launch with these options. Reject a pin that lacks any
+    # of them at setup time, not after a model has been loaded.
+    if ! "$binary" \
+        --cache-type-k q4_0 \
+        --cache-type-v q4_0 \
+        --flash-attn on \
+        --ubatch-size 256 \
+        --spec-type draft-mtp \
+        --spec-draft-n-max 2 \
+        --cache-type-k-draft f16 \
+        --cache-type-v-draft f16 \
+        --no-mmproj \
+        --jinja \
+        --version >/dev/null 2>&1 \
+        || ! "$binary" \
+            --spec-type draft-dflash \
+            --spec-draft-n-max 7 \
+            --version >/dev/null 2>&1; then
+        echo "FATAL: built llama-server does not accept the catalog profile CLI" >&2
+        return 1
+    fi
 }
 
 install_llamacpp() {
     require_sha256 "llama.cpp ${LLAMACPP_VERSION}" "$LLAMACPP_SHA256" \
         "AUTOLLAMACPP_SHA256"
-    if [[ ! "$LLAMACPP_VERSION" =~ ^b[1-9][0-9]*$ ]]; then
-        echo "FATAL: AUTOLLAMACPP_VERSION must use the b<number> build-tag format" >&2
+    if [[ ! "$LLAMACPP_VERSION" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|b[1-9][0-9]*)$ ]]; then
+        echo "FATAL: AUTOLLAMACPP_VERSION must use the v<major>.<minor>.<patch> release-tag or b<number> build-tag format" >&2
         return 2
     fi
     if [[ ! "$LLAMACPP_SOURCE_URL" =~ ^https?:// ]]; then
@@ -185,22 +212,37 @@ install_llamacpp() {
         echo "FATAL: cmake and make are required to build llama.cpp" >&2
         return 1
     fi
-    if [ ! -x "$CUDA_NVCC" ]; then
+    # The toolkit step ran in its own subshell (step -> run_with_errexit), so
+    # resolve nvcc here, after select_runtime_profile pinned the toolkit. The
+    # profile dnf layout installs under /usr/local/cuda-<version>/bin and the
+    # toolkit step also symlinks /usr/local/cuda, so find_nvcc covers both.
+    CUDA_NVCC="$(find_nvcc)" || CUDA_NVCC=""
+    if [ -z "$CUDA_NVCC" ]; then
         echo "FATAL: CUDA nvcc is required to build managed llama.cpp" >&2
         return 1
     fi
 
     verify_fit_params_patch_identity
 
-    local compute_capabilities build_identity install_dir marker
+    local compute_capabilities build_identity install_dir marker cuda_toolkit nvcc_version
+    if ! nvcc_version=$("$CUDA_NVCC" --version); then
+        echo "FATAL: could not determine CUDA toolkit version from ${CUDA_NVCC}" >&2
+        return 1
+    fi
+    cuda_toolkit=$(printf '%s\n' "$nvcc_version" | sed -n 's/.*release [0-9.]*, V\([0-9][0-9.]*\).*/\1/p')
+    if [[ ! "$cuda_toolkit" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "FATAL: could not determine CUDA toolkit version from ${CUDA_NVCC}" >&2
+        return 1
+    fi
     compute_capabilities=$(cuda_compute_capabilities) || return
-    marker=$(printf 'version=%s\nsource_sha256=%s\nbuild_profile=%s\nfit_cli_patch_sha256=%s\ncompute_capabilities=%s\ncmake_cuda_architectures=%s\n' \
+    marker=$(printf 'version=%s\nsource_sha256=%s\nbuild_profile=%s\nfit_cli_patch_sha256=%s\ncompute_capabilities=%s\ncmake_cuda_architectures=%s\ncuda_toolkit=%s\n' \
         "$LLAMACPP_VERSION" \
         "$LLAMACPP_SHA256" \
         "$LLAMACPP_BUILD_PROFILE" \
         "$LLAMACPP_FIT_PATCH_SHA256" \
         "${compute_capabilities//$'\n'/,}" \
-        "$LLAMACPP_CUDA_ARCHITECTURES")
+        "$LLAMACPP_CUDA_ARCHITECTURES" \
+        "$cuda_toolkit")
     build_identity=$(printf '%s' "$marker" | sha256sum | cut -c1-16)
     install_dir="${LLAMACPP_INSTALL_ROOT%/}/${LLAMACPP_VERSION}-${build_identity}"
 
@@ -241,15 +283,22 @@ install_llamacpp() {
         verify_sha256 "$archive" "$LLAMACPP_SHA256" \
             "llama.cpp ${LLAMACPP_VERSION} source"
         tar xzf "$archive" -C "$source_dir" --strip-components=1
-        # b10242's memory estimator supports unified KV internally, but its CLI
+        # The pinned memory estimator supports unified KV internally, but its CLI
         # allowlist omits llama-fit-params. Expose the existing option so the
         # planner estimates the exact KV mode used by llama-server.
         enable_fit_params_unified_kv "$source_dir"
 
         # Source tarballs have no .git, so cmake/build-info.cmake logs two harmless
         # "fatal: not a git repository" lines and falls back to BUILD_NUMBER=0.
-        # LLAMA_BUILD_NUMBER/COMMIT below override that fallback and are what
-        # installed_llamacpp_version() matches against -- they are not decorative.
+        # The version flags below are what installed_llamacpp_version() matches
+        # against -- they are not decorative. A release tag must clear the
+        # default "-dev" suffix; a build tag must override the fallback number.
+        local -a version_flags
+        if [[ "$LLAMACPP_VERSION" == v* ]]; then
+            version_flags=(-DLLAMA_BUILD_IS_DEV=OFF)
+        else
+            version_flags=(-DLLAMA_BUILD_NUMBER="${LLAMACPP_VERSION#b}")
+        fi
         cmake -S "$source_dir" -B "$build_dir" -G "Unix Makefiles" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CUDA_COMPILER="$CUDA_NVCC" \
@@ -265,7 +314,7 @@ install_llamacpp() {
             -DLLAMA_BUILD_UI=OFF \
             -DLLAMA_BUILD_MTMD=OFF \
             -DLLAMA_OPENSSL=OFF \
-            -DLLAMA_BUILD_NUMBER="${LLAMACPP_VERSION#b}" \
+            "${version_flags[@]}" \
             -DLLAMA_BUILD_COMMIT="$LLAMACPP_VERSION"
         cmake --build "$build_dir" --target llama-server llama-fit-params llama-quantize \
             --parallel "$(nproc)"
@@ -310,7 +359,11 @@ main() {
         "AUTOLLAMACPP_SHA256"
     step system_update run_system_update
     step nvidia_driver install_nvidia_driver
+    select_runtime_profile llamacpp || exit $?
+    step check_install_capacity check_install_capacity_or_warn
     step cuda_toolkit install_cuda_toolkit
+    step fabric_manager ensure_fabric_manager
+    step cuda_proof verify_cuda_execution
     step llamacpp_install install_llamacpp
     step nfs_mount mount_nfs_cache
     step firewall configure_firewall

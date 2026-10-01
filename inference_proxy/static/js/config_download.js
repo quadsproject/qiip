@@ -1,10 +1,10 @@
 // Config generators for OpenCode CLI, Pi coding agent, and OMP agent.
 // Generators are pure functions testable via Node.js.
 //
-// *opts* carries node display info: `name` (operator-facing name) and
-// `admin_only` (admin-only servers require a bearer token, so the generated
-// config declares apiKey auth with a placeholder instead of `auth: none` —
-// an admin-only server is unreachable anonymously by design).
+// *opts* carries `model_display_name` (server-supplied model label),
+// `name` (operator-facing node name), and `admin_only`. Admin-only servers
+// require a bearer token, so the generated config declares apiKey auth with
+// a placeholder instead of `auth: none`. They cannot be reached anonymously.
 
 var TOKEN_PLACEHOLDER = "<paste-qiip-token-here>";
 
@@ -15,6 +15,10 @@ function configApiKey(opts) {
     return opts.token || TOKEN_PLACEHOLDER;
   }
   return null;
+}
+
+function configModelName(modelId, opts) {
+  return opts && opts.model_display_name ? opts.model_display_name : modelId;
 }
 
 function generateOpenCodeConfig(baseUrl, modelId, opts) {
@@ -35,7 +39,7 @@ function generateOpenCodeConfig(baseUrl, modelId, opts) {
         options: options,
         models: {
           [modelId]: {
-            name: modelId,
+            name: configModelName(modelId, opts),
           },
         },
       },
@@ -59,7 +63,7 @@ function generatePiConfig(baseUrl, modelId, opts) {
           supportsDeveloperRole: false,
           supportsReasoningEffort: false,
         },
-        models: [{ id: modelId }],
+        models: [{ id: modelId, name: configModelName(modelId, opts) }],
       },
     },
   };
@@ -84,7 +88,7 @@ function yamlScalar(v) {
 
 function generateOmpConfig(baseUrl, modelId, opts) {
   var base = baseUrl.replace(/\/+$/, "");
-  var displayName = opts && opts.name ? opts.name : modelId + " (qiip)";
+  var displayName = opts && opts.name ? opts.name : configModelName(modelId, opts);
   var lines = [
     "providers:",
     "  qiip:",

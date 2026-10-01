@@ -12,11 +12,12 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
 from collections.abc import AsyncGenerator, Awaitable, Callable
-from contextlib import AsyncExitStack, asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -32,16 +33,19 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
 from inference_proxy.api.admin import admin_router
+from inference_proxy.api.admin_placement import admin_placement_router
 from inference_proxy.api.admin_tokens import admin_tokens_router
 from inference_proxy.api.auth import auth_router
 from inference_proxy.api.chat import chat_router
 from inference_proxy.api.dashboard import dashboard_router
+from inference_proxy.api.dialects import dialect_for_path
 from inference_proxy.api.errors import ApiAuthError
 from inference_proxy.api.fleet import fleet_router
 from inference_proxy.api.middleware import (
     NoStoreMiddleware,
     RequestLoggingMiddleware,
 )
+from inference_proxy.api.onboarding import onboarding_router
 from inference_proxy.api.profile import profile_router
 from inference_proxy.api.routes import router
 from inference_proxy.auth.allowlist import SSOAllowlist
@@ -61,9 +65,13 @@ from inference_proxy.huggingface.downloader import DownloadService
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.endpoint import EndpointPolicy
 from inference_proxy.models.openai import ErrorDetail, ErrorResponse
+from inference_proxy.placement.claims import ClaimStore
+from inference_proxy.placement.reconciler import PlacementReconciler
+from inference_proxy.placement.suspensions import SuspensionStore
 from inference_proxy.plugins.interfaces.auth import AuthPlugin
 from inference_proxy.plugins.manager import PluginManager
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
+from inference_proxy.provisioning.log_store import AttemptLogStore
 from inference_proxy.provisioning.provisioner import NodeProvisioner
 from inference_proxy.provisioning.ssh_client import SSHClient
 from inference_proxy.proxy.client import ProxyClient
@@ -92,6 +100,12 @@ async def _safe_async_cleanup(
             resource=resource,
             exc_info=True,
         )
+
+
+async def _cancel_task(task: asyncio.Task[None]) -> None:
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 def _safe_sync_cleanup(resource: str, cleanup: Callable[[], None]) -> None:
@@ -207,6 +221,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         async with AsyncExitStack() as resources:
             etcd_client = EtcdClient(resolved_settings.etcd)
+            suspensions = SuspensionStore(etcd_client)
+            app.state.placement_suspensions = suspensions
             resources.callback(_safe_sync_cleanup, "etcd client", etcd_client.close)
             registry = NodeRegistry()
             lease_manager = NodeLeaseManager(etcd_client)
@@ -428,7 +444,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 app.state.redfish_client = None
                 logger.info("redfish disabled (BMC credentials not configured)")
 
+            log_store = AttemptLogStore(
+                resolved_settings.provisioning.log_db_path,
+                max_bytes=resolved_settings.provisioning.log_storage_max_bytes,
+                attempt_max_bytes=resolved_settings.provisioning.log_attempt_max_bytes,
+                max_attempts=resolved_settings.provisioning.log_max_attempts,
+                retention_days=resolved_settings.provisioning.log_retention_days,
+                max_record_bytes=resolved_settings.provisioning.log_max_entry_bytes,
+            )
+            log_store.interrupt_running()
             log_buffer = ProvisioningLogBuffer(
+                store=log_store,
                 max_entries_per_host=(
                     resolved_settings.provisioning.log_max_entries_per_host
                 ),
@@ -463,6 +489,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "provisioner",
                 provisioner.shutdown,
             )
+            if asyncio.iscoroutinefunction(
+                getattr(provisioner, "reconcile_pending_operations", None)
+            ):
+                # Recovery evidence for operations interrupted by a restart
+                # before serving mutations. Best-effort background: the
+                # per-mutation hook in provision/teardown/relaunch is the gate.
+                startup_reconcile = asyncio.create_task(
+                    provisioner.reconcile_pending_operations(),
+                    name="provisioning-startup-reconcile",
+                )
+                resources.push_async_callback(
+                    _safe_async_cleanup,
+                    "startup reconcile",
+                    lambda: _cancel_task(startup_reconcile),
+                )
 
             if resolved_settings.quads.base_url is not None:
                 quads_server_timezone = resolved_settings.quads.server_timezone
@@ -511,10 +552,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "schedule enforcer",
                     schedule_enforcer.stop,
                 )
+
+                # Always constructed, so the admin surfaces can report catalog
+                # files and claims; its loop only runs when placement is
+                # enabled. It never scans or raises during startup: a missing
+                # catalog file is reported by the first pass, not fatal here.
+                placement_reconciler = PlacementReconciler(
+                    settings=resolved_settings.placement,
+                    quads_client=quads_client,
+                    quads_poller=quads_poller,
+                    registry=registry,
+                    provisioner=provisioner,
+                    artifact_index=artifact_index,
+                    claims=ClaimStore(etcd_client),
+                    suspensions=suspensions,
+                    lookahead_hours=(resolved_settings.quads.schedule_lookahead_hours),
+                )
+                placement_reconciler.start()
+                app.state.placement_reconciler = placement_reconciler
+                resources.push_async_callback(
+                    _safe_async_cleanup,
+                    "placement reconciler",
+                    placement_reconciler.stop,
+                )
             else:
                 app.state.quads_client = None
                 app.state.quads_poller = None
                 app.state.schedule_enforcer = None
+                app.state.placement_reconciler = None
+                if resolved_settings.placement.enabled:
+                    logger.warning(
+                        "placement_disabled_without_quads",
+                        reason="placement.enabled needs quads.base_url",
+                    )
 
             http_client = httpx.AsyncClient(
                 timeout=httpx.Timeout(
@@ -566,21 +636,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     async def _api_auth_error_handler(
-        _request: Request,
+        request: Request,
         exc: Exception,
     ) -> JSONResponse:
-        """Render token-auth failures as an OpenAI-compatible 401 body."""
+        """Render token-auth failures as a 401 in the client's API format.
+
+        OpenAI-compatible routes get the ``invalid_api_key`` body; the
+        Anthropic Messages API gets Anthropic's ``authentication_error``.
+        """
         if not isinstance(exc, ApiAuthError):
             raise exc
+        error = ErrorResponse(
+            error=ErrorDetail(
+                message=exc.message,
+                type="invalid_request_error",
+                code="invalid_api_key",
+            )
+        )
+        dialect = dialect_for_path(request.url.path)
         return JSONResponse(
             status_code=401,
-            content=ErrorResponse(
-                error=ErrorDetail(
-                    message=exc.message,
-                    type="invalid_request_error",
-                    code="invalid_api_key",
-                )
-            ).model_dump(),
+            content=dialect.error_content(error, 401),
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -600,11 +676,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.include_router(router)
     application.include_router(admin_router)
     application.include_router(admin_tokens_router)
+    application.include_router(admin_placement_router)
     application.include_router(dashboard_router)
     application.include_router(fleet_router)
     application.include_router(chat_router)
     application.include_router(auth_router)
     application.include_router(profile_router)
+    application.include_router(onboarding_router)
 
     static_dir = Path(__file__).resolve().parent / "static"
     application.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
