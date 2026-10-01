@@ -9,10 +9,12 @@ the recorded reason. Measurement uses the first SELECTED device when an
 otherwise physical device 0; queries are physical, so the subset is sized
 against its own cards.
 
-Status is honest: every row is `candidate`, derived from the families the
-pre-profile code already targeted with per-family tuning. No row has been
-validated on a real fleet node in this repository. Before trusting a row for
-production, run the fleet validation procedure below and record the result.
+Status is honest: rows are `candidate` unless validated on a real fleet
+node. The consumer-ada (SM 8.9) row is validated by the matched L4 pilot,
+which provisioned a real node and returned `READY`; see
+[docs/fleet-reliability.md](docs/fleet-reliability.md#matched-l4-pilot).
+No other row has been validated in this repository. Before trusting a row
+for production, run the fleet validation procedure below and record the result.
 
 ## Profiles
 

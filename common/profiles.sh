@@ -12,7 +12,7 @@ PROFILE_VOLTA_CUDA_TOOLKIT_VERSION="12.9"
 PROFILE_OS_ID="rhel"
 PROFILE_OS_MAJOR_MIN=9
 PROFILE_ARCH="x86_64"
-PROFILE_GLIBC_MIN="2.34"  # vLLM wheel ABI (manylinux_2_34, auto-vllm/setup.sh:26)
+PROFILE_GLIBC_MIN="2.34"  # vLLM wheel ABI (manylinux_2_34, auto-vllm/setup.sh:38)
 
 detect_profile_hardware() {
     if ! command -v nvidia-smi &>/dev/null; then

@@ -818,21 +818,24 @@ The qiip RPM uses a different layout from the git-checkout convention
 
 To move an existing gateway to the RPM install:
 
-1. Remove any stale unit copy so the RPM unit wins:
-   `sudo rm -f /etc/systemd/system/inference-proxy.service && sudo systemctl daemon-reload`.
-2. Stop the checkout service: `sudo systemctl stop inference-proxy`.
-3. Copy writable data: `sudo mv /opt/inference-proxy/data/qiip.db /var/lib/qiip/`
-   and `.../data/provisioning-logs.sqlite3` (new location defaults).
-4. Move settings: copy `INFERENCE_PROXY_*` values from
-   `/opt/inference-proxy/.env` into `/etc/qiip/qiip.env`.
-5. `sudo dnf install qiip` (after `dnf copr enable quadsdev/qiip`), copy
-   the config examples, then
-   `sudo systemctl enable --now inference-proxy`. The package now also
-   requires and starts nginx (deploys the bundled config when the stock
-   file is unmodified per the nginx-core rpmdb, so an operator-edited
-   `/etc/nginx/nginx.conf` is left untouched) and
-   serves the gateway as a tuned uvicorn process farm; tune worker counts
-   via the `server:` YAML block or `INFERENCE_PROXY_SERVER__WORKERS`.
+1. Stop the checkout service: `sudo systemctl stop inference-proxy`.
+2. `sudo dnf install qiip` (after `dnf copr enable quadsdev/qiip`). The
+   package requires and starts nginx (deploys the bundled config when the
+   stock file is unmodified per the nginx-core rpmdb, so an operator-edited
+   `/etc/nginx/nginx.conf` is left untouched) and serves the gateway as a
+   tuned uvicorn process farm; only one worker is supported, so tune the
+   other `server:` settings rather than the worker count.
+3. Copy writable data (create the destination directories first; the
+   package also creates them on install):
+   `sudo mkdir -p /var/lib/qiip /etc/qiip/conf`, then
+   `sudo mv /opt/inference-proxy/data/qiip.db /var/lib/qiip/` and
+   `.../data/provisioning-logs.sqlite3` (new location defaults).
+4. Move settings and any customized config: copy `INFERENCE_PROXY_*`
+   values from `/opt/inference-proxy/.env` into `/etc/qiip/qiip.env`, and
+   copy `/opt/inference-proxy/conf/*.yml` into `/etc/qiip/conf/`.
+5. Remove the stale unit copy so the RPM unit wins, then enable:
+   `sudo rm -f /etc/systemd/system/inference-proxy.service && sudo systemctl daemon-reload`
+   and `sudo systemctl enable --now inference-proxy`.
 
 The old `/opt/inference-proxy` checkout is no longer needed by the service;
 keep it only for development.
