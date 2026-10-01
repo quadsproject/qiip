@@ -53,6 +53,7 @@ class LocalNodeSSH(SSHClient):
         self.root = root
         self.environment = environment
         self.lose_launch = False
+        self.lose_launch_before_run = False
         self.fail_reads = 0
         self.launches = 0
         self.read_faults_injected = 0
@@ -90,6 +91,13 @@ class LocalNodeSSH(SSHClient):
             self.fail_reads -= 1
             self.read_faults_injected += 1
             raise SSHConnectionError(host, "controlled stream interruption")
+        if (
+            log_label == "provisioning log recorder (launch)"
+            and self.lose_launch_before_run
+        ):
+            self.lose_launch_before_run = False
+            self.launch_faults_injected += 1
+            raise SSHConnectionError(host, "controlled lost launch request")
         proc = await asyncio.create_subprocess_exec(
             "bash",
             "-c",

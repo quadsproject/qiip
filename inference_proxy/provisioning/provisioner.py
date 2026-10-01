@@ -995,8 +995,9 @@ class NodeProvisioner:
         older survivor and a second gateway cannot fence-bypass. Fresh or
         legacy nodes get the compatible recorder placed first so the probe is
         authoritative. Returns True when a live remote operation blocks a new
-        mutation (block=True) or a live survivor was recorded (block=False).
-        Never re-runs remote setup or engine launch.
+        mutation (block=True) or a live/survivor operation was found so a
+        teardown can warn (block=False). Never re-runs remote setup or engine
+        launch.
         """
         store = self._log_buffer.store
         if store is None or self._remote_logs is None:
@@ -1062,7 +1063,9 @@ class NodeProvisioner:
             history = await asyncio.to_thread(store.history, hostname, limit=1)
             match = history["attempts"][0] if history["attempts"] else None
         if match is None:
-            return block
+            # A live phase exists even if no local attempt row can be matched.
+            # It still blocks a mutation and must warn a teardown.
+            return True
         survivor = status == "survivor"
         existing = match.get("failure_summary") or ""
         summary = (
@@ -1077,7 +1080,9 @@ class NodeProvisioner:
             failure_summary=summary,
         )
         store.issue(match["attempt_id"], reason + "; conflicting retries blocked")
-        return block
+        # A live/survivor operation was found: block a mutation (block=True)
+        # and warn a teardown that a remote process may still be running.
+        return True
 
     async def _recover_pending_evidence(self, hostname: str) -> None:
         """Mirror remote evidence for unfinished attempts when nothing is live.
@@ -1108,8 +1113,17 @@ class NodeProvisioner:
             return
         hostnames = await asyncio.to_thread(store.pending_hosts)
         for hostname in hostnames:
-            with suppress(Exception):
-                await self._reconcile_host(hostname)
+            # Hold the host lifecycle lease so a concurrent placement retry or
+            # user mutation cannot race the probe's write to a new attempt.
+            lease = await self.try_reserve_host(hostname)
+            if lease is None:
+                logger.info("startup_reconcile_skipped", hostname=hostname)
+                continue
+            try:
+                with suppress(Exception):
+                    await self._reconcile_host(hostname)
+            finally:
+                lease.release()
             logger.info("startup_reconcile_finished", hostname=hostname)
 
     async def _power_on_if_needed(self, hostname: str) -> None:
@@ -3239,7 +3253,10 @@ class NodeProvisioner:
                 logger.warning(
                     "teardown_reconcile_survivor",
                     hostname=hostname,
-                    reason="a prior remote operation is still active on the node",
+                    reason=(
+                        "a prior remote operation is still active on the node; "
+                        "kill it manually on the host before reprovisioning"
+                    ),
                 )
             engine = self._resolve_teardown_engine(
                 hostname,

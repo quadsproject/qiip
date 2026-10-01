@@ -639,3 +639,118 @@ async def test_reconcile_recovers_completed_remote_evidence(
     assert list(phases.values())[-1]["exit_status"] == 0
     page = store.read(attempt, after=0, query="recovery-evidence", limit=10)
     assert page["records"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_block_false_reports_live_operation(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    """A teardown probe still reports a live operation for the warning path."""
+    provisioner, ssh, store = harness
+    provisioner.log_buffer.create(
+        "host1", engine="vllm", operation="provision", bundle_version="sha256:abc"
+    )
+    attempt = provisioner.log_buffer.attempts["host1"]
+    config = _recorder_config(attempt, "host1", ssh.root / "logs", command="sleep 20")
+    await _launch(ssh, config)
+
+    assert await provisioner._reconcile_host("host1", block=False) is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_block_false_reports_survivor(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    """A teardown probe reports a forced survivor so teardown can warm it."""
+    provisioner, ssh, store = harness
+    provisioner.log_buffer.create(
+        "host1", engine="vllm", operation="provision", bundle_version="sha256:abc"
+    )
+    attempt = provisioner.log_buffer.attempts["host1"]
+    config = _recorder_config(attempt, "host1", ssh.root / "logs", command="echo done")
+    await _launch(ssh, config)
+    phase = None
+    for _ in range(100):
+        manifest = await _node_manifest(ssh, config)
+        phases = manifest.get("attempt", {}).get("phases", {})
+        if phases:
+            phase = list(phases.keys())[0]
+            status = list(phases.values())[0].get("status")
+            recording = list(phases.values())[0].get("recording")
+            if status == "complete" and recording is False:
+                break
+        await asyncio.sleep(0.05)
+    assert phase is not None
+    node_store = AttemptLogStore(ssh.root / "logs" / "attempts.sqlite3")
+    node_store.update_phase(
+        attempt, phase, status="survivor", exit_status=130, pid=os.getpgrp()
+    )
+
+    assert await provisioner._reconcile_host("host1", block=False) is True
+    assert store.get(attempt)["survivor"] is True
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_marks_interrupted(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    """Startup reconcile recovers a live phase when the lease is free."""
+    provisioner, ssh, store = harness
+    provisioner.log_buffer.create(
+        "host1", engine="vllm", operation="provision", bundle_version="sha256:abc"
+    )
+    attempt = provisioner.log_buffer.attempts["host1"]
+    config = _recorder_config(attempt, "host1", ssh.root / "logs", command="sleep 20")
+    await _launch(ssh, config)
+
+    await provisioner.reconcile_pending_operations()
+    assert store.get(attempt)["status"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_skips_leased_host(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup reconcile must not probe a host another operation reserves."""
+    provisioner, _ssh, store = harness
+    provisioner.log_buffer.create(
+        "host1", engine="vllm", operation="provision", bundle_version="sha256:abc"
+    )
+    called: list[str] = []
+
+    async def spy(hostname: str, **_kwargs: object) -> bool:
+        called.append(hostname)
+        return True
+
+    monkeypatch.setattr(provisioner, "_reconcile_host", spy)
+    lease = await provisioner.try_reserve_host("host1")
+    assert lease is not None
+    try:
+        await provisioner.reconcile_pending_operations()
+    finally:
+        lease.release()
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_no_false_issue_when_leased(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    """A live phase that a concurrent lease holder owns is not raced."""
+    provisioner, ssh, store = harness
+    provisioner.log_buffer.create(
+        "host1", engine="vllm", operation="provision", bundle_version="sha256:abc"
+    )
+    attempt = provisioner.log_buffer.attempts["host1"]
+    config = _recorder_config(attempt, "host1", ssh.root / "logs", command="sleep 20")
+    await _launch(ssh, config)
+    lease = await provisioner.try_reserve_host("host1")
+    assert lease is not None
+    try:
+        await provisioner.reconcile_pending_operations()
+    finally:
+        lease.release()
+    state = store.get(attempt)
+    assert state["status"] != "interrupted"
+    assert "conflicting retries blocked" not in "; ".join(state["issues"])

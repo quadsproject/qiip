@@ -451,7 +451,10 @@ class RemoteLogCollector:
         self.store.update(attempt_id, stage=stage)
         duration = timeout or self.ssh.command_timeout
         # Record launch intent before touching SSH. If launch acknowledgement is
-        # lost, only retrieve this identity; never repeat setup or engine launch.
+        # lost, only retrieve this identity unless the phase never appeared on
+        # the node; the node launch action is idempotent per phase id, so a
+        # phase that was never created (request died before it was handled) can
+        # safely be re-sent once.
         attempt = self.store.get(attempt_id)
         self.store.update(
             attempt_id,
@@ -470,6 +473,22 @@ class RemoteLogCollector:
             )
         except (SSHConnectionError, TimeoutError):
             page = None
+
+        async def resend_launch() -> dict[str, Any] | None:
+            try:
+                return await self._request(
+                    attempt_id,
+                    "launch",
+                    phase=phase,
+                    stage=stage,
+                    command=command,
+                    timeout=duration,
+                    engine_log=engine_log,
+                )
+            except (SSHConnectionError, TimeoutError):
+                return None
+
+        launch_lost = page is None
         failures = 0
         failure_tail: deque[str] = deque(maxlen=20)
         deadline = asyncio.get_running_loop().time() + duration + 30
@@ -499,6 +518,12 @@ class RemoteLogCollector:
                 remote = (
                     self.store.get(attempt_id).get("remote_phases", {}).get(phase, {})
                 )
+                if launch_lost and not remote:
+                    # The launch never created this phase on the node: resend it
+                    # once with the same phase id (idempotent on the node).
+                    page = await resend_launch()
+                    launch_lost = False
+                    continue
                 if remote.get("status") == "complete" and (
                     engine_log is not None or not remote.get("recording")
                 ):
@@ -515,8 +540,14 @@ class RemoteLogCollector:
                             or "See persisted attempt logs",
                         )
                     return
-            except (SSHConnectionError, TimeoutError):
+            except (SSHConnectionError, TimeoutError) as exc:
                 failures += 1
+                if launch_lost and "unavailable" in str(exc):
+                    # The node has no attempt row to read, so the launch never
+                    # reached it; resend the idempotent launch once.
+                    page = await resend_launch()
+                    launch_lost = False
+                    continue
                 if failures > self.settings.log_reconnect_attempts:
                     raise
             if asyncio.get_running_loop().time() >= deadline:
