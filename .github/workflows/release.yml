@@ -64,10 +64,15 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # `gh pr create` (stable release PR) needs it; with an explicit
+      # permissions block every other scope is none.
+      pull-requests: write
     outputs:
       released: ${{ steps.psr.outputs.released }}
       tag: ${{ steps.psr.outputs.tag }}
       version: ${{ steps.psr.outputs.version }}
+      release_notes: ${{ steps.psr.outputs.release_notes }}
+      finalized: ${{ steps.psr.outputs.released == 'true' && github.ref_name == 'development' || steps.stable.outputs.finalized }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -79,6 +84,15 @@ jobs:
         uses: python-semantic-release/python-semantic-release@9a026e9303981c866c3425723009becb2437c757 # v10.6.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          # main is protected (strict Quality and Python 3.13 checks, no
+          # bypass), so PSR's direct push of a fresh bot commit would be
+          # rejected and the release would never happen. On main, PSR only
+          # prepares the version commit and tag locally; the stable step
+          # below opens a release PR that carries the required checks, and
+          # the tag/release/COPR build are finalized after it merges.
+          # development is not protected and keeps the direct push.
+          push: ${{ github.ref_name == 'development' }}
+          vcs_release: ${{ github.ref_name == 'development' }}
 
       # python-semantic-release bumps project.version in pyproject.toml but
       # never regenerates uv.lock, leaving every branch off development red on
@@ -106,10 +120,15 @@ jobs:
           python-version: "3.12"
           version: ${{ steps.uv_pin.outputs.version }}
 
-      - name: Refresh uv.lock after version bump
+      - name: Refresh uv.lock after version bump (development)
+        # python-semantic-release bumps project.version in pyproject.toml but
+        # never regenerates uv.lock, leaving every branch off development red
+        # on `uv sync --locked`. Refresh it right after a release lands. The
+        # token push below does not re-trigger workflows, and PSR's own
+        # commit-message gating means the follow-up run releases nothing.
         # Best-effort: a failed refresh never drops the COPR submission (see
         # the concurrency note above); a stale lock just goes red in CI.
-        if: steps.psr.outputs.released == 'true'
+        if: steps.psr.outputs.released == 'true' && github.ref_name == 'development'
         continue-on-error: true
         run: |
           set -euxo pipefail
@@ -144,11 +163,55 @@ jobs:
             git commit -m "chore: refresh uv.lock after version bump"
           done
 
+      - name: Prepare stable release
+        id: stable
+        if: steps.psr.outputs.released == 'true' && github.ref_name == 'main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_NOTES: ${{ steps.psr.outputs.release_notes }}
+        run: |
+          set -euxo pipefail
+          version="${{ steps.psr.outputs.version }}"
+          tag="${{ steps.psr.outputs.tag }}"
+          current="$(git show "origin/$GITHUB_REF_NAME:pyproject.toml" \
+            | sed -n 's/^version = "\(.*\)"/\1/p')"
+          if [[ "$current" == "$version" ]]; then
+            # The release PR merged: the version commit is already on main and
+            # PSR tagged this head. Publish the tag, GitHub release, and let
+            # the COPR job below build from the tag.
+            [[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/$GITHUB_REF_NAME")" ]] \
+              || { echo "post-merge release run produced extra commits; aborting" >&2; exit 1; }
+            git tag -f "$tag" HEAD
+            git push origin "$tag"
+            gh release create "$tag" --title "$tag" --notes "$RELEASE_NOTES" \
+              || gh release view "$tag" --repo "$GITHUB_REPOSITORY"
+            echo "finalized=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # First pass: PSR left the version commit locally. Refresh uv.lock,
+          # push a release branch, and open the PR whose checks gate the merge.
+          uv lock
+          if ! git diff --quiet -- uv.lock; then
+            git config user.name "qiip release"
+            git config user.email "noreply@github.com"
+            git add uv.lock
+            git commit -m "chore: refresh uv.lock after version bump"
+          fi
+          branch="release-$version"
+          git checkout -b "$branch"
+          git push -u origin "$branch"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base "$GITHUB_REF_NAME" \
+            --head "$branch" --title "chore: release $version" \
+            --body "Automated release PR. Merging publishes tag $tag, the GitHub release, and the COPR build from it." \
+            || gh pr view --repo "$GITHUB_REPOSITORY" --head "$branch" >/dev/null
+          echo "finalized=false" >> "$GITHUB_OUTPUT"
+
   copr_build:
     name: COPR build
     needs: semantic
     if: >-
       needs.semantic.outputs.released == 'true' &&
+      needs.semantic.outputs.finalized == 'true' &&
       github.repository == 'quadsproject/qiip'
     runs-on: ubuntu-latest
     container: fedora:43
