@@ -127,23 +127,36 @@ async function step(name) {
     page = page.replace("</body>", checks + "</body>")
     html = tmp_path / "start.html"
     html.write_text(page)
-    result = subprocess.run(
-        [
-            browser,
-            "--headless",
-            "--no-sandbox",
-            "--disable-gpu",
-            "--disable-background-networking",
-            "--no-first-run",
-            f"--user-data-dir={tmp_path / 'browser'}",
-            "--virtual-time-budget=5000",
-            "--dump-dom",
-            html.as_uri(),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
-    result_marker = re.search(r'data-test-result="([^"]+)"', result.stdout)
-    assert result_marker and result_marker[1] == "passed", result.stdout
+    # Headless Chrome occasionally hangs once on CI runners (the virtual-time
+    # budget never fires). That is a transient runner flake, not a page
+    # defect: one retry with a fresh profile absorbs it, a second failure is
+    # real and still fails the test.
+    last_error: subprocess.TimeoutExpired | None = None
+    for attempt in range(2):
+        try:
+            result = subprocess.run(
+                [
+                    browser,
+                    "--headless",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--disable-background-networking",
+                    "--no-first-run",
+                    f"--user-data-dir={tmp_path / f'browser-{attempt}'}",
+                    "--virtual-time-budget=5000",
+                    "--dump-dom",
+                    html.as_uri(),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired as exc:
+            last_error = exc
+            continue
+        assert result.returncode == 0, result.stderr
+        result_marker = re.search(r'data-test-result="([^"]+)"', result.stdout)
+        assert result_marker and result_marker[1] == "passed", result.stdout
+        return
+    assert last_error is not None
+    raise last_error
