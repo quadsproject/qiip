@@ -415,6 +415,7 @@ class ProvisioningTask:
     identity: ProvisioningIdentity
     operation: BackgroundOperation
     started: bool = False
+    attempt_id: str | None = None
 
 
 class BackgroundOperation(StrEnum):
@@ -945,14 +946,21 @@ class NodeProvisioner:
         failed_step: str | None = None,
         error: str | None = None,
         started_at: datetime | None = None,
+        history: bool = True,
     ) -> None:
-        """Write provisioning state to etcd (D-05). Best-effort (Pitfall 3)."""
+        """Write provisioning state to etcd (D-05). Best-effort (Pitfall 3).
+
+        ``history`` records the state transition on the current attempt.
+        Callers that run before ``_begin_log`` (power-on, a cancel before the
+        attempt starts) pass ``history=False``: the buffer still tracks the
+        previous finished attempt, so a history write would corrupt it.
+        """
         now = datetime.now(UTC)
         store = self._log_buffer.store
         attempt_id = self._log_buffer.attempts.get(hostname)
         if not isinstance(attempt_id, str):
             attempt_id = None
-        if store is not None and attempt_id is not None:
+        if history and store is not None and attempt_id is not None:
             fields: dict[str, object] = {"stage": failed_step or step.value}
             if step == ProvisioningStep.COMPLETE:
                 fields.update(
@@ -1146,7 +1154,7 @@ class NodeProvisioner:
             logger.info("redfish_not_configured", msg="skipping power check")
             return
 
-        await self._update_state(hostname, ProvisioningStep.POWERING_ON)
+        await self._update_state(hostname, ProvisioningStep.POWERING_ON, history=False)
         try:
             state = await self._redfish_client.power_action(hostname, "On")
             logger.info("power_on_result", hostname=hostname, state=state)
@@ -2164,8 +2172,37 @@ class NodeProvisioner:
                     placement=placement,
                 )
         except asyncio.CancelledError:
+            record = self._provisioning_tasks.get(hostname)
+            if record is None or record.attempt_id is None:
+                # Cancelled before the attempt was opened. The buffer may
+                # still track a row: close it only when it is a stale running
+                # row so the shutdown is visible; a finished row belongs to a
+                # previous attempt and must survive.
+                explicit = asyncio.current_task() in self._explicit_cancel_tasks
+                message = (
+                    "Provisioning cancelled by teardown"
+                    if explicit
+                    else "Gateway collection interrupted; remote command left running"
+                )
+                store = self._log_buffer.store
+                attempt_id = self._log_buffer.attempts.get(hostname)
+                current = (
+                    store.get(attempt_id)
+                    if store is not None and isinstance(attempt_id, str)
+                    else {}
+                )
+                if current.get("status") == "running":
+                    self._log(hostname, "error", message)
+                    await self._update_state(
+                        hostname,
+                        ProvisioningStep.FAILED,
+                        failed_step="cancelled" if explicit else "interrupted",
+                        error=message,
+                    )
+                    self._mark_log_complete(hostname)
+                raise
             store = self._log_buffer.store
-            attempt_id = self._log_buffer.attempts.get(hostname)
+            attempt_id = record.attempt_id
             attempt = store.get(attempt_id) if store and attempt_id else {}
             if (
                 attempt.get("status") == "complete"
@@ -2249,6 +2286,9 @@ class NodeProvisioner:
         self._begin_log(
             hostname, engine, model=artifact.model_alias if artifact else model
         )
+        record = self._provisioning_tasks.get(hostname)
+        if record is not None:
+            record.attempt_id = self._log_buffer.attempts.get(hostname)
         self._log(hostname, "info", "Provisioning started")
 
         await self._update_state(
@@ -3226,13 +3266,15 @@ class NodeProvisioner:
 
         if not record.started:
             # A task cancelled before its coroutine first runs cannot record
-            # its own terminal state. Normal cancellation is recorded inside
-            # provision() while that task still owns the host lease.
+            # its own terminal state. Its attempt has not been opened yet, so
+            # the buffer still tracks the previous finished attempt: only the
+            # etcd state may be written, never that older history row.
             await self._update_state(
                 hostname,
                 ProvisioningStep.FAILED,
                 failed_step="cancelled",
                 error="Provisioning cancelled by teardown",
+                history=False,
             )
         return record.identity
 
