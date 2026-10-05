@@ -9,7 +9,6 @@
 [![vLLM](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/sadsfae/188b760b19592c8913101f598f7cb382/raw/qiip-vllm.json)](https://docs.vllm.ai/)
 [![llama.cpp](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/sadsfae/188b760b19592c8913101f598f7cb382/raw/qiip-llamacpp.json)](https://github.com/ggml-org/llama.cpp)
 [![Release](https://img.shields.io/github/v/release/quadsproject/qiip)](https://github.com/quadsproject/qiip/releases)
-[![Dev release](https://img.shields.io/github/v/release/quadsproject/qiip?include_prereleases&sort=semver)](https://github.com/quadsproject/qiip/releases)
 [![COPR qiip](https://copr.fedorainfracloud.org/coprs/quadsdev/qiip/package/qiip/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/quadsdev/qiip/package/qiip/)
 [![COPR qiip-dev](https://copr.fedorainfracloud.org/coprs/quadsdev/qiip/package/qiip-dev/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/quadsdev/qiip/package/qiip-dev/)
 
