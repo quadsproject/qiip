@@ -21,6 +21,12 @@ pull request against `main`. The PR carries the required checks. Merging it
 re-triggers the workflow, which then creates the `v<version>` tag and the
 GitHub release and submits the `qiip` COPR build from that tag (the tag is
 created at the merge head, so the COPR build sees exactly what `main` has).
+The post-merge run detects that the stable version is already on `main` with
+no tag yet and runs python-semantic-release without commit or changelog
+generation, so the reviewed merge head is tagged as-is. The organization
+disallows Actions-created pull requests, so opening the release PR needs a
+`RELEASE_TOKEN` secret (a release identity with `repo` scope) or the
+organization setting allowing it.
 Development train releases still push directly; `development` is not
 protected.
 

@@ -79,6 +79,36 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The first run after a development->main merge only bumps the version
+      # locally and opens a release PR. Once that PR merges, main already
+      # carries the version bump, but PSR cannot see it as released without
+      # the tag (the tag is created only in this post-merge run): it would
+      # emit a second version commit and a duplicate CHANGELOG section,
+      # which the post-merge guard below rejects. Detect that finalize state
+      # first and run PSR without commit/changelog/tag generation there, so
+      # it computes the version and notes but leaves the merge head intact.
+      # A stable version on main without its tag is the reviewed release head
+      # (the release PR just merged); with the tag present, the next release
+      # is due and normal generation runs.
+      - name: Detect stable finalization
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml)"
+          if [[ "$GITHUB_REF_NAME" != "main" || ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "finalize=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Fail closed: a tag query error aborts the run instead of looking
+          # like "no tag yet" and finalizing an unreviewed head.
+          tags="$(git ls-remote --tags origin "refs/tags/v$version")"
+          if [[ -z "$tags" ]]; then
+            echo "finalize=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "finalize=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Python semantic release
         id: psr
         uses: python-semantic-release/python-semantic-release@9a026e9303981c866c3425723009becb2437c757 # v10.6.2
@@ -93,6 +123,13 @@ jobs:
           # development is not protected and keeps the direct push.
           push: ${{ github.ref_name == 'development' }}
           vcs_release: ${{ github.ref_name == 'development' }}
+          # On the finalize run (stable version already on main, no tag yet)
+          # PSR still computes the version and release notes, but it must not
+          # create another version commit, changelog section, or tag: the
+          # merge head is the reviewed release and the stable step tags it.
+          commit: ${{ steps.detect.outputs.finalize != 'true' }}
+          changelog: ${{ steps.detect.outputs.finalize != 'true' }}
+          tag: ${{ steps.detect.outputs.finalize != 'true' }}
 
       # python-semantic-release bumps project.version in pyproject.toml but
       # never regenerates uv.lock, leaving every branch off development red on
@@ -167,7 +204,14 @@ jobs:
         id: stable
         if: steps.psr.outputs.released == 'true' && github.ref_name == 'main'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The organization does not allow GitHub Actions to create or
+          # approve pull requests (can_approve_pull_request_reviews=false,
+          # repo PUT rejected with 409), so GITHUB_TOKEN cannot open the
+          # release PR. Use a release identity from a secret when present:
+          # a PAT of a release account with repo scope (or a GitHub App
+          # installation token) added as RELEASE_TOKEN. Without it the run
+          # fails here with the policy error.
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           RELEASE_NOTES: ${{ steps.psr.outputs.release_notes }}
         run: |
           set -euxo pipefail
@@ -177,14 +221,19 @@ jobs:
             | sed -n 's/^version = "\(.*\)"/\1/p')"
           if [[ "$current" == "$version" ]]; then
             # The release PR merged: the version commit is already on main and
-            # PSR tagged this head. Publish the tag, GitHub release, and let
-            # the COPR job below build from the tag.
+            # the merge head is the reviewed release. Publish the GitHub
+            # release first (gh creates the tag at the merge head); if that
+            # fails, nothing was created and a rerun can retry cleanly, unlike
+            # pushing the tag first, which would strand a tag with no release
+            # and skip every later run.
             [[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/$GITHUB_REF_NAME")" ]] \
               || { echo "post-merge release run produced extra commits; aborting" >&2; exit 1; }
+            gh release create "$tag" --title "$tag" --notes "$RELEASE_NOTES" \
+              --target "$(git rev-parse HEAD)" \
+              || gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null \
+              || { git push origin ":$tag" 2>/dev/null || true; echo "could not create GitHub release $tag; fix and rerun" >&2; exit 1; }
             git tag -f "$tag" HEAD
             git push origin "$tag"
-            gh release create "$tag" --title "$tag" --notes "$RELEASE_NOTES" \
-              || gh release view "$tag" --repo "$GITHUB_REPOSITORY"
             echo "finalized=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -198,12 +247,19 @@ jobs:
             git commit -m "chore: refresh uv.lock after version bump"
           fi
           branch="release-$version"
+          # A failed earlier run (for example missing RELEASE_TOKEN) can leave
+          # a stale branch with no PR; a newer bump commit then cannot push to
+          # it. Drop the stale branch so the run can start fresh.
+          if ! gh pr view --repo "$GITHUB_REPOSITORY" --head "$branch" >/dev/null 2>&1; then
+            git push origin ":$branch" 2>/dev/null || true
+          fi
           git checkout -b "$branch"
           git push -u origin "$branch"
           gh pr create --repo "$GITHUB_REPOSITORY" --base "$GITHUB_REF_NAME" \
             --head "$branch" --title "chore: release $version" \
             --body "Automated release PR. Merging publishes tag $tag, the GitHub release, and the COPR build from it." \
-            || gh pr view --repo "$GITHUB_REPOSITORY" --head "$branch" >/dev/null
+            || gh pr view --repo "$GITHUB_REPOSITORY" --head "$branch" >/dev/null \
+            || { echo "could not open or find release PR for $branch; the organization may need a RELEASE_TOKEN secret (release identity with repo scope) or to allow Actions-created PRs" >&2; exit 1; }
           echo "finalized=false" >> "$GITHUB_OUTPUT"
 
   copr_build:

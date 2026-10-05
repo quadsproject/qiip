@@ -16,7 +16,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -31,8 +31,10 @@ from inference_proxy.models.node import InferenceEngine
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
 from inference_proxy.provisioning.log_store import AttemptLogStore
 from inference_proxy.provisioning.provisioner import (
+    BackgroundOperation,
     NodeProvisioner,
     ProvisioningIdentity,
+    ProvisioningTask,
 )
 from inference_proxy.provisioning.remote_logs import RemoteLogCollector
 from inference_proxy.provisioning.ssh_client import (
@@ -40,6 +42,7 @@ from inference_proxy.provisioning.ssh_client import (
     SSHClient,
     SSHConnectionError,
 )
+from inference_proxy.provisioning.state import ProvisioningStep
 from tests.provisioning.test_vllm_scripts import _script_environment, _write_executable
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -600,3 +603,74 @@ async def test_explicit_gateway_cancellation_stops_detached_setup(
     assert attempt["status"] == "failed"
     assert "cancelled" in attempt["failure_summary"]
     assert any("Remote command cancelled" in issue for issue in attempt["issues"])
+
+
+@pytest.mark.asyncio
+async def test_state_written_before_begin_log_cannot_rewrite_previous_attempt(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    provisioner, _ssh, store = harness
+    provisioner._begin_log("host1", InferenceEngine.VLLM, model="org/model")
+    first = provisioner.log_buffer.attempts["host1"]
+    await provisioner._update_state("host1", ProvisioningStep.COMPLETE)
+    provisioner._mark_log_complete("host1")
+    assert store.get(first)["status"] == "complete"
+    before = store.get(first)
+
+    # Power-on and a cancel-before-start both run before _begin_log; the
+    # buffer still tracks the finished attempt, so neither may rewrite it.
+    redfish = MagicMock()
+    redfish.power_action = AsyncMock(return_value="On")
+    provisioner._redfish_client = redfish
+    with patch.object(provisioner, "_wait_for_ssh", new_callable=AsyncMock):
+        await provisioner._power_on_if_needed("host1")
+    assert store.get(first) == before
+
+    record = ProvisioningTask(
+        task=asyncio.create_task(asyncio.sleep(10)),
+        identity=ProvisioningIdentity(InferenceEngine.VLLM),
+        operation=BackgroundOperation.PROVISION,
+        started=False,
+    )
+    provisioner._provisioning_tasks["host1"] = record
+    await provisioner.cancel_provision("host1", record)
+    assert store.get(first) == before
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_power_on_does_not_rewrite_previous_attempt(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provisioner, _ssh, store = harness
+    provisioner._begin_log("host1", InferenceEngine.VLLM, model="org/model")
+    first = provisioner.log_buffer.attempts["host1"]
+    await provisioner._update_state("host1", ProvisioningStep.COMPLETE)
+    provisioner._mark_log_complete("host1")
+    assert store.get(first)["status"] == "complete"
+    before = store.get(first)
+
+    # Cancellation lands inside _power_on_if_needed, before _begin_log: the
+    # outer handler must not rewrite the previous attempt that the buffer
+    # still tracks.
+    entered = asyncio.Event()
+
+    async def blocking_power_on(hostname: str) -> None:
+        entered.set()
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(provisioner, "_power_on_if_needed", blocking_power_on)
+    monkeypatch.setattr(provisioner, "preflight", AsyncMock())
+    monkeypatch.setattr(provisioner, "_upload_scripts", AsyncMock())
+    task = provisioner.fire_background(
+        provisioner.provision("host1", model="org/model"),
+        provisioning_hostname="host1",
+        provisioning_identity=ProvisioningIdentity(InferenceEngine.VLLM),
+    )
+    async with asyncio.timeout(3):
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+    await provisioner.cancel_active_provision("host1")
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.get(first) == before
