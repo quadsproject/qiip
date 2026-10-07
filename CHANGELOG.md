@@ -2,6 +2,31 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.1 (2026-10-07)
+
+### Bug Fixes
+
+- Address GPU setup review findings ([#218](https://github.com/quadsproject/qiip/pull/218),
+  [`71aada2`](https://github.com/quadsproject/qiip/commit/71aada25870595039899bcdced281a19a6ddec71))
+
+- Copy driver reboot markers directly ([#218](https://github.com/quadsproject/qiip/pull/218),
+  [`71aada2`](https://github.com/quadsproject/qiip/commit/71aada25870595039899bcdced281a19a6ddec71))
+
+### Chores
+
+- Absorb transient Chrome hangs in browser tests
+  ([#215](https://github.com/quadsproject/qiip/pull/215),
+  [`482fe78`](https://github.com/quadsproject/qiip/commit/482fe7833407a235fea9babd0298b9e0414d2e79))
+
+- Drop duplicate dev release badge from README
+  ([`f800bba`](https://github.com/quadsproject/qiip/commit/f800bba67f4c2e2eb85a520ce1dc41575aacb74b))
+
+### Features
+
+- Reuse compatible GPU drivers during setup ([#218](https://github.com/quadsproject/qiip/pull/218),
+  [`71aada2`](https://github.com/quadsproject/qiip/commit/71aada25870595039899bcdced281a19a6ddec71))
+
+
 ## v0.1.0 (2026-10-05)
 
 - Initial Release
