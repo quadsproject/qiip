@@ -402,7 +402,12 @@ async def test_reconcile_bootstraps_missing_recorder(
 
     blocked = await provisioner._reconcile_host("host1")
     assert blocked is False
-    assert (ssh.root / "common" / "provision-logs.py").is_file()
+    collector = provisioner._remote_logs
+    assert collector is not None
+    recorder = ssh.root / collector.recorders["host1"]
+    assert recorder.is_file()
+    assert recorder.parent.parent.parent == ssh.root / ".qiip/bundles"
+    assert (recorder.parent.parent / "BUNDLE.json").is_file()
 
 
 @pytest.mark.asyncio

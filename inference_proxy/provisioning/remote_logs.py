@@ -40,6 +40,7 @@ class RemoteLogCollector:
         self.store = store
         self.buffer = buffer
         self.settings = settings
+        self.recorders: dict[str, str] = {}
         self._locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._diagnostic_locks: WeakValueDictionary[str, asyncio.Lock] = (
             WeakValueDictionary()
@@ -175,6 +176,13 @@ class RemoteLogCollector:
             engine=attempt["engine"],
             model=attempt["model"],
             bundle_version=attempt["bundle_version"],
+            selected_generation=attempt.get("selected_generation"),
+            recorder_path=attempt.get("recorder_path")
+            or (
+                f".qiip/bundles/{attempt['staged_bundle']}/common/provision-logs.py"
+                if attempt.get("staged_bundle")
+                else None
+            ),
             root=self.settings.log_remote_root,
             max_bytes=self.settings.log_remote_max_bytes,
             attempt_max_bytes=self.settings.log_remote_attempt_max_bytes,
@@ -225,7 +233,12 @@ class RemoteLogCollector:
         command = (
             "printf %s "
             + shlex.quote(json.dumps(config))
-            + " | python3 common/provision-logs.py "
+            + " | python3 "
+            + shlex.quote(
+                config.get("recorder_path")
+                or self.recorders.get(config["hostname"], "common/provision-logs.py")
+            )
+            + " "
             + action
         )
         try:
@@ -381,6 +394,13 @@ class RemoteLogCollector:
             remote_phases=remote.get("phases", {}),
             remote_sources=remote["sources"],
             remote_dropped_records=remote["dropped_records"],
+            **(
+                {
+                    "selected_generation": remote["selected_generation"],
+                }
+                if "selected_generation" in remote
+                else {}
+            ),
             issues=issues[-32:],
             **diagnostic_fields,
         )

@@ -1,6 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
+# Resolve the generation once, before sourcing any scripts or choosing tools.
+if [ "${QIIP_GENERATION_PINNED:-0}" != "1" ] \
+    && [ -L "${QIIP_GENERATION_ROOT:-/opt/qiip/llama_cpp}/current" ]; then
+    _qiip_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    exec python3 "${_qiip_script_dir}/../common/generations.py" exec \
+        "${QIIP_GENERATION_ROOT:-/opt/qiip/llama_cpp}" "$_qiip_script_dir" start-llamacpp.sh "$@"
+fi
+
 API_PORT="${AUTOLLAMACPP_PORT:-8000}"
 NFS_MOUNT_POINT="${AUTOLLAMACPP_NFS_MOUNT_POINT:-/srv/hf-cache}"
 # Shared name (setup.sh and the gateway use AUTOVLLM_NFS_EXPORT for both engines).

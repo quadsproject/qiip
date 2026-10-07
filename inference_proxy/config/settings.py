@@ -313,6 +313,7 @@ class ProvisioningSettings(BaseModel):
     min_disk_gb: int = 20
     drain_timeout: int = 30
     scripts_dir: Path = Path("auto-vllm")
+    generation_root: Path = Path("/opt/qiip")
     boot_wait_timeout: int = 300  # D-05: 5 minutes for cold boot
     boot_wait_interval: int = 10
     max_concurrent_provisions: int = Field(default=32, ge=1)
@@ -343,6 +344,15 @@ class ProvisioningSettings(BaseModel):
     llamacpp_source_url: str = DEFAULT_LLAMACPP_SOURCE_URL
     llamacpp_setup_timeout: float = Field(default=7200.0, gt=0)
     llamacpp_fit_target_mib: int = Field(default=512, ge=1)
+
+    @field_validator("generation_root")
+    @classmethod
+    def generation_root_is_absolute(cls, value: Path) -> Path:
+        if not value.is_absolute() or len(value.parts) < 2 or ".." in value.parts:
+            raise ValueError("generation_root must be a dedicated absolute directory")
+        if any(ord(c) < 32 for c in str(value)):
+            raise ValueError("generation_root must not contain control characters")
+        return value
 
     @field_validator("log_remote_root")
     @classmethod

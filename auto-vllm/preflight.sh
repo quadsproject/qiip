@@ -18,8 +18,8 @@ ATTENTION_BACKEND_OVERRIDE="${AUTOVLLM_ATTENTION_BACKEND:-}"
 NFS_EXPORT="${AUTOVLLM_NFS_EXPORT:-}"
 
 # Shared storage primitives (source/fstype/option verification, capacity).
-# Resolved from the node bundle layout first, then the installed location used
-# by systemd's ExecStartPre (setup.sh installs qiip-setup-base.sh).
+# Resolved from the selected bundle first. The installed fallback supports
+# nodes whose service unit predates generation dispatch.
 # shellcheck disable=SC1091 source=../common/setup-base.sh
 _COMMON_SH=""
 if [ -f "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/common/setup-base.sh" ]; then

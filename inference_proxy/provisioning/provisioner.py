@@ -9,10 +9,11 @@ Per D-15: Concrete class, no protocol/interface.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import shlex
+import tempfile
+import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass
@@ -56,6 +57,11 @@ from inference_proxy.models.node import (
     NodePlacement,
     NodeStatus,
     VllmParams,
+)
+from inference_proxy.provisioning.bundles import (
+    bundle_files,
+    bundle_manifest,
+    write_bundle,
 )
 from inference_proxy.provisioning.host_lifecycle import (
     HostLifecycleCoordinator,
@@ -156,6 +162,8 @@ _ENGINE_BUNDLE_FILES = {
         "uv.lock",
         "uv-x86_64-unknown-linux-gnu.tar.gz.sha256",
         "vllm-process.sh",
+        "preflight.sh",
+        "wait-fabric.sh",
     },
     InferenceEngine.LLAMA_CPP: {
         "llamacpp-process.sh",
@@ -503,6 +511,7 @@ class NodeProvisioner:
         self._owner_updates: set[asyncio.Task[Node]] = set()
         self._provisioning_tasks: dict[str, ProvisioningTask] = {}
         self._explicit_cancel_tasks: set[asyncio.Task[None]] = set()
+        self._remote_bundles: dict[tuple[str, InferenceEngine], str] = {}
 
     @property
     def log_buffer(self) -> ProvisioningLogBuffer:
@@ -516,24 +525,22 @@ class NodeProvisioner:
         model: str | None = None,
         operation: str = "provision",
     ) -> None:
-        digest = hashlib.sha256()
-        files = [
-            *self._engine_scripts_dir(engine).glob("*"),
-            *self._common_scripts_dir().glob("*"),
-            Path(__file__).with_name("log_store.py"),
-            Path(__file__).with_name("diagnostics.py"),
-        ]
-        for path in sorted(files):
-            if path.is_file():
-                digest.update(path.name.encode())
-                digest.update(path.read_bytes())
+        identity, _manifest = bundle_manifest(
+            bundle_files(self._engine_scripts_dir(engine), self._common_scripts_dir())
+        )
         self._log_buffer.create(
             hostname,
             engine=engine.value,
             model=model,
             operation=operation,
-            bundle_version="sha256:" + digest.hexdigest(),
+            bundle_version="sha256:" + identity,
         )
+        if self._log_buffer.store is not None and self._remote_logs is not None:
+            recorder = self._remote_logs.recorders.get(hostname)
+            if recorder:
+                self._log_buffer.store.update(
+                    self._log_buffer.attempts[hostname], recorder_path=recorder
+                )
 
     async def collect_logs(self, hostname: str, attempt_id: str) -> dict[str, object]:
         store = self._log_buffer.store
@@ -739,6 +746,7 @@ class NodeProvisioner:
             *(engine_dir / name for name in _ENGINE_BUNDLE_FILES[engine]),
             common_dir / "setup-base.sh",
             common_dir / "profiles.sh",
+            common_dir / "generations.py",
         }
         if self._remote_logs is not None:
             required.add(common_dir / "provision-logs.py")
@@ -755,6 +763,7 @@ class NodeProvisioner:
     ) -> dict[str, str]:
         """Return the exact environment accepted by setup.sh."""
         env = {
+            "QIIP_GENERATION_ROOT": str(self._settings.generation_root / engine.value),
             "AUTOVLLM_NFS_EXPORT": self._required_nfs_export(),
             "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
             "AUTOVLLM_NVIDIA_DRIVER_VERSION": self._settings.nvidia_driver_version,
@@ -936,6 +945,59 @@ class NodeProvisioner:
             f"{name}={shlex.quote(value)}" for name, value in env.items()
         )
         return f"{assignments} {command}"
+
+    def _remote_script_command(
+        self,
+        hostname: str,
+        engine: InferenceEngine,
+        script: str,
+        *,
+        env: dict[str, str] | None = None,
+        args: tuple[str, ...] = (),
+    ) -> str:
+        bundle = self._remote_bundles.get((hostname, engine))
+        directory = self._engine_scripts_dir(engine).name
+        if bundle is None:
+            return self._script_command(
+                script, scripts_dir=directory, env=env, args=args
+            )
+        if script == "setup.sh":
+            return self._script_command(
+                script, scripts_dir=f"{bundle}/{directory}", env=env, args=args
+            )
+        command = shlex.join(
+            (
+                "python3",
+                f"{bundle}/common/generations.py",
+                "exec",
+                str(self._settings.generation_root / engine.value),
+                f"{bundle}/{directory}",
+                script,
+                *args,
+            )
+        )
+        assignments = " ".join(
+            f"{key}={shlex.quote(value)}" for key, value in (env or {}).items()
+        )
+        return f"{assignments} {command}" if assignments else command
+
+    def _record_generation(self, hostname: str, line: str) -> None:
+        if not line.startswith("[GENERATION:") or not line.endswith("]"):
+            return
+        try:
+            selected = json.loads(line[len("[GENERATION:") : -1])
+            if not isinstance(selected, dict) or not isinstance(
+                selected.get("runtime_path"), str
+            ):
+                raise ValueError("expected generation metadata")
+        except ValueError:
+            logger.warning("invalid_generation_marker", hostname=hostname)
+            return
+        if self._log_buffer.store is not None:
+            self._log_buffer.store.update(
+                self._log_buffer.attempts[hostname],
+                selected_generation=selected,
+            )
 
     def _log(
         self,
@@ -1496,9 +1558,10 @@ class NodeProvisioner:
 
     async def _stop_llamacpp(self, hostname: str) -> None:
         """Stop llama.cpp through the verified engine-specific script."""
-        command = self._script_command(
+        command = self._remote_script_command(
+            hostname,
+            InferenceEngine.LLAMA_CPP,
             "stop-llamacpp.sh",
-            scripts_dir=self._engine_scripts_dir(InferenceEngine.LLAMA_CPP).name,
         )
         await self._ssh_run_command(hostname, command)
 
@@ -2498,26 +2561,57 @@ class NodeProvisioner:
         by an older gateway lack the ``active`` action; uploading first lets
         the reconcile gate distinguish "no evidence" from "unreachable".
         """
-        await self._ssh_client.upload(hostname, self._common_scripts_dir())
+        files = bundle_files(None, self._common_scripts_dir())
+        bundle = await self._publish_bundle(hostname, files)
         if self._remote_logs is not None:
-            await self._ssh_client.upload(
+            self._remote_logs.recorders[hostname] = f"{bundle}/common/provision-logs.py"
+
+    async def _publish_bundle(self, hostname: str, files: dict[str, bytes]) -> str:
+        # Unique upload paths leave partial transfers inactive and harmless.
+        # Snapshot bytes before the first await so a gateway checkout change
+        # cannot silently combine files from different versions.
+        with tempfile.TemporaryDirectory(prefix="qiip-bundle-") as temporary:
+            name = ".upload-" + uuid.uuid4().hex
+            staged = Path(temporary) / name
+            staged.mkdir()
+            identity = write_bundle(staged, files)
+            remote_staged = f".qiip/bundles/{name}"
+            final = f".qiip/bundles/{identity}"
+            await self._ssh_client.run(hostname, "mkdir -p .qiip/bundles")
+            await self._ssh_client.upload(hostname, staged, ".qiip/bundles/")
+            await self._ssh_client.run(
                 hostname,
-                Path(__file__).with_name("log_store.py"),
-                "common/log_store.py",
+                shlex.join(
+                    (
+                        "python3",
+                        f"{remote_staged}/common/generations.py",
+                        "publish-bundle",
+                        remote_staged,
+                        final,
+                        identity,
+                    )
+                ),
             )
-            await self._ssh_client.upload(
-                hostname,
-                Path(__file__).with_name("diagnostics.py"),
-                "common/diagnostics.py",
-            )
+        return final
 
     async def _upload_scripts(
         self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
     ) -> None:
         """Copy provisioning scripts to the remote host via SCP."""
-        scripts_dir, _common_dir = self._required_script_bundles(engine)
-        await self._ssh_client.upload(hostname, scripts_dir)
-        await self._ensure_remote_recorder(hostname)
+        scripts_dir, common_dir = self._required_script_bundles(engine)
+        bundle = await self._publish_bundle(
+            hostname, bundle_files(scripts_dir, common_dir)
+        )
+        self._remote_bundles[hostname, engine] = bundle
+        if self._remote_logs is not None:
+            self._remote_logs.recorders[hostname] = f"{bundle}/common/provision-logs.py"
+        if self._log_buffer.store is not None and hostname in self._log_buffer.attempts:
+            self._log_buffer.store.update(
+                self._log_buffer.attempts[hostname],
+                staged_bundle=bundle.rsplit("/", 1)[1],
+                bundle_version="sha256:" + bundle.rsplit("/", 1)[1],
+                recorder_path=f"{bundle}/common/provision-logs.py",
+            )
 
     async def _run_setup(
         self,
@@ -2528,10 +2622,11 @@ class NodeProvisioner:
         engine: InferenceEngine = InferenceEngine.VLLM,
     ) -> None:
         """Run setup.sh and parse step markers from stdout (D-05, D-06)."""
-        command = self._script_command(
+        command = self._remote_script_command(
+            hostname,
+            engine,
             "setup.sh",
             env=self._setup_script_env(engine),
-            scripts_dir=self._engine_scripts_dir(engine).name,
         )
         output: AsyncIterator[tuple[str, str]]
         if self._remote_logs is not None:
@@ -2561,6 +2656,7 @@ class NodeProvisioner:
                         resume_match.group(2),
                     )
                 if stream == "stdout":
+                    self._record_generation(hostname, line)
                     match = STEP_PATTERN.search(line)
                     if match:
                         step_name, status = match.group(1), match.group(2)
@@ -2952,7 +3048,9 @@ class NodeProvisioner:
             script = "start-llamacpp.sh"
         else:
             script = "start-vllm.sh"
-        command = self._script_command(
+        command = self._remote_script_command(
+            hostname,
+            engine,
             script,
             env=self._start_script_env(
                 model,
@@ -2962,7 +3060,6 @@ class NodeProvisioner:
                 vllm_params=vllm_params,
                 draft_artifact=draft_artifact,
             ),
-            scripts_dir=self._engine_scripts_dir(engine).name,
         )
         output: AsyncIterator[tuple[str, str]]
         if self._remote_logs is not None:
@@ -2985,6 +3082,7 @@ class NodeProvisioner:
             )
             self._log(hostname, "debug", line, stream=stream)
             if stream == "stdout":
+                self._record_generation(hostname, line)
                 match = MODEL_PATTERN.search(line)
                 if match:
                     model_name = match.group(1).strip()
@@ -3482,10 +3580,11 @@ class NodeProvisioner:
                 stop_script = "stop-llamacpp.sh"
             else:
                 stop_script = "stop-vllm.sh"
-            stop_command = self._script_command(
+            stop_command = self._remote_script_command(
+                hostname,
+                engine,
                 stop_script,
                 args=("--force",) if force else (),
-                scripts_dir=self._engine_scripts_dir(engine).name,
             )
             await self._ssh_run_command(hostname, stop_command)
 

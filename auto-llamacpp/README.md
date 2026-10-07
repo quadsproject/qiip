@@ -31,11 +31,15 @@ it depends only on the `make` package available from the standard RHEL
 repositories and does not require CodeReady Builder or `ninja-build`.
 
 Installations are immutable and build-identified under
-`/opt/llama.cpp/<version>-<identity>`. The three public binaries in
-`/usr/local/bin` are replaced with same-directory atomic symlink renames only
-after the new build reports the configured version. Repeating setup with the
-same source digest, transformation digest, build profile, and GPU capabilities
-reuses that installation.
+`/opt/llama.cpp/<version>-<identity>`. Setup verifies all three installed tools,
+their manifest, the source/build/profile identity, and managed CLI compatibility
+before publication. Managed setup selects the runtime and the complete script
+bundle together through `/opt/qiip/llama_cpp/current`, retaining the previous
+generation. Repeating setup with the same identity validates and reuses that
+installation. Standalone `install_llamacpp` callers expose the three tools
+through one `/opt/llama.cpp/current` pointer and stable compatibility links.
+See [transactional provisioning](../docs/transactional-provisioning.md) for
+interruption recovery and rollback.
 
 The full llama.cpp setup command has a separate two-hour default deadline
 (`INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT`) because it includes

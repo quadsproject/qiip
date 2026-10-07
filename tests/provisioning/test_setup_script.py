@@ -7,6 +7,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -321,6 +322,7 @@ def test_vllm_environment_syncs_with_frozen_uv_lock(tmp_path: Path) -> None:
     venv = tmp_path / "venv"
     bin_dir = venv / "bin"
     bin_dir.mkdir(parents=True)
+    _write_executable(bin_dir / "sudo", '#!/bin/bash\nexec "$@"\n')
     operation_log = tmp_path / "operations.log"
     uv_bin = tmp_path / "uv"
 
@@ -339,6 +341,14 @@ if [[ "$1" == '--version' ]]; then
 fi
 echo "env:$UV_PROJECT_ENVIRONMENT" >> "$AUTOVLLM_TEST_LOG"
 echo "$*" >> "$AUTOVLLM_TEST_LOG"
+mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
+cp "$AUTOVLLM_TEST_PYTHON" "$UV_PROJECT_ENVIRONMENT/bin/python"
+printf '#!/bin/bash\necho 1.13\n' > "$UV_PROJECT_ENVIRONMENT/bin/ninja"
+cat > "$UV_PROJECT_ENVIRONMENT/bin/vllm" <<'EOF'
+#!/bin/bash
+echo '--host --port --tensor-parallel-size --gpu-memory-utilization --max-model-len --max-num-batched-tokens --enable-auto-tool-choice --tool-call-parser --reasoning-parser --dtype --enforce-eager'
+EOF
+chmod +x "$UV_PROJECT_ENVIRONMENT/bin/"*
 """,
     )
     env = os.environ.copy()
@@ -347,6 +357,9 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
             "AUTOVLLM_VENV": str(venv),
             "AUTOVLLM_UV_BIN": str(uv_bin),
             "AUTOVLLM_TEST_LOG": str(operation_log),
+            "AUTOVLLM_TEST_PYTHON": str(bin_dir / "python"),
+            "AUTOVLLM_BOOTSTRAP_PYTHON": sys.executable,
+            "PATH": f"{bin_dir}:{env['PATH']}",
         }
     )
 
@@ -359,10 +372,13 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
     )
 
     assert result.returncode == 0, result.stderr
+    runtime = next((tmp_path / "venv-generations").iterdir())
+    assert (runtime / "RUNTIME.json").is_file()
+    assert venv.is_dir() and not venv.is_symlink()
     assert operation_log.read_text().splitlines() == [
-        f"env:{venv}",
+        f"env:{runtime}",
         f"sync --project {SCRIPT_ROOT / 'auto-vllm'} --frozen --no-dev "
-        "--no-install-project --no-build --python /usr/bin/python3.12 "
+        f"--no-install-project --no-build --python {sys.executable} "
         "--python-platform x86_64-manylinux_2_34",
     ]
 

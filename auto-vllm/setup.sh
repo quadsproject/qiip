@@ -30,6 +30,9 @@ else
 fi
 LLMFIT_URL="${LLMFIT_URL:-https://github.com/AlexsJones/llmfit/releases/download/v${LLMFIT_RELEASE}/llmfit-v${LLMFIT_RELEASE}-x86_64-unknown-linux-musl.tar.gz}"
 VLLM_VENV="${AUTOVLLM_VENV:-/opt/vllm-venv}"
+VLLM_RUNTIME_ROOT="${AUTOVLLM_RUNTIME_ROOT:-${VLLM_VENV}-generations}"
+VLLM_BOOTSTRAP_PYTHON="${AUTOVLLM_BOOTSTRAP_PYTHON:-/usr/bin/python3.12}"
+QIIP_GENERATION_ROOT="${QIIP_GENERATION_ROOT:-/opt/qiip/vllm}"
 LLMFIT_BIN="${AUTOVLLM_LLMFIT_BIN:-/usr/local/bin/llmfit}"
 INSTALL_TMP_DIR="${AUTOVLLM_TMP_DIR:-/tmp}"
 UV_BIN="${AUTOVLLM_UV_BIN:-/usr/local/bin/uv}"
@@ -110,48 +113,53 @@ install_vllm() {
     reject_retired_flashinfer_index
     install_uv
 
-    UV_PROJECT_ENVIRONMENT="$VLLM_VENV" "$UV_BIN" sync \
-        --project "$UV_PROJECT" \
-        --frozen \
-        --no-dev \
-        --no-install-project \
-        --no-build \
-        --python /usr/bin/python3.12 \
-        --python-platform "$UV_PYTHON_PLATFORM"
+    local identity runtime marker cli option python_version
+    python_version=$("$VLLM_BOOTSTRAP_PYTHON" --version)
+    marker=$(printf 'schema=2\nprofile=%s\ncuda=%s\npython=%s\nuv=%s\n' \
+        "${PROFILE_NAME:-unselected}" "${PROFILE_CUDA_TOOLKIT_VERSION:-unknown}" \
+        "$python_version" "$UV_VERSION"; \
+        sha256sum "${UV_PROJECT}/pyproject.toml" "${UV_PROJECT}/uv.lock" | awk '{print $1}')
+    identity=$(printf '%s' "$marker" | sha256sum | cut -d ' ' -f 1)
+    runtime="${VLLM_RUNTIME_ROOT%/}/${identity}"
+    if [ -f "${runtime}/RUNTIME.json" ]; then
+        qiip_generation_tool verify-runtime "$runtime" "$marker"
+    else
+        # This is its final path: uv-generated entry points embed it. Retries
+        # reconcile only an inactive, unsealed installation, never current.
+        qiip_require_inactive_runtime "$runtime" "$QIIP_GENERATION_ROOT"
+        UV_PROJECT_ENVIRONMENT="$runtime" "$UV_BIN" sync \
+            --project "$UV_PROJECT" \
+            --frozen \
+            --no-dev \
+            --no-install-project \
+            --no-build \
+            --python "$VLLM_BOOTSTRAP_PYTHON" \
+            --python-platform "$UV_PYTHON_PLATFORM"
+    fi
 
-    "${VLLM_VENV}/bin/python" -c \
-        'from importlib.metadata import version; from packaging.version import Version; import flashinfer_cubin; assert Version(version("flashinfer-cubin")).public == Version(version("flashinfer-python")).public'
+    "${runtime}/bin/python" -c \
+        'from importlib.metadata import version; from packaging.version import Version; import torch, vllm, flashinfer, flashinfer_cubin; assert Version(version("flashinfer-cubin")).public == Version(version("flashinfer-python")).public'
+    "${runtime}/bin/ninja" --version >/dev/null
+    cli=$("${runtime}/bin/vllm" serve --help=all)
+    for option in --host --port --tensor-parallel-size --gpu-memory-utilization \
+        --max-model-len --max-num-batched-tokens --enable-auto-tool-choice \
+        --tool-call-parser --reasoning-parser --dtype --enforce-eager; do
+        if ! grep -Eq -- "(^|[[:space:],])${option}([[:space:],=]|$)" <<<"$cli"; then
+            echo "FATAL: vLLM CLI does not support ${option}" >&2
+            return 1
+        fi
+    done
+    if [ ! -f "${runtime}/RUNTIME.json" ]; then
+        qiip_generation_tool seal-runtime "$runtime" "$marker" python vllm ninja
+    fi
+    if [ -n "${QIIP_RUNTIME_SELECTION:-}" ]; then
+        printf '%s\n' "$runtime" > "$QIIP_RUNTIME_SELECTION"
+    fi
 }
 
 install_vllm_unit() {
-    sudo install -m 755 "${SCRIPT_DIR}/wait-fabric.sh" /usr/local/bin/wait-nvswitch-fabric
-    sudo install -m 755 "${SCRIPT_DIR}/preflight.sh" /usr/local/bin/vllm-preflight
-    sudo install -m 755 "${SCRIPT_DIR}/../common/setup-base.sh" /usr/local/bin/qiip-setup-base.sh
-    sudo install -m 755 "${SCRIPT_DIR}/../common/profiles.sh" /usr/local/bin/qiip-profiles.sh
-    # A previous provisioning may have left a selection here; re-setup starts
-    # from defaults and start-vllm.sh rewrites the file on first success.
-    sudo rm -f /etc/vllm/vllm.env
-    cat <<UNIT | sudo tee /etc/systemd/system/vllm.service > /dev/null
-[Unit]
-Description=vLLM inference server
-After=network-online.target nvidia-fabricmanager.service
-Wants=network-online.target
-
-[Service]
-Type=exec
-Environment="AUTOVLLM_NFS_EXPORT=${NFS_EXPORT}"
-Environment="AUTOVLLM_NFS_MOUNT_POINT=${NFS_MOUNT_POINT}"
-Environment="AUTOVLLM_MIN_FREE_GB=${AUTOVLLM_MIN_FREE_GB:-20}"
-EnvironmentFile=-/etc/vllm/vllm.env
-ExecStartPre=/usr/local/bin/wait-nvswitch-fabric
-ExecStartPre=/usr/local/bin/vllm-preflight --check-only
-ExecStart=${SCRIPT_DIR}/start-vllm.sh
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-UNIT
+    sudo ln -sfn "${QIIP_GENERATION_ROOT}/current/vllm.service" /etc/systemd/system/vllm.service.qiip-pending
+    sudo mv -Tf /etc/systemd/system/vllm.service.qiip-pending /etc/systemd/system/vllm.service
     sudo systemctl daemon-reload
 }
 
@@ -164,12 +172,14 @@ main() {
     reject_retired_flashinfer_index
     require_sha256 "llmfit ${LLMFIT_RELEASE}" "$LLMFIT_SHA256" \
         "AUTOVLLM_LLMFIT_SHA256"
+    begin_engine_generation
     prepare_runtime vllm
     step vllm_install install_vllm
-    step vllm_unit install_vllm_unit
     step nfs_mount mount_nfs_cache
     step firewall configure_firewall
     soft_step llmfit_install install_llmfit
+    step generation_activate activate_engine_generation vllm
+    step vllm_unit install_vllm_unit
 
     echo "Setup complete"
 }

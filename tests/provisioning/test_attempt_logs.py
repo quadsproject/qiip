@@ -11,6 +11,7 @@ import asyncio
 import gzip
 import json
 import re
+import shlex
 import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -21,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from common import generations
 from inference_proxy.config.settings import (
     LLMFitSettings,
     ProvisioningSettings,
@@ -46,6 +48,156 @@ from inference_proxy.provisioning.state import ProvisioningStep
 from tests.provisioning.test_vllm_scripts import _script_environment, _write_executable
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.asyncio
+async def test_prior_selection_does_not_replace_candidate_setup_bundle_identity(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    provisioner, ssh, store = harness
+    runtime = ssh.root / "runtime"
+    (runtime / "bin").mkdir(parents=True)
+    _write_executable(runtime / "bin/vllm", "#!/bin/bash\nexit 0\n")
+    generations.seal_runtime(runtime, "prior-runtime", ["vllm"])
+    root = provisioner._settings.generation_root / "vllm"
+    bundle = generations.setup_bundle(ssh.root / "releases", ssh.root / "auto-vllm")
+    selected = generations.activate(
+        root, bundle, "auto-vllm", runtime, {"QIIP_ENGINE": "vllm"}
+    )
+    source = ssh.root / "auto-vllm/setup.sh"
+    source.write_text(source.read_text() + "\n# next setup bundle\n")
+    provisioner._begin_log("host1", InferenceEngine.VLLM)
+    attempt = provisioner.log_buffer.attempts["host1"]
+    candidate = store.get(attempt)["bundle_version"]
+    assert candidate != "sha256:" + selected["bundle_id"]
+    collector = provisioner._remote_logs
+    assert collector is not None
+    command = shlex.join(
+        ("python3", str(bundle / "common/generations.py"), "selected", str(root))
+    )
+    async for _stream, _line in collector.run("host1", command, stage="setup"):
+        pass
+    await provisioner._finish_remote_logs("host1")
+    assert store.get(attempt)["selected_generation"] == selected
+    assert store.get(attempt)["bundle_version"] == candidate
+
+
+@pytest.mark.asyncio
+async def test_selected_generation_survives_lost_activation_acknowledgement(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    provisioner, ssh, store = harness
+    runtime = ssh.root / "runtime"
+    (runtime / "bin").mkdir(parents=True)
+    _write_executable(runtime / "bin/vllm", "#!/bin/bash\necho fixture-runtime\n")
+    generations.seal_runtime(runtime, "frozen-dependencies-and-profile", ["vllm"])
+    bundle = generations.setup_bundle(ssh.root / "releases", ssh.root / "auto-vllm")
+    root = provisioner._settings.generation_root / "vllm"
+    provisioner._begin_log("host1", InferenceEngine.VLLM)
+    attempt = provisioner.log_buffer.attempts["host1"]
+    collector = provisioner._remote_logs
+    assert collector is not None
+    collector.recorders["host1"] = str(bundle / "common/provision-logs.py")
+    ssh.lose_launch = True
+    ssh.fail_reads = 1
+    command = shlex.join(
+        (
+            "python3",
+            str(bundle / "common/generations.py"),
+            "activate",
+            str(root),
+            str(bundle),
+            "auto-vllm",
+            str(runtime),
+            json.dumps({"QIIP_ENGINE": "vllm"}),
+        )
+    )
+    async for _stream, _line in collector.run("host1", command, stage="setup"):
+        pass
+    await provisioner._finish_remote_logs("host1")
+    selected = generations.evidence((root / "current").resolve())
+    assert store.get(attempt)["selected_generation"] == selected
+    assert store.get(attempt)["bundle_version"] == "sha256:" + selected["bundle_id"]
+    remote = AttemptLogStore(ssh.root / "logs/attempts.sqlite3")
+    assert remote.get(attempt)["selected_generation"] == selected
+    assert ssh.launch_faults_injected == 1 and ssh.read_faults_injected == 1
+    assert not list(bundle.rglob("*.pyc"))
+
+
+@pytest.mark.parametrize("metadata", ["recorder_path", "staged_bundle"])
+async def test_logs_and_diagnostics_recover_immutable_recorder_after_gateway_restart(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore], metadata: str
+) -> None:
+    provisioner, ssh, store = harness
+    await provisioner._ensure_remote_recorder("host1")
+    provisioner._begin_log("host1", InferenceEngine.VLLM)
+    await provisioner._upload_scripts("host1")
+    attempt = provisioner.log_buffer.attempts["host1"]
+    collector = provisioner._remote_logs
+    assert collector is not None
+    recorder = store.get(attempt)["recorder_path"]
+    if metadata == "staged_bundle":
+        store.update(attempt, recorder_path=None)
+    async for _stream, _line in collector.run(
+        "host1", "echo restart-evidence", stage="setup"
+    ):
+        pass
+    collector.record_failure(attempt, "setup", RuntimeError("fixture failure"))
+    await collector.collect(attempt, finish=True)
+    shutil.rmtree(ssh.root / "common")
+    reopened = AttemptLogStore(store.path)
+    restarted = RemoteLogCollector(
+        ssh, reopened, ProvisioningLogBuffer(store=reopened), provisioner._settings
+    )
+    assert not restarted.recorders
+    await restarted.collect(attempt)
+    await restarted.diagnose(attempt)
+    assert any(
+        "restart-evidence" in record["msg"]
+        for record in reopened.read(attempt)["records"]
+    )
+    assert (
+        reopened.get(attempt)["diagnostics"]["sources"]["os"]["status"] == "collected"
+    )
+    assert (ssh.root / recorder).is_file()
+    assert ssh.launches == 1
+
+
+async def test_malformed_generation_output_does_not_abort_gateway_or_recorder(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    provisioner, _ssh, store = harness
+    provisioner._begin_log("host1", InferenceEngine.VLLM)
+    attempt = provisioner.log_buffer.attempts["host1"]
+    valid = {"runtime_path": "/opt/fixture-runtime", "generation_id": "fixture"}
+    good = "[GENERATION:" + json.dumps(valid) + "]"
+    provisioner._record_generation("host1", good)
+    malformed = [
+        "[GENERATION:{broken}]",
+        "[GENERATION:null]",
+        "[GENERATION:[]]",
+        "[GENERATION:{}]",
+        "[GENERATION:truncated",
+    ]
+    for line in malformed:
+        provisioner._record_generation("host1", line)
+    assert store.get(attempt)["selected_generation"] == valid
+    collector = provisioner._remote_logs
+    assert collector is not None
+    command = shlex.join(("printf", "%s\n", good, *malformed, "still-running"))
+    output = []
+    async for _stream, line in collector.run("host1", command, stage="setup"):
+        output.append(line)
+    await collector.collect(attempt, finish=True)
+    assert "still-running" in output
+    assert store.get(attempt)["selected_generation"] == valid
+    assert any(
+        "Malformed generation marker" in issue for issue in store.get(attempt)["issues"]
+    )
+    assert all(
+        phase["exit_status"] == 0
+        for phase in store.get(attempt)["remote_phases"].values()
+    )
 
 
 class LocalNodeSSH(SSHClient):
@@ -165,6 +317,7 @@ def harness(tmp_path: Path) -> tuple[NodeProvisioner, LocalNodeSSH, AttemptLogSt
     store = AttemptLogStore(tmp_path / "gateway.sqlite3")
     buffer = ProvisioningLogBuffer(store=store)
     settings = ProvisioningSettings(
+        generation_root=node / "generations",
         scripts_dir=node / "auto-vllm",
         nfs_mount_point=environment["AUTOVLLM_NFS_MOUNT_POINT"],
         log_remote_root=str(node / "logs"),
@@ -254,6 +407,7 @@ async def test_setup_boundary_recovers_lost_ack_and_interruption(
     mount_nfs_cache() { :; }
     configure_firewall() { :; }
     install_llmfit() { :; }
+    activate_engine_generation() { :; }
     check_driver_resume() { :; }
     install_missing_packages() { :; }
     installed_driver_compatible() { :; }
