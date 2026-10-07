@@ -695,6 +695,11 @@ async function refreshDetail() {
         } else {
           var pb = document.createElement("span"); pb.className = "badge badge-in-progress"; pb.textContent = "in progress"; tdStatus.appendChild(pb);
         }
+        if (task.resume_state) {
+          var rb = document.createElement("span"); rb.className = "badge badge-failed";
+          rb.textContent = formatSetupResumeState(task.resume_state);
+          tdStatus.appendChild(rb);
+        }
         ttr.appendChild(tdStatus);
 
         var tdErr = document.createElement("td");

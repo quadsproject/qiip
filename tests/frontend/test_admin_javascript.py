@@ -1695,6 +1695,73 @@ sandbox.fetch = async function (url) {
     assert result == {"display": "table-row"}
 
 
+@pytest.mark.parametrize(
+    ("resume_state", "label"),
+    [
+        ("maintenance_required", "Maintenance required"),
+        ("reboot_required", "Reboot required"),
+        ("future_resume_state", "Setup paused"),
+    ],
+)
+def test_dashboard_displays_required_setup_resume_action(
+    resume_state: str, label: str
+) -> None:
+    result = _run_dashboard_scenario(
+        r"""
+const failed = node("gpu01", "failed", ["setup", "teardown"]);
+failed.resume_state = "__RESUME_STATE__";
+sandbox.fetch = async function (url) {
+  if (url === "/admin/nodes") return response([failed]);
+  if (url === "/admin/metrics") return response({ per_node: {} });
+  if (url === "/admin/quads/status") return response({ status: "connected" });
+  throw new Error("unexpected request " + url);
+};
+(async function () {
+  await sandbox.refreshDashboard();
+  process.stdout.write(JSON.stringify({ labels: allElements.filter(function (el) {
+    return el.className === "badge badge-failed";
+  }).map(function (el) { return el.textContent; }) }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+""".replace("__RESUME_STATE__", resume_state)
+    )
+    assert isinstance(result, dict)
+    labels = result["labels"]
+    assert isinstance(labels, list)
+    assert label in labels
+
+
+@pytest.mark.parametrize(
+    ("resume_state", "label"),
+    [
+        ("maintenance_required", "Maintenance required"),
+        ("reboot_required", "Reboot required"),
+        ("future_resume_state", "Setup paused"),
+    ],
+)
+def test_node_detail_displays_required_setup_resume_action(
+    resume_state: str, label: str
+) -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([{
+  hostname: "gpu01", current_step: "failed", failed_step: "nvidia_driver",
+  started_at: "2026-07-31T12:00:00Z", updated_at: "2026-07-31T12:01:00Z",
+  resume_state: "__RESUME_STATE__", error: "Resolve maintenance, then retry setup",
+}], true, "vllm", null, "failed");
+(async function () {
+  await sandbox.refreshDetail();
+  console.log(JSON.stringify({ labels: byId("tasks-table-body").children[0].children[1].children.map(function (el) {
+    return el.textContent;
+  }) }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+""".replace("__RESUME_STATE__", resume_state)
+    )
+    assert isinstance(result, dict)
+    labels = result["labels"]
+    assert isinstance(labels, list)
+    assert label in labels
+
+
 def test_dashboard_preserves_open_action_menu_across_refresh() -> None:
     result = _run_dashboard_scenario(
         r"""

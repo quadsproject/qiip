@@ -371,10 +371,11 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
     ("installed_version", "expected_returncode", "expected_marker"),
     [
         ("580.126.09", 0, "[STEP:nvidia_driver:OK]"),
+        ("580.95.05", 0, "[STEP:nvidia_driver:OK]"),
         ("570.172.08", 1, "[STEP:nvidia_driver:FAIL]"),
     ],
 )
-def test_existing_nvidia_driver_version_matrix(
+def test_existing_nvidia_driver_compatibility_matrix(
     tmp_path: Path,
     installed_version: str,
     expected_returncode: int,
@@ -413,15 +414,14 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
     )
 
     result = _run_shell(
-        _source_and("step nvidia_driver install_nvidia_driver"), env=env
+        _source_and("step nvidia_driver installed_driver_compatible"), env=env
     )
 
     assert result.returncode == expected_returncode
     assert expected_marker in result.stdout
-    if installed_version != "580.126.09":
-        assert "does not match requested" in result.stdout
-        operations = operation_log.read_text().splitlines()
-        assert any("remove" in op and "nvidia" in op for op in operations)
+    assert not operation_log.exists()
+    if expected_returncode == 0:
+        assert "minimum=580.65.06" in result.stdout
 
 
 @pytest.mark.parametrize("valid_checksum", [True, False])
@@ -460,6 +460,7 @@ echo sha256sum >> "$AUTOVLLM_TEST_LOG"
 exec /usr/bin/sha256sum "$@"
 """,
     )
+    _write_executable(fake_bin / "rpm", "#!/bin/bash\nexit 0\n")
     _write_executable(
         fake_bin / "sudo",
         """#!/bin/bash
@@ -471,18 +472,27 @@ exit 0
         **{k: v for k, v in os.environ.items() if k != "BASH_ENV"},
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "AUTOVLLM_TMP_DIR": str(tmp_path),
+        "AUTOVLLM_DRIVER_STATE_DIR": str(tmp_path / "state"),
         "AUTOVLLM_NVIDIA_DRIVER_SHA256": digest,
         "AUTOVLLM_TEST_LOG": str(operation_log),
         "AUTOVLLM_TEST_ARCHIVE_CONTENT": archive_content,
     }
 
-    result = _run_shell(_source_and("install_nvidia_driver"), env=env)
+    result = _run_shell(
+        _source_and(
+            f"GPU_DEVICE_ROOT={shlex.quote(str(tmp_path / 'devices'))}\n"
+            f"GPU_MODULE_ROOT={shlex.quote(str(tmp_path / 'modules'))}\n"
+            "install_nvidia_driver"
+        ),
+        env=env,
+    )
     operations = operation_log.read_text().splitlines()
 
     if valid_checksum:
-        assert result.returncode == 0, result.stderr
+        assert result.returncode == 20, result.stderr
         assert operations[:2] == ["wget", "sha256sum"]
-        assert operations[-1].startswith("sudo:sh ")
+        assert any(op.startswith("sudo:sh ") for op in operations)
+        assert "[RESUME:reboot_required:" in result.stdout
     else:
         assert result.returncode != 0
         assert "SHA-256 verification failed" in result.stderr
@@ -708,7 +718,10 @@ def test_runtime_flashinfer_index_override_fails_before_setup_work(
     assert not attempted_work.exists()
 
 
-def test_system_update_pins_running_kernel_and_build_packages(tmp_path: Path) -> None:
+@pytest.mark.parametrize("engine", ["vllm", "llamacpp"])
+def test_prerequisites_are_engine_specific_and_never_update_os(
+    tmp_path: Path, engine: str
+) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     operation_log = tmp_path / "operations.log"
@@ -718,6 +731,7 @@ def test_system_update_pins_running_kernel_and_build_packages(tmp_path: Path) ->
 [[ "$1" == '-r' ]] && echo '5.14.0-test'
 """,
     )
+    _write_executable(bin_dir / "rpm", "#!/bin/bash\nexit 1\n")
     _write_executable(
         bin_dir / "sudo",
         """#!/bin/bash
@@ -733,20 +747,28 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
         }
     )
 
-    result = _run_shell(_source_and("run_system_update\ninstall_cuda_toolkit"), env=env)
+    result = _run_shell(
+        _source_and(
+            f"install_runtime_prerequisites {engine}\ninstall_kernel_build_dependencies\ninstall_cuda_toolkit"
+        ),
+        env=env,
+    )
 
     assert result.returncode == 0, result.stderr
     operations = operation_log.read_text().splitlines()
-    assert operations[0] == (
-        "dnf -y install kernel-devel-5.14.0-test kernel-headers-5.14.0-test"
-    )
+    assert operations[0] == "dnf -y install wget nfs-utils pciutils gcc-c++"
     assert operations[1] == (
-        "dnf -y install cmake gcc gcc-c++ make wget nfs-utils elfutils-libelf-devel "
-        "python3.12 python3.12-devel"
+        "dnf -y install python3.12 python3.12-devel"
+        if engine == "vllm"
+        else "dnf -y install cmake make gcc"
     )
-    assert operations[2] == "dnf -y update --exclude=kernel*"
+    assert operations[2] == (
+        "dnf -y install kernel-devel-5.14.0-test kernel-headers-5.14.0-test "
+        "gcc make elfutils-libelf-devel"
+    )
+    assert "dnf -y update" not in "\n".join(operations)
+    assert ("python3.12-devel" in "\n".join(operations)) is (engine == "vllm")
     assert operations[3] == "dnf -y install dnf-plugins-core"
-    assert "ninja" not in "\n".join(operations)
 
 
 @pytest.mark.parametrize("backend", ["firewalld", "iptables", "none"])

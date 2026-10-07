@@ -88,9 +88,21 @@ LLMFit, mount NFS, and open the firewall:
 AUTOVLLM_NFS_EXPORT=storage.example.com:/exports/huggingface ./setup.sh
 ```
 
-An already-installed NVIDIA driver must exactly match
-`AUTOVLLM_NVIDIA_DRIVER_VERSION`; setup refuses to hot-swap a different live
-kernel driver. Custom NVIDIA or LLMFit versions require matching SHA-256 values.
+A compatible installed NVIDIA driver is reused after a CUDA execution probe,
+even when it differs from `AUTOVLLM_NVIDIA_DRIVER_VERSION`. That setting selects
+the fallback installer. Working drivers do not require kernel headers; setup
+installs only missing prerequisites, including `python3.12-devel` for Triton's
+runtime helper compilation, and does not update the OS. The CUDA proof preserves
+`AUTOVLLM_GPU_DEVICES` or the caller's `CUDA_VISIBLE_DEVICES` selection. Replacement
+requires a verified artifact, an idle node, and matching running-kernel build
+dependencies. Custom replacement NVIDIA or LLMFit versions require matching
+SHA-256 values.
+
+`[RESUME:maintenance_required:...]` and `[RESUME:reboot_required:...]` stop setup
+before engine installation. Resolve the logged reason and retry setup. Reboot
+requests are remembered across retries, and the driver and CUDA runtime are
+validated again after a new boot. See the
+[driver maintenance runbook](../UPGRADING.md#13-prepare-for-strict-driver-and-cache-checks).
 
 Setup and start select a tested runtime profile from measured hardware
 (compute capability, VRAM, OS/ABI), not GPU marketing names. `setup.sh`

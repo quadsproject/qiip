@@ -1,11 +1,11 @@
 """Provisioning step and state types for node setup tracking.
 
-ProvisioningStep (D-06): 13-member StrEnum matching the provisioner's
-step sequence from PREFLIGHT through COMPLETE/FAILED.
+ProvisioningStep (D-06): StrEnum for tracked setup and lifecycle steps.
 
 ProvisioningState (D-07, D-08): Frozen Pydantic model capturing the
 current provisioning state of a host.  The ``failed_step`` and ``error``
-fields are populated when ``current_step`` is FAILED (D-08).
+fields are populated when ``current_step`` is FAILED (D-08). An optional
+``resume_state`` identifies required operator action before a setup retry.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ class ProvisioningStep(StrEnum):
     PREFLIGHT = "preflight"
     UPLOADING_SCRIPTS = "uploading_scripts"
     SYSTEM_UPDATE = "system_update"
+    SYSTEM_PREREQUISITES = "system_prerequisites"
     NVIDIA_DRIVER = "nvidia_driver"
     CUDA_TOOLKIT = "cuda_toolkit"
     VLLM_INSTALL = "vllm_install"
@@ -46,6 +47,13 @@ class ProvisioningStep(StrEnum):
     FAILED = "failed"
 
 
+class ProvisioningResumeState(StrEnum):
+    """Operator action required before a fresh, fully probed setup retry."""
+
+    MAINTENANCE_REQUIRED = "maintenance_required"
+    REBOOT_REQUIRED = "reboot_required"
+
+
 class ProvisioningState(BaseModel):
     """Current provisioning state for a host (D-07, D-08).
 
@@ -62,3 +70,4 @@ class ProvisioningState(BaseModel):
     updated_at: datetime
     failed_step: str | None = None
     error: str | None = None
+    resume_state: ProvisioningResumeState | None = None

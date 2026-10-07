@@ -22,6 +22,7 @@ from inference_proxy.models.node import (
     NodeStatus,
 )
 from inference_proxy.models.quads import QUADSHost
+from inference_proxy.provisioning.state import ProvisioningResumeState
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 from inference_proxy.routing.connection_tracker import ConnectionTracker
 from inference_proxy.services.unified_nodes import UnifiedNodeService
@@ -508,3 +509,29 @@ class TestFailedState:
         n = svc.get_unified_nodes()[0]
         assert n.failed_step is None
         assert n.error is None
+
+    @pytest.mark.parametrize("resume_state", list(ProvisioningResumeState))
+    def test_failed_node_keeps_resume_state_and_retry_actions(
+        self, resume_state: ProvisioningResumeState
+    ) -> None:
+        registry = NodeRegistry()
+        registry.add(_node("gpu01", status=NodeStatus.FAILED))
+        svc = _service(
+            registry=registry,
+            poller=_poller(hosts=[_host("gpu01")], available=["gpu01"]),
+        )
+        now = datetime.now(UTC)
+        tasks = {
+            "gpu01": TaskStatusResponse(
+                hostname="gpu01",
+                current_step="failed",
+                started_at=now,
+                updated_at=now,
+                failed_step="nvidia_driver",
+                resume_state=resume_state,
+                error="Resolve GPU maintenance, then retry setup",
+            )
+        }
+        node = svc.get_unified_nodes(task_map=tasks)[0]
+        assert node.resume_state == resume_state
+        assert node.actions == ["setup", "teardown"]

@@ -283,6 +283,18 @@ def test_toolkit_accepts_exact_profile_version(tmp_path: Path) -> None:
     assert "dnf" not in result.stdout
 
 
+def test_nvcc_prefers_matching_profile_compiler_over_old_override(
+    tmp_path: Path,
+) -> None:
+    env = _toolkit_env(tmp_path, nvcc_version="13.0")
+    old_nvcc = tmp_path / "old-nvcc"
+    _write_executable(old_nvcc, "#!/bin/bash\necho V12.4.0\n")
+    env["CUDA_NVCC"] = str(old_nvcc)
+    result = _source_and_call(SETUP_BASE, "find_nvcc", env)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(tmp_path / "bin" / "nvcc")
+
+
 def test_toolkit_installs_exact_when_nvcc_mismatches(tmp_path: Path) -> None:
     env = _toolkit_env(tmp_path, nvcc_version="12.4")
     result = _source_and_call(
@@ -340,6 +352,7 @@ done
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["CUDA_NVCC"] = str(bin_dir / "nvcc")
+    env["GPU_COMPUTE_CAP"] = "8.0"
     return env
 
 
@@ -364,6 +377,7 @@ def test_cuda_probe_compiles_with_real_nvcc(tmp_path: Path) -> None:
         Path(env["CUDA_NVCC"]),
         f'''#!/bin/bash
 set -e
+if [ "$1" = "--version" ]; then echo V13.0.0; exit 0; fi
 "{nvcc}" -c "$3" -o "$2.o"
 printf '#!/bin/bash\\nexit 0\\n' > "$2"
 chmod +x "$2"
@@ -385,7 +399,7 @@ def test_verify_cuda_execution_fails_closed_when_probe_fails(
         'verify_cuda_execution\necho "rc=$?"',
         env,
     )
-    assert result.stdout.splitlines()[-1] == "rc=1"
+    assert result.stdout.splitlines()[-1] == "rc=10"
     assert "FATAL: CUDA execution probe failed" in result.stderr
 
 
@@ -571,6 +585,21 @@ def test_wait_fabric_returns_immediately_when_training_complete(
     assert "READY" in result.stdout
 
 
+def test_ready_fabric_manager_is_reused_without_package_or_service_changes(
+    tmp_path: Path,
+) -> None:
+    env = _fabric_env(tmp_path)
+    attempted_mutation = tmp_path / "mutation"
+    _write_executable(
+        tmp_path / "bin" / "sudo",
+        f"#!/bin/bash\ntouch '{attempted_mutation}'\nexit 99\n",
+    )
+    result = _source_and_call(SETUP_BASE, "ensure_fabric_manager", env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "reusing without restart" in result.stdout
+    assert not attempted_mutation.exists()
+
+
 def _setup_main_order(script: Path, engine: str, env: dict[str, str]) -> list[str]:
     """Run the setup main with every real install step stubbed so the wiring
     order (profile select before toolkit/proof/fabric) is observable."""
@@ -582,10 +611,15 @@ def _setup_main_order(script: Path, engine: str, env: dict[str, str]) -> list[st
 source {script!s}
 NFS_EXPORT=storage.example.com:/exports/hf
 require_sha256() {{ :; }}
+check_driver_resume() {{ :; }}
+detect_profile_os() {{ :; }}
+check_os_abi() {{ :; }}
+nvidia-smi() {{ :; }}
+installed_driver_compatible() {{ :; }}
 reject_retired_flashinfer_index() {{ :; }}
 step() {{ echo "STEP:$1"; }}
 soft_step() {{ echo "STEP:$1"; }}
-select_runtime_profile() {{ echo "PROFILE:$1"; return 0; }}
+select_runtime_profile() {{ PROFILE_NAME="$1-fixture"; echo "PROFILE:$1"; return 0; }}
 install_nvidia_driver() {{ :; }}
 install_cuda_toolkit() {{ :; }}
 verify_cuda_execution() {{ :; }}
@@ -614,7 +648,7 @@ def test_vllm_setup_selects_profile_before_toolkit(tmp_path: Path) -> None:
     profile_at = lines.index("PROFILE:vllm")
     toolkit_at = lines.index("STEP:cuda_toolkit")
     fabric_at = lines.index("STEP:fabric_manager")
-    proof_at = lines.index("STEP:cuda_proof")
+    proof_at = lines.index("[STEP:cuda_proof:START]")
     assert profile_at < toolkit_at < fabric_at < proof_at
 
 
@@ -646,7 +680,7 @@ def test_llamacpp_setup_selects_profile_and_prepares_fabric(tmp_path: Path) -> N
     profile_at = lines.index("PROFILE:llamacpp")
     toolkit_at = lines.index("STEP:cuda_toolkit")
     fabric_at = lines.index("STEP:fabric_manager")
-    proof_at = lines.index("STEP:cuda_proof")
+    proof_at = lines.index("[STEP:cuda_proof:START]")
     assert profile_at < toolkit_at < fabric_at < proof_at
 
 

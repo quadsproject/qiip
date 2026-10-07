@@ -244,8 +244,8 @@ async def test_setup_boundary_recovers_lost_ack_and_interruption(
     setup = ssh.root / "auto-vllm/setup.sh"
     text = setup.read_text()
     text, injected = re.subn(
-        r"(?m)^    step system_update run_system_update$",
-        """    run_system_update() { echo "setup stdout"; echo "setup stderr" >&2; sleep 0.1; }
+        r"(?m)^    prepare_runtime vllm$",
+        """    install_runtime_prerequisites() { echo "setup stdout"; echo "setup stderr" >&2; sleep 0.1; }
     install_nvidia_driver() { :; }
     install_cuda_toolkit() { :; }
     ensure_fabric_manager() { :; }
@@ -254,7 +254,11 @@ async def test_setup_boundary_recovers_lost_ack_and_interruption(
     mount_nfs_cache() { :; }
     configure_firewall() { :; }
     install_llmfit() { :; }
-    step system_update run_system_update""",
+    check_driver_resume() { :; }
+    install_missing_packages() { :; }
+    installed_driver_compatible() { :; }
+    verify_cuda_execution() { :; }
+    prepare_runtime vllm""",
         text,
     )
     assert injected == 1, "setup fixture boundary changed; refusing to run installers"
@@ -273,7 +277,7 @@ async def test_setup_boundary_recovers_lost_ack_and_interruption(
     messages = [r["msg"] for r in page["records"]]
     assert messages.count("setup stdout") == 1
     assert messages.count("setup stderr") == 1
-    assert "system_update" in steps
+    assert "system_prerequisites" in steps
     assert any(r["source"] == "journal" for r in page["records"])
     assert ssh.launches == 1
     assert ssh.launch_faults_injected == 1

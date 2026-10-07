@@ -59,6 +59,7 @@ from inference_proxy.provisioning.provisioner import (
     ProvisioningError,
     ProvisioningIdentity,
     SelfSetupError,
+    SetupResumeRequiredError,
     _parse_llamacpp_runtime_fit,
     served_model_id,
 )
@@ -72,6 +73,7 @@ from inference_proxy.resilience.health_checker import (
     _ConsecutiveFailures,
     _probe_all_nodes,
 )
+from tests.provisioning.test_driver_reuse import _host, _setup
 
 _TEST_ENDPOINT_POLICY = EndpointPolicy.from_values(
     allowed_hosts=["host1"],
@@ -1752,6 +1754,108 @@ class TestSetupFailure:
 
 class TestProvisioningFailureAccuracy:
     """P3/P7/P8/E14: failures are terminal, accurate, and diagnosable."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("host_settings", "resume_state"),
+        [
+            ({"HEADERS_RC": "1"}, None),
+            (
+                {"INSTALLED_DRIVER": "570.172.08", "GPU_BUSY": "1"},
+                "maintenance_required",
+            ),
+            (
+                {"INSTALLED_DRIVER": "570.172.08", "NEEDS_REBOOT": "1"},
+                "reboot_required",
+            ),
+            ({"PROBE_RC": "1"}, "maintenance_required"),
+        ],
+    )
+    async def test_real_setup_result_controls_gateway_launch(
+        self, tmp_path: Path, host_settings: dict[str, str], resume_state: str | None
+    ) -> None:
+        result = _setup(_host(tmp_path, **host_settings))
+        etcd, _values, state_payloads = _recording_etcd()
+        ssh = MagicMock()
+        ssh.upload = AsyncMock()
+
+        async def setup_output(
+            host: str, command: str
+        ) -> AsyncIterator[tuple[str, str]]:
+            assert "setup.sh" in command
+            for line in result.stdout.splitlines():
+                yield "stdout", line
+            for line in result.stderr.splitlines():
+                yield "stderr", line
+            if result.returncode:
+                raise RemoteCommandError(host, command, result.returncode)
+
+        ssh.run_streaming = setup_output
+        provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
+        with (
+            patch.object(provisioner, "preflight", new_callable=AsyncMock),
+            patch.object(provisioner, "_verify_gpu", new_callable=AsyncMock),
+            patch.object(
+                provisioner,
+                "_read_gpu_inventory",
+                new_callable=AsyncMock,
+                return_value=(),
+            ),
+            patch.object(
+                provisioner,
+                "_run_start_vllm",
+                new_callable=AsyncMock,
+                return_value="org/model",
+            ) as launch,
+            patch.object(provisioner, "_poll_health", new_callable=AsyncMock),
+            patch.object(provisioner, "_register_node", new_callable=AsyncMock),
+        ):
+            if resume_state:
+                with pytest.raises(SetupResumeRequiredError):
+                    await provisioner.provision("host1")
+                launch.assert_not_awaited()
+                assert state_payloads[-1]["resume_state"] == resume_state
+            else:
+                await provisioner.provision("host1")
+                launch.assert_awaited_once()
+                assert state_payloads[-1]["current_step"] == "complete"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "resume_state", ["maintenance_required", "reboot_required"]
+    )
+    @pytest.mark.parametrize("ssh_fails", [True, False])
+    async def test_setup_resume_marker_is_persisted_and_blocks_launch(
+        self, resume_state: str, ssh_fails: bool
+    ) -> None:
+        etcd, values, state_payloads = _recording_etcd()
+        ssh = MagicMock()
+        ssh.upload = AsyncMock()
+
+        async def setup_resume(
+            host: str, command: str
+        ) -> AsyncIterator[tuple[str, str]]:
+            assert "setup.sh" in command
+            yield "stdout", "[STEP:nvidia_driver:START]"
+            yield (
+                "stdout",
+                f"[RESUME:{resume_state}:Drain/reboot the node, then retry setup]",
+            )
+            yield "stdout", "[STEP:nvidia_driver:FAIL]"
+            if ssh_fails:
+                raise RemoteCommandError(host, command, 1)
+
+        ssh.run_streaming = setup_resume
+        provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
+        with patch.object(provisioner, "preflight", new_callable=AsyncMock):
+            with pytest.raises(SetupResumeRequiredError, match="then retry setup"):
+                await provisioner.provision("host1")
+
+        assert state_payloads[-1]["current_step"] == "failed"
+        assert state_payloads[-1]["failed_step"] == "nvidia_driver"
+        assert state_payloads[-1]["resume_state"] == resume_state
+        assert "then retry setup" in str(state_payloads[-1]["error"])
+        assert json.loads(values["/nodes/host1"])["status"] == "failed"
 
     @pytest.mark.asyncio
     async def test_initial_registration_failure_aborts_before_ssh(self) -> None:

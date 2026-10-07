@@ -440,6 +440,12 @@ async function refreshDashboard() {
             stepBadge.textContent = "failed at " + node.failed_step;
             detail.appendChild(stepBadge);
           }
+          if (node.resume_state) {
+            const resumeBadge = document.createElement("span");
+            resumeBadge.className = "badge badge-failed";
+            resumeBadge.textContent = formatSetupResumeState(node.resume_state);
+            detail.appendChild(resumeBadge);
+          }
 
           if (node.error) {
             const errPre = document.createElement("pre");

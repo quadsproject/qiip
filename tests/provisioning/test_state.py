@@ -22,7 +22,7 @@ class TestProvisioningStepEnum:
     """ProvisioningStep has 13 members matching D-06 step sequence."""
 
     def test_member_count(self) -> None:
-        assert len(ProvisioningStep) == 25
+        assert len(ProvisioningStep) == 26
 
     def test_member_values(self) -> None:
         expected = {
@@ -30,6 +30,7 @@ class TestProvisioningStepEnum:
             "PREFLIGHT": "preflight",
             "UPLOADING_SCRIPTS": "uploading_scripts",
             "SYSTEM_UPDATE": "system_update",
+            "SYSTEM_PREREQUISITES": "system_prerequisites",
             "NVIDIA_DRIVER": "nvidia_driver",
             "VLLM_INSTALL": "vllm_install",
             "NFS_MOUNT": "nfs_mount",
