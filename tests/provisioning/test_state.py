@@ -1,7 +1,7 @@
 """Unit tests for provisioning state types.
 
 Tests cover:
-- ProvisioningStep enum has 13 members matching step sequence (D-06)
+- ProvisioningStep enum tracks setup and lifecycle steps (D-06)
 - ProvisioningState model is frozen with all 6 fields (D-07)
 - ProvisioningState round-trips through model_dump/model_validate
 - ProvisioningState rejects mutation (frozen)
@@ -19,10 +19,10 @@ from inference_proxy.provisioning.state import ProvisioningState, ProvisioningSt
 
 
 class TestProvisioningStepEnum:
-    """ProvisioningStep has 13 members matching D-06 step sequence."""
+    """ProvisioningStep covers setup and managed lifecycle operations."""
 
     def test_member_count(self) -> None:
-        assert len(ProvisioningStep) == 26
+        assert len(ProvisioningStep) == 27
 
     def test_member_values(self) -> None:
         expected = {
@@ -33,6 +33,7 @@ class TestProvisioningStepEnum:
             "SYSTEM_PREREQUISITES": "system_prerequisites",
             "NVIDIA_DRIVER": "nvidia_driver",
             "VLLM_INSTALL": "vllm_install",
+            "GENERATION_ACTIVATE": "generation_activate",
             "NFS_MOUNT": "nfs_mount",
             "FIREWALL": "firewall",
             "LLMFIT_INSTALL": "llmfit_install",

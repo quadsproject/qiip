@@ -168,6 +168,7 @@ install_vllm_unit() {{ :; }}
 mount_nfs_cache() {{ :; }}
 configure_firewall() {{ :; }}
 install_llmfit() {{ :; }}
+activate_engine_generation() {{ :; }}
 main
 """
     return subprocess.run(

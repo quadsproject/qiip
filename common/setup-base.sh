@@ -9,6 +9,60 @@ _qiip_profiles="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/profiles.sh"
 source "$_qiip_profiles"
 unset _qiip_profiles
 
+qiip_generation_tool() {
+    case "$1" in
+        seal-runtime|setup-bundle|activate|rollback)
+            sudo python3 "${SCRIPT_DIR}/../common/generations.py" "$@" ;;
+        *) python3 "${SCRIPT_DIR}/../common/generations.py" "$@" ;;
+    esac
+}
+
+qiip_require_inactive_runtime() {
+    local runtime="$1" root selected resolved
+    shift
+    if [ -L "$runtime" ]; then
+        echo "FATAL: versioned runtime path must not be a symlink: ${runtime}" >&2
+        return 1
+    fi
+    [ -e "$runtime" ] || return 0
+    resolved=$(readlink -f "$runtime")
+    for root in "$@"; do
+        for selected in "$root/current" "$root/previous" \
+            "$root/current/runtime" "$root/previous/runtime" \
+            "$root"/generations/*/runtime; do
+            if [ -e "$selected" ] && [ "$(readlink -f "$selected")" = "$resolved" ]; then
+                echo "FATAL: refusing to modify a published runtime: ${runtime}" >&2
+                return 1
+            fi
+        done
+    done
+}
+
+begin_engine_generation() {
+    QIIP_RUNTIME_SELECTION=$(mktemp "${INSTALL_TMP_DIR%/}/qiip-runtime.XXXXXX")
+    # Steps execute in subshells; this per-attempt file carries the verified
+    # installation path back to main without touching a shared active path.
+    trap 'rm -f "$QIIP_RUNTIME_SELECTION"' EXIT
+    qiip_generation_tool selected "$QIIP_GENERATION_ROOT"
+}
+
+activate_engine_generation() {
+    local engine="$1" runtime bundle config
+    runtime=$(<"$QIIP_RUNTIME_SELECTION")
+    [ -n "$runtime" ] || { echo "FATAL: no verified engine runtime" >&2; return 1; }
+    bundle=$(qiip_generation_tool setup-bundle "$QIIP_GENERATION_ROOT" "$SCRIPT_DIR")
+    config=$(python3 -c 'import json,sys; print(json.dumps(dict(zip(sys.argv[1::2], sys.argv[2::2]))))' \
+        QIIP_ENGINE "$engine" \
+        AUTOVLLM_NFS_EXPORT "$NFS_EXPORT" \
+        AUTOVLLM_NFS_MOUNT_POINT "$NFS_MOUNT_POINT" \
+        AUTOVLLM_API_PORT "$API_PORT" \
+        AUTOVLLM_MIN_FREE_GB "${AUTOVLLM_MIN_FREE_GB:-20}" \
+        AUTOLLAMACPP_NFS_MOUNT_POINT "$NFS_MOUNT_POINT" \
+        AUTOLLAMACPP_PORT "$API_PORT")
+    qiip_generation_tool activate "$QIIP_GENERATION_ROOT" "$bundle" \
+        "$(basename "$SCRIPT_DIR")" "$runtime" "$config"
+}
+
 require_sha256() {
     local label="$1"
     local digest="$2"

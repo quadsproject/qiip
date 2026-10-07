@@ -15,6 +15,7 @@ import time
 from collections.abc import Iterator
 from contextlib import suppress
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 LOG_SOURCES = ("setup.stdout", "setup.stderr", "start.stdout", "start.stderr", "engine")
@@ -62,17 +63,23 @@ def source_commands(config: dict[str, Any]) -> dict[str, list[str]]:
         "--since=" + since,
         "--until=" + until,
     ]
-    runtime = (
-        ["/usr/local/bin/llama-server", "--version"]
-        if config["engine"] == "llama_cpp"
-        else [
-            "/opt/vllm-venv/bin/python",
-            "-c",
-            "import importlib.metadata as m; import torch; "
-            "print('vllm=' + m.version('vllm')); "
-            "print('torch=' + torch.__version__); print('CUDA runtime=' + str(torch.version.cuda))",
-        ]
-    )
+    # A failed first setup has no authoritative runtime to probe. Avoid
+    # attributing a stale legacy installation to this attempt.
+    runtime = []
+    selected = config.get("selected_generation")
+    if selected:
+        binaries = Path(selected["runtime_path"]) / "bin"
+        runtime = (
+            [str(binaries / "llama-server"), "--version"]
+            if config["engine"] == "llama_cpp"
+            else [
+                str(binaries / "python"),
+                "-c",
+                "import importlib.metadata as m; import torch; "
+                "print('vllm=' + m.version('vllm')); "
+                "print('torch=' + torch.__version__); print('CUDA runtime=' + str(torch.version.cuda))",
+            ]
+        )
     return {
         "nvidia_services": [
             *journal,
@@ -234,7 +241,12 @@ def collect(config: dict[str, Any], store: Any) -> None:
     if phase.get("finished_at"):
         command["finished_at"] = phase["finished_at"]
     failure["command"] = command
-    config = {**config, "failure": failure}
+    config = {
+        **config,
+        "failure": failure,
+        "selected_generation": attempt.get("selected_generation")
+        or config.get("selected_generation"),
+    }
     window_until = journal_until(failure)
     command_pending = bool(command.get("phase_id") and not command.get("finished_at"))
     deadline = time.monotonic() + config["diagnostics_timeout"]
@@ -261,6 +273,12 @@ def collect(config: dict[str, Any], store: Any) -> None:
             try:
                 if name in LOG_SOURCES:
                     result = store.tail(attempt_id, name, max_bytes=max_bytes)
+                elif name == "runtime" and not commands[name]:
+                    result = dict(
+                        status="unavailable",
+                        reason="No generation was selected for this attempt",
+                        deferred=False,
+                    )
                 else:
                     result = capture(
                         commands[name],
@@ -275,7 +293,7 @@ def collect(config: dict[str, Any], store: Any) -> None:
                 )
         output = result.pop("output", "")
         result.setdefault("collected_at", timestamp())
-        result["deferred"] = result["status"] in {"unavailable", "timed_out"}
+        result.setdefault("deferred", result["status"] in {"unavailable", "timed_out"})
         if name in JOURNAL_SOURCES:
             result["window_until"] = window_until
             if command_pending:

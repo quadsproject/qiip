@@ -65,6 +65,7 @@ from inference_proxy.provisioning.provisioner import (
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
+    SSHClient,
     SSHConnectionError,
 )
 from inference_proxy.redfish.errors import RedfishError
@@ -231,7 +232,7 @@ def _llamacpp_fit_log(
 
 def _make_provisioner(
     *,
-    ssh_client: MagicMock | None = None,
+    ssh_client: SSHClient | MagicMock | None = None,
     etcd_client: MagicMock | None = None,
     settings: ProvisioningSettings | None = None,
     llmfit_settings: LLMFitSettings | None = None,
@@ -245,8 +246,11 @@ def _make_provisioner(
     artifact_index: GGUFArtifactIndex | None = None,
 ) -> NodeProvisioner:
     """Build a NodeProvisioner with mock dependencies."""
+    ssh_client = ssh_client or MagicMock()
+    if isinstance(ssh_client, MagicMock) and not isinstance(ssh_client.run, AsyncMock):
+        ssh_client.run = AsyncMock(return_value=("", "", 0))
     return NodeProvisioner(
-        ssh_client=ssh_client or MagicMock(),
+        ssh_client=ssh_client,
         etcd_client=etcd_client or MagicMock(),
         settings=settings
         or ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0),
@@ -332,6 +336,7 @@ def test_script_env_prefix_exact() -> None:
     )
 
     assert provisioner._setup_script_env() == {
+        "QIIP_GENERATION_ROOT": "/opt/qiip/vllm",
         "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
         "AUTOVLLM_NVIDIA_DRIVER_VERSION": "999.1",
@@ -396,6 +401,7 @@ def test_script_env_prefix_exact() -> None:
     }
     llama_setup = provisioner._setup_script_env(InferenceEngine.LLAMA_CPP)
     assert llama_setup == {
+        "QIIP_GENERATION_ROOT": "/opt/qiip/llama_cpp",
         "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
         "AUTOVLLM_NVIDIA_DRIVER_VERSION": "999.1",
@@ -459,6 +465,7 @@ def test_script_env_prefix_exact() -> None:
     assert shlex.split(
         provisioner._script_command("setup.sh", env=provisioner._setup_script_env())
     ) == [
+        "QIIP_GENERATION_ROOT=/opt/qiip/vllm",
         "AUTOVLLM_NFS_EXPORT=nfs.example:/exports/hf cache",
         "AUTOVLLM_NFS_MOUNT_POINT=/srv/hf cache",
         "AUTOVLLM_NVIDIA_DRIVER_VERSION=999.1",
@@ -693,10 +700,11 @@ async def test_llamacpp_bundle_uses_configured_sibling_root(tmp_path: Path) -> N
 
     await provisioner._upload_scripts("host1", InferenceEngine.LLAMA_CPP)
 
-    assert [item.args for item in ssh.upload.await_args_list] == [
-        ("host1", llama_dir),
-        ("host1", common_dir),
-    ]
+    assert ssh.upload.await_count == 1
+    assert ssh.upload.await_args.args[2] == ".qiip/bundles/"
+    assert provisioner._remote_bundles["host1", InferenceEngine.LLAMA_CPP].startswith(
+        ".qiip/bundles/"
+    )
 
 
 @pytest.mark.asyncio
@@ -2841,6 +2849,7 @@ class TestVerifyGpu:
 def _make_full_provisioner(etcd: MagicMock) -> tuple[NodeProvisioner, MagicMock]:
     """Build a provisioner with mocks suitable for full provision() tests."""
     ssh = MagicMock()
+    ssh.run = AsyncMock(return_value=("", "", 0))
 
     async def mock_streaming(
         host: str,
@@ -2923,6 +2932,7 @@ class TestStateTracking:
         """On failure, last state write has current_step=failed with details."""
         etcd = MagicMock()
         ssh = MagicMock()
+        ssh.run = AsyncMock(return_value=("", "", 0))
 
         async def mock_streaming(
             host: str,
@@ -3313,12 +3323,11 @@ class TestTeardownGraceful:
         commands: list[str] = []
         operation_order: list[str] = []
 
-        async def mock_upload(host: str, local_path: Path) -> None:
+        async def mock_upload(host: str, local_path: Path, remote_path: str) -> None:
             assert host == "host1"
-            assert local_path in {
-                provisioner._settings.scripts_dir,
-                provisioner._settings.scripts_dir.parent / "common",
-            }
+            assert remote_path == ".qiip/bundles/"
+            assert (local_path / "BUNDLE.json").is_file()
+            assert (local_path / "auto-vllm/stop-vllm.sh").is_file()
             operation_order.append("upload")
 
         async def mock_streaming(
@@ -3340,8 +3349,10 @@ class TestTeardownGraceful:
             mock_tt.return_value = True
             await provisioner.teardown("host1")
 
-        assert commands == ["bash auto-vllm/stop-vllm.sh"]
-        assert operation_order == ["upload", "upload", "stop"]
+        assert len(commands) == 1
+        assert shlex.split(commands[0])[-1] == "stop-vllm.sh"
+        assert "generations.py exec" in commands[0]
+        assert operation_order == ["upload", "stop"]
 
     @pytest.mark.asyncio
     async def test_scripts_dir_respected_in_commands(self, tmp_path: Path) -> None:
@@ -3377,23 +3388,18 @@ class TestTeardownGraceful:
         )
         await provisioner._run_start_vllm("host1", model="org/model")
 
-        assert [item.args for item in ssh.upload.await_args_list[:2]] == [
-            ("host1", scripts_dir),
-            ("host1", common_dir),
-        ]
-        assert [shlex.split(command)[-1] for command in commands[:2]] == [
-            "provision scripts -- vllm/setup.sh",
-            "provision scripts -- vllm/start-vllm.sh",
+        assert ssh.upload.await_count == 1
+        bundle = provisioner._remote_bundles["host1", InferenceEngine.VLLM]
+        assert shlex.split(commands[0])[-1] == f"{bundle}/{scripts_dir.name}/setup.sh"
+        assert shlex.split(commands[1])[-2:] == [
+            f"{bundle}/{scripts_dir.name}",
+            "start-vllm.sh",
         ]
         assert all("auto-vllm/" not in command for command in commands)
 
         await asyncio.wait_for(provisioner.teardown("host1", force=True), timeout=1)
 
-        assert shlex.split(commands[2]) == [
-            "bash",
-            "provision scripts -- vllm/stop-vllm.sh",
-            "--force",
-        ]
+        assert shlex.split(commands[2])[-2:] == ["stop-vllm.sh", "--force"]
         assert all("auto-vllm/" not in command for command in commands)
 
     @pytest.mark.asyncio
@@ -3507,7 +3513,8 @@ class TestTeardownForce:
             mock_tt.return_value = True
             await provisioner.teardown("host1", force=True)
 
-        assert commands == ["bash auto-vllm/stop-vllm.sh --force"]
+        assert len(commands) == 1
+        assert shlex.split(commands[0])[-2:] == ["stop-vllm.sh", "--force"]
 
 
 class TestDrainTimeout:
@@ -3640,7 +3647,7 @@ class TestTeardownSSHFailure:
             host: str,
             command: str,
         ) -> AsyncIterator[tuple[str, str]]:
-            assert command == "bash auto-vllm/stop-vllm.sh --force"
+            assert shlex.split(command)[-2:] == ["stop-vllm.sh", "--force"]
             raise RemoteCommandError(host, command, 1, "process survived")
             yield  # pragma: no cover
 

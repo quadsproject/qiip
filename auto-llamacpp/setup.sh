@@ -46,6 +46,7 @@ else
 fi
 LLAMACPP_SOURCE_URL="${AUTOLLAMACPP_SOURCE_URL:-https://github.com/ggml-org/llama.cpp/archive/refs/tags/${LLAMACPP_VERSION}.tar.gz}"
 LLAMACPP_INSTALL_ROOT="${AUTOLLAMACPP_INSTALL_ROOT:-/opt/llama.cpp}"
+QIIP_GENERATION_ROOT="${QIIP_GENERATION_ROOT:-/opt/qiip/llama_cpp}"
 LLAMACPP_LINK_DIR="${AUTOLLAMACPP_LINK_DIR:-/usr/local/bin}"
 LLAMACPP_CUDA_ARCHITECTURES="${AUTOLLAMACPP_CUDA_ARCHITECTURES:-native}"
 LLAMACPP_BUILD_PROFILE="cuda-portable-cpu-v2-fit-concurrency"
@@ -235,29 +236,27 @@ install_llamacpp() {
         return 1
     fi
     compute_capabilities=$(cuda_compute_capabilities) || return
-    marker=$(printf 'version=%s\nsource_sha256=%s\nbuild_profile=%s\nfit_cli_patch_sha256=%s\ncompute_capabilities=%s\ncmake_cuda_architectures=%s\ncuda_toolkit=%s\n' \
+    marker=$(printf 'publication_schema=1\nversion=%s\nsource_sha256=%s\nbuild_profile=%s\nfit_cli_patch_sha256=%s\ncompute_capabilities=%s\ncmake_cuda_architectures=%s\ncuda_toolkit=%s\nprofile=%s\n' \
         "$LLAMACPP_VERSION" \
         "$LLAMACPP_SHA256" \
         "$LLAMACPP_BUILD_PROFILE" \
         "$LLAMACPP_FIT_PATCH_SHA256" \
         "${compute_capabilities//$'\n'/,}" \
         "$LLAMACPP_CUDA_ARCHITECTURES" \
-        "$cuda_toolkit")
+        "$cuda_toolkit" "${PROFILE_NAME:-unselected}")
     build_identity=$(printf '%s' "$marker" | sha256sum | cut -c1-16)
     install_dir="${LLAMACPP_INSTALL_ROOT%/}/${LLAMACPP_VERSION}-${build_identity}"
 
-    if [ -x "${install_dir}/bin/llama-server" ] \
-        && [ -x "${install_dir}/bin/llama-fit-params" ] \
-        && [ -f "${install_dir}/BUILD-INFO" ] \
-        && [ "$(<"${install_dir}/BUILD-INFO")" = "$marker" ] \
-        && [ "$(installed_llamacpp_version "${install_dir}/bin/llama-server")" = "$LLAMACPP_VERSION" ]; then
-        sudo mkdir -p "$LLAMACPP_LINK_DIR"
-        atomic_link "${install_dir}/bin/llama-server" "${LLAMACPP_LINK_DIR%/}/llama-server"
-        atomic_link "${install_dir}/bin/llama-fit-params" "${LLAMACPP_LINK_DIR%/}/llama-fit-params"
-        atomic_link "${install_dir}/bin/llama-quantize" "${LLAMACPP_LINK_DIR%/}/llama-quantize"
+    if [ -f "${install_dir}/RUNTIME.json" ]; then
+        qiip_generation_tool verify-runtime "$install_dir" "$marker"
+        verify_managed_server_cli "${install_dir}/bin/llama-server"
+        verify_fit_params_cli "${install_dir}/bin/llama-fit-params"
+        select_llamacpp_runtime "$install_dir"
         echo "llama-server ${LLAMACPP_VERSION} already installed for CUDA capabilities ${compute_capabilities//$'\n'/,}, skipping"
         return 0
     fi
+
+    qiip_require_inactive_runtime "$install_dir" "$QIIP_GENERATION_ROOT" "$LLAMACPP_INSTALL_ROOT"
 
     # run_with_errexit invokes steps inside its own set -e subshell, where a
     # function RETURN trap is not reliable. Keep the entire build and publish
@@ -339,10 +338,43 @@ install_llamacpp() {
         sudo install -m 755 "$fit_bin" "${install_dir}/bin/llama-fit-params"
         sudo install -m 755 "$quantize_bin" "${install_dir}/bin/llama-quantize"
         sudo install -m 644 "${work_dir}/BUILD-INFO" "${install_dir}/BUILD-INFO"
-        atomic_link "${install_dir}/bin/llama-server" "${LLAMACPP_LINK_DIR%/}/llama-server"
-        atomic_link "${install_dir}/bin/llama-fit-params" "${LLAMACPP_LINK_DIR%/}/llama-fit-params"
-        atomic_link "${install_dir}/bin/llama-quantize" "${LLAMACPP_LINK_DIR%/}/llama-quantize"
+        # Validate the installed copies too; failed copying or disk exhaustion
+        # must never produce a completion manifest or switch the active set.
+        verify_managed_server_cli "${install_dir}/bin/llama-server"
+        verify_fit_params_cli "${install_dir}/bin/llama-fit-params"
+        qiip_generation_tool seal-runtime "$install_dir" "$marker" \
+            llama-server llama-fit-params llama-quantize
+        select_llamacpp_runtime "$install_dir"
     )
+}
+
+select_llamacpp_runtime() {
+    local install_dir="$1" binary
+    if [ -n "${QIIP_RUNTIME_SELECTION:-}" ]; then
+        printf '%s\n' "$install_dir" > "$QIIP_RUNTIME_SELECTION"
+    else
+        # Standalone install_llamacpp callers use one pointer for all tools.
+        # Stable compatibility links are installed once, before the commit.
+        sudo mkdir -p "$LLAMACPP_LINK_DIR"
+        if [ ! -L "${LLAMACPP_INSTALL_ROOT%/}/current" ] \
+            && [ -L "${LLAMACPP_LINK_DIR%/}/llama-server" ] \
+            && [ -e "${LLAMACPP_LINK_DIR%/}/llama-server" ]; then
+            local old_binary
+            old_binary=$(readlink -f "${LLAMACPP_LINK_DIR%/}/llama-server")
+            atomic_link "$(dirname "$(dirname "$old_binary")")" \
+                "${LLAMACPP_INSTALL_ROOT%/}/current"
+        fi
+        for binary in llama-server llama-fit-params llama-quantize; do
+            atomic_link "${LLAMACPP_INSTALL_ROOT%/}/current/bin/${binary}" \
+                "${LLAMACPP_LINK_DIR%/}/${binary}"
+        done
+        if [ -L "${LLAMACPP_INSTALL_ROOT%/}/current" ] \
+            && [ "$(readlink -f "${LLAMACPP_INSTALL_ROOT%/}/current")" != "$install_dir" ]; then
+            atomic_link "$(readlink -f "${LLAMACPP_INSTALL_ROOT%/}/current")" \
+                "${LLAMACPP_INSTALL_ROOT%/}/previous"
+        fi
+        atomic_link "$install_dir" "${LLAMACPP_INSTALL_ROOT%/}/current"
+    fi
 }
 
 # --- Main ---
@@ -355,11 +387,13 @@ main() {
         "AUTOVLLM_LLMFIT_SHA256"
     require_sha256 "llama.cpp ${LLAMACPP_VERSION}" "$LLAMACPP_SHA256" \
         "AUTOLLAMACPP_SHA256"
+    begin_engine_generation
     prepare_runtime llamacpp
     step llamacpp_install install_llamacpp
     step nfs_mount mount_nfs_cache
     step firewall configure_firewall
     soft_step llmfit_install install_llmfit
+    step generation_activate activate_engine_generation llama_cpp
 
     echo "Setup complete"
 }

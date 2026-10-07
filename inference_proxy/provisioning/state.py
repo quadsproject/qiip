@@ -29,6 +29,7 @@ class ProvisioningStep(StrEnum):
     CUDA_TOOLKIT = "cuda_toolkit"
     VLLM_INSTALL = "vllm_install"
     LLAMACPP_INSTALL = "llamacpp_install"
+    GENERATION_ACTIVATE = "generation_activate"
     NFS_MOUNT = "nfs_mount"
     FIREWALL = "firewall"
     LLMFIT_INSTALL = "llmfit_install"

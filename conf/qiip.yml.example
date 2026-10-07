@@ -104,6 +104,8 @@ provisioning:
   min_disk_gb: 20
   drain_timeout: 30
   scripts_dir: auto-vllm
+  # Complete script/runtime/configuration generations on each managed node.
+  generation_root: /opt/qiip
   boot_wait_timeout: 300
   boot_wait_interval: 10
   max_concurrent_provisions: 32
