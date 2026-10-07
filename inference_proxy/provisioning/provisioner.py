@@ -75,7 +75,11 @@ from inference_proxy.provisioning.ssh_client import (
     SSHClient,
     SSHConnectionError,
 )
-from inference_proxy.provisioning.state import ProvisioningState, ProvisioningStep
+from inference_proxy.provisioning.state import (
+    ProvisioningResumeState,
+    ProvisioningState,
+    ProvisioningStep,
+)
 from inference_proxy.redfish.client import RedfishClient
 from inference_proxy.redfish.errors import RedfishError
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
@@ -93,6 +97,9 @@ _SELF_SETUP_PROBE_TIMEOUT = 5.0
 _OPTIONAL_HEALTH_STATUSES = frozenset({404, 405, 501})
 
 STEP_PATTERN = re.compile(r"\[STEP:(\w+):(START|OK|FAIL|WARN)\]")
+RESUME_PATTERN = re.compile(
+    r"\[RESUME:(maintenance_required|reboot_required):([^\]\r\n]+)\]"
+)
 MODEL_PATTERN = re.compile(r"#\s*Model:\s+(.+)")
 LLAMACPP_CONTEXT_PATTERN = re.compile(
     r"initializing, n_slots = (?P<slots>\d+), "
@@ -161,6 +168,14 @@ _ENGINE_BUNDLE_FILES = {
 
 class ProvisioningError(Exception):
     """Raised when any stage of provisioning fails."""
+
+
+class SetupResumeRequiredError(ProvisioningError):
+    """Setup stopped at a maintenance boundary; retry after operator action."""
+
+    def __init__(self, state: ProvisioningResumeState, reason: str) -> None:
+        super().__init__(reason)
+        self.resume_state = state
 
 
 class SelfSetupError(Exception):
@@ -945,6 +960,7 @@ class NodeProvisioner:
         *,
         failed_step: str | None = None,
         error: str | None = None,
+        resume_state: ProvisioningResumeState | None = None,
         started_at: datetime | None = None,
         history: bool = True,
     ) -> None:
@@ -987,6 +1003,7 @@ class NodeProvisioner:
             updated_at=now,
             failed_step=failed_step,
             error=error,
+            resume_state=resume_state,
         )
         key = f"/provisioning/{hostname}"
         value = json.dumps(state.model_dump(mode="json")).encode("utf-8")
@@ -2428,6 +2445,11 @@ class NodeProvisioner:
                 ProvisioningStep.FAILED,
                 failed_step=current_step,
                 error=str(exc),
+                resume_state=(
+                    exc.resume_state
+                    if isinstance(exc, SetupResumeRequiredError)
+                    else None
+                ),
                 started_at=provision_started_at,
             )
             # Update node entry to FAILED so it doesn't stay stuck as PROVISIONING
@@ -2529,41 +2551,57 @@ class NodeProvisioner:
             )
         else:
             output = self._ssh_client.run_streaming(hostname, command)
-        async for stream, line in output:
-            if stream == "stdout":
-                match = STEP_PATTERN.search(line)
-                if match:
-                    step_name, status = match.group(1), match.group(2)
-                    on_step(step_name)
-                    if status in {"START", "WARN"}:
-                        with suppress(ValueError):
-                            await self._update_state(
-                                hostname,
-                                ProvisioningStep(step_name),
-                                started_at=started_at,
+        resume: SetupResumeRequiredError | None = None
+        try:
+            async for stream, line in output:
+                resume_match = RESUME_PATTERN.search(line)
+                if resume_match:
+                    resume = SetupResumeRequiredError(
+                        ProvisioningResumeState(resume_match.group(1)),
+                        resume_match.group(2),
+                    )
+                if stream == "stdout":
+                    match = STEP_PATTERN.search(line)
+                    if match:
+                        step_name, status = match.group(1), match.group(2)
+                        on_step(step_name)
+                        if status in {"START", "WARN"}:
+                            with suppress(ValueError):
+                                await self._update_state(
+                                    hostname,
+                                    ProvisioningStep(step_name),
+                                    started_at=started_at,
+                                )
+                        if status == "FAIL":
+                            logger.error(
+                                "step_failed", step=step_name, hostname=hostname
                             )
-                    if status == "FAIL":
-                        logger.error("step_failed", step=step_name, hostname=hostname)
-                        self._log(hostname, "error", f"[STEP:{step_name}:FAIL]")
-                    elif status == "WARN":
-                        logger.warning(
-                            "step_warning", step=step_name, hostname=hostname
-                        )
-                        self._log(hostname, "warning", f"[STEP:{step_name}:WARN]")
+                            self._log(hostname, "error", f"[STEP:{step_name}:FAIL]")
+                        elif status == "WARN":
+                            logger.warning(
+                                "step_warning", step=step_name, hostname=hostname
+                            )
+                            self._log(hostname, "warning", f"[STEP:{step_name}:WARN]")
+                        else:
+                            logger.info(
+                                "step_marker",
+                                step=step_name,
+                                status=status,
+                                hostname=hostname,
+                            )
+                            self._log(hostname, "info", f"[STEP:{step_name}:{status}]")
                     else:
-                        logger.info(
-                            "step_marker",
-                            step=step_name,
-                            status=status,
-                            hostname=hostname,
-                        )
-                        self._log(hostname, "info", f"[STEP:{step_name}:{status}]")
+                        logger.debug("setup_stdout", line=line, hostname=hostname)
+                        self._log(hostname, "debug", line, stream="stdout")
                 else:
-                    logger.debug("setup_stdout", line=line, hostname=hostname)
-                    self._log(hostname, "debug", line, stream="stdout")
-            else:
-                logger.warning("setup_stderr", line=line, hostname=hostname)
-                self._log(hostname, "warning", line, stream="stderr")
+                    logger.warning("setup_stderr", line=line, hostname=hostname)
+                    self._log(hostname, "warning", line, stream="stderr")
+        except Exception as exc:
+            if resume is not None:
+                raise resume from exc
+            raise
+        if resume is not None:
+            raise resume
 
     async def _verify_gpu(self, hostname: str) -> None:
         """Verify GPUs are visible after setup.sh installs the NVIDIA driver."""

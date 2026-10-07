@@ -5,14 +5,43 @@
 # VRAM, OS/ABI), never GPU marketing names.
 
 # Profile-relevant constants (single source of truth)
-PROFILE_CUDA_TOOLKIT_VERSION="13.0"  # matches torch 2.11.0 CUDA-13.0 wheels in auto-vllm/uv.lock
+PROFILE_DEFAULT_CUDA_TOOLKIT_VERSION="13.0"  # matches torch 2.11.0 CUDA-13.0 wheels in auto-vllm/uv.lock
+PROFILE_CUDA_TOOLKIT_VERSION="$PROFILE_DEFAULT_CUDA_TOOLKIT_VERSION"
 # CUDA 13.0 removed Maxwell/Pascal/Volta (offline compilation and libraries);
 # 12.x is the last series that can target Volta SM70, so Volta pins 12.9.
 PROFILE_VOLTA_CUDA_TOOLKIT_VERSION="12.9"
+# NVIDIA's CUDA compatibility contract, plus the execution probe, permits
+# reuse without requiring the exact installer version. No cuda-compat shim.
+# https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/
+# https://docs.nvidia.com/cuda/archive/12.9.2/cuda-toolkit-release-notes/
+PROFILE_DEFAULT_DRIVER_MIN="580.65.06"
+PROFILE_VOLTA_DRIVER_MIN="575.57.08"
+PROFILE_VOLTA_DRIVER_MAX_BRANCH="580"
+PROFILE_DRIVER_MIN="$PROFILE_DEFAULT_DRIVER_MIN"
+PROFILE_DRIVER_MAX_BRANCH=""
 PROFILE_OS_ID="rhel"
 PROFILE_OS_MAJOR_MIN=9
 PROFILE_ARCH="x86_64"
 PROFILE_GLIBC_MIN="2.34"  # vLLM wheel ABI (manylinux_2_34, auto-vllm/setup.sh:38)
+
+detect_profile_os() {
+    OS_ID="unknown"
+    OS_VERSION_ID="0"
+    local os_release="${PROFILE_OS_RELEASE:-/etc/os-release}"
+    if [ -r "$os_release" ]; then
+# shellcheck disable=SC1091,SC1090
+        . "$os_release"
+        OS_ID="${ID:-unknown}"
+        OS_VERSION_ID="${VERSION_ID:-0}"
+    fi
+    OS_ARCH=$(uname -m)
+    GLIBC_VERSION=$(ldd --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+' | head -1)
+    [ -n "${GLIBC_VERSION:-}" ] || GLIBC_VERSION="0"
+}
+
+profile_gpu_devices() {
+    printf '%s\n' "${GPU_DEVICES_OVERRIDE:-${AUTOVLLM_GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-}}}"
+}
 
 detect_profile_hardware() {
     if ! command -v nvidia-smi &>/dev/null; then
@@ -28,12 +57,10 @@ detect_profile_hardware() {
     # AUTOVLLM_GPU_DEVICES semantics): an explicit subset is sized against its
     # own cards. Physical inventory is the full list; nvidia-smi ignores
     # CUDA_VISIBLE_DEVICES, so queries stay physical.
-    local query_index=0
-    if [ -n "${GPU_DEVICES_OVERRIDE:-}" ]; then
-        local -a _profile_devices=()
-        IFS=',' read -r -a _profile_devices <<< "$GPU_DEVICES_OVERRIDE"
-        query_index="${_profile_devices[0]}"
-    fi
+    local devices query_index
+    devices=$(profile_gpu_devices)
+    query_index="${devices%%,*}"
+    query_index="${query_index:-0}"
     GPU_MODEL=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$query_index" | xargs)
     GPU_VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits -i "$query_index")
     GPU_VRAM_GB=$(( (GPU_VRAM_MB + 512) / 1024 ))
@@ -41,18 +68,8 @@ detect_profile_hardware() {
     GPU_DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader \
         | sed '/^[[:space:]]*$/d' | head -1 | xargs)
     NVSWITCH_COUNT=$(lspci 2>/dev/null | grep -ci nvswitch || true)
-    OS_ID="unknown"
-    OS_VERSION_ID="0"
-    local os_release="${PROFILE_OS_RELEASE:-/etc/os-release}"
-    if [ -r "$os_release" ]; then
-# shellcheck disable=SC1091,SC1090
-        . "$os_release"
-        OS_ID="${ID:-unknown}"
-        OS_VERSION_ID="${VERSION_ID:-0}"
-    fi
-    OS_ARCH=$(uname -m)
-    GLIBC_VERSION=$(ldd --version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+' | head -1)
-    [ -n "${GLIBC_VERSION:-}" ] || GLIBC_VERSION="0"
+    # prepare_runtime already checks these immutable facts before mutations.
+    if [ "${1:-0}" != "1" ]; then detect_profile_os; fi
     return 0
 }
 
@@ -87,19 +104,21 @@ check_os_abi() {
 
 # Selects the tested runtime profile for the measured hardware of <engine>
 # (vllm|llamacpp). Exports PROFILE_* and prints:
+# Optional second argument 1 reuses OS facts validated by prepare_runtime
+# earlier in this invocation; standalone callers always measure and check OS.
 #   [PROFILE:select:<name> (<reason>)]          selected
 #   [REJECT:unsupported_hardware:<explanation>] unsupported combination
 # Exit: 0 selected, 1 probe/transient failure, 3 unsupported.
 select_runtime_profile() {
-    local engine="$1"
-    detect_profile_hardware || return 1
+    local engine="$1" os_validated="${2:-0}"
+    detect_profile_hardware "$os_validated" || return 1
 
     local reason
     reason="model=${GPU_MODEL} sm=${GPU_COMPUTE_CAP} vram=${GPU_VRAM_GB}GB count=${GPU_COUNT} driver=${GPU_DRIVER_VERSION} nvswitch=${NVSWITCH_COUNT} os=${OS_ID}${OS_VERSION_ID} ${OS_ARCH} glibc=${GLIBC_VERSION}"
     local signature="${reason}"
     reason="${reason} engine=${engine}"
 
-    if ! check_os_abi "$engine"; then
+    if [ "$os_validated" != "1" ] && ! check_os_abi "$engine"; then
         echo "[REJECT:unsupported_hardware:OS/ABI check failed; measured: ${signature}]" >&2
         return 3
     fi
@@ -154,6 +173,13 @@ select_runtime_profile() {
     fi
     if [ "$bucket" = "volta" ]; then
         PROFILE_CUDA_TOOLKIT_VERSION="$PROFILE_VOLTA_CUDA_TOOLKIT_VERSION"
+        PROFILE_DRIVER_MIN="$PROFILE_VOLTA_DRIVER_MIN"
+        # R580 is the last driver branch supporting Volta.
+        PROFILE_DRIVER_MAX_BRANCH="$PROFILE_VOLTA_DRIVER_MAX_BRANCH"
+    else
+        PROFILE_CUDA_TOOLKIT_VERSION="$PROFILE_DEFAULT_CUDA_TOOLKIT_VERSION"
+        PROFILE_DRIVER_MIN="$PROFILE_DEFAULT_DRIVER_MIN"
+        PROFILE_DRIVER_MAX_BRANCH=""
     fi
 
     PROFILE_NAME="${engine}-${bucket}"
@@ -161,6 +187,7 @@ select_runtime_profile() {
     PROFILE_REASON="$reason"
     export PROFILE_NAME PROFILE_BUCKET PROFILE_REASON
     export PROFILE_CUDA_TOOLKIT_VERSION
+    export PROFILE_DRIVER_MIN PROFILE_DRIVER_MAX_BRANCH
     echo "[PROFILE:select:${PROFILE_NAME} (${PROFILE_REASON})]"
     return 0
 }

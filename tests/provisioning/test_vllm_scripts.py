@@ -84,6 +84,7 @@ esac
     _write_executable(
         bin_dir / "nvcc",
         """#!/bin/bash
+if [ "$1" = "--version" ]; then echo V13.0.0; exit 0; fi
 out=""
 while [[ "$#" -gt 0 ]]; do
     if [[ "$1" == "-o" ]]; then
@@ -175,6 +176,7 @@ fi
     env.update(
         {
             "PATH": f"{bin_dir}:{env['PATH']}",
+            "CUDA_NVCC": str(bin_dir / "nvcc"),
             "AUTOVLLM_BIN": str(vllm_bin),
             "AUTOVLLM_SCRIPT_DIR": str(SCRIPT_ROOT / "auto-vllm"),
             "AUTOVLLM_COMMAND_PATTERN": f"{vllm_bin} serve",

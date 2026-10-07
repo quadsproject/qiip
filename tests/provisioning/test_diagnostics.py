@@ -42,8 +42,8 @@ def _prepare(
 ) -> None:
     setup = ssh.root / "auto-vllm/setup.sh"
     text, count = re.subn(
-        r"(?m)^    step system_update run_system_update$",
-        """    run_system_update() { :; }
+        r"(?m)^    prepare_runtime vllm$",
+        """    install_runtime_prerequisites() { :; }
     install_nvidia_driver() { :; }
     install_cuda_toolkit() { :; }
     ensure_fabric_manager() { :; }
@@ -52,7 +52,11 @@ def _prepare(
     mount_nfs_cache() { :; }
     configure_firewall() { :; }
     install_llmfit() { :; }
-    step system_update run_system_update""",
+    check_driver_resume() { :; }
+    install_missing_packages() { :; }
+    installed_driver_compatible() { :; }
+    verify_cuda_execution() { :; }
+    prepare_runtime vllm""",
         setup.read_text(),
     )
     assert count == 1, "Refuse to run real installation functions"

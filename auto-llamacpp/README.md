@@ -96,6 +96,18 @@ AUTOVLLM_NFS_EXPORT=storage.example.com:/exports/huggingface ./setup.sh
 Shared environment variables use the `AUTOVLLM_` prefix for backward
 compatibility with existing provisioning infrastructure.
 
+Setup reuses compatible drivers after a real CUDA execution probe and installs
+only missing prerequisites. A working stack does not need kernel headers or
+an OS update. `AUTOVLLM_NVIDIA_DRIVER_VERSION` selects the fallback installer;
+replacement requires checksum verification, node idleness, and matching
+running-kernel build dependencies. Compatible RPM and runfile/DKMS installs can
+rebuild a missing module before replacement. Until hardware can be measured,
+bootstrap drivers must satisfy the Volta recovery limits (575.57.08 through R580).
+Maintenance and reboot requirements stop
+setup with a `[RESUME:...]` marker; resolve the reason and retry setup to
+revalidate the stack before the source build. See the
+[driver maintenance runbook](../UPGRADING.md#13-prepare-for-strict-driver-and-cache-checks).
+
 ## Run
 
 Start llama-server with an exact path relative to the mounted export root and

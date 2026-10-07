@@ -164,6 +164,7 @@ class UnifiedNodeService:
             owner=node.owner,
             failed_step=task.failed_step if task else None,
             error=task.error if task else None,
+            resume_state=task.resume_state if task else None,
         )
 
     @staticmethod

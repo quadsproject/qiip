@@ -59,114 +59,355 @@ soft_step() {
     fi
 }
 
-run_system_update() {
-    local running_kernel
-    running_kernel=$(uname -r)
-    # The NVIDIA driver builds a kernel module against headers that match the
-    # RUNNING kernel exactly. Installing a different version silently yields a
-    # module that fails to compile ("Unable to find the kernel source tree"),
-    # so require an exact match and fail loudly with a fix hint rather than
-    # degrade to whatever version the repos happen to carry.
-    if rpm -q "kernel-devel-${running_kernel}" "kernel-headers-${running_kernel}" &>/dev/null; then
-        echo "kernel-devel/headers for ${running_kernel} already installed"
-    elif ! sudo dnf -y install \
-        "kernel-devel-${running_kernel}" "kernel-headers-${running_kernel}"; then
-        echo "FATAL: kernel-devel/kernel-headers for the running kernel ${running_kernel} are not available in the configured repositories." >&2
-        echo "The NVIDIA driver cannot build its kernel module without headers matching the running kernel." >&2
-        echo "Fix by either:" >&2
-        echo "  1. Booting a kernel whose -devel/-headers ARE installed or available" >&2
-        echo "     (e.g. 'grubby --set-default /boot/vmlinuz-<version>' then reboot), or" >&2
-        echo "  2. Enabling the repository that provides kernel-devel-${running_kernel}." >&2
-        return 1
+# Install only absent packages: an ordinary retry must not upgrade the OS.
+install_missing_packages() {
+    local package
+    local -a missing_packages=()
+    for package in "$@"; do
+        rpm -q "$package" &>/dev/null || missing_packages+=("$package")
+    done
+    if [ "${#missing_packages[@]}" -gt 0 ]; then
+        sudo dnf -y install "${missing_packages[@]}"
     fi
-    sudo dnf -y install cmake gcc gcc-c++ make wget nfs-utils elfutils-libelf-devel \
-        python3.12 python3.12-devel
-    sudo dnf -y update '--exclude=kernel*'
 }
 
-install_nvidia_driver() {
-    # shellcheck disable=SC2153  # DRIVER_VERSION is set by the sourcing script
+install_runtime_prerequisites() {
+    local engine="$1"
+    # gcc-c++ is nvcc's host compiler for the CUDA proof in both profiles.
+    install_missing_packages wget nfs-utils pciutils gcc-c++
+    if [ "$engine" = "vllm" ]; then
+        # Triton compiles its Python CUDA helper when vLLM first loads a model.
+        install_missing_packages python3.12 python3.12-devel
+    else
+        install_missing_packages cmake make gcc
+    fi
+}
+
+install_kernel_build_dependencies() {
+    local running_kernel
+    running_kernel=$(uname -r)
+    if ! install_missing_packages \
+        "kernel-devel-${running_kernel}" "kernel-headers-${running_kernel}" \
+        gcc make elfutils-libelf-devel; then
+        resume_required maintenance_required \
+            "Matching kernel build dependencies for ${running_kernel} are unavailable; enable their repository or boot a kernel with matching headers, then retry setup"
+        return 21
+    fi
+}
+
+driver_version_compatible() {
+    local version="$1" minimum="${2:-$PROFILE_DRIVER_MIN}" maximum="${3-$PROFILE_DRIVER_MAX_BRANCH}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || return 1
+    [ "$(printf '%s\n' "$minimum" "$version" | sort -V | head -1)" = "$minimum" ] || return 1
+    [ -z "$maximum" ] || [ "${version%%.*}" -le "$maximum" ]
+}
+
+installed_driver_compatible() {
+    local versions version minimum="${1:-$PROFILE_DRIVER_MIN}" maximum="${2-$PROFILE_DRIVER_MAX_BRANCH}"
+    versions=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader) || return 2
+    [ -n "$versions" ] || return 2
+    while IFS= read -r version; do
+        version=$(xargs <<< "$version")
+        if [[ ! "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "FATAL: cannot establish driver compatibility from '${version}'" >&2
+            return 2
+        fi
+        if ! driver_version_compatible "$version" "$minimum" "$maximum"; then
+            echo "Driver ${version} cannot satisfy minimum ${minimum} / maximum branch ${maximum:-none}" >&2
+            return 1
+        fi
+    done <<< "$versions"
+    echo "Driver compatibility: installed=${versions//$'\n'/,} profile=${PROFILE_NAME:-bootstrap} minimum=${minimum} max_branch=${maximum:-none}; CUDA execution still required"
+}
+
+# These markers are retained in the gateway's failed task as resume_state.
+# Retrying setup probes everything again; it never automatically reboots.
+resume_required() {
+    echo "[RESUME:$1:$2]"
+}
+
+DRIVER_STATE_DIR="${AUTOVLLM_DRIVER_STATE_DIR:-/var/lib/qiip/setup}"
+BOOT_ID_FILE="${BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
+GPU_DEVICE_ROOT="${GPU_DEVICE_ROOT:-/dev}"
+GPU_MODULE_ROOT="${GPU_MODULE_ROOT:-/sys/module}"
+GPU_DRM_SYS_ROOT="${GPU_DRM_SYS_ROOT:-/sys/class/drm}"
+
+require_driver_reboot() {
+    local reason="$1"
+    sudo mkdir -p "$DRIVER_STATE_DIR"
+    sudo cp "$BOOT_ID_FILE" "${DRIVER_STATE_DIR}/driver-reboot"
+    resume_required reboot_required "${reason}; reboot the node, then retry setup"
+}
+
+check_driver_resume() {
+    if [ -f "${DRIVER_STATE_DIR}/driver-reboot" ]; then
+        if [ "$(cat "${DRIVER_STATE_DIR}/driver-reboot")" = "$(cat "$BOOT_ID_FILE")" ]; then
+            resume_required reboot_required "Driver maintenance is waiting for a new boot; reboot the node, then retry setup"
+            return 20
+        fi
+        echo "New boot detected after driver maintenance; revalidating the driver and CUDA runtime"
+    fi
+}
+
+check_gpu_idle() {
+    local clients status
+    if nvidia-smi &>/dev/null; then
+        if ! clients=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits); then
+            resume_required maintenance_required "Cannot prove GPU compute idleness; inspect GPU users, then retry setup"
+            return 21
+        fi
+        if [ -n "${clients//[[:space:]]/}" ]; then
+            resume_required maintenance_required "GPU compute processes are active; drain and stop GPU users, then retry setup"
+            return 21
+        fi
+    fi
+    # fuser also catches graphics clients, persistence and Fabric Manager,
+    # including when NVML is broken. Never kill those users automatically.
+    local -a devices=()
+    local device vendor_file vendor
+    for device in "$GPU_DEVICE_ROOT"/nvidia* "$GPU_DEVICE_ROOT"/nvidia-caps/*; do
+        [ -e "$device" ] && [ ! -d "$device" ] && devices+=("$device")
+    done
+    for device in "$GPU_DEVICE_ROOT"/dri/*; do
+        if [ ! -e "$device" ] || [ -d "$device" ]; then continue; fi
+        vendor_file="${GPU_DRM_SYS_ROOT}/${device##*/}/device/vendor"
+        [ -r "$vendor_file" ] || continue
+        vendor=$(<"$vendor_file")
+        # BMC consoles and other vendors' DRM clients do not use this driver.
+        [ "${vendor,,}" = "0x10de" ] && devices+=("$device")
+    done
+    if [ "${#devices[@]}" -gt 0 ]; then
+        if sudo fuser "${devices[@]}"; then status=0; else status=$?; fi
+        if [ "$status" -ne 1 ]; then
+            resume_required maintenance_required "GPU device users are active or cannot be inspected; stop GPU services and clients, then retry setup"
+            return 21
+        fi
+    fi
+}
+
+nvidia_driver_rpms() {
+    # Query each family separately and combine the matches into one union of
+    # exact installed names/versions, including overlapping package families.
+    local pattern
+    for pattern in '*nvidia*driver*' '*kmod-nvidia*' '*xorg-x11-drv-nvidia*'; do
+        rpm -qa --qf "$1" "$pattern" || return $?
+    done | sort -u
+}
+
+installed_nvidia_build_version() {
+    local version
+    version=$(nvidia_driver_rpms '%{VERSION}\n' | sort -u) || version=""
+    if [[ "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+        printf '%s\n' "$version"
+        return 0
+    fi
+    # Runfile --dkms installs retain the version even when the new kernel has
+    # no module yet. Do not infer compatibility from a library's mere presence.
+    version=$(dkms status -m nvidia 2>/dev/null \
+        | sed -nE 's@^nvidia/([0-9]+\.[0-9]+(\.[0-9]+)?)(,|:).*@\1@p' | sort -u) || version=""
+    [[ "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || return 1
+    printf '%s\n' "$version"
+}
+
+# Called only after missing/incompatible driver evidence, never just because
+# the installed version differs from the configured replacement artifact.
+install_nvidia_driver() (
+    set -e
+    local recovery_minimum="${RECOVERY_DRIVER_MIN:-$PROFILE_DRIVER_MIN}"
+    local recovery_maximum="${RECOVERY_DRIVER_MAX_BRANCH-$PROFILE_DRIVER_MAX_BRANCH}"
+    # shellcheck disable=SC2153  # DRIVER_VERSION is set by the engine script
     require_sha256 "NVIDIA driver ${DRIVER_VERSION}" "$DRIVER_SHA256" \
         "AUTOVLLM_NVIDIA_DRIVER_SHA256"
-    if nvidia-smi &>/dev/null; then
-        local installed_versions
-        installed_versions=$(
-            nvidia-smi --query-gpu=driver_version --format=csv,noheader \
-                | sed '/^[[:space:]]*$/d' | sort -u
-        )
-        if [ "$installed_versions" = "$DRIVER_VERSION" ]; then
-            echo "NVIDIA driver ${DRIVER_VERSION} already installed, skipping"
-            return 0
-        fi
-        installed_versions=${installed_versions//$'\n'/, }
-        echo "Installed NVIDIA driver ${installed_versions:-unknown} does not match requested ${DRIVER_VERSION}; uninstalling"
-        if [ -x /usr/bin/nvidia-uninstall ]; then
-            sudo /usr/bin/nvidia-uninstall --silent
-        else
-            sudo dnf -y remove '*nvidia*driver*' 2>/dev/null || true
-        fi
-        sudo rm -f /etc/modprobe.d/blacklist-nouveau.conf
-        sudo modprobe -r nvidia 2>/dev/null || true
+    if ! driver_version_compatible "$DRIVER_VERSION" "$recovery_minimum" "$recovery_maximum"; then
+        echo "FATAL: replacement driver ${DRIVER_VERSION} cannot satisfy profile minimum ${recovery_minimum} / maximum branch ${recovery_maximum:-none}" >&2
+        return 2
     fi
-    if modinfo nvidia &>/dev/null; then
-        echo "NVIDIA kernel module found but not loaded, loading"
-        sudo modprobe nvidia
-    fi
-    if ls /usr/lib64/libnvidia-ml.so.* &>/dev/null; then
-        echo "RPM-installed NVIDIA driver found, kernel module missing for $(uname -r)"
-        echo "Rebuilding kernel module"
-        if (sudo dkms autoinstall 2>/dev/null || sudo akmods --force 2>/dev/null) \
-            && sudo modprobe nvidia && nvidia-smi; then
-            return 0
-        fi
-        echo "Kernel module rebuild failed, removing broken RPM driver"
-        sudo dnf -y remove '*nvidia*driver*' 2>/dev/null || true
-        sudo rm -f /etc/modprobe.d/blacklist-nouveau.conf
-    fi
-    local work_dir installer status
+    local work_dir installer installed_version
     work_dir=$(mktemp -d "${INSTALL_TMP_DIR%/}/auto-setup-driver.XXXXXX")
+    trap 'rm -rf "$work_dir"' EXIT
     installer="${work_dir}/NVIDIA-driver.run"
-    if wget -q "${NVIDIA_DRIVER_URL}" -O "$installer"; then
-        :
-    else
-        status=$?
-        rm -rf "$work_dir"
-        return "$status"
+    install_missing_packages wget
+    wget -q "$NVIDIA_DRIVER_URL" -O "$installer"
+    verify_sha256 "$installer" "$DRIVER_SHA256" "NVIDIA driver ${DRIVER_VERSION}"
+    # Verify the fallback artifact before any rebuild, removal or replacement.
+    install_missing_packages psmisc
+    check_gpu_idle
+    install_kernel_build_dependencies
+    # Recheck immediately before driver mutation after dependency installation.
+    check_gpu_idle
+
+    installed_version=$(installed_nvidia_build_version) || installed_version=""
+    if ! nvidia-smi &>/dev/null && driver_version_compatible "$installed_version" "$recovery_minimum" "$recovery_maximum"; then
+        echo "Compatible installed driver ${installed_version} has no working module; rebuilding for $(uname -r)"
+        if (sudo dkms autoinstall || sudo akmods --force) \
+            && sudo modprobe nvidia && nvidia-smi &>/dev/null; then
+            if installed_driver_compatible "$recovery_minimum" "$recovery_maximum"; then
+                echo "Existing NVIDIA module rebuilt; CUDA execution still required"
+                return 0
+            fi
+        fi
+        echo "Existing module rebuild failed; using verified replacement"
     fi
-    if ! verify_sha256 "$installer" "$DRIVER_SHA256" \
-        "NVIDIA driver ${DRIVER_VERSION}"; then
-        rm -rf "$work_dir"
+    if ! install_missing_packages dkms; then
+        resume_required maintenance_required "DKMS is required for the verified runfile installer; enable its repository, then retry setup"
+        return 21
+    fi
+    check_gpu_idle
+
+    # Unload leaf modules first. Do not uninstall while the loaded driver is
+    # still held by a client or the kernel; expose the maintenance boundary.
+    local module holder holders
+    for module in nvidia_peermem nvidia_uvm nvidia_drm nvidia_modeset nvidia; do
+        if [ -d "${GPU_MODULE_ROOT}/${module}" ]; then
+            if ! sudo modprobe -r "$module"; then
+                holders=""
+                for holder in "${GPU_MODULE_ROOT}/${module}/holders/"*; do
+                    [ -e "$holder" ] && holders+="${holder##*/} "
+                done
+                resume_required maintenance_required \
+                    "Cannot unload ${module}; module holders: ${holders:-none detected}; stop clients or unload dependent modules, then retry setup"
+                return 21
+            fi
+        fi
+    done
+    if [ -x /usr/bin/nvidia-uninstall ]; then
+        sudo /usr/bin/nvidia-uninstall --silent
+    else
+        local packages
+        local -a driver_packages=()
+        packages=$(nvidia_driver_rpms '%{NAME}\n')
+        if [ -n "$packages" ]; then
+            mapfile -t driver_packages <<< "$packages"
+            sudo dnf -y remove "${driver_packages[@]}"
+        fi
+    fi
+    echo 'blacklist nouveau' | sudo tee /etc/modprobe.d/blacklist-nouveau.conf >/dev/null
+    sudo dracut --force
+    if [ -d "${GPU_MODULE_ROOT}/nouveau" ] && ! sudo modprobe -r nouveau; then
+        require_driver_reboot "Nouveau remains loaded after blacklisting"
+        return 20
+    fi
+    if ! sudo sh "$installer" --dkms --no-x-check --no-nouveau-check --ui=none --no-questions; then
+        echo "FATAL: NVIDIA driver installation failed; inspect installer logs before retrying setup" >&2
         return 1
     fi
-    chmod +x "$installer"
-    echo 'blacklist nouveau' | sudo tee /etc/modprobe.d/blacklist-nouveau.conf
-    sudo dracut --force
-    sudo modprobe -r nouveau 2>/dev/null || true
-    if sudo sh "$installer" --dkms --no-x-check --no-nouveau-check --ui=none --no-questions; then
-        status=0
-    else
-        status=$?
+    if ! sudo modprobe nvidia; then
+        resume_required maintenance_required "Replacement module could not load; inspect kernel/module signing and build diagnostics, then retry setup"
+        return 21
     fi
-    rm -rf "$work_dir"
-    return "$status"
+    if ! nvidia-smi &>/dev/null \
+        || [ "$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | sort -u | xargs)" != "$DRIVER_VERSION" ]; then
+        require_driver_reboot "Replacement driver is installed but not active"
+        return 20
+    fi
+)
+
+# Select from the existing stack first. A broken/missing module may prevent
+# hardware measurements: restore it with the pinned bootstrap driver, then
+# select the measured profile before toolkit or engine installation.
+prepare_runtime() {
+    local engine="$1" repaired=0 compatibility_status
+    # Before NVML measurements, preserve any stack that could support this
+    # engine. llama.cpp's Volta profile can use a CUDA 12.9 driver. After
+    # recovery the measured profile, not this provisional floor, is enforced.
+    local RECOVERY_DRIVER_MIN="$PROFILE_DEFAULT_DRIVER_MIN" RECOVERY_DRIVER_MAX_BRANCH=""
+    if [ "$engine" = "llamacpp" ]; then
+        RECOVERY_DRIVER_MIN="$PROFILE_VOLTA_DRIVER_MIN"
+        RECOVERY_DRIVER_MAX_BRANCH="$PROFILE_VOLTA_DRIVER_MAX_BRANCH"
+    fi
+    check_driver_resume || return $?
+    detect_profile_os
+    if ! check_os_abi "$engine"; then
+        echo "[REJECT:unsupported_hardware:OS/ABI check failed before driver preparation]" >&2
+        return 3
+    fi
+    step check_install_capacity check_install_capacity_or_warn
+    # Required both for missing-driver PCI evidence and profile measurement.
+    step system_prerequisites install_missing_packages pciutils
+    if ! nvidia-smi &>/dev/null; then
+        if modinfo nvidia &>/dev/null; then
+            sudo modprobe nvidia || true
+        fi
+        if ! nvidia-smi &>/dev/null; then
+            echo "Driver unavailable; GPU profile measurements require module repair first"
+            local pci_inventory
+            pci_inventory=$(lspci -Dn) || return 1
+            if ! grep -Eq ' 03[0-9a-f]{2}: 10de:' <<< "$pci_inventory"; then
+                echo "[REJECT:unsupported_hardware:no NVIDIA GPU PCI device found for driver repair]" >&2
+                return 3
+            fi
+            step nvidia_driver install_nvidia_driver
+            repaired=1
+        fi
+    fi
+    select_runtime_profile "$engine" 1 || return $?
+    RECOVERY_DRIVER_MIN="$PROFILE_DRIVER_MIN"
+    RECOVERY_DRIVER_MAX_BRANCH="$PROFILE_DRIVER_MAX_BRANCH"
+    step system_prerequisites install_runtime_prerequisites "$engine"
+    if installed_driver_compatible; then compatibility_status=0; else compatibility_status=$?; fi
+    if [ "$compatibility_status" -ne 0 ]; then
+        if [ "$compatibility_status" -eq 2 ]; then
+            resume_required maintenance_required "Cannot establish the installed driver version; inspect NVML/module health, then retry setup"
+            return 21
+        fi
+        echo "Installed driver cannot satisfy ${PROFILE_NAME}; preparing verified replacement"
+        step nvidia_driver install_nvidia_driver
+        repaired=1
+        select_runtime_profile "$engine" 1 || return $?
+        step nvidia_driver installed_driver_compatible
+    fi
+    step cuda_toolkit install_cuda_toolkit
+    step fabric_manager ensure_fabric_manager
+    echo "[STEP:cuda_proof:START]"
+    run_with_errexit verify_cuda_execution
+    if [ "$STEP_STATUS" -ne 0 ]; then
+        echo "[STEP:cuda_proof:FAIL]"
+        if [ "$STEP_STATUS" -eq 10 ]; then
+            if [ "$repaired" -eq 1 ]; then
+                require_driver_reboot "CUDA execution failed after driver repair"
+                return 20
+            fi
+            resume_required maintenance_required "CUDA execution failed despite a compatible driver version; inspect device/fabric/runtime health, then retry setup"
+            return 21
+        fi
+        return "$STEP_STATUS"
+    fi
+    echo "[STEP:cuda_proof:OK]"
+    if [ -f "${DRIVER_STATE_DIR}/driver-reboot" ]; then
+        sudo rm -f "${DRIVER_STATE_DIR}/driver-reboot"
+    fi
+    echo "GPU stack satisfies ${PROFILE_NAME}; continuing without further driver changes"
+}
+
+nvcc_toolkit_version() {
+    "$1" --version 2>/dev/null | grep -oP 'V\K[0-9]+\.[0-9]+' | head -1
 }
 
 # Locates nvcc for the profile toolkit. The NVIDIA RHEL9 repo installs under
-# /usr/local/cuda-<version>/bin (no /usr/local/cuda symlink), so candidate
-# paths are checked in order; CUDA_NVCC always wins.
+# /usr/local/cuda-<version>/bin (no /usr/local/cuda symlink). Prefer a matching
+# version over an old default symlink or PATH compiler; retain a mismatched
+# candidate only to diagnose it in the install/proof gates.
 find_nvcc() {
     local required="${1:-${PROFILE_CUDA_TOOLKIT_VERSION:-}}"
-    local candidate
+    local candidate installed fallback=""
     for candidate in \
         "${CUDA_NVCC:-}" \
         "/usr/local/cuda/bin/nvcc" \
         "/usr/local/cuda-${required}/bin/nvcc" \
         "$(command -v nvcc 2>/dev/null || true)"; do
         if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-            echo "$candidate"
-            return 0
+            installed=$(nvcc_toolkit_version "$candidate") || installed=""
+            if [ -z "$required" ] || [ "$installed" = "$required" ]; then
+                echo "$candidate"
+                return 0
+            fi
+            [ -n "$fallback" ] || fallback="$candidate"
         fi
     done
+    if [ -n "$fallback" ]; then
+        echo "$fallback"
+        return 0
+    fi
     return 1
 }
 
@@ -176,14 +417,14 @@ install_cuda_toolkit() {
     nvcc="$(find_nvcc "$required")" || nvcc=""
     if [ -n "$nvcc" ] && [ -x "$nvcc" ]; then
         local installed
-        installed=$("$nvcc" --version 2>/dev/null | grep -oP 'V\K[0-9]+\.[0-9]+' | head -1) || true
+        installed=$(nvcc_toolkit_version "$nvcc") || installed=""
         if [ "$installed" = "$required" ]; then
             echo "CUDA toolkit ${required} already installed, skipping"
             return 0
         fi
         echo "CUDA toolkit ${installed:-unknown} installed; installing exact ${required}"
     fi
-    sudo dnf -y install dnf-plugins-core
+    install_missing_packages dnf-plugins-core
     sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
     local pkg="cuda-toolkit-${required//./-}"
     if ! sudo dnf -y install "$pkg"; then
@@ -207,31 +448,69 @@ verify_cuda_execution() {
         echo "FATAL: nvcc not found; install the profile CUDA toolkit first" >&2
         return 1
     fi
+    local toolkit_version
+    toolkit_version=$(nvcc_toolkit_version "$nvcc") || toolkit_version=""
+    if [ "$toolkit_version" != "$PROFILE_CUDA_TOOLKIT_VERSION" ]; then
+        echo "FATAL: CUDA proof requires toolkit ${PROFILE_CUDA_TOOLKIT_VERSION}; ${nvcc} reports ${toolkit_version:-unknown}" >&2
+        return 1
+    fi
     local work_dir
     work_dir=$(mktemp -d "${INSTALL_TMP_DIR:-/tmp}/cuda-probe.XXXXXX")
     cat > "${work_dir}/cuda_probe.cu" <<'EOF'
 #include <stdio.h>
+#include <cuda_runtime.h>
 __global__ void k(int *x) { *x = 42; }
 int main() {
-    int h = 0, *d;
-    if (cudaMalloc(&d, sizeof(int)) != cudaSuccess) { printf("cudaMalloc failed\n"); return 1; }
-    k<<<1, 1>>>(d);
-    if (cudaMemcpy(&h, d, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) {
-        printf("cudaMemcpy failed\n"); return 1;
+    int count = 0, driver = 0, runtime = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
+        printf("cudaGetDeviceCount failed or no CUDA devices\n"); return 1;
     }
-    cudaFree(d);
-    return h == 42 ? 0 : 1;
+    if (cudaDriverGetVersion(&driver) != cudaSuccess ||
+        cudaRuntimeGetVersion(&runtime) != cudaSuccess) return 1;
+    printf("CUDA driver API=%d runtime=%d devices=%d\n", driver, runtime, count);
+    for (int i = 0; i < count; ++i) {
+        int h = 0, *d = NULL;
+        if (cudaSetDevice(i) != cudaSuccess || cudaMalloc(&d, sizeof(int)) != cudaSuccess) {
+            printf("cudaSetDevice/cudaMalloc failed on device %d\n", i); return 1;
+        }
+        k<<<1, 1>>>(d);
+        if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess ||
+            cudaMemcpy(&h, d, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess || h != 42) {
+            printf("CUDA kernel/copy failed on device %d\n", i); return 1;
+        }
+        if (cudaFree(d) != cudaSuccess) return 1;
+        printf("CUDA execution verified on device %d\n", i);
+    }
+    return 0;
 }
 EOF
-    if ! "$nvcc" -o "${work_dir}/cuda_probe" "${work_dir}/cuda_probe.cu"; then
+    # Build for the selected profile, including SM70 on CUDA 12.9. Retain PTX
+    # for newer selected cards, without compiling for unrelated physical GPUs.
+    local capability="${GPU_COMPUTE_CAP:-}" devices query_index sm
+    local -a arch_flags=()
+    devices=$(profile_gpu_devices)
+    if [ -z "$capability" ]; then
+        query_index="${devices%%,*}"
+        capability=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i "${query_index:-0}" | xargs) || capability=""
+    fi
+    if ! [[ "$capability" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        rm -rf "$work_dir"
+        echo "FATAL: cannot establish the selected profile's CUDA architecture" >&2
+        return 1
+    fi
+    sm="${capability//./}"
+    arch_flags+=(-gencode "arch=compute_${sm},code=[sm_${sm},compute_${sm}]")
+    if ! "$nvcc" -o "${work_dir}/cuda_probe" "${work_dir}/cuda_probe.cu" "${arch_flags[@]}"; then
         rm -rf "$work_dir"
         echo "FATAL: nvcc failed to compile the CUDA execution probe" >&2
         return 1
     fi
-    if ! "${work_dir}/cuda_probe"; then
+    local -a probe_env=()
+    [ -z "$devices" ] || probe_env+=("CUDA_VISIBLE_DEVICES=$devices")
+    if ! env "${probe_env[@]}" "${work_dir}/cuda_probe"; then
         rm -rf "$work_dir"
         echo "FATAL: CUDA execution probe failed on the device; driver/toolkit/device unusable" >&2
-        return 1
+        return 10
     fi
     rm -rf "$work_dir"
     echo "CUDA execution verified: probe kernel compiled and ran"
@@ -451,6 +730,10 @@ ensure_fabric_manager() {
         return 0
     fi
     echo "Found ${nvswitch_count} NVSwitch device(s), Fabric Manager required"
+    if fabric_ready >/dev/null 2>&1; then
+        echo "Matching Fabric Manager is active and trained, reusing without restart"
+        return 0
+    fi
 
     local driver_version=""
     if command -v nvidia-smi &>/dev/null; then

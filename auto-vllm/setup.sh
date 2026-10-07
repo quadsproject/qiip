@@ -162,17 +162,9 @@ main() {
         return 2
     fi
     reject_retired_flashinfer_index
-    require_sha256 "NVIDIA driver ${DRIVER_VERSION}" "$DRIVER_SHA256" \
-        "AUTOVLLM_NVIDIA_DRIVER_SHA256"
     require_sha256 "llmfit ${LLMFIT_RELEASE}" "$LLMFIT_SHA256" \
         "AUTOVLLM_LLMFIT_SHA256"
-    step system_update run_system_update
-    step nvidia_driver install_nvidia_driver
-    select_runtime_profile vllm || exit $?
-    step check_install_capacity check_install_capacity_or_warn
-    step cuda_toolkit install_cuda_toolkit
-    step fabric_manager ensure_fabric_manager
-    step cuda_proof verify_cuda_execution
+    prepare_runtime vllm
     step vllm_install install_vllm
     step vllm_unit install_vllm_unit
     step nfs_mount mount_nfs_cache

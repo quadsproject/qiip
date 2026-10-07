@@ -351,19 +351,11 @@ main() {
         echo "FATAL: AUTOVLLM_NFS_EXPORT is required for node provisioning" >&2
         return 2
     fi
-    require_sha256 "NVIDIA driver ${DRIVER_VERSION}" "$DRIVER_SHA256" \
-        "AUTOVLLM_NVIDIA_DRIVER_SHA256"
     require_sha256 "llmfit ${LLMFIT_RELEASE}" "$LLMFIT_SHA256" \
         "AUTOVLLM_LLMFIT_SHA256"
     require_sha256 "llama.cpp ${LLAMACPP_VERSION}" "$LLAMACPP_SHA256" \
         "AUTOLLAMACPP_SHA256"
-    step system_update run_system_update
-    step nvidia_driver install_nvidia_driver
-    select_runtime_profile llamacpp || exit $?
-    step check_install_capacity check_install_capacity_or_warn
-    step cuda_toolkit install_cuda_toolkit
-    step fabric_manager ensure_fabric_manager
-    step cuda_proof verify_cuda_execution
+    prepare_runtime llamacpp
     step llamacpp_install install_llamacpp
     step nfs_mount mount_nfs_cache
     step firewall configure_firewall

@@ -28,6 +28,7 @@ from inference_proxy.models.node import (
     LlamaCppRuntimeState,
     VllmParams,
 )
+from inference_proxy.provisioning.state import ProvisioningResumeState
 
 _HOSTNAME_RE = re.compile(r"[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?")
 
@@ -81,6 +82,7 @@ class AdminNodeResponse(BaseModel):
     admin_only: bool = False
     failed_step: str | None = None
     error: str | None = None
+    resume_state: ProvisioningResumeState | None = None
     placement_blocker: str | None = None
     owner: str = ""
 
@@ -237,6 +239,7 @@ class TaskStatusResponse(BaseModel):
     updated_at: datetime
     failed_step: str | None = None
     error: str | None = None
+    resume_state: ProvisioningResumeState | None = None
 
 
 class QUADSStatusResponse(BaseModel):

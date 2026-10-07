@@ -215,6 +215,7 @@ class TestAdminNodesPopulated:
             "admin_only",
             "failed_step",
             "error",
+            "resume_state",
             "placement_blocker",
             "owner",
         }
@@ -336,6 +337,7 @@ class TestAdminNodesPopulated:
                 "name": "",
                 "failed_step": None,
                 "error": None,
+                "resume_state": None,
                 "placement_blocker": None,
             }
         ]
@@ -1145,6 +1147,28 @@ class TestLlamaCppRelaunchEndpoint:
 
 class TestTasksEndpoint:
     """GET /admin/provisioning/tasks returns task status from etcd."""
+
+    @pytest.mark.parametrize(
+        "resume_state", ["maintenance_required", "reboot_required"]
+    )
+    def test_resume_state_survives_task_response(
+        self, client: TestClient, mock_provisioner: MagicMock, resume_state: str
+    ) -> None:
+        task_data = {
+            "hostname": "gpu01",
+            "current_step": "failed",
+            "started_at": "2026-07-07T12:00:00Z",
+            "updated_at": "2026-07-07T12:05:00Z",
+            "failed_step": "nvidia_driver",
+            "error": "Resolve driver maintenance, then retry setup",
+            "resume_state": resume_state,
+        }
+        mock_provisioner.list_tasks_raw.return_value = [
+            (json.dumps(task_data).encode(), {"key": b"/provisioning/gpu01"}),
+        ]
+        response = client.get("/admin/provisioning/tasks")
+        assert response.status_code == 200
+        assert response.json()[0]["resume_state"] == resume_state
 
     def test_returns_tasks_from_etcd(
         self,
