@@ -209,8 +209,10 @@ redfish:
   # BMC name that bmc_host_template renders, e.g. mgmt-...) is an exact
   # override and beats any lab. Anything matching nothing falls back to
   # bmc_username/bmc_password above, which must be set to use overrides. Keys
-  # are lowercased; surrounding whitespace, leading/trailing dots and
-  # case-duplicate keys are rejected at startup. For example:
+  # are lowercased and surrounding whitespace is stripped; a key that is
+  # empty, has a leading dot, ends with a dot on a `labs` entry (a trailing
+  # dot on a `hosts` entry is stripped), or duplicates another after
+  # normalization is rejected at startup. For example:
   #   labs:
   #     rdu2.scalelab: { username: root, password: mypass1 }
   #     rdu3.labs.perfscale: { username: root, password: mypass2 }

@@ -1427,8 +1427,10 @@ over any lab; `labs` maps a dotted FQDN segment such as `rdu2.scalelab`,
 matched as a dot-bounded substring with the longest identifier first and equal
 lengths resolved lexicographically. A hostname matching neither falls back to
 `bmc_username`/`bmc_password`, which must be set when overrides are used. Keys
-are lowercased; empty keys, leading or trailing dots and case-duplicate keys
-are rejected at startup.
+are lowercased and surrounding whitespace is stripped; a key that is empty,
+has a leading dot, ends with a dot on a `labs` entry (a trailing dot on a
+`hosts` entry is stripped), or duplicates another after normalization is
+rejected at startup.
 
 ## Architecture
 
