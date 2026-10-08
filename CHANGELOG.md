@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.3 (2026-10-08)
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`d501b3f`](https://github.com/quadsproject/qiip/commit/d501b3f77bf02b9a5ce5cad4eb093884ad847187))
+
+### Features
+
+- Add user leaderboard and token dashboard
+  ([`b41d846`](https://github.com/quadsproject/qiip/commit/b41d846818f061810a2480e943611d16618d2a7b))
+
+
 ## Unreleased
 
 ### Features
