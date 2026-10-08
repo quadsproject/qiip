@@ -145,6 +145,12 @@ provisioning:
   llamacpp_version: v0.4.1
   llamacpp_sha256: ef3d5b1907a391500ae11b5e61a8e2022e0deaac9790899cad9c4e02f03bfb9a
   llamacpp_source_url: https://github.com/ggml-org/llama.cpp/archive/refs/tags/{version}.tar.gz
+  # Configure both values to reuse verified builds from a shared HTTP(S) catalog.
+  llamacpp_artifact_catalog_url: ""
+  llamacpp_artifact_catalog_sha256: ""
+  llamacpp_allow_source_build: true
+  # 0 selects from available RAM/CPU; a positive value adds a job ceiling.
+  llamacpp_build_jobs: 0
   llamacpp_setup_timeout: 7200.0
   llamacpp_fit_target_mib: 512
 

@@ -417,6 +417,9 @@ def test_script_env_prefix_exact() -> None:
         "AUTOLLAMACPP_SOURCE_URL": (
             "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v0.4.1.tar.gz"
         ),
+        "AUTOLLAMACPP_ARTIFACT_CATALOG_URL": "",
+        "AUTOLLAMACPP_ARTIFACT_CATALOG_SHA256": "",
+        "AUTOLLAMACPP_ALLOW_SOURCE_BUILD": "1",
     }
     artifact = _artifact()
     assert provisioner._start_script_env(None, InferenceEngine.LLAMA_CPP, artifact) == {

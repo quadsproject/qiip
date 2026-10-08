@@ -928,6 +928,7 @@ if [[ "${1:-}" == '--build' ]]; then
     mkdir -p "$build_dir/bin"
     cat > "$build_dir/bin/llama-server" <<'EOF'
 #!/bin/bash
+if [ "$*" = '--list-devices' ]; then echo 'CUDA0: NVIDIA fixture'; exit 0; fi
 if [ "$*" != '--version' ]; then
     printf 'server' >> "$AUTOLLAMACPP_TEST_LOG"
     printf ' <%s>' "$@" >> "$AUTOLLAMACPP_TEST_LOG"
@@ -950,14 +951,15 @@ printf '\n' >> "$AUTOLLAMACPP_TEST_LOG"
 metadata='--parallel 1 --kv-unified --gpu-layers all --verbosity 5 --version'
 estimate='--ctx-size 4096 --parallel 2 --kv-unified --gpu-layers all --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --fit-print on --verbosity 0 --version'
 case "$*" in
-    "$metadata"|"$estimate") ;;
+    "$metadata"|"$estimate"|'--version') ;;
     *) exit 45 ;;
 esac
 echo 'version: 0.4.1 (build 0, commit v0.4.1)' >&2
 EOF
     cat > "$build_dir/bin/llama-quantize" <<'EOF'
 #!/bin/bash
-exit 0
+echo 'usage: llama-quantize [--help] model-f32.gguf type'
+exit 1
 EOF
     chmod +x "$build_dir/bin/llama-server" "$build_dir/bin/llama-fit-params" "$build_dir/bin/llama-quantize"
 fi
@@ -965,13 +967,33 @@ fi
     )
     _write_executable(
         fake_bin / "nvcc",
-        "#!/bin/bash\necho 'Cuda compilation tools, release 13.0, V13.0.88'\n",
+        """#!/bin/bash
+if [ "$*" = '--version' ]; then
+    echo 'Cuda compilation tools, release 13.0, V13.0.88'
+else
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = '-o' ]; then
+            printf '#!/bin/bash\\necho CUDA_EXECUTED\\n' > "$2"
+            chmod +x "$2"
+            exit 0
+        fi
+        shift
+    done
+    exit 1
+fi
+""",
+    )
+    _write_executable(fake_bin / "rpm", "#!/bin/bash\nexit 0\n")
+    _write_executable(fake_bin / "dnf", "#!/bin/bash\nexit 0\n")
+    _write_executable(
+        fake_bin / "ldd",
+        "#!/bin/bash\nif [ \"$*\" = --version ]; then echo 'ldd (GNU libc) 2.34'; else echo 'not a dynamic executable' >&2; exit 1; fi\n",
     )
     _write_executable(
         fake_bin / "nvidia-smi",
         """#!/bin/bash
 if [[ "$*" == *'--query-gpu=compute_cap'* ]]; then
-    printf '8.0\n9.0\n'
+    if [[ "$*" == *' -i '* ]]; then printf '8.0\n'; else printf '8.0\n9.0\n'; fi
     exit 0
 fi
 exit 1
@@ -1068,7 +1090,7 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     assert (link_dir / "llama-quantize").resolve().is_file()
     marker = (link_dir / "llama-server").resolve().parents[1] / "BUILD-INFO"
     marker_text = marker.read_text()
-    assert "build_profile=cuda-portable-cpu-v2-fit-concurrency" in marker_text
+    assert "build_profile=cuda-portable-cpu-v3-artifact" in marker_text
     assert (
         "fit_cli_patch_sha256="
         "58917efc78ca760a2a1dd162d84e6cf1930c5b62a8dd9710bb4579ca4f2d69dc"
@@ -1199,18 +1221,22 @@ def test_install_rebuilds_when_resolved_cuda_toolkit_changes(
 ) -> None:
     env, operation_log, link_dir = _build_fixture(tmp_path)
     nvcc = Path(env["AUTOLLAMACPP_NVCC"])
-    _write_executable(
-        nvcc, "#!/bin/bash\necho 'Cuda compilation tools, release 12.9, V12.9.86'\n"
+    nvcc_body = nvcc.read_text()
+    _write_executable(nvcc, nvcc_body.replace("13.0, V13.0.88", "12.9, V12.9.86"))
+    first = _run_shell(
+        _source_setup("PROFILE_CUDA_TOOLKIT_VERSION=12.9\ninstall_llamacpp"), env=env
     )
-    first = _run_shell(_source_setup("install_llamacpp"), env=env)
     assert first.returncode == 0, first.stderr
     old_binary = (link_dir / "llama-server").resolve()
 
     _write_executable(
         nvcc,
-        f"#!/bin/bash\necho 'Cuda compilation tools, release {next_version.rsplit('.', 1)[0]}, V{next_version}'\n",
+        nvcc_body.replace(
+            "13.0, V13.0.88", f"{next_version.rsplit('.', 1)[0]}, V{next_version}"
+        ),
     )
-    second = _run_shell(_source_setup("install_llamacpp"), env=env)
+    command = f"PROFILE_CUDA_TOOLKIT_VERSION={next_version.rsplit('.', 1)[0]}\ninstall_llamacpp"
+    second = _run_shell(_source_setup(command), env=env)
     assert second.returncode == 0, second.stderr
     new_binary = (link_dir / "llama-server").resolve()
     assert new_binary != old_binary
@@ -1218,7 +1244,7 @@ def test_install_rebuilds_when_resolved_cuda_toolkit_changes(
         f"cuda_toolkit={next_version}"
         in (new_binary.parents[1] / "BUILD-INFO").read_text()
     )
-    third = _run_shell(_source_setup("install_llamacpp"), env=env)
+    third = _run_shell(_source_setup(command), env=env)
     assert third.returncode == 0, third.stderr
     assert (link_dir / "llama-server").resolve() == new_binary
     assert (
@@ -1233,14 +1259,16 @@ def test_install_rejects_unverifiable_cuda_toolkit(
 ) -> None:
     env, operation_log, link_dir = _build_fixture(tmp_path)
     _write_executable(Path(env["AUTOLLAMACPP_NVCC"]), f"#!/bin/bash\n{nvcc_body}\n")
-    result = _run_shell(_source_setup("install_llamacpp"), env=env)
+    result = _run_shell(
+        _source_setup("install_cuda_toolkit() { :; }\ninstall_llamacpp"), env=env
+    )
     assert result.returncode != 0
     assert (
         f"FATAL: could not determine CUDA toolkit version from {env['AUTOLLAMACPP_NVCC']}"
         in result.stderr
     )
     assert not link_dir.exists()
-    assert not operation_log.exists()
+    assert not operation_log.exists() or "wget" not in operation_log.read_text()
 
 
 def test_build_tag_pins_build_number_and_rejects_other_version(

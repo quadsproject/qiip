@@ -719,6 +719,32 @@ patch update. Existing installations without this marker rebuild once on their
 next setup. An unreadable compiler version stops setup before a cached build can
 be reused.
 
+### 30. Reuse verified llama.cpp artifacts and bound source builds
+
+New llama.cpp setups use the `cuda-portable-cpu-v3-artifact` profile. Its sealed
+package includes all three tools, a CUDA execution probe, portable CPU settings,
+bundled CUDA/compiler libraries, and source/transformation/compiler/OS identity.
+Older installations remain available for rollback; their next setup needs a new
+package. Compatible local packages are reused without downloading a catalog or
+installing a toolchain. A selected-profile package no longer rebuilds solely
+because a local compiler or CUDA toolkit patch version changes.
+
+To distribute builds between nodes, publish packages on representative GPU
+producers and configure both `LLAMACPP_ARTIFACT_CATALOG_URL` and
+`LLAMACPP_ARTIFACT_CATALOG_SHA256` under `INFERENCE_PROXY_PROVISIONING__`.
+`LLAMACPP_ALLOW_SOURCE_BUILD=false` requires a verified matching local or remote
+artifact; the default remains `true`. Catalog updates require a new pinned
+digest. See the [producer workflow](auto-llamacpp/README.md#produce-and-distribute-a-catalog).
+
+Source fallback now reserves 2 GiB of available RAM and budgets 4 GiB per job,
+with `LLAMACPP_BUILD_JOBS` as an optional ceiling (`0` means automatic). The
+defaults require at least 6 GiB available RAM, 12 GiB of build space, and 4 GiB
+of installation space. Requirements add when both paths share a filesystem.
+Setup can choose alternate scratch storage and proves CUDA execution before
+compiling the engine. Source/archive checksums and transactional activation
+remain mandatory. Check artifact hit/miss, fallback reason, resource and timing
+markers in attempt logs before fleet rollout.
+
 ## Artifact Sources and Mirror Policy
 
 There is no single global mirror switch. Each source has a different trust and configuration boundary.
@@ -728,7 +754,8 @@ There is no single global mirror switch. Each source has a different trust and c
 | NVIDIA `.run` installer used by `setup.sh` | Node-side `NVIDIA_DRIVER_URL`; the gateway does not forward a URL setting | `AUTOVLLM_NVIDIA_DRIVER_SHA256`, normally populated from `PROVISIONING__NVIDIA_DRIVER_SHA256` | Point the node-side variable at a mirror serving byte-identical content, or configure the matching custom digest with the custom version. |
 | LLMFit archive used by `setup.sh` | Node-side `LLMFIT_URL`; the gateway forwards version and digest but not this URL | `AUTOVLLM_LLMFIT_SHA256`, normally populated from `LLMFIT__SHA256` | Point the node-side variable at byte-identical mirrored content. When invoking setup through QIIP, arrange the variable in the node's SSH environment or customize the shipped bundle. |
 | On-demand LLMFit runner install | `INFERENCE_PROXY_LLMFIT__INSTALL_URL` | `INFERENCE_PROXY_LLMFIT__SHA256` | Set the validated HTTP(S) `{version}` URL template and matching digest. Configure this separately from the setup-script URL. |
-| llama.cpp source archive | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` with the pinned `LLAMACPP_VERSION` | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256`; verification happens before extraction or build | Point the validated `{version}` URL template at a mirror serving byte-identical tag archives, or configure the matching digest with a custom version. Managed nodes compile CUDA-enabled binaries locally because the pinned release has no Linux CUDA archive. |
+| llama.cpp source archive | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` with the pinned `LLAMACPP_VERSION` | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256`; verification happens before extraction or build | Point the validated `{version}` URL template at a mirror serving byte-identical tag archives, or configure the matching digest with a custom version. Source fallback compiles CUDA-enabled binaries when allowed and no compatible artifact is available. |
+| llama.cpp build catalog and packages | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_ARTIFACT_CATALOG_URL` | The catalog SHA-256 pins package URLs, archive digests, sizes and source/profile/ABI identities; setup validates the complete package and CUDA execution | Publish verified packages to the mirror first, then atomically publish its catalog and update the gateway's catalog digest. |
 | HuggingFace model snapshots and GGUF files | Repository ID, optional requested revision, and exact GGUF file set in the administrative download request | Download status records the resolved immutable commit; native discovery binds that commit to one standalone GGUF or complete split family and an exact entrypoint | Pre-seed the standard HuggingFace cache on the declared NFS export. QIIP does not provide a separate model-hub mirror URL. A resolved commit records reproducibility but is not an independently configured content digest. |
 | uv bootstrap binary | Pinned GitHub release in `setup.sh` and `auto-vllm/.uv-version` | Vendored checksum from Astral's release assets | Air-gapped nodes may preinstall the exact pinned uv version at the expected path. Changing the download source requires a reviewed bundle change. |
 | vLLM, FlashInfer, and Python dependencies | `auto-vllm/pyproject.toml` plus `auto-vllm/uv.lock` | Registry artifact hashes for the full installable closure; source builds are refused | Regenerate and review the node project and lock for a custom index. Runtime `FLASHINFER_INDEX_URL` overrides are rejected. A pre-seeded uv cache may be used only when it satisfies the frozen lock. |

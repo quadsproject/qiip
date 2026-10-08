@@ -47,6 +47,13 @@ SCRIPT_DIR="${AUTOLLAMACPP_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}"
 LLAMACPP_BIN="${AUTOLLAMACPP_BIN:-/usr/local/bin/llama-server}"
 LLAMACPP_FIT_BIN="${AUTOLLAMACPP_FIT_BIN:-/usr/local/bin/llama-fit-params}"
 LLAMACPP_INSTALL_ROOT="${AUTOLLAMACPP_INSTALL_ROOT:-/opt/llama.cpp}"
+# Published CUDA/compiler libraries travel with the selected executable.
+_qiip_runtime_bin=$(readlink -f -- "$LLAMACPP_BIN" 2>/dev/null || true)
+if [ -n "$_qiip_runtime_bin" ] && [ -d "$(dirname "$(dirname "$_qiip_runtime_bin")")/lib" ]; then
+    LD_LIBRARY_PATH="$(dirname "$(dirname "$_qiip_runtime_bin")")/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH
+fi
+unset _qiip_runtime_bin
 PID_FILE="${AUTOLLAMACPP_PID_FILE:-/var/run/llamacpp.pid}"
 LLAMACPP_LOG_FILE="${AUTOLLAMACPP_LOG_FILE:-/var/log/llamacpp-serve.log}"
 PROC_ROOT="${AUTOLLAMACPP_PROC_ROOT:-/proc}"

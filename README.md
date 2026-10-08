@@ -1233,19 +1233,25 @@ Provisioning resource and retention controls:
 | `INFERENCE_PROXY_PROVISIONING__LOG_RECONNECT_ATTEMPTS` | `3` | Consecutive automatic retrieval retries after SSH errors |
 | `INFERENCE_PROXY_PROVISIONING__LOG_POLL_INTERVAL` | `1` | Seconds between node log retrieval requests |
 
-Managed llama.cpp provisioning builds a verified source tag with CUDA enabled
-for the NVIDIA GPU attached to the node. It has five gateway settings:
+Managed llama.cpp provisioning reuses compatible verified CUDA builds, with a
+controlled source fallback for the attached NVIDIA GPUs. Gateway settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION` | `v0.4.1` | Pinned llama.cpp release tag (`v<major>.<minor>.<patch>`, or a nightly `b<number>` build tag) |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256` | committed digest | SHA-256 of the source archive selected by the version |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` | GitHub tag archive | Validated HTTP(S) URL template containing exactly one `{version}` placeholder |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_ARTIFACT_CATALOG_URL` | empty | HTTP(S) catalog of verified CUDA builds; configure its SHA-256 together with the URL |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_ARTIFACT_CATALOG_SHA256` | empty | SHA-256 of the complete artifact catalog; archive digests are pinned inside it |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_ALLOW_SOURCE_BUILD` | `true` | Permit verified source compilation when no usable artifact exists; `false` requires a compatible sealed build |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_BUILD_JOBS` | `0` | Compiler-job ceiling; automatic sizing (`0`) and explicit ceilings both respect available CPU and RAM |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT` | `7200` | Total wall-clock deadline for the llama.cpp setup command, including the CUDA source build (seconds) |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB` | `512` | Free VRAM margin per GPU enforced by the llama.cpp capacity planner (MiB) |
 
 Changing `LLAMACPP_VERSION` requires an explicitly configured matching digest.
-The node verifies the archive before extracting it, builds `llama-server`,
+Artifact production, compatibility rules, source resource budgets, and rollout
+are described in [the llama.cpp setup guide](auto-llamacpp/README.md#verified-build-artifacts).
+The source fallback verifies the archive before extracting it, builds `llama-server`,
 `llama-fit-params`, and `llama-quantize`, and atomically publishes a versioned
 installation under `/opt/llama.cpp`. CUDA kernels target the attached GPU; the
 supporting CPU backend uses a portable non-native profile so host assembler

@@ -601,8 +601,7 @@ def test_ready_fabric_manager_is_reused_without_package_or_service_changes(
 
 
 def _setup_main_order(script: Path, engine: str, env: dict[str, str]) -> list[str]:
-    """Run the setup main with every real install step stubbed so the wiring
-    order (profile select before toolkit/proof/fabric) is observable."""
+    """Observe profile/driver wiring with engine installation stubbed."""
     return subprocess.run(
         [
             "bash",
@@ -665,12 +664,8 @@ def test_setup_checks_install_capacity_before_large_installs(
         < lines.index("STEP:cuda_toolkit")
         < lines.index("STEP:vllm_install")
     )
-    llamacpp_lines = _setup_main_order(LLAMACPP_SETUP, "llamacpp", env)
-    assert (
-        llamacpp_lines.index("STEP:check_install_capacity")
-        < llamacpp_lines.index("STEP:cuda_toolkit")
-        < llamacpp_lines.index("STEP:llamacpp_install")
-    )
+    # llama.cpp's installer sizes capacity for the selected artifact or source
+    # path. The behavioral artifact tests exercise that gate before compilation.
 
 
 def test_llamacpp_setup_selects_profile_and_prepares_fabric(tmp_path: Path) -> None:
@@ -678,10 +673,9 @@ def test_llamacpp_setup_selects_profile_and_prepares_fabric(tmp_path: Path) -> N
     env["AUTOVLLM_SCRIPT_DIR"] = str(SCRIPT_ROOT / "auto-vllm")
     lines = _setup_main_order(LLAMACPP_SETUP, "llamacpp", env)
     profile_at = lines.index("PROFILE:llamacpp")
-    toolkit_at = lines.index("STEP:cuda_toolkit")
     fabric_at = lines.index("STEP:fabric_manager")
-    proof_at = lines.index("[STEP:cuda_proof:START]")
-    assert profile_at < toolkit_at < fabric_at < proof_at
+    install_at = lines.index("[STEP:llamacpp_install:START]")
+    assert profile_at < fabric_at < install_at
 
 
 def test_llamacpp_cpu_only_main_skips_profile_selection(tmp_path: Path) -> None:

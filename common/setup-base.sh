@@ -360,7 +360,7 @@ install_nvidia_driver() (
 # hardware measurements: restore it with the pinned bootstrap driver, then
 # select the measured profile before toolkit or engine installation.
 prepare_runtime() {
-    local engine="$1" repaired=0 compatibility_status
+    local engine="$1" deferred_cuda="${2:-0}" repaired=0 compatibility_status
     # Before NVML measurements, preserve any stack that could support this
     # engine. llama.cpp's Volta profile can use a CUDA 12.9 driver. After
     # recovery the measured profile, not this provisional floor, is enforced.
@@ -375,7 +375,11 @@ prepare_runtime() {
         echo "[REJECT:unsupported_hardware:OS/ABI check failed before driver preparation]" >&2
         return 3
     fi
-    step check_install_capacity check_install_capacity_or_warn
+    # Deferred llama.cpp checks exact artifact sizes or its build/install
+    # budgets, including alternate scratch filesystems, in the installer.
+    if [ "$engine" != "llamacpp" ] || [ "$deferred_cuda" != "1" ]; then
+        step check_install_capacity check_install_capacity_or_warn
+    fi
     # Required both for missing-driver PCI evidence and profile measurement.
     step system_prerequisites install_missing_packages pciutils
     if ! nvidia-smi &>/dev/null; then
@@ -397,7 +401,11 @@ prepare_runtime() {
     select_runtime_profile "$engine" 1 || return $?
     RECOVERY_DRIVER_MIN="$PROFILE_DRIVER_MIN"
     RECOVERY_DRIVER_MAX_BRANCH="$PROFILE_DRIVER_MAX_BRANCH"
-    step system_prerequisites install_runtime_prerequisites "$engine"
+    if [ "$engine" = "llamacpp" ] && [ "$deferred_cuda" = "1" ]; then
+        step system_prerequisites install_missing_packages wget nfs-utils python3
+    else
+        step system_prerequisites install_runtime_prerequisites "$engine"
+    fi
     if installed_driver_compatible; then compatibility_status=0; else compatibility_status=$?; fi
     if [ "$compatibility_status" -ne 0 ]; then
         if [ "$compatibility_status" -eq 2 ]; then
@@ -409,6 +417,15 @@ prepare_runtime() {
         repaired=1
         select_runtime_profile "$engine" 1 || return $?
         step nvidia_driver installed_driver_compatible
+    fi
+    # llama.cpp can prove the prepared driver with a verified prebuilt probe.
+    # Its installer must complete that proof before selecting any runtime.
+    if [ "$engine" = "llamacpp" ] && [ "$deferred_cuda" = "1" ]; then
+        step fabric_manager ensure_fabric_manager
+        # Read by the engine installer after its prebuilt or source CUDA proof.
+        # shellcheck disable=SC2034
+        QIIP_DRIVER_REPAIRED="$repaired"
+        return 0
     fi
     step cuda_toolkit install_cuda_toolkit
     step fabric_manager ensure_fabric_manager
@@ -565,6 +582,13 @@ EOF
         rm -rf "$work_dir"
         echo "FATAL: CUDA execution probe failed on the device; driver/toolkit/device unusable" >&2
         return 10
+    fi
+    # Artifact producers retain the exact kernel that passed on this node.
+    if [ -n "${1:-}" ]; then
+        if ! cp "${work_dir}/cuda_probe" "$1"; then
+            rm -rf "$work_dir"
+            return 1
+        fi
     fi
     rm -rf "$work_dir"
     echo "CUDA execution verified: probe kernel compiled and ran"

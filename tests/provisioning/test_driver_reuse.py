@@ -163,7 +163,7 @@ GPU_DEVICE_ROOT="$FIXTURE_ROOT/devices"
 GPU_MODULE_ROOT="$FIXTURE_ROOT/modules"
 BOOT_ID_FILE="$FIXTURE_ROOT/boot-id"
 install_vllm() {{ echo ENGINE_INSTALLED; }}
-install_llamacpp() {{ echo ENGINE_INSTALLED; }}
+install_llamacpp() {{ verify_cuda_execution; echo ENGINE_INSTALLED; }}
 install_vllm_unit() {{ :; }}
 mount_nfs_cache() {{ :; }}
 configure_firewall() {{ :; }}
