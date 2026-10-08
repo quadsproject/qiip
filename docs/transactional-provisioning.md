@@ -25,10 +25,17 @@ FlashInfer, checks matching FlashInfer Python/cubin versions, and verifies
 Python, ninja, and the managed `vllm serve` options.
 
 llama.cpp installations retain the source digest, version, transformation,
-build profile, GPU capabilities, CUDA architecture/toolkit, and runtime profile
+build profile, compiler, OS/ABI, GPU capabilities, CUDA architecture/toolkit, and runtime profile
 in `BUILD-INFO`. Setup checks the installed server and fit-planner CLI and seals
-all three executables in `RUNTIME.json`. A sealed installation is verified and
+all three tools in `RUNTIME.json`. A sealed installation is verified and
 reused. Failed verification does not overwrite a sealed installation.
+New builds also seal a compiled CUDA execution probe, `BUILD-INFO`, and bundled
+CUDA/compiler libraries. A pinned artifact catalog can supply these packages
+without installing a compilation toolchain. Source and artifact installations
+copy a complete verified package to an inactive staging directory on the
+installation filesystem, flush it, and publish it under a lock before selection.
+An interrupted copy leaves the active generation untouched. See the
+[artifact producer and fallback guide](../auto-llamacpp/README.md#verified-build-artifacts).
 
 `RUNTIME.json` records dependency/profile identity and executable digests.
 External executable symlinks, including uv's RPM-managed Python interpreter,
