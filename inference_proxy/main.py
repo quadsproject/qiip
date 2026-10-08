@@ -299,6 +299,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 kwargs={
                     "connection_tracker": connection_tracker,
                     "lease_manager": lease_manager,
+                    "etcd_client": etcd_client,
                 },
                 daemon=True,
             )

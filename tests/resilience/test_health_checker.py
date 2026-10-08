@@ -10,6 +10,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import json
 import threading
 from unittest.mock import MagicMock, call, patch
 
@@ -1047,3 +1048,560 @@ def test_half_open_inference_probe_preserves_endpoint_scheme() -> None:
         json={"model": "llama-3", "prompt": "ping", "max_tokens": 1},
         timeout=2.0,
     )
+
+
+def _models_response(payload: object, *, status_code: int = 200) -> MagicMock:
+    response = MagicMock(status_code=status_code)
+    response.json.return_value = payload
+    return response
+
+
+class TestSelfSetupModelAutoRediscovery:
+    """A switched backend model is followed without a manual re-adoption."""
+
+    def test_health_cycle_adopts_new_primary_model(self) -> None:
+        """/v1/models drift overwrites the tracked model in the registry."""
+        registry = NodeRegistry()
+        registry.add(
+            _make_node(self_setup=True, model="nvidia/Qwen3.8-Flash-Next-NVFP4")
+        )
+        failures = _FailureCounts()
+        client = MagicMock(spec=httpx.Client)
+
+        def probe(url: str) -> MagicMock:
+            if url.endswith("/health"):
+                return MagicMock(status_code=200)
+            return _models_response(
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+                            "object": "model",
+                        },
+                        {"id": "alias", "object": "model"},
+                    ],
+                }
+            )
+
+        client.get.side_effect = probe
+        try:
+            _probe_all_nodes(registry, CircuitBreakerRegistry(), client, failures, 3)
+        finally:
+            failures.close()
+
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.model == "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
+        assert result.status == NodeStatus.HEALTHY
+
+    def test_etcd_record_updated_by_revision_cas_preserving_fields(self) -> None:
+        """The committed model write is a CAS that keeps sibling fields."""
+        from inference_proxy.discovery.etcd_client import EtcdRecord
+
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        etcd.get_record.return_value = EtcdRecord(
+            key=b"/nodes/node-1",
+            value=json.dumps(
+                {
+                    "endpoint": "http://10.0.1.100:8000",
+                    "model": "llama-3",
+                    "owner": "ops@example.com",
+                    "admin_only": True,
+                }
+            ).encode("utf-8"),
+            mod_revision=11,
+            lease_id=0,
+        )
+        etcd.replace_if_revision.return_value = 12
+        client = MagicMock(spec=httpx.Client)
+
+        def probe(url: str) -> MagicMock:
+            if url.endswith("/health"):
+                return MagicMock(status_code=200)
+            return _models_response({"data": [{"id": "qwen-3"}]})
+
+        client.get.side_effect = probe
+        _probe_all_nodes(
+            registry,
+            CircuitBreakerRegistry(),
+            client,
+            _FailureCounts(),
+            3,
+            etcd_client=etcd,
+        )
+
+        etcd.get_record.assert_called_once_with("/nodes/node-1")
+        (key, value), kwargs = etcd.replace_if_revision.call_args
+        assert key == "/nodes/node-1"
+        assert json.loads(value) == {
+            "endpoint": "http://10.0.1.100:8000",
+            "model": "qwen-3",
+            "owner": "ops@example.com",
+            "admin_only": True,
+        }
+        assert kwargs == {"expected_mod_revision": 11, "lease_id": 0}
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.model == "qwen-3"
+
+    def test_cas_conflict_retries_then_writes(self) -> None:
+        """A lost revision comparison is retried with the fresh record."""
+        from inference_proxy.discovery.etcd_client import EtcdRecord
+
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        etcd.get_record.side_effect = [
+            EtcdRecord(key=b"/nodes/node-1", value=b"{}", mod_revision=11),
+            EtcdRecord(key=b"/nodes/node-1", value=b"{}", mod_revision=12),
+        ]
+        etcd.replace_if_revision.side_effect = [None, 13]
+        client = MagicMock(spec=httpx.Client)
+        client.get.side_effect = [
+            MagicMock(status_code=200),
+            _models_response({"data": [{"id": "qwen-3"}]}),
+        ]
+
+        _probe_all_nodes(
+            registry,
+            CircuitBreakerRegistry(),
+            client,
+            _FailureCounts(),
+            3,
+            etcd_client=etcd,
+        )
+
+        assert etcd.get_record.call_count == 2
+        assert etcd.replace_if_revision.call_args_list[-1].kwargs == {
+            "expected_mod_revision": 12,
+            "lease_id": 0,
+        }
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.model == "qwen-3"
+
+    def test_cas_exhaustion_still_patches_registry(self) -> None:
+        """Persistent contention: etcd keeps its record, memory stays live."""
+        from inference_proxy.discovery.etcd_client import EtcdRecord
+
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        etcd.get_record.return_value = EtcdRecord(
+            key=b"/nodes/node-1", value=b"{}", mod_revision=11
+        )
+        etcd.replace_if_revision.return_value = None
+        client = MagicMock(spec=httpx.Client)
+        client.get.side_effect = [
+            MagicMock(status_code=200),
+            _models_response({"data": [{"id": "qwen-3"}]}),
+        ]
+
+        _probe_all_nodes(
+            registry,
+            CircuitBreakerRegistry(),
+            client,
+            _FailureCounts(),
+            3,
+            etcd_client=etcd,
+        )
+
+        assert etcd.replace_if_revision.call_count == 3
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.model == "qwen-3"
+
+    def test_replaced_endpoint_withholds_model_write(self) -> None:
+        """A stale observation from a re-adopted node writes nothing."""
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        client = MagicMock(spec=httpx.Client)
+
+        def probe(url: str) -> MagicMock:
+            if url.endswith("/health"):
+                return MagicMock(status_code=200)
+            current = registry.get("node-1")
+            assert current is not None
+            registry.add(
+                current.model_copy(
+                    update={"endpoint": "10.0.1.200:8000", "model": "llama-3"}
+                )
+            )
+            return _models_response({"data": [{"id": "qwen-3"}]})
+
+        client.get.side_effect = probe
+        _probe_all_nodes(
+            registry,
+            CircuitBreakerRegistry(),
+            client,
+            _FailureCounts(),
+            3,
+            etcd_client=etcd,
+        )
+
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.model == "llama-3"
+        assert result.endpoint == "10.0.1.200:8000"
+        etcd.replace_if_revision.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            pytest.param(MagicMock(status_code=503), id="non-200"),
+            pytest.param(_models_response(None), id="non-object-body"),
+            pytest.param(_models_response({"data": []}), id="empty-list"),
+            pytest.param(_models_response({"data": [{"object": "model"}]}), id="no-id"),
+        ],
+    )
+    def test_unusable_models_response_keeps_last_model(
+        self,
+        response: MagicMock,
+    ) -> None:
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        client = MagicMock(spec=httpx.Client)
+        client.get.side_effect = [MagicMock(status_code=200), response]
+
+        _probe_all_nodes(
+            registry,
+            CircuitBreakerRegistry(),
+            client,
+            _FailureCounts(),
+            3,
+            etcd_client=etcd,
+        )
+
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.model == "llama-3"
+        assert result.status == NodeStatus.HEALTHY
+        etcd.replace_if_revision.assert_not_called()
+
+    def test_models_fetch_exception_keeps_last_model(self) -> None:
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        client = MagicMock(spec=httpx.Client)
+        client.get.side_effect = [
+            MagicMock(status_code=200),
+            httpx.TimeoutException("models timed out"),
+        ]
+
+        _probe_all_nodes(
+            registry, CircuitBreakerRegistry(), client, _FailureCounts(), 3
+        )
+
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.model == "llama-3"
+
+    def test_managed_node_probes_health_only(self) -> None:
+        """Only self-setup nodes pay for the model refresh."""
+        registry = NodeRegistry()
+        registry.add(_make_node(model="llama-3"))
+        client = MagicMock(spec=httpx.Client)
+        client.get.return_value = MagicMock(status_code=200)
+
+        _probe_all_nodes(
+            registry, CircuitBreakerRegistry(), client, _FailureCounts(), 3
+        )
+
+        client.get.assert_called_once_with("http://10.0.1.100:8000/health")
+
+    def test_half_open_recovery_uses_refreshed_model(self) -> None:
+        """The breaker trial posts the model the server now reports."""
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True, status=NodeStatus.UNHEALTHY))
+        cb_registry = CircuitBreakerRegistry(threshold=1)
+        cb_registry.get_or_create("node-1").record_failure()
+        client = MagicMock(spec=httpx.Client)
+        client.get.side_effect = [
+            MagicMock(status_code=200),
+            _models_response({"data": [{"id": "qwen-3"}]}),
+        ]
+        client.post.return_value = httpx.Response(
+            200,
+            request=httpx.Request("POST", "http://10.0.1.100:8000/v1/completions"),
+        )
+
+        _probe_all_nodes(registry, cb_registry, client, _FailureCounts(), 3)
+
+        client.post.assert_called_once_with(
+            "http://10.0.1.100:8000/v1/completions",
+            json={"model": "qwen-3", "prompt": "ping", "max_tokens": 1},
+            timeout=2.0,
+        )
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.model == "qwen-3"
+        assert result.status == NodeStatus.HEALTHY
+
+    def test_fallback_probe_does_not_fetch_models_twice(self) -> None:
+        """The /v1/models liveness fallback body also carries the model id."""
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        client = MagicMock(spec=httpx.Client)
+        client.get.side_effect = [
+            MagicMock(status_code=404),
+            _models_response({"data": [{"id": "qwen-3"}]}),
+        ]
+
+        _probe_all_nodes(
+            registry, CircuitBreakerRegistry(), client, _FailureCounts(), 3
+        )
+
+        assert client.get.call_args_list == [
+            call("http://10.0.1.100:8000/health"),
+            call("http://10.0.1.100:8000/v1/models"),
+        ]
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.model == "qwen-3"
+
+    def test_etcd_errors_keep_node_healthy_and_patch_model(self) -> None:
+        """A degraded etcd cannot demote a node whose probes are 200."""
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        etcd.get_record.side_effect = RuntimeError("etcd unavailable")
+        client = MagicMock(spec=httpx.Client)
+
+        def probe(url: str) -> MagicMock:
+            if url.endswith("/health"):
+                return MagicMock(status_code=200)
+            return _models_response({"data": [{"id": "qwen-3"}]})
+
+        client.get.side_effect = probe
+        failures = _FailureCounts()
+        try:
+            for _ in range(3):
+                _probe_all_nodes(
+                    registry,
+                    CircuitBreakerRegistry(),
+                    client,
+                    failures,
+                    3,
+                    etcd_client=etcd,
+                )
+        finally:
+            failures.close()
+
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.status == NodeStatus.HEALTHY
+        assert result.model == "qwen-3"
+        assert failures._counts.get("node-1", 0) == 0
+
+    def test_replace_failure_isolated_from_liveness(self) -> None:
+        """An error after the read leaves status HEALTHY with the new model."""
+        from inference_proxy.discovery.etcd_client import EtcdRecord
+
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        etcd.get_record.return_value = EtcdRecord(
+            key=b"/nodes/node-1", value=b"{}", mod_revision=11
+        )
+        etcd.replace_if_revision.side_effect = RuntimeError("transaction failed")
+        client = MagicMock(spec=httpx.Client)
+        client.get.side_effect = [
+            MagicMock(status_code=200),
+            _models_response({"data": [{"id": "qwen-3"}]}),
+        ]
+
+        _probe_all_nodes(
+            registry,
+            CircuitBreakerRegistry(),
+            client,
+            _FailureCounts(),
+            3,
+            etcd_client=etcd,
+        )
+
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.status == NodeStatus.HEALTHY
+        assert result.model == "qwen-3"
+
+    def test_concurrent_adopted_entry_wins_over_stale_snapshot(self) -> None:
+        """The CAS write patches the fresh entry, never the stale snapshot."""
+        from inference_proxy.discovery.etcd_client import EtcdRecord
+
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        etcd.get_record.return_value = EtcdRecord(
+            key=b"/nodes/node-1", value=b"{}", mod_revision=11
+        )
+
+        def commit(_key: str, _value: bytes, **_kwargs: object) -> int:
+            current = registry.get("node-1")
+            assert current is not None
+            registry.add(
+                current.model_copy(
+                    update={
+                        "endpoint": "10.0.1.200:8000",
+                        "status": NodeStatus.DRAINING,
+                        "model": "qwen-9",
+                    }
+                )
+            )
+            return 12
+
+        etcd.replace_if_revision.side_effect = commit
+        client = MagicMock(spec=httpx.Client)
+        client.get.side_effect = [
+            MagicMock(status_code=200),
+            _models_response({"data": [{"id": "qwen-3"}]}),
+        ]
+
+        _probe_all_nodes(
+            registry,
+            CircuitBreakerRegistry(),
+            client,
+            _FailureCounts(),
+            3,
+            etcd_client=etcd,
+        )
+
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.model == "qwen-9"
+        assert result.endpoint == "10.0.1.200:8000"
+        assert result.status == NodeStatus.DRAINING
+
+    def test_no_etcd_patches_fresh_entry_status(self) -> None:
+        """The memory-only branch keeps a concurrent status transition."""
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        client = MagicMock(spec=httpx.Client)
+        calls = iter(range(2))
+
+        def probe(_url: str) -> MagicMock:
+            if next(calls) == 0:
+                return MagicMock(status_code=200)
+            current = registry.get("node-1")
+            assert current is not None
+            registry.add(current.model_copy(update={"status": NodeStatus.DRAINING}))
+            return _models_response({"data": [{"id": "qwen-3"}]})
+
+        client.get.side_effect = probe
+        _probe_all_nodes(
+            registry, CircuitBreakerRegistry(), client, _FailureCounts(), 3
+        )
+
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.model == "qwen-3"
+        assert result.status == NodeStatus.DRAINING
+
+    def test_unchanged_model_skips_writes_without_etcd(self) -> None:
+        """The no-change fast path fetches models once and writes nothing."""
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        client = MagicMock(spec=httpx.Client)
+
+        def probe(url: str) -> MagicMock:
+            if url.endswith("/health"):
+                return MagicMock(status_code=200)
+            return _models_response({"data": [{"id": "llama-3"}]})
+
+        client.get.side_effect = probe
+        _probe_all_nodes(
+            registry, CircuitBreakerRegistry(), client, _FailureCounts(), 3
+        )
+
+        assert client.get.call_args_list == [
+            call("http://10.0.1.100:8000/health"),
+            call("http://10.0.1.100:8000/v1/models"),
+        ]
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.model == "llama-3"
+
+    def test_matching_model_still_repairs_etcd_record(self) -> None:
+        """With etcd present, a matching id still converges the record."""
+        from inference_proxy.discovery.etcd_client import EtcdRecord
+
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        etcd.get_record.return_value = EtcdRecord(
+            key=b"/nodes/node-1",
+            value=json.dumps(
+                {"endpoint": "http://10.0.1.100:8000", "model": "stale-id"}
+            ).encode("utf-8"),
+            mod_revision=11,
+            lease_id=0,
+        )
+        etcd.replace_if_revision.return_value = 12
+        client = MagicMock(spec=httpx.Client)
+
+        def probe(url: str) -> MagicMock:
+            if url.endswith("/health"):
+                return MagicMock(status_code=200)
+            return _models_response({"data": [{"id": "llama-3"}]})
+
+        client.get.side_effect = probe
+        _probe_all_nodes(
+            registry,
+            CircuitBreakerRegistry(),
+            client,
+            _FailureCounts(),
+            3,
+            etcd_client=etcd,
+        )
+
+        (_key, value), _kwargs = etcd.replace_if_revision.call_args
+        assert json.loads(value)["model"] == "llama-3"
+
+    def test_unusable_etcd_records_patch_registry_only(self) -> None:
+        """Absent, malformed, and non-dict records: memory converges anyway."""
+        from inference_proxy.discovery.etcd_client import EtcdRecord
+
+        registry = NodeRegistry()
+        registry.add(_make_node(self_setup=True))
+        etcd = MagicMock()
+        etcd.prefix = "/nodes/"
+        etcd.get_record.side_effect = [
+            None,
+            EtcdRecord(key=b"/nodes/node-1", value=b"{not json", mod_revision=11),
+            EtcdRecord(key=b"/nodes/node-1", value=b"[1, 2]", mod_revision=12),
+        ]
+        client = MagicMock(spec=httpx.Client)
+
+        def probe(url: str) -> MagicMock:
+            if url.endswith("/health"):
+                return MagicMock(status_code=200)
+            return _models_response({"data": [{"id": "qwen-3"}]})
+
+        client.get.side_effect = probe
+        for _ in range(3):
+            _probe_all_nodes(
+                registry,
+                CircuitBreakerRegistry(),
+                client,
+                _FailureCounts(),
+                3,
+                etcd_client=etcd,
+            )
+
+        etcd.replace_if_revision.assert_not_called()
+        result = registry.get("node-1")
+        assert result is not None
+        assert result.model == "qwen-3"
+        assert result.status == NodeStatus.HEALTHY
