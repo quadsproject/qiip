@@ -644,6 +644,12 @@ Requirements and limits:
 - **Breaker recovery**: opening the breaker recovers by probing the registered
   model on `/v1/completions`, so the server must expose an OpenAI-compatible
   completions endpoint.
+- **Model auto-rediscovery**: every health cycle re-reads `/v1/models` for a
+  self-setup node; when the server now reports a different primary model, the
+  in-memory registry (the breaker's source of truth) is patched first and the
+  etcd record then follows through a revision CAS, without a manual
+  re-adoption. A failed or unparseable response keeps the last known model;
+  while etcd is degraded the record lags until the next cycle re-converges it.
 
 A custom `port` is rejected for a plain pool registration (without
 `self_setup`), because that node is provisioned later on the configured default
