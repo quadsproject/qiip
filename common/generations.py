@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -68,8 +69,15 @@ def verify_bundle(root: Path, expected: str | None = None) -> dict[str, Any]:
     return manifest
 
 
-def publish_bundle(staged: Path, final: Path, expected: str) -> None:
-    verify_bundle(staged, expected)
+def publish_directory(
+    staged: Path, final: Path, verify: Callable[[Path], Any], lock_path: Path
+) -> None:
+    """Publish verified directory content; quarantine damage and converge on retry.
+
+    Callers must ensure the destination is inactive before replacing a runtime.
+    Quarantined content remains available for inspection after failed publication.
+    """
+    verify(staged)
     # Flush uploads before the rename. An incomplete directory never becomes a
     # candidate, including when an upload runs out of space or loses its SSH.
     for path in staged.rglob("*"):
@@ -80,26 +88,43 @@ def publish_bundle(staged: Path, final: Path, expected: str) -> None:
         if path.is_dir():
             sync_directory(path)
     sync_directory(staged)
-    with (final.parent / ".publication.lock").open("a") as lock:
+    with lock_path.open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if final.exists():
+        if final.exists() or final.is_symlink():
             try:
-                verify_bundle(final, expected)
-            except (OSError, ValueError, subprocess.CalledProcessError):
+                if final.is_symlink():
+                    raise ValueError("Publication destination is a symlink")
+                verify(final)
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                TypeError,
+                subprocess.CalledProcessError,
+            ):
                 # Keep damaged content for inspection, then publish the already
                 # verified upload. A crash between renames is repaired by retry.
                 quarantine = Path(
                     tempfile.mkdtemp(
-                        prefix=".corrupt-" + expected + "-", dir=final.parent
+                        prefix=".corrupt-" + final.name + "-", dir=final.parent
                     )
                 )
-                os.rename(final, quarantine)
+                os.rename(final, quarantine / "contents")
                 sync_directory(final.parent)
             else:
                 shutil.rmtree(staged)
         if staged.exists():
             os.rename(staged, final)
         sync_directory(final.parent)
+
+
+def publish_bundle(staged: Path, final: Path, expected: str) -> None:
+    publish_directory(
+        staged,
+        final,
+        lambda path: verify_bundle(path, expected),
+        final.parent / ".publication.lock",
+    )
 
 
 def setup_bundle(root: Path, engine: Path) -> Path:

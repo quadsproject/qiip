@@ -6,6 +6,7 @@ import hashlib
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -868,6 +869,11 @@ def _build_fixture(
     operation_log = tmp_path / "operations.log"
     fake_bin = tmp_path / "fake bin -- tools"
     fake_bin.mkdir()
+    # Use the test interpreter for node helpers so subprocess coverage can
+    # measure the actual shell-driven setup path, including its CLI commands.
+    _write_executable(
+        fake_bin / "python3", f'#!/bin/bash\nexec {shlex.quote(sys.executable)} "$@"\n'
+    )
     archive_content = "verified llama.cpp source fixture"
     digest = hashlib.sha256(archive_content.encode()).hexdigest()
     if not valid_checksum:
@@ -1060,7 +1066,7 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     assert "<-G> <Unix Makefiles>" in configure
     assert "<-DGGML_CUDA=ON>" in configure
     assert "<-DGGML_NATIVE=OFF>" in configure
-    assert "<-DCMAKE_CUDA_ARCHITECTURES=native>" in configure
+    assert "<-DCMAKE_CUDA_ARCHITECTURES=80;90>" in configure
     assert "<-DBUILD_SHARED_LIBS=OFF>" in configure
     assert "<-DLLAMA_BUILD_TESTS=OFF>" in configure
     assert "<-DLLAMA_BUILD_EXAMPLES=OFF>" in configure
@@ -1096,6 +1102,7 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
         "58917efc78ca760a2a1dd162d84e6cf1930c5b62a8dd9710bb4579ca4f2d69dc"
     ) in marker_text
     assert "compute_capabilities=8.0,9.0" in marker_text
+    assert "compiled_cuda_architectures=80,90" in marker_text
 
 
 def test_install_resolves_nvcc_after_toolkit_install(tmp_path: Path) -> None:

@@ -31,6 +31,7 @@ IDENTITY_KEYS = {
     "build_profile",
     "fit_cli_patch_sha256",
     "compute_capabilities",
+    "compiled_cuda_architectures",
     "cmake_cuda_architectures",
     "cuda_toolkit",
     "profile",
@@ -43,11 +44,13 @@ IDENTITY_KEYS = {
 
 
 def metadata(identity: str) -> dict[str, str]:
+    if not isinstance(identity, str):
+        raise ValueError("Invalid llama.cpp artifact identity")
     rows = identity.splitlines()
     result = dict(row.split("=", 1) for row in rows)
     if len(result) != len(rows) or set(result) != IDENTITY_KEYS:
         raise ValueError("Incomplete llama.cpp artifact identity")
-    if result["publication_schema"] != "2":
+    if result["publication_schema"] != "3":
         raise ValueError("Unsupported llama.cpp artifact schema")
     for key in ("source_sha256", "fit_cli_patch_sha256"):
         if not re.fullmatch(r"[a-f0-9]{64}", result[key]):
@@ -57,6 +60,17 @@ def metadata(identity: str) -> dict[str, str]:
     ):
         raise ValueError("Missing compiler/CUDA identity")
     version_tuple(result["glibc"])
+    if result["cmake_cuda_architectures"] == "native":
+        raise ValueError("Artifact must record resolved CUDA compile targets")
+    if not re.fullmatch(
+        r"[1-9][0-9]*(?:,[1-9][0-9]*)*", result["compiled_cuda_architectures"]
+    ):
+        raise ValueError("Invalid compiled CUDA architectures")
+    resolved = targets(
+        result["cmake_cuda_architectures"], result["compute_capabilities"]
+    )
+    if resolved["compiled_cuda_architectures"] != result["compiled_cuda_architectures"]:
+        raise ValueError("Compiled CUDA architecture identity mismatch")
     return result
 
 
@@ -84,24 +98,60 @@ def compatible(identity: str, host: dict[str, str]) -> bool:
         return False
     if version_tuple(info["glibc"]) > version_tuple(host["glibc"]):
         return False
-    # Conservatively require every measured GPU architecture; do not guess
-    # PTX forward compatibility. Explicit architecture overrides are respected.
-    if not set(host["compute_capabilities"].split(",")).issubset(
-        info["compute_capabilities"].split(",")
-    ):
+    # Match the actual engine/probe targets, never the producer's GPU inventory.
+    # Require exact targets even for PTX; do not guess forward compatibility.
+    required = {
+        capability.replace(".", "")
+        for capability in host["compute_capabilities"].split(",")
+    }
+    if not required.issubset(info["compiled_cuda_architectures"].split(",")):
         return False
     return host["cmake_cuda_architectures"] == "native" or (
         info["cmake_cuda_architectures"] == host["cmake_cuda_architectures"]
     )
 
 
+def targets(architectures: str, capabilities: str) -> dict[str, str]:
+    """Resolve native to explicit CMake targets shared by the engine and probe."""
+    if not re.fullmatch(r"[1-9][0-9]*\.[0-9](?:,[1-9][0-9]*\.[0-9])*", capabilities):
+        raise ValueError("Invalid measured CUDA capabilities")
+    if architectures == "native":
+        architectures = ";".join(
+            capability.replace(".", "") for capability in capabilities.split(",")
+        )
+    if not re.fullmatch(
+        r"[1-9][0-9]*(?:-(?:real|virtual))?(?:;[1-9][0-9]*(?:-(?:real|virtual))?)*",
+        architectures,
+    ):
+        raise ValueError(
+            "CUDA architectures must be native or explicit numeric CMake targets"
+        )
+    compiled = sorted(
+        {item.split("-", 1)[0] for item in architectures.split(";")}, key=int
+    )
+    return {
+        "cmake_cuda_architectures": architectures,
+        "compiled_cuda_architectures": ",".join(compiled),
+    }
+
+
 def verify_package(root: Path, identity: str | None = None) -> dict[str, Any]:
+    if root.is_symlink():
+        raise ValueError("Artifact root must not be a symlink")
     manifest = json.loads((root / "RUNTIME.json").read_text())
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), dict):
+        raise ValueError("Invalid artifact manifest")
     metadata(manifest["identity"])
     expected = {f"bin/{name}" for name in TOOLS}
-    if set(manifest["files"]) != expected or manifest.get("external_links"):
+    if (
+        set(manifest["files"]) != expected
+        or not isinstance(manifest.get("external_links", {}), dict)
+        or manifest.get("external_links")
+    ):
         raise ValueError("Artifact must contain all three tools and its CUDA probe")
     data = manifest.get("data_files", {})
+    if not isinstance(data, dict) or not all(isinstance(name, str) for name in data):
+        raise ValueError("Invalid artifact data manifest")
     allowed = expected | set(data) | {"RUNTIME.json"}
     actual = set()
     for path in root.rglob("*"):
@@ -129,6 +179,8 @@ def verify_package(root: Path, identity: str | None = None) -> dict[str, Any]:
 
 
 def safe_url(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("Invalid artifact URL")
     parsed = urlsplit(value)
     if (
         parsed.scheme not in {"http", "https"}
@@ -146,10 +198,16 @@ def safe_url(value: str) -> str:
 
 def select(catalog: Path, host: dict[str, str]) -> dict[str, Any] | None:
     document = json.loads(catalog.read_text())
-    if document.get("schema") != 1 or not isinstance(document.get("artifacts"), list):
+    if (
+        not isinstance(document, dict)
+        or document.get("schema") != 1
+        or not isinstance(document.get("artifacts"), list)
+    ):
         raise ValueError("Unsupported artifact catalog")
     for entry in document["artifacts"]:
-        if compatible(entry["identity"], host):
+        try:
+            if not isinstance(entry, dict) or not compatible(entry["identity"], host):
+                continue
             safe_url(entry["url"])
             if not re.fullmatch(r"[a-f0-9]{64}", entry["sha256"]):
                 raise ValueError("Invalid artifact digest")
@@ -157,6 +215,8 @@ def select(catalog: Path, host: dict[str, str]) -> dict[str, Any] | None:
                 if type(entry[key]) is not int or not 0 < entry[key] <= 32 * 1024**3:
                     raise ValueError("Invalid artifact size")
             return entry
+        except (ValueError, KeyError, TypeError):
+            continue
     return None
 
 
@@ -247,29 +307,24 @@ def seal(root: Path, identity: str) -> None:
 def install(staged: Path, final: Path) -> None:
     manifest = verify_package(staged)
     final.parent.mkdir(parents=True, exist_ok=True)
-    with (final.parent / ".runtime-publication.lock").open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if (final / "RUNTIME.json").exists():
-            verify_package(final, manifest["identity"])
-            return
-        pending = Path(tempfile.mkdtemp(prefix=".install-", dir=final.parent))
-        try:
-            shutil.copytree(staged, pending, dirs_exist_ok=True)
-            verify_package(pending, manifest["identity"])
-            # Flush all files and directories before making completion visible.
-            seal(pending, manifest["identity"])
-            if final.exists():
-                final.rename(
-                    final.with_name(final.name + ".incomplete-" + pending.name)
-                )
-            os.replace(pending, final)
-            generations.sync_directory(final.parent)
-        finally:
-            if pending.exists():
-                shutil.rmtree(pending)
+    pending = Path(tempfile.mkdtemp(prefix=".install-", dir=final.parent))
+    try:
+        shutil.copytree(staged, pending, dirs_exist_ok=True)
+        generations.publish_directory(
+            pending,
+            final,
+            lambda path: verify_package(path, manifest["identity"]),
+            final.parent / ".runtime-publication.lock",
+        )
+    finally:
+        if pending.exists():
+            shutil.rmtree(pending)
 
 
 def publish(runtime: Path, output: Path, base_url: str) -> dict[str, Any]:
+    # Archive/catalog publication is a different transaction from directory
+    # publication: the archive is durable before the catalog references it, and
+    # both operations share one lock to preserve entries from concurrent writers.
     manifest = verify_package(runtime)
     info = metadata(manifest["identity"])
     # Publication is a hardware action on the producer, not an assertion from
@@ -361,8 +416,10 @@ def resources(temporary: Path, install: Path) -> dict[str, Any]:
         raise ValueError("Cannot determine available build memory")
     available_mib = int(matched[1]) // 1024
 
-    def number(name: str, default: int) -> int:
+    def number(name: str, default: int, *, automatic: bool = False) -> int:
         value = os.environ.get(name, str(default))
+        if automatic and value == "0":
+            return default
         if not re.fullmatch(r"[1-9][0-9]*", value):
             raise ValueError(f"{name} must be a positive integer")
         return int(value)
@@ -375,7 +432,7 @@ def resources(temporary: Path, install: Path) -> dict[str, Any]:
             f"Insufficient available build memory: {available_mib} MiB; need {reserve + per_job} MiB for one job"
         )
     cpu = int(subprocess.check_output(["nproc"], text=True, timeout=5))
-    jobs = min(cpu, memory_jobs, number("AUTOLLAMACPP_BUILD_JOBS", cpu))
+    jobs = min(cpu, memory_jobs, number("AUTOLLAMACPP_BUILD_JOBS", cpu, automatic=True))
     build_bytes = number("AUTOLLAMACPP_BUILD_FREE_MIB", 12288) * 1024**2
     install_bytes = number("AUTOLLAMACPP_INSTALL_FREE_MIB", 4096) * 1024**2
     candidates = [temporary]
@@ -417,12 +474,16 @@ def main() -> int:
             "publish",
             "resources",
             "capacity",
+            "targets",
+            "verify",
         ],
     )
     parser.add_argument("arguments", nargs="+")
     args = parser.parse_args()
     values = args.arguments
-    if args.command == "select":
+    if args.command == "targets":
+        print(json.dumps(targets(values[0], values[1])))
+    elif args.command == "select":
         entry = select(Path(values[0]), json.loads(values[1]))
         if entry is None:
             return 4
@@ -457,6 +518,8 @@ def main() -> int:
         unpack(Path(values[0]), Path(values[1]), json.loads(values[2]))
     elif args.command == "seal":
         seal(Path(values[0]), values[1])
+    elif args.command == "verify":
+        verify_package(Path(values[0]), values[1])
     elif args.command == "install":
         install(Path(values[0]), Path(values[1]))
     elif args.command == "libraries":
