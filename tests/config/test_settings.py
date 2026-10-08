@@ -784,13 +784,23 @@ class TestRedfishBmcCredentials:
         rs = RedfishSettings.model_validate(
             {
                 "bmc_username": "root",
-                "bmc_password": SecretStr("mypass1"),
+                "bmc_password": SecretStr("default-bmc-secret"),
                 "bmc_credentials": {
-                    "labs": {"rdu2.scalelab": {"username": "root", "password": "x"}}
+                    "labs": {
+                        "rdu2.scalelab": {
+                            "username": "root",
+                            "password": "lab-override-secret",
+                        }
+                    }
                 },
             }
         )
-        assert "mypass1" not in repr(rs)
+        rendered = repr(rs)
+        # Guards the nested BmcCredential.password specifically: a distinctive
+        # override value must be masked, so the test fails if it stops being a
+        # SecretStr even though the default password is still masked.
+        assert "lab-override-secret" not in rendered
+        assert "default-bmc-secret" not in rendered
 
     def test_overrides_require_default_credentials(self) -> None:
         with pytest.raises(ValidationError, match="bmc_credentials requires"):
