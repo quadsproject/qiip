@@ -748,6 +748,8 @@ class NodeProvisioner:
             common_dir / "profiles.sh",
             common_dir / "generations.py",
         }
+        if engine == InferenceEngine.LLAMA_CPP:
+            required.add(common_dir / "llamacpp_artifacts.py")
         if self._remote_logs is not None:
             required.add(common_dir / "provision-logs.py")
         missing = sorted(str(path) for path in required if not path.is_file())
@@ -779,6 +781,17 @@ class NodeProvisioner:
             env["AUTOLLAMACPP_SOURCE_URL"] = (
                 self._settings.llamacpp_source_download_url()
             )
+            env["AUTOLLAMACPP_ARTIFACT_CATALOG_URL"] = (
+                self._settings.llamacpp_artifact_catalog_url
+            )
+            env["AUTOLLAMACPP_ARTIFACT_CATALOG_SHA256"] = (
+                self._settings.llamacpp_artifact_catalog_sha256
+            )
+            env["AUTOLLAMACPP_ALLOW_SOURCE_BUILD"] = (
+                "1" if self._settings.llamacpp_allow_source_build else "0"
+            )
+            if self._settings.llamacpp_build_jobs:
+                env["AUTOLLAMACPP_BUILD_JOBS"] = str(self._settings.llamacpp_build_jobs)
         return env
 
     def _start_script_env(

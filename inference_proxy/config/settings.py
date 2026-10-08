@@ -342,6 +342,10 @@ class ProvisioningSettings(BaseModel):
     llamacpp_version: str = DEFAULT_LLAMACPP_VERSION
     llamacpp_sha256: str = DEFAULT_LLAMACPP_SHA256
     llamacpp_source_url: str = DEFAULT_LLAMACPP_SOURCE_URL
+    llamacpp_artifact_catalog_url: str = ""
+    llamacpp_artifact_catalog_sha256: str = ""
+    llamacpp_allow_source_build: bool = True
+    llamacpp_build_jobs: int = Field(default=0, ge=0)
     llamacpp_setup_timeout: float = Field(default=7200.0, gt=0)
     llamacpp_fit_target_mib: int = Field(default=512, ge=1)
 
@@ -460,6 +464,30 @@ class ProvisioningSettings(BaseModel):
     def llamacpp_source_download_url(self) -> str:
         """Render the validated source URL for the selected upstream tag."""
         return self.llamacpp_source_url.format(version=self.llamacpp_version)
+
+    @model_validator(mode="after")
+    def llamacpp_artifact_catalog_is_pinned(self) -> Self:
+        url = self.llamacpp_artifact_catalog_url
+        checksum = self.llamacpp_artifact_catalog_sha256
+        if bool(url) != bool(checksum):
+            raise ValueError("llamacpp artifact catalog requires both URL and SHA-256")
+        if url:
+            parsed = urlsplit(url)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.fragment
+                or any(ord(character) < 32 for character in url)
+            ):
+                raise ValueError(
+                    "llamacpp artifact catalog URL must be a plain HTTP(S) URL"
+                )
+            self.llamacpp_artifact_catalog_sha256 = _validate_sha256(
+                checksum, setting="provisioning.llamacpp_artifact_catalog_sha256"
+            )
+        return self
 
     @model_validator(mode="after")
     def log_entry_limit_fits_host_budget(self) -> Self:

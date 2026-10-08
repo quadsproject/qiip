@@ -123,7 +123,12 @@ def setup_bundle(root: Path, engine: Path) -> Path:
     return final.resolve()
 
 
-def seal_runtime(root: Path, identity: str, binaries: list[str]) -> None:
+def seal_runtime(
+    root: Path,
+    identity: str,
+    binaries: list[str],
+    data_files: list[str] | None = None,
+) -> None:
     files = {}
     external_links = {}
     for name in binaries:
@@ -148,7 +153,14 @@ def seal_runtime(root: Path, identity: str, binaries: list[str]) -> None:
     sync_directory(root)
     write_json(
         root / "RUNTIME.json",
-        {"identity": identity, "files": files, "external_links": external_links},
+        {
+            "identity": identity,
+            "files": files,
+            "external_links": external_links,
+            "data_files": {
+                name: file_digest(root / name) for name in (data_files or [])
+            },
+        },
     )
 
 
@@ -168,6 +180,9 @@ def verify_runtime(root: Path, identity: str | None = None) -> dict[str, Any]:
             or not os.access(path, os.X_OK)
         ):
             raise ValueError(f"Required external executable link is corrupt: {path}")
+    for name, expected in manifest.get("data_files", {}).items():
+        if file_digest(root / name) != expected:
+            raise ValueError(f"Required runtime data is corrupt: {root / name}")
     return manifest
 
 
