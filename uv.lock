@@ -573,7 +573,7 @@ wheels = [
 
 [[package]]
 name = "inference-proxy"
-version = "0.2.0.dev2"
+version = "0.2.0.dev3"
 source = { editable = "." }
 dependencies = [
     { name = "asyncssh" },
