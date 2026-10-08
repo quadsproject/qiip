@@ -189,6 +189,9 @@ class FakeProvisioner:
         # ``None`` for a record that cannot be parsed.
         self.stored_nodes: dict[str, Node | None] = {}
         self.stored_node_error: Exception | None = None
+        # BMC power as placement reads it: an absent host is "unknown" (None).
+        self.power_states: dict[str, str] = {}
+        self.power_state_error: Exception | None = None
 
     async def try_reserve_host(self, hostname: str) -> HostLifecycleLease | None:
         return await self.lifecycle.try_acquire(hostname)
@@ -213,6 +216,11 @@ class FakeProvisioner:
             return True, self.stored_nodes[hostname]
         node = self.registry.get(hostname)
         return node is not None, node
+
+    async def power_state(self, hostname: str) -> str | None:
+        if self.power_state_error is not None:
+            raise self.power_state_error
+        return self.power_states.get(hostname)
 
     async def cancel_active_provision(self, hostname: str) -> None:
         """Explicit cancel: stops the task and, like the real one, the remote worker."""

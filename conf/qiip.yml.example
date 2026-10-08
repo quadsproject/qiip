@@ -202,6 +202,19 @@ redfish:
   power_poll_interval: 5.0
   # Always False for self-signed BMC certs.
   verify_ssl: false
+  # Per-lab and per-host BMC credential overrides. A hostname is matched to a
+  # lab identifier (a dotted FQDN segment) as a dot-bounded substring; the
+  # longest identifier wins. A full FQDN under `hosts` is an exact override and
+  # beats any lab. Anything matching nothing falls back to bmc_username/
+  # bmc_password above, which must be set to use overrides. For example:
+  #   labs:
+  #     rdu2.scalelab: { username: root, password: mypass1 }
+  #     rdu3.labs.perfscale: { username: root, password: mypass2 }
+  #   hosts:
+  #     a20-h10-000-r670.rdu2.scalelab.example.com: { username: root, password: mypass3 }
+  bmc_credentials:
+    labs: {}
+    hosts: {}
 
 llmfit:
   # Model recommendation via SSH; version and sha256 are one upgrade unit.

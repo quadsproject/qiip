@@ -710,6 +710,8 @@ class PlacementReconciler:
 
     async def _remote_work_blocker(self, hostname: str) -> str | None:
         """Why a launch must wait for the host itself, or ``None``."""
+        if await self._host_is_powered_off(hostname):
+            return None
         try:
             async with asyncio.timeout(_REMOTE_PROBE_TIMEOUT_SECONDS):
                 running = await self._provisioner.remote_lifecycle_processes(hostname)
@@ -719,6 +721,25 @@ class PlacementReconciler:
         if running:
             return "an earlier provisioning command is still running on the host"
         return None
+
+    async def _host_is_powered_off(self, hostname: str) -> bool:
+        """True only when the BMC reports the host off; unknown reads as on.
+
+        A powered-off host runs no earlier setup, so the SSH probe is skipped
+        and provisioning powers it on. Redfish being off, a read error, or a
+        transitional state all fall back to the probe: unknown is never off.
+        """
+        try:
+            async with asyncio.timeout(_REMOTE_PROBE_TIMEOUT_SECONDS):
+                state = await self._provisioner.power_state(hostname)
+        except Exception as exc:
+            logger.debug(
+                "power_state_probe_failed",
+                hostname=hostname,
+                error=str(exc) or type(exc).__name__,
+            )
+            return False
+        return state == "Off"
 
     async def _ready_candidates(
         self, candidates: list[Candidate]

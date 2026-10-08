@@ -755,6 +755,59 @@ def test_redfish_partial_config_rejected(
         RedfishSettings.model_validate(values)
 
 
+class TestRedfishBmcCredentials:
+    def test_parses_labs_and_hosts(self) -> None:
+        rs = RedfishSettings.model_validate(
+            {
+                "bmc_username": "root",
+                "bmc_password": SecretStr("mypass1"),
+                "bmc_credentials": {
+                    "labs": {
+                        "rdu2.scalelab": {"username": "root", "password": "mypass1"},
+                    },
+                    "hosts": {
+                        "a20-h10-000-r670.rdu2.scalelab.example.com": {
+                            "username": "root",
+                            "password": "mypass3",
+                        },
+                    },
+                },
+            }
+        )
+        lab = rs.bmc_credentials.labs["rdu2.scalelab"]
+        assert lab.username == "root"
+        assert lab.password.get_secret_value() == "mypass1"
+        host = rs.bmc_credentials.hosts["a20-h10-000-r670.rdu2.scalelab.example.com"]
+        assert host.password.get_secret_value() == "mypass3"
+
+    def test_password_is_secret(self) -> None:
+        rs = RedfishSettings.model_validate(
+            {
+                "bmc_username": "root",
+                "bmc_password": SecretStr("mypass1"),
+                "bmc_credentials": {
+                    "labs": {"rdu2.scalelab": {"username": "root", "password": "x"}}
+                },
+            }
+        )
+        assert "mypass1" not in repr(rs)
+
+    def test_overrides_require_default_credentials(self) -> None:
+        with pytest.raises(ValidationError, match="bmc_credentials requires"):
+            RedfishSettings.model_validate(
+                {
+                    "bmc_credentials": {
+                        "labs": {"rdu2.scalelab": {"username": "root", "password": "x"}}
+                    }
+                }
+            )
+
+    def test_default_is_empty(self) -> None:
+        rs = RedfishSettings()
+        assert rs.bmc_credentials.labs == {}
+        assert rs.bmc_credentials.hosts == {}
+
+
 @pytest.mark.parametrize(
     "template",
     [

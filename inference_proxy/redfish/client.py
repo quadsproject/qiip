@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable, Mapping
 
 import httpx
 import structlog
@@ -55,6 +56,36 @@ async def _sleep(delay: float) -> None:
     await asyncio.sleep(delay)
 
 
+def make_bmc_auth_resolver(
+    default: httpx.Auth,
+    *,
+    labs: Mapping[str, httpx.Auth],
+    hosts: Mapping[str, httpx.Auth],
+) -> Callable[[str], httpx.Auth]:
+    """Return a per-hostname BMC auth selector.
+
+    Precedence: an exact full-FQDN override in ``hosts``, then a lab identifier
+    in ``labs`` matched as a dot-bounded substring with the longest identifier
+    first (the most specific wins), then ``default``. Dot-padding both sides
+    keeps ``rdu2`` from matching ``rdu20``.
+    """
+    overrides = {host.rstrip(".").lower(): auth for host, auth in hosts.items()}
+    identifiers = {ident.lower(): auth for ident, auth in labs.items()}
+    ordered = sorted(identifiers, key=len, reverse=True)
+
+    def resolve(hostname: str) -> httpx.Auth:
+        host = hostname.rstrip(".").lower()
+        if host in overrides:
+            return overrides[host]
+        padded = f".{host}."
+        for ident in ordered:
+            if f".{ident}." in padded:
+                return identifiers[ident]
+        return default
+
+    return resolve
+
+
 class RedfishClient:
     """Async client for Redfish BMC power management.
 
@@ -63,7 +94,8 @@ class RedfishClient:
         bmc_host_template: Template for resolving BMC hostname (D-01).
         system_id: Redfish system ID (default ``"1"``).
         hostname_policy: Trust policy for caller-supplied node hostnames.
-        auth: Credentials applied only after destination validation.
+        auth_for: Selects BMC credentials for a node hostname, applied only
+            after destination validation.
         poll_timeout: Seconds to wait for power state transition (D-04).
         poll_interval: Seconds between power state polls.
     """
@@ -75,7 +107,7 @@ class RedfishClient:
         system_id: str,
         *,
         hostname_policy: EndpointPolicy,
-        auth: httpx.Auth,
+        auth_for: Callable[[str], httpx.Auth],
         poll_timeout: float = 60.0,
         poll_interval: float = 5.0,
     ) -> None:
@@ -83,7 +115,7 @@ class RedfishClient:
         self._bmc_host_template = bmc_host_template
         self._system_id = system_id
         self._hostname_policy = hostname_policy
-        self._auth = auth
+        self._auth_for = auth_for
         self._poll_timeout = poll_timeout
         self._poll_interval = poll_interval
 
@@ -111,7 +143,7 @@ class RedfishClient:
         bmc = self._resolve_bmc_host(hostname)
         url = f"https://{bmc}/redfish/v1/Systems/{self._system_id}"
         try:
-            resp = await self._client.get(url, auth=self._auth)
+            resp = await self._client.get(url, auth=self._auth_for(hostname))
             resp.raise_for_status()
         except httpx.HTTPError as exc:
             msg = extract_error_message(exc)
@@ -181,7 +213,7 @@ class RedfishClient:
             resp = await self._client.post(
                 url,
                 json={"ResetType": action},
-                auth=self._auth,
+                auth=self._auth_for(hostname),
             )
             resp.raise_for_status()
         except httpx.HTTPError as exc:

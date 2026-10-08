@@ -925,6 +925,32 @@ class AuthSettings(BaseModel):
         return value
 
 
+class BmcCredential(BaseModel):
+    """A single BMC username/password pair."""
+
+    username: str
+    password: SecretStr
+
+
+class BmcCredentials(BaseModel):
+    """Per-lab and per-host BMC credential overrides.
+
+    ``labs`` maps a hostname identifier, a dotted FQDN segment such as
+    ``rdu2.scalelab``, to its credentials. ``hosts`` maps a full FQDN to an
+    exact override that wins over any lab. A hostname matching nothing here
+    falls back to ``redfish.bmc_username`` / ``bmc_password``.
+    """
+
+    labs: dict[str, BmcCredential] = Field(
+        default_factory=dict,
+        description="Hostname identifier -> BMC credentials.",
+    )
+    hosts: dict[str, BmcCredential] = Field(
+        default_factory=dict,
+        description="Full FQDN -> BMC credentials (highest precedence).",
+    )
+
+
 class RedfishSettings(BaseModel):
     """Redfish BMC configuration.
 
@@ -941,6 +967,7 @@ class RedfishSettings(BaseModel):
     power_poll_timeout: float = 60.0
     power_poll_interval: float = 5.0
     verify_ssl: bool = False  # D-05: always False for self-signed BMC certs
+    bmc_credentials: BmcCredentials = Field(default_factory=BmcCredentials)
 
     @field_validator("bmc_host_template")
     @classmethod
@@ -983,6 +1010,17 @@ class RedfishSettings(BaseModel):
         if self.bmc_username is not None and self.bmc_password is None:
             raise ValueError(
                 "redfish.bmc_password must be configured with bmc_username"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def credentials_require_default(self) -> Self:
+        """Per-lab/host overrides need the default pair they fall back to."""
+        overrides = self.bmc_credentials.labs or self.bmc_credentials.hosts
+        if overrides and self.bmc_username is None:
+            raise ValueError(
+                "redfish.bmc_credentials requires bmc_username and bmc_password, "
+                "the default used when no host or lab matches"
             )
         return self
 
