@@ -18,6 +18,9 @@ missing ``/health`` endpoint (HTTP 404/405/501) as optional and falls
 back to a ``/v1/models`` probe. An authoritative unhealthy response
 (e.g. ``/health`` 503) is still a failure. Managed nodes require a
 healthy ``/health`` response.
+The same cycle refreshes the tracked model id for self-setup nodes from
+``/v1/models``, so a backend that restarts with another model is followed
+without a manual re-adoption.
 
 **Timeout** (per T-05-02): Health probes use a 5-second timeout. The
 inference recovery probe has its own 2-second timeout so a wedged engine
@@ -41,15 +44,18 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import threading
 
 import httpx
 import structlog
 
+from inference_proxy.discovery.etcd_client import EtcdClient
 from inference_proxy.discovery.node_leases import NodeLeaseManager
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.endpoint import build_backend_url
 from inference_proxy.models.node import NodeStatus
+from inference_proxy.provisioning.provisioner import served_model_id
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 from inference_proxy.routing import drain_cleanup
 from inference_proxy.routing.connection_tracker import ConnectionTracker
@@ -105,6 +111,7 @@ def run_health_checker(
     failure_threshold: int = 3,
     connection_tracker: ConnectionTracker | None = None,
     lease_manager: NodeLeaseManager | None = None,
+    etcd_client: EtcdClient | None = None,
 ) -> None:
     """Probe registered nodes and manage HEALTHY/UNHEALTHY transitions.
 
@@ -132,6 +139,7 @@ def run_health_checker(
                 failure_threshold,
                 connection_tracker=connection_tracker,
                 lease_manager=lease_manager,
+                etcd_client=etcd_client,
             )
             if stop_event.wait(timeout=interval):
                 break
@@ -149,6 +157,7 @@ def _probe_all_nodes(
     *,
     connection_tracker: ConnectionTracker | None = None,
     lease_manager: NodeLeaseManager | None = None,
+    etcd_client: EtcdClient | None = None,
 ) -> None:
     """Probe every node in the registry once.
 
@@ -172,6 +181,7 @@ def _probe_all_nodes(
             consecutive_failures=consecutive_failures,
             failure_threshold=failure_threshold,
             lease_manager=lease_manager,
+            etcd_client=etcd_client,
         )
 
 
@@ -180,31 +190,220 @@ def _probe_liveness(
     endpoint: str,
     client: httpx.Client,
     self_setup: bool,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, str | None]:
     """Probe a node's health endpoint and report whether it is alive.
 
-    Returns ``(alive, reason)``. For a self-setup node a missing ``/health``
-    endpoint (HTTP 404/405/501) is optional: the probe falls back to the
-    OpenAI-compatible ``/v1/models`` contract the node was adopted on. All other
-    non-200 responses, and managed nodes, are treated as failures.
+    Returns ``(alive, reason, observed_model)``.  For a self-setup node a
+    missing ``/health`` endpoint (HTTP 404/405/501) is optional: the probe
+    falls back to the OpenAI-compatible ``/v1/models`` contract the node was
+    adopted on, and that response's primary model id is returned so the
+    caller does not fetch it twice.  All other non-200 responses, and managed
+    nodes, are treated as failures.  ``observed_model`` is ``None`` whenever
+    no ``/v1/models`` body was parsed.
     """
     health_url = build_backend_url(endpoint, "/health")
     response = client.get(health_url)
     if response.status_code == 200:
-        return True, "healthy"
+        return True, "healthy", None
     if self_setup and response.status_code in _OPTIONAL_HEALTH_STATUSES:
         models_url = build_backend_url(endpoint, "/v1/models")
         models = client.get(models_url)
         if models.status_code == 200:
+            try:
+                observed = served_model_id(models.json())
+            except Exception:
+                observed = None
             return (
                 True,
                 f"missing /health ({response.status_code}); /v1/models ok",
+                observed,
             )
         return (
             False,
             f"missing /health; /v1/models returned {models.status_code}",
+            None,
         )
-    return False, f"non-200 status: {response.status_code}"
+    return False, f"non-200 status: {response.status_code}", None
+
+
+def _apply_model_if_current(
+    registry: NodeRegistry,
+    node_id: str,
+    endpoint: str,
+    model: str,
+) -> bool:
+    """Patch the model only while the probed registration is still current.
+
+    The write is applied to the entry re-read under the registry lock, so a
+    concurrent re-adoption or drain is never reverted by a stale snapshot.
+    Returns whether the model is present on the current entry.
+    """
+    with registry.locked():
+        latest = registry.get(node_id)
+        if latest is None or latest.endpoint != endpoint:
+            return False
+        if latest.model != model:
+            registry.add(latest.model_copy(update={"model": model}))
+        return True
+
+
+def _refresh_self_setup_model(
+    *,
+    node_id: str,
+    endpoint: str,
+    registry: NodeRegistry,
+    client: httpx.Client,
+    self_setup: bool,
+    observed_model: str | None,
+    etcd_client: EtcdClient | None = None,
+) -> None:
+    """Reconcile a self-setup node's tracked model with the live server.
+
+    The backend can be restarted with a different primary model outside the
+    proxy's control, so every successful liveness cycle re-reads
+    ``/v1/models`` (single-model contract: the first reported id, same as
+    adoption).  The in-memory registry is patched as soon as a new id is
+    observed -- it is the source of truth for the breaker's half-open
+    trial -- and the etcd record then follows through a revision CAS so a
+    concurrent owner/name/admin-only write is never clobbered.  Every etcd
+    call is isolated so a degraded etcd cannot demote a live node; if a
+    write fails, the record lags the registry until the next cycle
+    re-converges it, or until the restart snapshot is re-discovered.  The
+    endpoint guard mirrors the lease-refresh rule: a stale observation
+    from a replaced registration writes nothing.
+    """
+    if not self_setup:
+        return
+    model = observed_model
+    if model is None:
+        try:
+            models = client.get(build_backend_url(endpoint, "/v1/models"))
+        except Exception:
+            logger.debug(
+                "self_setup_model_refresh_fetch_failed",
+                node_id=node_id,
+                exc_info=True,
+            )
+            return
+        if models.status_code != 200:
+            logger.debug(
+                "self_setup_model_refresh_non_200",
+                node_id=node_id,
+                status_code=models.status_code,
+            )
+            return
+        try:
+            model = served_model_id(models.json())
+        except Exception:
+            logger.debug(
+                "self_setup_model_refresh_unparseable",
+                node_id=node_id,
+                exc_info=True,
+            )
+            return
+    if model is None:
+        return
+    current = registry.get(node_id)
+    if current is None or current.endpoint != endpoint:
+        logger.debug(
+            "model refresh withheld after endpoint changed",
+            node_id=node_id,
+            probed_endpoint=endpoint,
+            current_endpoint=current.endpoint if current is not None else None,
+        )
+        return
+    if current.model == model and etcd_client is None:
+        return
+    if etcd_client is None:
+        if _apply_model_if_current(registry, node_id, endpoint, model):
+            logger.info(
+                "self_setup_model_refreshed_without_etcd",
+                node_id=node_id,
+                previous_model=current.model,
+                model=model,
+            )
+        else:
+            logger.debug(
+                "model refresh withheld after endpoint changed",
+                node_id=node_id,
+                probed_endpoint=endpoint,
+            )
+        return
+    key = f"{etcd_client.prefix}{node_id}"
+    for _attempt in range(3):
+        try:
+            record = etcd_client.get_record(key)
+        except Exception:
+            logger.debug(
+                "self_setup_model_refresh_read_failed",
+                node_id=node_id,
+                exc_info=True,
+            )
+            _apply_model_if_current(registry, node_id, endpoint, model)
+            return
+        if record is None:
+            logger.debug(
+                "self_setup_model_refresh_key_absent",
+                node_id=node_id,
+                key=key,
+            )
+            _apply_model_if_current(registry, node_id, endpoint, model)
+            return
+        try:
+            data = json.loads(record.value)
+        except Exception:
+            logger.debug(
+                "self_setup_model_refresh_malformed_record",
+                node_id=node_id,
+                exc_info=True,
+            )
+            _apply_model_if_current(registry, node_id, endpoint, model)
+            return
+        if not isinstance(data, dict):
+            logger.debug(
+                "self_setup_model_refresh_malformed_record",
+                node_id=node_id,
+            )
+            _apply_model_if_current(registry, node_id, endpoint, model)
+            return
+        data["model"] = model
+        try:
+            new_revision = etcd_client.replace_if_revision(
+                key,
+                json.dumps(data).encode("utf-8"),
+                expected_mod_revision=record.mod_revision,
+                lease_id=record.lease_id,
+            )
+        except Exception:
+            logger.debug(
+                "self_setup_model_refresh_write_failed",
+                node_id=node_id,
+                exc_info=True,
+            )
+            _apply_model_if_current(registry, node_id, endpoint, model)
+            return
+        if new_revision is not None:
+            if _apply_model_if_current(registry, node_id, endpoint, model):
+                logger.info(
+                    "self_setup_model_refreshed",
+                    node_id=node_id,
+                    previous_model=current.model,
+                    model=model,
+                    revision=new_revision,
+                )
+            else:
+                logger.debug(
+                    "model refresh withheld after endpoint changed",
+                    node_id=node_id,
+                    probed_endpoint=endpoint,
+                )
+            return
+    _apply_model_if_current(registry, node_id, endpoint, model)
+    logger.warning(
+        "self_setup_model_refresh_cas_exhausted",
+        node_id=node_id,
+        model=model,
+    )
 
 
 def _probe_node(
@@ -217,31 +416,44 @@ def _probe_node(
     consecutive_failures: _ConsecutiveFailures,
     failure_threshold: int,
     lease_manager: NodeLeaseManager | None = None,
+    etcd_client: EtcdClient | None = None,
 ) -> None:
     """Probe a single node and update its status if needed.
 
-    A ``self_setup`` node treats a missing ``/health`` endpoint as optional and
-    falls back to ``/v1/models``; managed nodes still require a healthy
-    ``/health`` response (per D-03/D-04).
+        A ``self_setup`` node treats a missing ``/health`` endpoint as optional and
+        falls back to ``/v1/models``; managed nodes still require a healthy
+        ``/health`` response (per D-03/D-04).
+    After a successful liveness probe the tracked model id of a self-setup node
+    is reconciled from ``/v1/models`` (see ``_refresh_self_setup_model``), and
+    the breaker recovery trial below therefore uses the refreshed model.
 
-    Args:
-        node_id: The node's unique identifier.
-        endpoint: The node's HTTP endpoint (host:port).
-        registry: The node registry to update on status changes.
-        circuit_breaker_registry: Circuit breaker registry for resets.
-        client: The synchronous HTTP client for probing.
-        consecutive_failures: Mutable dict tracking per-node failure counts.
-        failure_threshold: Consecutive failures before marking UNHEALTHY.
+        Args:
+            node_id: The node's unique identifier.
+            endpoint: The node's HTTP endpoint (host:port).
+            registry: The node registry to update on status changes.
+            circuit_breaker_registry: Circuit breaker registry for resets.
+            client: The synchronous HTTP client for probing.
+            consecutive_failures: Mutable dict tracking per-node failure counts.
+            failure_threshold: Consecutive failures before marking UNHEALTHY.
     """
     current = registry.get(node_id)
     self_setup = current.self_setup if current is not None else False
     try:
-        alive, reason = _probe_liveness(
+        alive, reason, observed_model = _probe_liveness(
             endpoint=endpoint,
             client=client,
             self_setup=self_setup,
         )
         if alive:
+            _refresh_self_setup_model(
+                node_id=node_id,
+                endpoint=endpoint,
+                registry=registry,
+                client=client,
+                self_setup=self_setup,
+                observed_model=observed_model,
+                etcd_client=etcd_client,
+            )
             health_evidence = _handle_probe_success(
                 node_id=node_id,
                 registry=registry,
