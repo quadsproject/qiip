@@ -623,7 +623,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "coverage", specifier = ">=7.0" },
+    { name = "coverage", specifier = ">=7.10" },
     { name = "httpx2", specifier = ">=2.7,<3.0" },
     { name = "mypy", specifier = ">=2.1" },
     { name = "pytest", specifier = ">=8.0" },

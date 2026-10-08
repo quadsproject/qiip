@@ -557,20 +557,34 @@ int main() {
 EOF
     # Build for the selected profile, including SM70 on CUDA 12.9. Retain PTX
     # for newer selected cards, without compiling for unrelated physical GPUs.
-    local capability="${GPU_COMPUTE_CAP:-}" devices query_index sm
+    local capability="${GPU_COMPUTE_CAP:-}" devices query_index sm architecture targets="${2:-}"
     local -a arch_flags=()
     devices=$(profile_gpu_devices)
-    if [ -z "$capability" ]; then
+    if [ -z "$targets" ] && [ -z "$capability" ]; then
         query_index="${devices%%,*}"
         capability=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader -i "${query_index:-0}" | xargs) || capability=""
     fi
-    if ! [[ "$capability" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    if [ -z "$targets" ] && ! [[ "$capability" =~ ^[0-9]+\.[0-9]+$ ]]; then
         rm -rf "$work_dir"
         echo "FATAL: cannot establish the selected profile's CUDA architecture" >&2
         return 1
     fi
-    sm="${capability//./}"
-    arch_flags+=(-gencode "arch=compute_${sm},code=[sm_${sm},compute_${sm}]")
+    targets="${targets:-${capability//./}}"
+    if ! [[ "$targets" =~ ^[1-9][0-9]*(-real|-virtual)?(\;[1-9][0-9]*(-real|-virtual)?)*$ ]]; then
+        rm -rf "$work_dir"
+        echo "FATAL: CUDA proof requires explicit numeric compile targets" >&2
+        return 1
+    fi
+    local -a target_list=()
+    IFS=';' read -r -a target_list <<< "$targets"
+    for architecture in "${target_list[@]}"; do
+        sm="${architecture%%-*}"
+        case "$architecture" in
+            *-real) arch_flags+=(-gencode "arch=compute_${sm},code=sm_${sm}") ;;
+            *-virtual) arch_flags+=(-gencode "arch=compute_${sm},code=compute_${sm}") ;;
+            *) arch_flags+=(-gencode "arch=compute_${sm},code=[sm_${sm},compute_${sm}]") ;;
+        esac
+    done
     if ! "$nvcc" -o "${work_dir}/cuda_probe" "${work_dir}/cuda_probe.cu" "${arch_flags[@]}"; then
         rm -rf "$work_dir"
         echo "FATAL: nvcc failed to compile the CUDA execution probe" >&2

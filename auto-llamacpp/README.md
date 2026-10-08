@@ -28,10 +28,10 @@ resolves the selected runtime and loads its libraries from `lib/`.
 
 The package identity records the source tag/digest, fit-CLI transformation
 digest, build profile, compiler version, full CUDA toolkit version, measured GPU
-architectures, CMake architecture selection, runtime profile, OS major version,
+architectures, resolved engine/probe compile targets, runtime profile, OS major version,
 machine architecture, and glibc version. A consumer requires the same source,
 transformation, build/runtime profile, OS major and machine architecture, a
-matching CUDA toolkit series, coverage for every measured GPU architecture, and
+matching CUDA toolkit series, compiled coverage for every selected GPU architecture, and
 glibc at least as new as the producer's. Explicit CMake architecture overrides
 must match. Selected-profile installations can be reused across local compiler
 and toolkit patch updates. Host-specific CPU instruction flags are disabled.
@@ -42,8 +42,12 @@ checks the sealed binaries and libraries, server/fit version, managed CLI
 options, quantizer help, CUDA backend discovery, and actual probe-kernel
 execution before installation and activation. A cache hit requires no CMake,
 Make, host compiler, or CUDA toolkit installation. Driver repair can still
-require its own kernel build dependencies. CUDA execution failure stops setup
-with the existing maintenance/reboot handling instead of starting a rebuild.
+require its own kernel build dependencies. A downloaded artifact's CUDA-proof
+failure is a cache miss. When source fallback is allowed, a freshly compiled probe checks
+driver/device/fabric health before downloading or compiling the engine. Failure
+of that fresh proof stops setup with the existing maintenance/reboot handling.
+A previously verified local runtime failing execution also stops setup for
+driver/device/fabric inspection.
 
 ### Produce and distribute a catalog
 
@@ -52,7 +56,7 @@ setup with the pinned source pair and no artifact catalog, then validate a real
 inference request. Publish that selected runtime from the same script bundle:
 
 ```bash
-bundle=$(readlink -f /opt/qiip/llama_cpp/current/bundle)
+bundle=$(dirname "$(readlink -f /opt/qiip/llama_cpp/current/common)")
 runtime=$(readlink -f /opt/qiip/llama_cpp/current/runtime)
 python3 "$bundle/common/llamacpp_artifacts.py" publish \
   "$runtime" /srv/llamacpp-artifacts https://artifacts.example/llamacpp
@@ -72,8 +76,11 @@ INFERENCE_PROXY_PROVISIONING__LLAMACPP_ALLOW_SOURCE_BUILD=false
 
 Update the pinned catalog digest whenever its contents change. Publish archives
 before making a new catalog available. No production catalog or fleet GPU
-validation is claimed by the controlled regression fixtures. Profile validation
-status remains in `common/PROFILES.md`.
+validation is claimed by the controlled regression fixtures. Runtime-profile
+validation status remains in `common/PROFILES.md`; the
+`cuda-portable-cpu-v3-artifact` build profile still requires producer and consumer
+validation on each representative fleet GPU configuration, including mixed GPU
+selections and any explicit architecture overrides, before publishing catalogs.
 
 ### Resource-aware source fallback
 
@@ -82,8 +89,12 @@ With source fallback allowed (the default), a cache miss downloads the pinned
 GitHub tag source archive, verifies
 its committed SHA-256 before extraction, applies one digest-pinned CLI
 allowlist transformation, and compiles `llama-server`, `llama-fit-params`, and
-`llama-quantize` with `GGML_CUDA=ON` and the attached GPUs' native CUDA
-architecture. The supporting CPU backend uses `GGML_NATIVE=OFF`: managed
+`llama-quantize` with `GGML_CUDA=ON`. The default `native` selection resolves to
+explicit numeric CMake targets for every selected GPU. The same targets compile
+the packaged CUDA probe and are recorded in its schema-3 identity. An override
+via `AUTOLLAMACPP_CUDA_ARCHITECTURES` must use explicit numeric CMake targets
+(for example `80;90`, optionally suffixed `-real` or `-virtual`); unbounded
+`all`/`all-major` selections are rejected. The supporting CPU backend uses `GGML_NATIVE=OFF`: managed
 inference is CUDA-only, and the portable CPU profile avoids coupling builds to
 host-specific compiler and assembler feature support.
 The build uses CMake's explicit Unix Makefiles generator with parallel jobs, so
@@ -103,7 +114,7 @@ against both staging and installation capacity.
 Standalone producers can tune `AUTOLLAMACPP_BUILD_RESERVE_MIB`,
 `AUTOLLAMACPP_BUILD_JOB_MIB`, `AUTOLLAMACPP_BUILD_FREE_MIB`, and
 `AUTOLLAMACPP_INSTALL_FREE_MIB` (all positive integers), set a job ceiling with
-`AUTOLLAMACPP_BUILD_JOBS`, or require a specific build directory with
+`AUTOLLAMACPP_BUILD_JOBS` (`0` or unset means automatic), or require a specific build directory with
 `AUTOLLAMACPP_BUILD_TMP_DIR`. A missing/unwritable directory or unmeasurable
 capacity fails before compilation. Resource budgets are conservative policy
 values, not measurements of peak compiler memory on every fleet profile.

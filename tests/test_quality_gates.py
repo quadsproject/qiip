@@ -14,13 +14,17 @@ def test_ci_enforces_branch_coverage_floor() -> None:
     coverage = project["tool"]["coverage"]
 
     assert coverage["run"]["branch"] is True
-    assert coverage["run"]["source"] == ["inference_proxy"]
+    assert coverage["run"]["source"] == ["inference_proxy", "common"]
+    assert coverage["report"]["omit"] == ["common/provision-logs.py"]
+    assert coverage["run"]["patch"] == ["subprocess", "execv", "_exit"]
+    assert coverage["run"]["parallel"] is True
     assert coverage["report"]["fail_under"] == 93
     assert coverage["report"]["precision"] == 2
     assert coverage["report"]["show_missing"] is True
 
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text()
     assert workflow.count("uv run --frozen coverage run -m pytest") == 1
+    assert workflow.count("uv run --frozen coverage combine") == 1
     assert workflow.count("uv run --frozen coverage report") == 1
 
 

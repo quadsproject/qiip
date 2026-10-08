@@ -714,10 +714,12 @@ arguments. Manual script environment variables and managed relaunch settings are
 unchanged, and provisioning log redaction still applies.
 
 llama.cpp `BUILD-INFO` now records `cuda_toolkit`, the full version reported by the
-resolved `nvcc`. Setup rebuilds when that version changes, including a toolkit
-patch update. Existing installations without this marker rebuild once on their
-next setup. An unreadable compiler version stops setup before a cached build can
-be reused.
+resolved `nvcc`. That full version is part of each source-built installation's
+identity, so a source fallback produces a different installation when it changes,
+including a toolkit patch update. Compatible selected-profile packages can be
+reused across local toolkit patch updates as described in §30. Existing
+installations without this marker need a new package on their next setup. A
+source fallback requires a readable compiler version before compiling.
 
 ### 30. Reuse verified llama.cpp artifacts and bound source builds
 
