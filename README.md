@@ -60,6 +60,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Admin-only inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). At `/v1` they are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with an `admin_only` badge in the admin fleet view. Token usage from admin-only servers is tracked on the token summary pages exactly like any other node
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
 - **Self-service onboarding** -- signed-in normal users land on `/start`: one question per screen (name a token, pick a coding tool, pick models) ending in a short-lived `curl ... | bash` line that writes the tool's config; returning users see their single token and its models. See [Self-service onboarding](#self-service-onboarding-start)
+- **Usage leaderboard** -- signed-in users get a simple dashboard at `/leaderboard`: every non-admin user ranked by token usage (admin tokens and usage never appear), plus the viewer's own token manager (create replaces, delete revokes) and a per-harness config download with optional model and harness pickers (RFE #156)
 - **Per-token model scope** -- a token minted by the onboarding flow may only request the models chosen for it; other models are refused on `/v1` with `403 model_not_permitted`, and `/v1/models` lists only the token's models
 - **User API tokens** -- admin-role users can mint `qiip_...` bearer tokens on their profile page to call the `/v1` inference API; normal users own exactly one token, managed on `/start`. Tokens are stored as SHA-256 digests and can be revoked at any time
 - **Stable agent-config token** -- one derived per-user key (`agent-config`) is shared by every config download across servers and browsers; its raw value is derived from `auth.session_secret` + user + generation and never stored, so revoking it rotates the key embedded in already-downloaded configs (configuration downloads for admin-only servers require the Google session that can mint it)
@@ -109,6 +110,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Run tests](#run-tests)
   - [Lint and format](#lint-and-format)
   - [Type check](#type-check)
+- [User guide (for gateway users)](docs/user-guide.md)
 - [Releases (stable and development trains)](docs/releases.md)
 - [Durable provisioning evidence](#durable-provisioning-evidence)
 - [Troubleshooting](#troubleshooting)
@@ -389,6 +391,7 @@ Public endpoints:
 | `GET` | `/chat` | Browser chat playground |
 | `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage (signed-in normal users are redirected to `/start`) |
 | `GET` | `/start` | Onboarding wizard and token home for signed-in normal users; anonymous visitors get the sign-in page, admins are redirected to `/dashboard` |
+| `GET` | `/leaderboard` | Leaderboard and token dashboard for signed-in normal users (admins are redirected to `/dashboard`): non-admin usage ranking, the viewer's own tokens (create/delete), and a per-harness config download |
 | `GET` | `/s/{id}` | Setup script for a live onboarding link. The id is the credential: 15 minute life, not logged. A dead link returns a script that explains and exits 1 |
 | `GET` | `/auth/login` | Start Google OAuth sign-in (302 to Google) |
 | `GET` | `/auth/callback` | Google redirect target; signs the session cookie |
@@ -420,9 +423,11 @@ Onboarding endpoints (signed-in normal users only; admin-role sessions get 403):
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/onboarding/state` | Identity, the user's current token (never the raw secret), models online right now, and the supported coding tools |
-| `POST` | `/onboarding/token` | Mint the user's single token with a name and a model list; revokes every other token the user has |
+| `POST` | `/onboarding/token` | Mint the user's single token; name and model list are optional (no name defaults to `default`, no models means every model online right now). Revokes every other token the user has |
 | `PUT` | `/onboarding/token/models` | Replace the token's model list (409 for tokens minted before this flow) |
 | `POST` | `/onboarding/setup-link` | Create a `/s/{id}` link for one coding tool; returns the ready-to-paste command and its expiry |
+| `POST` | `/onboarding/config` | Download the config file for one coding tool with the user's own token embedded; models outside the token's scope are added to it first |
+| `GET` | `/onboarding/leaderboard` | Non-admin users ranked by usage; admin users are never listed |
 
 Admin-authenticated endpoints (HTTP Basic or admin-role session):
 
@@ -1073,6 +1078,9 @@ them when the reference model or your accounting changes.
 
 ### Self-service onboarding (`/start`)
 
+New here? The [user guide](docs/user-guide.md) is written for gateway
+users; this section is the operator-facing description of the same flow.
+
 Normal (non-admin) users get one page. After Google sign-in they land on
 `/start`, and every operations page (`/dashboard`, node detail, `/models`,
 `/chat`, `/profile`, the token and admin pages) redirects them back to it.
@@ -1098,6 +1106,13 @@ needs `bash`; `python3` is used for JSON merges when present.
 
 A user who already has a token sees only that token, the models it may use
 (tap to change), and buttons to set up another tool or replace the token.
+
+The header also links to the usage leaderboard (`/leaderboard`): every
+non-admin user ranked by token usage (admin users and their usage are never
+shown), plus the viewer's own token manager. From there a normal user can
+delete the token, create a new one by picking an optional model (nothing
+picked means every model online right now), and optionally pick an agent
+harness to download that harness's config file with the token embedded.
 
 | Coding tool | Config written | Models | Needs |
 |-------------|----------------|--------|-------|
