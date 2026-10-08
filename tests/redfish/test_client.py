@@ -11,7 +11,7 @@ from pytest_httpx import HTTPXMock
 
 import inference_proxy.redfish.client as redfish_module
 from inference_proxy.models.endpoint import EndpointPolicy
-from inference_proxy.redfish.client import RedfishClient
+from inference_proxy.redfish.client import RedfishClient, make_bmc_auth_resolver
 from inference_proxy.redfish.errors import RedfishDestinationError, RedfishError
 
 BMC_TEMPLATE = "mgmt-{hostname}"
@@ -44,10 +44,56 @@ def _redfish_client(
         template,
         SYSTEM_ID,
         hostname_policy=_policy(*allowed_hosts),
-        auth=resolved_auth,
+        auth_for=lambda _hostname: resolved_auth,
         poll_timeout=poll_timeout,
         poll_interval=poll_interval,
     )
+
+
+class TestBmcAuthResolver:
+    DEFAULT = httpx.BasicAuth("default", "d")
+    SCALE = httpx.BasicAuth("scale", "s")
+    PERF = httpx.BasicAuth("perf", "p")
+    OVERRIDE = httpx.BasicAuth("override", "o")
+
+    def _resolver(self) -> object:
+        return make_bmc_auth_resolver(
+            self.DEFAULT,
+            labs={"rdu2.scalelab": self.SCALE, "rdu3.labs.perfscale": self.PERF},
+            hosts={"a20-h10-000-r670.rdu2.scalelab.example.com": self.OVERRIDE},
+        )
+
+    def test_lab_identifier_match(self) -> None:
+        resolve = self._resolver()
+        assert resolve("d20-h13-000-r650.rdu2.scalelab.example.com") is self.SCALE
+        assert resolve("bb37-h13-000-r750.rdu3.labs.perfscale.example.com") is self.PERF
+
+    def test_full_fqdn_override_beats_lab(self) -> None:
+        resolve = self._resolver()
+        assert resolve("a20-h10-000-r670.rdu2.scalelab.example.com") is self.OVERRIDE
+
+    def test_default_when_nothing_matches(self) -> None:
+        assert self._resolver()("unknown-host.example.com") is self.DEFAULT
+
+    def test_case_and_trailing_dot_normalized(self) -> None:
+        assert self._resolver()("X.RDU2.ScaleLab.example.com.") is self.SCALE
+
+    def test_dot_boundary_prevents_partial_token_match(self) -> None:
+        resolve = make_bmc_auth_resolver(
+            self.DEFAULT, labs={"rdu2": self.SCALE}, hosts={}
+        )
+        assert resolve("host.rdu20.example.com") is self.DEFAULT
+        assert resolve("host.rdu2.example.com") is self.SCALE
+
+    def test_longest_identifier_wins_on_overlap(self) -> None:
+        broad = httpx.BasicAuth("broad", "b")
+        narrow = httpx.BasicAuth("narrow", "n")
+        resolve = make_bmc_auth_resolver(
+            self.DEFAULT,
+            labs={"scalelab": broad, "rdu2.scalelab": narrow},
+            hosts={},
+        )
+        assert resolve("h.rdu2.scalelab.example.com") is narrow
 
 
 class TestGetPowerState:

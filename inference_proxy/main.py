@@ -78,7 +78,7 @@ from inference_proxy.proxy.client import ProxyClient
 from inference_proxy.quads.client import QUADSClient
 from inference_proxy.quads.poller import QUADSPoller
 from inference_proxy.quads.schedule_enforcer import ScheduleEnforcer
-from inference_proxy.redfish.client import RedfishClient
+from inference_proxy.redfish.client import RedfishClient, make_bmc_auth_resolver
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 from inference_proxy.resilience.health_checker import run_health_checker
 from inference_proxy.routing.connection_tracker import ConnectionTracker
@@ -426,15 +426,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "redfish HTTP client",
                     redfish_http.aclose,
                 )
+                default_auth = httpx.BasicAuth(
+                    username=redfish_username,
+                    password=redfish_password.get_secret_value(),
+                )
+                bmc_credentials = resolved_settings.redfish.bmc_credentials
+                auth_for = make_bmc_auth_resolver(
+                    default_auth,
+                    labs={
+                        ident: httpx.BasicAuth(
+                            cred.username, cred.password.get_secret_value()
+                        )
+                        for ident, cred in bmc_credentials.labs.items()
+                    },
+                    hosts={
+                        fqdn: httpx.BasicAuth(
+                            cred.username, cred.password.get_secret_value()
+                        )
+                        for fqdn, cred in bmc_credentials.hosts.items()
+                    },
+                )
                 redfish_client = RedfishClient(
                     redfish_http,
                     bmc_host_template=resolved_settings.redfish.bmc_host_template,
                     system_id=resolved_settings.redfish.system_id,
                     hostname_policy=endpoint_policy,
-                    auth=httpx.BasicAuth(
-                        username=redfish_username,
-                        password=redfish_password.get_secret_value(),
-                    ),
+                    auth_for=auth_for,
                     poll_timeout=resolved_settings.redfish.power_poll_timeout,
                     poll_interval=resolved_settings.redfish.power_poll_interval,
                 )

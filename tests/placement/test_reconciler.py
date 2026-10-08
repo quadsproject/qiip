@@ -1102,6 +1102,45 @@ async def test_a_first_launch_is_blocked_and_its_share_goes_to_another_host(
 
 
 @pytest.mark.asyncio
+async def test_a_powered_off_host_skips_the_ssh_probe_and_launches() -> None:
+    """Off means no earlier setup can run: skip the probe and let the launch on.
+
+    remote_processes is set too; the launch proves the probe never ran.
+    """
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.power_states["l4-00"] = "Off"
+    rig.provisioner.remote_processes["l4-00"] = list(_SETUP_RUNNING)
+    await rig.run()
+    assert "l4-00" in _placed(rig)
+    assert "l4-00" not in _skips(rig)
+    assert rig.provisioner.remote_checks == [], "a powered-off host is not SSH-probed"
+
+
+@pytest.mark.asyncio
+async def test_a_powered_on_host_still_runs_the_ssh_probe() -> None:
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.power_states["l4-00"] = "On"
+    rig.provisioner.remote_processes["l4-00"] = list(_SETUP_RUNNING)
+    await rig.run()
+    assert rig.provisioner.calls == []
+    assert "l4-00" in rig.provisioner.remote_checks
+    assert _skips(rig)["l4-00"] == (
+        "blocked: an earlier provisioning command is still running on the host"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_power_state_falls_back_to_the_ssh_probe() -> None:
+    """Unknown is never read as off: the probe still guards the launch."""
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.power_state_error = ConnectionError("bmc unreachable")
+    rig.provisioner.remote_processes["l4-00"] = list(_SETUP_RUNNING)
+    await rig.run()
+    assert "l4-00" in rig.provisioner.remote_checks
+    assert _skips(rig)["l4-00"].startswith("blocked: ")
+
+
+@pytest.mark.asyncio
 async def test_a_deferred_host_that_leaves_the_inventory_is_forgotten() -> None:
     rig = Rig(_l4s(1), retry_backoff_seconds=60)
     rig.provisioner.remote_processes["l4-00"] = list(_SETUP_RUNNING)

@@ -3660,6 +3660,23 @@ class TestTeardownSSHFailure:
         registry.remove.assert_not_called()
 
 
+class TestPowerState:
+    """Placement reads BMC power through the provisioner before its SSH probe."""
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_redfish_not_configured(self) -> None:
+        provisioner = _make_provisioner()
+        assert await provisioner.power_state("host1") is None
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_redfish_client(self) -> None:
+        redfish = MagicMock()
+        redfish.get_power_state = AsyncMock(return_value="Off")
+        provisioner = _make_provisioner(redfish_client=redfish)
+        assert await provisioner.power_state("host1") == "Off"
+        redfish.get_power_state.assert_awaited_once_with("host1")
+
+
 class TestPowerOnIfNeeded:
     """D-01, D-04, D-06, D-07: Power-on logic before SSH provisioning."""
 
