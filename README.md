@@ -1525,13 +1525,18 @@ uv run --frozen pytest
 
 # With branch coverage (the same gate used by CI)
 uv run --frozen coverage run -m pytest
+uv run --frozen coverage combine
 uv run --frozen coverage report
 
 # Specific module
 uv run --frozen pytest tests/api/test_routes.py -v
 ```
 
-Coverage is measured over `inference_proxy` with branch tracking enabled. CI
+Coverage is measured over `inference_proxy`, `common/generations.py`, and
+`common/llamacpp_artifacts.py`, with branch tracking and subprocess collection
+enabled. The existing recorder (`common/provision-logs.py`) is excluded from
+this floor; its copied-bundle workers need separate coverage instrumentation.
+Combine the per-process data before reporting. CI
 enforces a 93% combined statement-and-branch floor, raised from 92% once the
 measured total stayed near 94%. The total may move as
 code is added or removed. The floor prevents new untested code from materially

@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import shlex
 import shutil
+import subprocess
 import tarfile
 from pathlib import Path
 from typing import Any
@@ -123,6 +125,264 @@ def _install(env: dict[str, str]) -> Any:
     )
 
 
+def test_documented_producer_command_uses_the_selected_script_bundle(
+    tmp_path: Path,
+) -> None:
+    env, _published_dir, _entry = _published(tmp_path)
+    result = _run_shell(
+        f"source {shlex.quote(str(SETUP_SCRIPT))}\n"
+        + """
+mount_nfs_cache() { :; }
+configure_firewall() { :; }
+install_llmfit() { :; }
+main
+""",
+        env=env,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    readme = (SETUP_SCRIPT.parent / "README.md").read_text()
+    command = readme.split("```bash\n", 1)[1].split("```", 1)[0]
+    command = command.replace(
+        "/opt/qiip/llama_cpp", env["QIIP_GENERATION_ROOT"]
+    ).replace("/srv/llamacpp-artifacts", str(tmp_path / "republished"))
+    result = _run_shell(command, env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    catalog = tmp_path / "republished/catalog.json"
+    assert json.loads(result.stdout.splitlines()[-1])[
+        "catalog_sha256"
+    ] == generations.file_digest(catalog)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        None,
+        [],
+        {},
+        {"identity": 7},
+        {"identity": "publication_schema=2"},
+        {"sha256": "bad"},
+        {"url": "file:///artifact"},
+        {"url": None},
+        {"archive_bytes": 0},
+        {"unpacked_bytes": True},
+    ],
+)
+def test_catalog_skips_bad_entries_before_a_valid_match(
+    tmp_path: Path, bad: Any
+) -> None:
+    _env, published, entry = _published(tmp_path)
+    malformed = {**entry, **bad} if isinstance(bad, dict) and bad else bad
+    catalog = published / "catalog.json"
+    catalog.write_text(json.dumps({"schema": 1, "artifacts": [malformed, entry]}))
+    host = artifacts.metadata(entry["identity"])
+    host.update(cuda_toolkit="13.0", cmake_cuda_architectures="native")
+    assert artifacts.select(catalog, host) == entry
+    catalog.write_text(json.dumps({"schema": 1, "artifacts": [malformed]}))
+    assert artifacts.select(catalog, host) is None
+
+
+@pytest.mark.parametrize("failure", ["library", "manifest", "incomplete", "inventory"])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_damaged_install_is_quarantined_and_publication_retry_converges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str, interrupted: bool
+) -> None:
+    env, published, entry = _published(tmp_path)
+    staged = tmp_path / "staged"
+    artifacts.unpack(published / Path(entry["url"]).name, staged, entry)
+    final = Path(env["AUTOLLAMACPP_INSTALL_ROOT"]) / "runtime"
+    artifacts.install(staged, final)
+    if failure == "library":
+        (final / "lib/libcudart.so.13").write_bytes(b"damaged library")
+    elif failure == "manifest":
+        (final / "RUNTIME.json").write_text("not json")
+    elif failure == "inventory":
+        damaged = json.loads((final / "RUNTIME.json").read_text())
+        damaged["files"] = list(damaged["files"])
+        (final / "RUNTIME.json").write_text(json.dumps(damaged))
+    else:
+        (final / "RUNTIME.json").unlink()
+    rename = os.rename
+
+    def interrupted_rename(source: Any, destination: Any) -> None:
+        if Path(destination) == final:
+            raise OSError("controlled interrupted publication")
+        rename(source, destination)
+
+    if interrupted:
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "rename", interrupted_rename)
+            with pytest.raises(OSError, match="interrupted publication"):
+                artifacts.install(staged, final)
+        assert not final.exists()
+        assert not list(final.parent.glob(".install-*"))
+    artifacts.install(staged, final)
+    artifacts.verify_package(final, entry["identity"])
+    artifacts.install(staged, final)  # An intact installed copy is idempotent.
+    assert len(list(final.parent.glob(".corrupt-*"))) == 1
+    assert not list(final.parent.glob(".install-*"))
+    assert not list(final.parent.glob("*.incomplete-*"))
+
+
+@pytest.mark.parametrize("catalog", [False, True])
+def test_setup_recovers_a_corrupt_inactive_runtime(
+    tmp_path: Path, catalog: bool
+) -> None:
+    env, published, entry = _published(tmp_path)
+    identity = hashlib.sha256(entry["identity"].encode()).hexdigest()[:16]
+    final = Path(env["AUTOLLAMACPP_INSTALL_ROOT"]) / f"v0.4.1-{identity}"
+    final.parent.mkdir()
+    artifacts.unpack(published / Path(entry["url"]).name, final, entry)
+    (final / "lib/libcudart.so.13").write_bytes(b"damaged")
+    if not catalog:
+        env.update(
+            AUTOLLAMACPP_ARTIFACT_CATALOG_URL="",
+            AUTOLLAMACPP_ARTIFACT_CATALOG_SHA256="",
+            AUTOLLAMACPP_ALLOW_SOURCE_BUILD="1",
+        )
+    result = _install(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    artifacts.verify_package(final, entry["identity"])
+    assert (Path(env["AUTOLLAMACPP_LINK_DIR"]) / "llama-server").resolve().parents[
+        1
+    ] == final
+    assert len(list(final.parent.glob(".corrupt-*"))) == 1
+
+
+@pytest.mark.parametrize("stack_ok", [False, True])
+def test_downloaded_cuda_failure_uses_fresh_proof_before_source_build(
+    tmp_path: Path, stack_ok: bool
+) -> None:
+    env, published, entry = _published(tmp_path)
+    archive = published / Path(entry["url"]).name
+    extracted = tmp_path / "modified"
+    artifacts.unpack(archive, extracted, entry)
+    (extracted / "bin/cuda-probe").write_text("#!/bin/bash\nexit 10\n")
+    artifacts.seal(extracted, entry["identity"])
+    with tarfile.open(archive, "w:gz") as stream:
+        for path in extracted.rglob("*"):
+            if path.is_file():
+                stream.add(path, arcname=path.relative_to(extracted))
+    entry.update(
+        sha256=generations.file_digest(archive),
+        archive_bytes=archive.stat().st_size,
+        unpacked_bytes=sum(
+            p.stat().st_size for p in extracted.rglob("*") if p.is_file()
+        ),
+    )
+    (published / "catalog.json").write_text(
+        json.dumps({"schema": 1, "artifacts": [entry]})
+    )
+    env.update(
+        AUTOLLAMACPP_ARTIFACT_CATALOG_SHA256=generations.file_digest(
+            published / "catalog.json"
+        ),
+        AUTOLLAMACPP_ALLOW_SOURCE_BUILD="1",
+    )
+    if not stack_ok:
+        nvcc = Path(env["AUTOLLAMACPP_NVCC"])
+        nvcc.write_text(nvcc.read_text().replace("echo CUDA_EXECUTED", "exit 10"))
+    result = _install(env)
+    assert "[BUILD:fallback:artifact_cuda_proof_failed]" in result.stdout
+    log = Path(env["AUTOLLAMACPP_TEST_LOG"]).read_text()
+    if stack_ok:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "[BUILD:compile:OK:" in result.stdout
+    else:
+        assert result.returncode == 10, result.stdout + result.stderr
+        assert "CUDA execution probe failed" in result.stderr
+        assert "cmake" not in log
+        assert "https://mirror.example/" not in log
+        assert not list(Path(env["AUTOLLAMACPP_INSTALL_ROOT"]).glob("*/RUNTIME.json"))
+
+
+@pytest.mark.parametrize("selection", ["native", "80-real;90-virtual"])
+def test_engine_and_probe_share_explicit_targets_on_a_mixed_producer(
+    tmp_path: Path, selection: str
+) -> None:
+    env, log, links = _build_fixture(tmp_path)
+    env["AUTOLLAMACPP_CUDA_ARCHITECTURES"] = selection
+    nvcc = Path(env["AUTOLLAMACPP_NVCC"])
+    nvcc.write_text(
+        nvcc.read_text().replace(
+            "else\n",
+            'else\n    printf \'probe <%s>\\n\' "$@" >> "$AUTOLLAMACPP_TEST_LOG"\n',
+            1,
+        )
+    )
+    result = _run_shell(_source_setup("install_llamacpp"), env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected = "80;90" if selection == "native" else selection
+    operations = log.read_text()
+    assert f"<-DCMAKE_CUDA_ARCHITECTURES={expected}>" in operations
+    for sm in ("80", "90"):
+        code = (
+            f"[sm_{sm},compute_{sm}]"
+            if selection == "native"
+            else (f"sm_{sm}" if sm == "80" else f"compute_{sm}")
+        )
+        assert f"<arch=compute_{sm},code={code}>" in operations
+    runtime = (links / "llama-server").resolve().parents[1]
+    info = artifacts.metadata(artifacts.verify_package(runtime)["identity"])
+    assert info["compiled_cuda_architectures"] == "80,90"
+    assert info["cmake_cuda_architectures"] == expected
+
+
+@pytest.mark.parametrize("catalog", [True, False])
+def test_download_failure_is_reported_without_claiming_an_incompatible_artifact(
+    tmp_path: Path, catalog: bool
+) -> None:
+    env, _published_dir, _entry = _published(tmp_path)
+    wget = Path(env["PATH"].split(":")[0]) / "wget"
+    wget.write_text(
+        wget.read_text().replace(
+            'case "$url" in',
+            f'if [[ "$url" {"==" if catalog else "!="} */catalog.json ]]; then exit 8; fi\ncase "$url" in',
+        )
+    )
+    result = _install(env)
+    assert result.returncode != 0
+    assert "[ARTIFACT:miss:artifact_download_failed]" in result.stdout
+    assert "artifact_download_failed" in result.stderr
+    assert "source fallback is disabled" in result.stderr
+    assert "cmake" not in Path(env["AUTOLLAMACPP_TEST_LOG"]).read_text()
+
+
+@pytest.mark.parametrize("cap, expected", [(None, 2), ("0", 2), ("64", 2), ("1", 1)])
+def test_automatic_job_cap_still_obeys_cpu_and_ram(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cap: str | None, expected: int
+) -> None:
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(f"MemAvailable: {10 * 1024**2} kB\n")
+    monkeypatch.setenv("AUTOLLAMACPP_MEMINFO", str(meminfo))
+    monkeypatch.delenv("AUTOLLAMACPP_BUILD_JOBS", raising=False)
+    if cap is not None:
+        monkeypatch.setenv("AUTOLLAMACPP_BUILD_JOBS", cap)
+    monkeypatch.setattr(subprocess, "check_output", lambda *_args, **_kwargs: "64")
+    monkeypatch.setattr(artifacts, "capacity", lambda _requirements: None)
+    assert artifacts.resources(tmp_path, tmp_path / "install")["jobs"] == expected
+
+
+def test_compatibility_uses_compile_targets_instead_of_producer_gpu_inventory(
+    tmp_path: Path,
+) -> None:
+    _env, _published_dir, entry = _published(tmp_path)
+    info = artifacts.metadata(entry["identity"])
+    info.update(
+        compute_capabilities="8.0,9.0",
+        cmake_cuda_architectures="80-real",
+        compiled_cuda_architectures="80",
+    )
+    identity = "\n".join(f"{key}={value}" for key, value in info.items())
+    host = {**info, "cuda_toolkit": "13.0", "cmake_cuda_architectures": "native"}
+    assert not artifacts.compatible(identity, host)
+    host["compute_capabilities"] = "8.0"
+    assert artifacts.compatible(identity, host)
+    info["compiled_cuda_architectures"] = "80,90"
+    with pytest.raises(ValueError, match="architecture identity mismatch"):
+        artifacts.metadata("\n".join(f"{key}={value}" for key, value in info.items()))
+
+
 def test_published_artifact_activates_without_a_compiler_and_launch_finds_libraries(
     tmp_path: Path,
 ) -> None:
@@ -182,13 +442,14 @@ def test_catalog_compatibility_requires_source_transform_hardware_and_abi(
     identity = "\n".join(
         f"{key}={value}"
         for key, value in {
-            "publication_schema": "2",
+            "publication_schema": "3",
             "version": "v0.4.1",
             "source_sha256": "a" * 64,
             "fit_cli_patch_sha256": "b" * 64,
             "build_profile": "portable",
             "compute_capabilities": "8.0",
-            "cmake_cuda_architectures": "native",
+            "compiled_cuda_architectures": "80",
+            "cmake_cuda_architectures": "80",
             "cuda_toolkit": "13.0.88",
             "profile": "llamacpp-ampere-a100",
             "compiler": "GNU-11.5.0",
@@ -200,6 +461,7 @@ def test_catalog_compatibility_requires_source_transform_hardware_and_abi(
     )
     host = artifacts.metadata(identity)
     host["cuda_toolkit"] = "13.0"
+    host["cmake_cuda_architectures"] = "native"
     assert artifacts.compatible(identity, host)
     host[mismatch] = {
         "source_sha256": "c" * 64,
@@ -320,6 +582,8 @@ def test_source_build_and_package_target_only_selected_gpus(tmp_path: Path) -> N
     runtime = (links / "llama-server").resolve().parents[1]
     info = artifacts.metadata(artifacts.verify_package(runtime)["identity"])
     assert info["compute_capabilities"] == "8.0"
+    assert info["compiled_cuda_architectures"] == "80"
+    assert info["cmake_cuda_architectures"] == "80"
     assert "CUDA_MASK=0" in log.read_text()
 
 

@@ -284,7 +284,10 @@ reuse_llamacpp_artifact() (
     require_sha256 "llama.cpp artifact catalog" "$LLAMACPP_ARTIFACT_CATALOG_SHA256" AUTOLLAMACPP_ARTIFACT_CATALOG_SHA256
     work_dir=$(mktemp -d "${INSTALL_TMP_DIR%/}/llamacpp-artifact.XXXXXX")
     trap 'rm -rf "$work_dir"' EXIT
-    wget -q --timeout=30 --tries=2 "$LLAMACPP_ARTIFACT_CATALOG_URL" -O "${work_dir}/catalog.json"
+    if ! wget -q --timeout=30 --tries=2 "$LLAMACPP_ARTIFACT_CATALOG_URL" -O "${work_dir}/catalog.json"; then
+        echo "[ARTIFACT:download:FAIL:catalog]" >&2
+        exit 6
+    fi
     verify_sha256 "${work_dir}/catalog.json" "$LLAMACPP_ARTIFACT_CATALOG_SHA256" "llama.cpp artifact catalog"
     if entry=$(llamacpp_artifact_tool select "${work_dir}/catalog.json" "$host"); then :; else
         local status=$?
@@ -301,13 +304,16 @@ reuse_llamacpp_artifact() (
     llamacpp_artifact_tool capacity "$work_dir" "$((archive_bytes + unpacked_bytes))" \
         "$LLAMACPP_INSTALL_ROOT" "$unpacked_bytes"
     echo "[ARTIFACT:download:START] ${url}"
-    wget -q --timeout=30 --tries=2 "$url" -O "${work_dir}/runtime.tar.gz"
+    if ! wget -q --timeout=30 --tries=2 "$url" -O "${work_dir}/runtime.tar.gz"; then
+        echo "[ARTIFACT:download:FAIL:archive]" >&2
+        exit 6
+    fi
     llamacpp_artifact_tool unpack "${work_dir}/runtime.tar.gz" "${work_dir}/runtime" "$entry"
     verify_llamacpp_binaries "${work_dir}/runtime"
-    verify_llamacpp_cuda "${work_dir}/runtime"
+    verify_llamacpp_cuda "${work_dir}/runtime" || exit 5
     sudo python3 "${SCRIPT_DIR}/../common/llamacpp_artifacts.py" install "${work_dir}/runtime" "$runtime"
     verify_llamacpp_binaries "$runtime"
-    verify_llamacpp_cuda "$runtime"
+    verify_llamacpp_cuda "$runtime" || exit 5
     select_llamacpp_runtime "$runtime"
     echo "[ARTIFACT:hit:catalog] ${runtime}"
 )
@@ -348,17 +354,25 @@ install_llamacpp() {
         echo "[TIMING:llamacpp:artifact_seconds=$((SECONDS - started))]"
         return 0
     fi
-    # A failed CUDA execution proof is a stack failure, not a cache miss.
+    # A previously verified local runtime failing execution indicates a stack
+    # failure. A downloaded probe/backend can instead be incompatible.
     if [ "$STEP_STATUS" -eq 10 ]; then return 10; fi
-    fallback_reason="no_compatible_artifact"
-    [ "$STEP_STATUS" -eq 4 ] || fallback_reason="artifact_verification_or_download_failed"
+    case "$STEP_STATUS" in
+        4) fallback_reason="no_compatible_artifact" ;;
+        5) fallback_reason="artifact_cuda_proof_failed" ;;
+        6) fallback_reason="artifact_download_failed" ;;
+        *) fallback_reason="artifact_verification_failed" ;;
+    esac
     echo "[ARTIFACT:miss:${fallback_reason}]"
     if [ "$LLAMACPP_ALLOW_SOURCE_BUILD" = "0" ]; then
-        echo "FATAL: no verified compatible llama.cpp artifact; source fallback is disabled" >&2
+        echo "FATAL: llama.cpp artifact unavailable (${fallback_reason}); source fallback is disabled" >&2
         return 1
     fi
     echo "[BUILD:fallback:${fallback_reason}]"
-    local plan jobs build_tmp
+    local plan jobs build_tmp target_plan compile_architectures compiled_architectures
+    target_plan=$(llamacpp_artifact_tool targets "$LLAMACPP_CUDA_ARCHITECTURES" "$(cuda_compute_capabilities | paste -sd, -)")
+    compile_architectures=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["cmake_cuda_architectures"])' "$target_plan")
+    compiled_architectures=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["compiled_cuda_architectures"])' "$target_plan")
     plan=$(llamacpp_artifact_tool resources "$INSTALL_TMP_DIR" "$LLAMACPP_INSTALL_ROOT")
     jobs=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["jobs"])' "$plan")
     build_tmp=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["temporary"])' "$plan")
@@ -399,20 +413,20 @@ install_llamacpp() {
     fi
     compute_capabilities=$(cuda_compute_capabilities) || return
     compiler=$(g++ -dumpfullversion -dumpversion)
-    marker=$(printf 'publication_schema=2\nversion=%s\nsource_sha256=%s\nbuild_profile=%s\nfit_cli_patch_sha256=%s\ncompute_capabilities=%s\ncmake_cuda_architectures=%s\ncuda_toolkit=%s\nprofile=%s\ncompiler=GNU-%s\nos_id=%s\nos_major=%s\narch=%s\nglibc=%s\n' \
+    marker=$(printf 'publication_schema=3\nversion=%s\nsource_sha256=%s\nbuild_profile=%s\nfit_cli_patch_sha256=%s\ncompute_capabilities=%s\ncompiled_cuda_architectures=%s\ncmake_cuda_architectures=%s\ncuda_toolkit=%s\nprofile=%s\ncompiler=GNU-%s\nos_id=%s\nos_major=%s\narch=%s\nglibc=%s\n' \
         "$LLAMACPP_VERSION" \
         "${LLAMACPP_SHA256,,}" \
         "$LLAMACPP_BUILD_PROFILE" \
         "$LLAMACPP_FIT_PATCH_SHA256" \
         "${compute_capabilities//$'\n'/,}" \
-        "$LLAMACPP_CUDA_ARCHITECTURES" \
+        "$compiled_architectures" "$compile_architectures" \
         "$cuda_toolkit" "${PROFILE_NAME:-unselected}" "$compiler" \
         "$OS_ID" "${OS_VERSION_ID%%.*}" "$OS_ARCH" "$GLIBC_VERSION")
     build_identity=$(printf '%s' "$marker" | sha256sum | cut -c1-16)
     install_dir="${LLAMACPP_INSTALL_ROOT%/}/${LLAMACPP_VERSION}-${build_identity}"
 
-    if [ -f "${install_dir}/RUNTIME.json" ]; then
-        qiip_generation_tool verify-runtime "$install_dir" "$marker"
+    if [ -f "${install_dir}/RUNTIME.json" ] \
+        && llamacpp_artifact_tool verify "$install_dir" "$marker"; then
         verify_llamacpp_binaries "$install_dir"
         verify_llamacpp_cuda "$install_dir"
         select_llamacpp_runtime "$install_dir"
@@ -444,9 +458,9 @@ install_llamacpp() {
         mkdir -p "$source_dir" "${staged}/bin"
         # Prove the prepared driver before downloading or compiling the engine,
         # and retain that same probe in the completed package.
-        verify_cuda_execution "${staged}/bin/cuda-probe"
         devices=$(profile_gpu_devices)
         [ -z "$devices" ] || export CUDA_VISIBLE_DEVICES="$devices"
+        verify_cuda_execution "${staged}/bin/cuda-probe" "$compile_architectures"
 
         wget -q "$LLAMACPP_SOURCE_URL" -O "$archive"
         verify_sha256 "$archive" "$LLAMACPP_SHA256" \
@@ -475,7 +489,7 @@ install_llamacpp() {
             -DCMAKE_CXX_COMPILER="$(command -v g++)" \
             -DCMAKE_CUDA_HOST_COMPILER="$(command -v g++)" \
             -DCMAKE_CUDA_COMPILER="$CUDA_NVCC" \
-            -DCMAKE_CUDA_ARCHITECTURES="$LLAMACPP_CUDA_ARCHITECTURES" \
+            -DCMAKE_CUDA_ARCHITECTURES="$compile_architectures" \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CUDA=ON \
             -DGGML_NATIVE=OFF \

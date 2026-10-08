@@ -29,7 +29,7 @@ dev = [
     "pytest-asyncio>=1.4",
     "pytest-httpx>=0.36",
     "httpx2>=2.7,<3.0",
-    "coverage>=7.0",
+    "coverage>=7.10",
 ]
 
 [build-system]
@@ -57,9 +57,14 @@ asyncio_mode = "auto"
 
 [tool.coverage.run]
 branch = true
-source = ["inference_proxy"]
+source = ["inference_proxy", "common"]
+patch = ["subprocess", "execv", "_exit"]
+parallel = true
 
 [tool.coverage.report]
+# Recorder workers execute copied bundles and need separate path mapping.
+# Keep this gate on the gateway and node runtime/generation helpers.
+omit = ["common/provision-logs.py"]
 fail_under = 93
 precision = 2
 show_missing = true

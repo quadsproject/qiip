@@ -76,6 +76,7 @@ jobs:
       - name: Test with coverage
         run: |
           uv run --frozen coverage run -m pytest
+          uv run --frozen coverage combine
           uv run --frozen coverage report
 
       - name: Extract badge values
