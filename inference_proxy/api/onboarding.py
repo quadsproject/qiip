@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import re
 import shlex
+from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlsplit
 
@@ -36,7 +37,7 @@ from inference_proxy.auth.dependencies import (
     get_sso_allowlist,
     require_profile_user,
 )
-from inference_proxy.auth.models import ApiToken, User
+from inference_proxy.auth.models import ApiToken, LeaderboardEntry, User
 from inference_proxy.auth.scopes import has_admin_access, pickable_endpoints
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import (
@@ -67,10 +68,15 @@ _LINK_ID = re.compile(r"^[a-z0-9]{8,32}$")
 
 
 class TokenRequest(BaseModel):
-    """Body for minting the user's token."""
+    """Body for minting the user's token.
 
-    name: str = Field(min_length=1, max_length=60)
-    models: list[str] = Field(min_length=1, max_length=50)
+    ``name`` and ``models`` are optional: the dashboard flow lets the user
+    pick just a model (or nothing, meaning every model online right now),
+    and the server names the token when no name is given.
+    """
+
+    name: str | None = Field(default=None, max_length=60)
+    models: list[str] = Field(default_factory=list, max_length=50)
 
 
 class ModelsRequest(BaseModel):
@@ -81,6 +87,13 @@ class ModelsRequest(BaseModel):
 
 class SetupLinkRequest(BaseModel):
     """Body for creating a setup-script link."""
+
+    harness: str
+    models: list[str] = Field(min_length=1, max_length=50)
+
+
+class ConfigRequest(BaseModel):
+    """Body for downloading a harness config file."""
 
     harness: str
     models: list[str] = Field(min_length=1, max_length=50)
@@ -237,6 +250,16 @@ def _require_available(models: list[str], available: list[str]) -> list[str]:
     return chosen
 
 
+async def _widen_token_scope(
+    store: AuthStore, user_id: int, token: ApiToken, models: list[str]
+) -> None:
+    """Add *models* to the token's scope so the requested config always works."""
+    if token.model_scope is not None:
+        widened = list(dict.fromkeys([*token.model_scope, *models]))
+        if widened != token.model_scope:
+            await asyncio.to_thread(store.set_token_models, user_id, token.id, widened)
+
+
 @onboarding_router.get("/start", response_class=HTMLResponse, response_model=None)
 async def start_page(
     request: Request,
@@ -306,12 +329,14 @@ async def create_personal_token(
     setup script delivers it straight into the harness config.
     """
     await enforce_mint_allowlist(user, settings, allowlist)
-    name = body.name.strip()
+    name = body.name if body.name is not None else "default"
+    name = name.strip()
     if not name:
         raise HTTPException(status_code=422, detail="Give your token a name")
-    models = _require_available(
-        body.models, _available_models(user, settings, registry)
-    )
+    available = _available_models(user, settings, registry)
+    if not body.models and not available:
+        raise HTTPException(status_code=400, detail="No models are online right now")
+    models = _require_available(body.models or available, available)
     created = await asyncio.to_thread(
         store.create_personal_token, user.id, name, models, _session_secret(settings)
     )
@@ -393,10 +418,7 @@ async def create_setup_link(
             detail="This token can no longer be exported. Create a new token first.",
         )
     base_url = public_base_url(settings)
-    if token.model_scope is not None:
-        widened = list(dict.fromkeys([*token.model_scope, *models]))
-        if widened != token.model_scope:
-            await asyncio.to_thread(store.set_token_models, user.id, token.id, widened)
+    await _widen_token_scope(store, user.id, token, models)
     link_id, expires = await asyncio.to_thread(
         store.create_setup_link,
         user.id,
@@ -414,6 +436,72 @@ async def create_setup_link(
         "harness": harness.id,
         "run_command": harness.command,
     }
+
+
+def _config_content_type(filename: str) -> str:
+    """Content type for a rendered harness config file."""
+    suffix = Path(filename).suffix
+    return {
+        ".json": "application/json",
+        ".yml": "application/yaml",
+        ".yaml": "application/yaml",
+        ".toml": "application/toml",
+    }.get(suffix, "text/plain")
+
+
+@onboarding_router.post("/onboarding/config", response_class=PlainTextResponse)
+async def download_config(
+    body: ConfigRequest,
+    user: Annotated[User, Depends(require_normal_user)],
+    store: Annotated[AuthStore, Depends(get_auth_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    registry: NodeRegistry = Depends(get_registry),
+) -> PlainTextResponse:
+    """Render the harness config file with the user's own token embedded.
+
+    The button on the leaderboard dashboard downloads exactly what the
+    setup script would write, so a user who only wants the file gets the
+    same config. Models outside the token's scope are added to it first
+    (same as setup links), and the raw token is re-derived server-side so
+    it never lands in a log or a URL.
+    """
+    harness = get_harness(body.harness)
+    if harness is None or harness.requires_route not in _served_routes():
+        raise HTTPException(status_code=400, detail="That tool isn't supported yet")
+    token = await asyncio.to_thread(store.get_active_token, user.id)
+    if token is None:
+        raise HTTPException(status_code=404, detail="You don't have a token yet")
+    if token.purpose != "personal":
+        raise HTTPException(
+            status_code=409,
+            detail="This token was created the old way. Create a new token first.",
+        )
+    models = _require_available(
+        body.models, _available_models(user, settings, registry)
+    )
+    if not harness.multi_model and len(models) != 1:
+        raise HTTPException(
+            status_code=400, detail=f"{harness.label} works with exactly one model"
+        )
+    raw = await asyncio.to_thread(
+        store.reveal_personal_token, token.id, _session_secret(settings)
+    )
+    if raw is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This token can no longer be exported. Create a new token first.",
+        )
+    await _widen_token_scope(store, user.id, token, models)
+    filename = Path(harness.config_path).name
+    content = harness.render(public_base_url(settings), raw, models)
+    return PlainTextResponse(
+        content,
+        media_type=_config_content_type(filename),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @onboarding_router.get("/s/{link_id}", response_class=PlainTextResponse)
@@ -457,3 +545,42 @@ async def setup_script(
         logger.warning("setup script could not be rendered", harness=harness.id)
         return expired
     return PlainTextResponse(script, headers=headers)
+
+
+@onboarding_router.get("/leaderboard", response_class=HTMLResponse, response_model=None)
+async def leaderboard_page(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> HTMLResponse | RedirectResponse:
+    """Render the leaderboard + token dashboard HTML shell (normal users).
+
+    The page drives the normal-user onboarding endpoints, so admins are
+    sent to their token dashboard (``/dashboard``) and full-access users to
+    ``/profile``, exactly like ``start_page``. Anonymous visitors get the
+    sign-in page.
+    """
+    role = viewer_role(request, settings)
+    if role == "admin":
+        return RedirectResponse("/dashboard", status_code=302)
+    if role == "user" and session_user_has_full_access(request, settings):
+        return RedirectResponse("/profile", status_code=302)
+    if role is None:
+        return signin_response(
+            request,
+            oauth_enabled=settings.oauth.enabled,
+            sessions_available=settings.auth.session_secret is not None,
+        )
+    return templates.TemplateResponse(
+        request=request,
+        name="leaderboard.html",
+        context={"active_page": "leaderboard"},
+    )
+
+
+@onboarding_router.get("/onboarding/leaderboard")
+async def leaderboard(
+    user: Annotated[User, Depends(require_profile_user)],
+    store: Annotated[AuthStore, Depends(get_auth_store)],
+) -> list[LeaderboardEntry]:
+    """Rank non-admin users by usage; admin rows are never listed."""
+    return await asyncio.to_thread(store.list_leaderboard)

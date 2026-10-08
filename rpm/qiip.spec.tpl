@@ -89,7 +89,7 @@ chmod 0600 %{buildroot}%{_sysconfdir}/qiip/qiip.env
 
 %files -f %{pyproject_files}
 %license LICENSE
-%doc README.md UPGRADING.md docs/releases.md
+%doc README.md UPGRADING.md docs/releases.md docs/user-guide.md
 %dir %{_datadir}/qiip
 %{_datadir}/qiip/auto-vllm
 %{_datadir}/qiip/auto-llamacpp

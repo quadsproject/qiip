@@ -175,6 +175,22 @@ class UsageTotals(BaseModel):
     total_tokens: int
 
 
+class LeaderboardEntry(BaseModel):
+    """Per-user aggregate counts for the non-admin leaderboard (RFE #156)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    email: str
+    name: str
+    token_count: int
+    active_token_count: int
+    request_count: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
 class AdminUserStats(BaseModel):
     """Per-user aggregate counts for the admin token dashboard (RFE #113)."""
 
