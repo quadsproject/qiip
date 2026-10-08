@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## Unreleased
+
+### Features
+
+- Leaderboard and token dashboard for normal users: usage ranking of
+  non-admin users, own-token create/delete, and per-harness config download
+  ([#156](https://github.com/quadsproject/qiip/issues/156))
+
+### Documentation
+
+- Add a user guide (`docs/user-guide.md`) covering sign-in, onboarding,
+  tokens, and the leaderboard
+
 ## v0.2.0-dev.2 (2026-10-08)
 
 ### Bug Fixes
@@ -21,7 +34,6 @@
 
 - Reuse verified llama.cpp builds with bounded source fallback
   ([`2ebf719`](https://github.com/quadsproject/qiip/commit/2ebf7199b949abf54539af6692f893a1e22f1008))
-
 
 ## v0.2.0-dev.1 (2026-10-07)
 

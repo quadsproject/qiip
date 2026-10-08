@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>QIIP - Leaderboard</title>
+    <meta name="description" content="Token usage leaderboard and your own tokens for the QIIP inference proxy.">
+    <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
+    <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
+</head>
+<body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    {% include "partials/navbar.html" %}
+
+    <div class="dashboard">
+        <header class="dashboard-header">
+            <div>
+                <h1>Leaderboard</h1>
+                <p id="board-note">Loading...</p>
+            </div>
+            <div class="header-right">
+                <p id="last-updated"></p>
+                <p id="poll-warning"></p>
+            </div>
+        </header>
+
+        <main id="main-content">
+            <div id="error-banner" class="profile-error" hidden></div>
+
+            <section class="card">
+                <h2 class="card-title">Usage leaderboard</h2>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">#</th>
+                                <th scope="col">User</th>
+                                <th scope="col">Tokens</th>
+                                <th scope="col">Requests</th>
+                                <th scope="col">Prompt tokens</th>
+                                <th scope="col">Completion tokens</th>
+                                <th scope="col">Total tokens</th>
+                            </tr>
+                        </thead>
+                        <tbody id="leaderboard-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="card">
+                <h2 class="card-title">Your tokens</h2>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th scope="col">Name</th>
+                                <th scope="col">Prefix</th>
+                                <th scope="col">Created</th>
+                                <th scope="col">Last used</th>
+                                <th scope="col">Status</th>
+                                <th scope="col">Models</th>
+                                <th scope="col">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tokens-table-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="card">
+                <h2 class="card-title">Create a token</h2>
+                <form id="token-form" class="setup-form">
+                    <div class="token-field">
+                        <label for="token-model">Model</label>
+                        <select id="token-model" aria-label="Model (optional)">
+                            <option value="">All models (optional)</option>
+                        </select>
+                    </div>
+                    <div class="token-field">
+                        <label for="token-harness">Agent harness</label>
+                        <select id="token-harness" aria-label="Agent harness (optional)">
+                            <option value="">None (skip config)</option>
+                        </select>
+                    </div>
+                    <div class="token-actions">
+                        <button type="submit" id="token-create-btn" class="btn btn-primary">Create</button>
+                        <button type="button" id="config-download-btn" class="btn btn-neutral" disabled>Download config</button>
+                    </div>
+                </form>
+            </section>
+        </main>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <footer>
+        <p>QIIP Inference Proxy</p>
+    </footer>
+
+    <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/leaderboard.js') }}"></script>
+</body>
+</html>

@@ -34,6 +34,7 @@ from inference_proxy.auth.models import (
     AdminUserStats,
     ApiToken,
     CreatedToken,
+    LeaderboardEntry,
     SetupLink,
     TokenAuth,
     TokenUsage,
@@ -1009,6 +1010,50 @@ class AuthStore:
                 picture=row["picture"],
                 is_admin=bool(row["is_admin"]),
                 created_at=_parse_iso(row["created_at"]),
+                token_count=row["token_count"],
+                active_token_count=row["active_token_count"],
+                request_count=row["request_count"],
+                prompt_tokens=row["prompt_tokens"],
+                completion_tokens=row["completion_tokens"],
+                total_tokens=row["total_tokens"],
+            )
+            for row in rows
+        ]
+
+    def list_leaderboard(self) -> list[LeaderboardEntry]:
+        """Return non-admin users with token and usage counts, usage-first.
+
+        Admin-role users are never listed: their tokens and usage stay out
+        of the user-facing leaderboard (RFE #156).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT u.id, u.email, u.name,
+                       (SELECT COUNT(*) FROM tokens t
+                          WHERE t.user_id = u.id) AS token_count,
+                       (SELECT COUNT(*) FROM tokens t
+                          WHERE t.user_id = u.id AND t.revoked = 0)
+                           AS active_token_count,
+                       COALESCE((SELECT SUM(request_count) FROM usage w
+                                   WHERE w.user_id = u.id), 0) AS request_count,
+                       COALESCE((SELECT SUM(prompt_tokens) FROM usage w
+                                   WHERE w.user_id = u.id), 0) AS prompt_tokens,
+                       COALESCE((SELECT SUM(completion_tokens) FROM usage w
+                                   WHERE w.user_id = u.id), 0) AS completion_tokens,
+                       COALESCE((SELECT SUM(total_tokens) FROM usage w
+                                   WHERE w.user_id = u.id), 0) AS total_tokens
+                  FROM users u
+                 WHERE u.is_admin = 0
+                 ORDER BY total_tokens DESC, request_count DESC,
+                          u.created_at ASC, u.id ASC
+                """
+            ).fetchall()
+        return [
+            LeaderboardEntry(
+                id=row["id"],
+                email=row["email"],
+                name=row["name"],
                 token_count=row["token_count"],
                 active_token_count=row["active_token_count"],
                 request_count=row["request_count"],
