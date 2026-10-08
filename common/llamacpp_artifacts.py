@@ -36,6 +36,7 @@ IDENTITY_KEYS = {
     "cuda_toolkit",
     "profile",
     "compiler",
+    "cpu_flags",
     "os_id",
     "os_major",
     "arch",
@@ -50,7 +51,7 @@ def metadata(identity: str) -> dict[str, str]:
     result = dict(row.split("=", 1) for row in rows)
     if len(result) != len(rows) or set(result) != IDENTITY_KEYS:
         raise ValueError("Incomplete llama.cpp artifact identity")
-    if result["publication_schema"] != "3":
+    if result["publication_schema"] != "4":
         raise ValueError("Unsupported llama.cpp artifact schema")
     for key in ("source_sha256", "fit_cli_patch_sha256"):
         if not re.fullmatch(r"[a-f0-9]{64}", result[key]):
@@ -60,6 +61,7 @@ def metadata(identity: str) -> dict[str, str]:
     ):
         raise ValueError("Missing compiler/CUDA identity")
     version_tuple(result["glibc"])
+    feature_set(result["cpu_flags"])
     if result["cmake_cuda_architectures"] == "native":
         raise ValueError("Artifact must record resolved CUDA compile targets")
     if not re.fullmatch(
@@ -80,6 +82,34 @@ def version_tuple(value: str) -> tuple[int, ...]:
     return tuple(int(part) for part in value.split("."))
 
 
+def feature_set(value: str) -> set[str]:
+    if not re.fullmatch(r"[a-z0-9_]+(?:,[a-z0-9_]+)*", value):
+        raise ValueError("Invalid CPU feature identity")
+    flags = set(value.split(","))
+    if ",".join(sorted(flags)) != value:
+        raise ValueError("CPU feature identity must be sorted and unique")
+    return flags
+
+
+def cpu_features(cpuinfo: Path) -> dict[str, str]:
+    """Require artifact features on every consumer CPU, including mixed CPUs."""
+    cpus = []
+    for block in re.split(r"\n\s*\n", cpuinfo.read_text()):
+        if not re.search(r"^processor\s*:", block, re.M):
+            continue
+        lines = re.findall(r"^flags\s*:\s*([^\n]+)", block, re.M)
+        if len(lines) != 1:
+            raise ValueError("Cannot determine CPU features for every processor")
+        flags = ",".join(sorted(set(lines[0].split())))
+        cpus.append(feature_set(flags))
+    if not cpus:
+        raise ValueError("Cannot determine CPU features from cpuinfo")
+    return {
+        "cpu_flags": ",".join(sorted(set.intersection(*cpus))),
+        "build_cpu_flags": ",".join(sorted(set.union(*cpus))),
+    }
+
+
 def compatible(identity: str, host: dict[str, str]) -> bool:
     info = metadata(identity)
     exact = (
@@ -97,6 +127,8 @@ def compatible(identity: str, host: dict[str, str]) -> bool:
     if not info["cuda_toolkit"].startswith(host["cuda_toolkit"] + "."):
         return False
     if version_tuple(info["glibc"]) > version_tuple(host["glibc"]):
+        return False
+    if not feature_set(info["cpu_flags"]).issubset(feature_set(host["cpu_flags"])):
         return False
     # Match the actual engine/probe targets, never the producer's GPU inventory.
     # Require exact targets even for PTX; do not guess forward compatibility.
@@ -366,6 +398,7 @@ def publish(runtime: Path, output: Path, base_url: str) -> dict[str, Any]:
                 "unpacked_bytes": sum(p.stat().st_size for p in files),
             }
             with staged.open("rb") as stream:
+                os.fchmod(stream.fileno(), 0o644)
                 os.fsync(stream.fileno())
             os.replace(staged, output / filename)
             generations.sync_directory(output)
@@ -476,12 +509,15 @@ def main() -> int:
             "capacity",
             "targets",
             "verify",
+            "cpu",
         ],
     )
     parser.add_argument("arguments", nargs="+")
     args = parser.parse_args()
     values = args.arguments
-    if args.command == "targets":
+    if args.command == "cpu":
+        print(json.dumps(cpu_features(Path(values[0]))))
+    elif args.command == "targets":
         print(json.dumps(targets(values[0], values[1])))
     elif args.command == "select":
         entry = select(Path(values[0]), json.loads(values[1]))

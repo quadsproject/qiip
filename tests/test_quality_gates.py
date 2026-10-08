@@ -27,6 +27,17 @@ def test_ci_enforces_branch_coverage_floor() -> None:
     assert workflow.count("uv run --frozen coverage combine") == 1
     assert workflow.count("uv run --frozen coverage report") == 1
 
+    readme = (PROJECT_ROOT / "README.md").read_text()
+    commands = [
+        "uv run --frozen coverage run -m pytest",
+        "uv run --frozen coverage combine",
+        "uv run --frozen coverage report",
+    ]
+    assert [readme.index(command) for command in commands] == sorted(
+        readme.index(command) for command in commands
+    )
+    assert ".coverage.*" in (PROJECT_ROOT / ".gitignore").read_text().splitlines()
+
 
 def test_ci_exercises_badge_extraction_without_blocking_on_publication() -> None:
     """PRs exercise extraction; optional Gist writes cannot fail Quality."""

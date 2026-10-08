@@ -301,8 +301,9 @@ to CPU inference. Direct use of the scripts retains the existing standalone CPU
 branch, but it is outside QIIP's managed-node support boundary. Validate a
 disposable node from each GPU family before fleet rollout because the build is
 specialized for the attached CUDA architecture. The supporting CPU backend is
-built with `GGML_NATIVE=OFF` to avoid host-specific compiler/assembler feature
-mismatches; this fixed profile is part of the immutable build identity.
+built with `GGML_NATIVE=ON`; its producer CPU feature requirements are part of
+the immutable build identity, and consumers must support those features. See §30
+for artifact compatibility and rebuilding earlier profiles.
 
 ### 21. Use exact immutable GGUF artifacts
 
@@ -723,9 +724,13 @@ source fallback requires a readable compiler version before compiling.
 
 ### 30. Reuse verified llama.cpp artifacts and bound source builds
 
-New llama.cpp setups use the `cuda-portable-cpu-v3-artifact` profile. Its sealed
-package includes all three tools, a CUDA execution probe, portable CPU settings,
-bundled CUDA/compiler libraries, and source/transformation/compiler/OS identity.
+New llama.cpp setups use the `cuda-native-cpu-v4-artifact` profile and schema 4.
+Its sealed package includes all three tools, a CUDA execution probe, native CPU
+settings, bundled CUDA/compiler libraries, and source/transformation/compiler/OS
+identity. Every consumer CPU must support all recorded producer CPU features;
+source builds require uniform CPU features on the producer. Executables embed
+`$ORIGIN/../lib` as their RPATH so direct tools and diagnostics load bundled
+libraries without a toolkit or `LD_LIBRARY_PATH`.
 Older installations remain available for rollback; their next setup needs a new
 package. Compatible local packages are reused without downloading a catalog or
 installing a toolchain. A selected-profile package no longer rebuilds solely
@@ -742,8 +747,9 @@ Source fallback now reserves 2 GiB of available RAM and budgets 4 GiB per job,
 with `LLAMACPP_BUILD_JOBS` as an optional ceiling (`0` means automatic). The
 defaults require at least 6 GiB available RAM, 12 GiB of build space, and 4 GiB
 of installation space. Requirements add when both paths share a filesystem.
-Setup can choose alternate scratch storage and proves CUDA execution before
-compiling the engine. Source/archive checksums and transactional activation
+Setup can choose alternate scratch storage for both the CUDA probe and the
+engine build, and proves CUDA execution before compiling the engine.
+Source/archive checksums and transactional activation
 remain mandatory. Check artifact hit/miss, fallback reason, resource and timing
 markers in attempt logs before fleet rollout.
 

@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -20,6 +21,7 @@ from common import generations
 from common import llamacpp_artifacts as artifacts
 from inference_proxy.config.settings import ProvisioningSettings
 from inference_proxy.models.node import InferenceEngine
+from inference_proxy.provisioning.diagnostics import source_commands
 from tests.provisioning.test_llamacpp_scripts import (
     SETUP_SCRIPT,
     _build_fixture,
@@ -326,6 +328,298 @@ def test_engine_and_probe_share_explicit_targets_on_a_mixed_producer(
     info = artifacts.metadata(artifacts.verify_package(runtime)["identity"])
     assert info["compiled_cuda_architectures"] == "80,90"
     assert info["cmake_cuda_architectures"] == expected
+    for option in (
+        "<-Xlinker>",
+        "<--disable-new-dtags>",
+        "<-rpath>",
+        "<$ORIGIN/../lib>",
+    ):
+        assert option in operations
+
+
+def _cpuinfo(path: Path, *flags: str) -> None:
+    path.write_text(
+        "\n\n".join(
+            f"processor : {index}\nflags : {features}"
+            for index, features in enumerate(flags)
+        )
+        + "\n"
+    )
+
+
+def test_native_artifacts_require_features_on_every_consumer_cpu(
+    tmp_path: Path,
+) -> None:
+    env, published, entry = _published(tmp_path)
+    info = artifacts.metadata(entry["identity"])
+    assert info["cpu_flags"] == "avx,avx2,f16c,fma,sse2"
+    cpuinfo = tmp_path / "consumer-cpuinfo"
+    env["AUTOLLAMACPP_CPUINFO"] = str(cpuinfo)
+    # Extra VNNI/AVX512/AMX features do not require recompiling a compatible build.
+    _cpuinfo(cpuinfo, "sse2 avx avx2 fma f16c avx512f avx_vnni amx_tile")
+    result = _install(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[ARTIFACT:hit:catalog]" in result.stdout
+    _cpuinfo(cpuinfo, "sse2 avx avx2 fma f16c", "sse2 avx avx2 fma f16c avx512f")
+    result = _install(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[ARTIFACT:hit:local]" in result.stdout
+    # A subset on one processor rejects even an already cached package.
+    _cpuinfo(cpuinfo, "sse2 avx avx2 fma f16c", "sse2 avx fma f16c")
+    result = _install(env)
+    assert result.returncode != 0
+    assert "no_compatible_artifact" in result.stderr
+    host = {**info, **artifacts.cpu_features(cpuinfo), "cuda_toolkit": "13.0"}
+    assert artifacts.select(published / "catalog.json", host) is None
+    # A native producer requiring newer instructions cannot run on the baseline.
+    info["cpu_flags"] = "amx_tile,avx,avx2,avx512f,avx_vnni,f16c,fma,sse2"
+    _cpuinfo(cpuinfo, "sse2 avx avx2 fma f16c")
+    host.update(artifacts.cpu_features(cpuinfo))
+    assert not artifacts.compatible(
+        "\n".join(f"{key}={value}" for key, value in info.items()), host
+    )
+
+
+def test_cpu_feature_detection_normalizes_each_processor(tmp_path: Path) -> None:
+    cpuinfo = tmp_path / "cpuinfo"
+    _cpuinfo(cpuinfo, "sse2 avx avx2 avx", "fma sse2 avx")
+    with cpuinfo.open("a") as stream:
+        stream.write("\nHardware : extra non-processor section\n")
+    assert artifacts.cpu_features(cpuinfo) == {
+        "cpu_flags": "avx,sse2",
+        "build_cpu_flags": "avx,avx2,fma,sse2",
+    }
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Hardware : unknown\n",
+        "processor : 0\nmodel name : missing flags\n",
+        "processor : 0\nflags : avx\nflags : sse2\n",
+        "processor : 0\nflags : avx bad/flag\n",
+    ],
+)
+def test_unknown_cpu_features_fail_before_toolchain_installation(
+    tmp_path: Path, content: str
+) -> None:
+    env, log, links = _build_fixture(tmp_path)
+    Path(env["AUTOLLAMACPP_CPUINFO"]).write_text(content)
+    result = _run_shell(_source_setup("install_llamacpp"), env=env)
+    assert result.returncode != 0
+    assert "CPU feature" in result.stderr
+    assert not log.exists()
+    assert not (links / "llama-server").exists()
+
+
+def test_mixed_cpu_native_source_build_stops_before_installation(
+    tmp_path: Path,
+) -> None:
+    env, log, links = _build_fixture(tmp_path)
+    _cpuinfo(Path(env["AUTOLLAMACPP_CPUINFO"]), "sse2 avx", "sse2")
+    result = _run_shell(_source_setup("install_llamacpp"), env=env)
+    assert result.returncode != 0
+    assert "native source builds require uniform CPU flags" in result.stderr
+    assert not log.exists()
+    assert not (links / "llama-server").exists()
+
+
+@pytest.mark.parametrize("flags", ["", "avx,,sse2", "avx,avx", "sse2,avx", "AVX"])
+def test_noncanonical_cpu_feature_identity_is_rejected(flags: str) -> None:
+    with pytest.raises(ValueError, match="CPU feature identity"):
+        artifacts.feature_set(flags)
+
+
+def test_legacy_artifacts_without_native_cpu_identity_are_rejected(
+    tmp_path: Path,
+) -> None:
+    _env, _published_dir, entry = _published(tmp_path)
+    with pytest.raises(ValueError, match="Unsupported llama.cpp artifact schema"):
+        artifacts.metadata(
+            entry["identity"].replace("publication_schema=4", "publication_schema=3")
+        )
+    without_flags = "\n".join(
+        row
+        for row in entry["identity"].splitlines()
+        if not row.startswith("cpu_flags=")
+    )
+    with pytest.raises(ValueError, match="Incomplete llama.cpp artifact identity"):
+        artifacts.metadata(without_flags)
+
+
+def test_published_archives_are_readable_with_a_restrictive_umask(
+    tmp_path: Path,
+) -> None:
+    original = os.umask(0o077)
+    try:
+        _env, published, entry = _published(tmp_path)
+    finally:
+        os.umask(original)
+    archive = published / Path(entry["url"]).name
+    assert archive.stat().st_mode & 0o777 == 0o644
+    assert generations.file_digest(archive) == entry["sha256"]
+
+
+def test_source_probe_uses_selected_scratch_when_original_directory_is_missing(
+    tmp_path: Path,
+) -> None:
+    env, log, links = _build_fixture(tmp_path)
+    scratch = tmp_path / "alternate scratch"
+    scratch.mkdir()
+    env.update(
+        AUTOVLLM_TMP_DIR=str(tmp_path / "missing original scratch"),
+        AUTOLLAMACPP_BUILD_TMP_DIR=str(scratch),
+    )
+    nvcc = Path(env["AUTOLLAMACPP_NVCC"])
+    nvcc.write_text(
+        nvcc.read_text().replace(
+            "else\n",
+            'else\n    printf \'probe <%s>\\n\' "$@" >> "$AUTOLLAMACPP_TEST_LOG"\n',
+            1,
+        )
+    )
+    result = _run_shell(_source_setup("install_llamacpp"), env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"<{scratch}/cuda-probe." in log.read_text()
+    assert not list(scratch.iterdir())
+    assert (links / "llama-server").resolve().is_file()
+
+
+def test_real_elf_tools_find_bundled_transitive_libraries_without_producer_sdk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Exercise the setup's actual CMake flags with a real two-library ELF chain.
+    # The fixture deliberately has no RPATH on its libraries: DT_RUNPATH on the
+    # executable alone cannot resolve the indirect dependency after relocation.
+    env, log, links = _build_fixture(tmp_path)
+    result = _run_shell(_source_setup("install_llamacpp"), env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    identity = (
+        (links / "llama-server")
+        .resolve()
+        .parents[1]
+        .joinpath("BUILD-INFO")
+        .read_text()
+        .rstrip("\n")
+    )
+    rpath_options = re.findall(
+        r"<(-DCMAKE_(?:BUILD_WITH_INSTALL_RPATH|INSTALL_RPATH|INSTALL_RPATH_USE_LINK_PATH|EXE_LINKER_FLAGS)=[^>]+)>",
+        log.read_text(),
+    )
+    assert len(rpath_options) == 4
+    producer = tmp_path / "elf-producer"
+    producer.mkdir()
+    sdk = producer / "sdk"
+    sdk.mkdir()
+    (producer / "leaf.c").write_text("int leaf(void) { return 42; }\n")
+    (producer / "direct.c").write_text(
+        "int leaf(void); int direct(void) { return leaf(); }\n"
+    )
+    subprocess.run(
+        [
+            "gcc",
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libqiip_leaf.so",
+            "-o",
+            str(sdk / "libqiip_leaf.so"),
+            str(producer / "leaf.c"),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "gcc",
+            "-shared",
+            "-fPIC",
+            "-Wl,-soname,libqiip_direct.so",
+            "-o",
+            str(sdk / "libqiip_direct.so"),
+            str(producer / "direct.c"),
+            f"-L{sdk}",
+            "-lqiip_leaf",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    (producer / "main.c").write_text(
+        "#include <stdio.h>\n#include <string.h>\n"
+        "int direct(void);\n"
+        "int main(int argc, char **argv) {\n"
+        "  if (direct() != 42) return 99;\n"
+        '  if (argc > 1 && !strcmp(argv[1], "--list-devices")) puts("CUDA0: ELF fixture");\n'
+        '  else if (argc > 1 && !strcmp(argv[1], "--help")) { puts("usage: llama-quantize"); return 1; }\n'
+        '  else puts("version: 0.4.1 (ELF loader fixture)");\n'
+        "  return 0;\n}\n"
+    )
+    (producer / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.16)\nproject(loader_fixture C)\n"
+        'set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")\n'
+        "foreach(tool llama-server llama-fit-params llama-quantize cuda-probe)\n"
+        "  add_executable(${tool} main.c)\n"
+        '  target_link_libraries(${tool} PRIVATE "${CMAKE_SOURCE_DIR}/sdk/libqiip_direct.so")\n'
+        '  target_link_options(${tool} PRIVATE "-Wl,-rpath-link,${CMAKE_SOURCE_DIR}/sdk")\n'
+        "endforeach()\n"
+    )
+    build = producer / "build"
+    subprocess.run(
+        ["cmake", "-S", str(producer), "-B", str(build), *rpath_options],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["cmake", "--build", str(build)], check=True, capture_output=True)
+    staged = tmp_path / "elf-staged"
+    shutil.copytree(build / "bin", staged / "bin")
+    monkeypatch.setenv("LD_LIBRARY_PATH", str(sdk))
+    artifacts.bundle_libraries(staged / "bin", staged / "lib")
+    assert {path.name for path in (staged / "lib").iterdir()} == {
+        "libqiip_direct.so",
+        "libqiip_leaf.so",
+    }
+    (staged / "BUILD-INFO").write_text(identity + "\n")
+    artifacts.seal(staged, identity)
+    installed = tmp_path / "elf-consumer/runtime"
+    artifacts.install(staged, installed)
+    shutil.rmtree(producer)
+    shutil.rmtree(staged)
+    monkeypatch.delenv("LD_LIBRARY_PATH")
+    monkeypatch.delenv("LD_PRELOAD", raising=False)
+    for tool in artifacts.TOOLS:
+        binary = installed / "bin" / tool
+        dynamic = subprocess.check_output(["readelf", "-d", str(binary)], text=True)
+        assert "(RPATH)" in dynamic and "[$ORIGIN/../lib]" in dynamic
+        assert "RUNPATH" not in dynamic and str(producer) not in dynamic
+        assert (
+            subprocess.run([str(binary), "--version"], capture_output=True).returncode
+            == 0
+        )
+    # Publish the same compatibility links used by standalone setup callers.
+    result = _run_shell(
+        _source_setup(f"select_llamacpp_runtime {shlex.quote(str(installed))}"), env=env
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    for tool in artifacts.TOOLS[:-1]:
+        assert (
+            subprocess.run(
+                [str(links / tool), "--version"], capture_output=True
+            ).returncode
+            == 0
+        )
+    diagnostics = source_commands(
+        {
+            "engine": "llama_cpp",
+            "selected_generation": {"runtime_path": str(installed)},
+            "failure": {
+                "started_at": "2026-10-08T12:00:00+00:00",
+                "failed_at": "2026-10-08T12:01:00+00:00",
+            },
+            "mount_point": str(tmp_path),
+        }
+    )
+    result = subprocess.run(diagnostics["runtime"], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "0.4.1" in result.stdout
 
 
 @pytest.mark.parametrize("catalog", [True, False])
@@ -434,6 +728,7 @@ def test_published_artifact_activates_without_a_compiler_and_launch_finds_librar
         "os_major",
         "glibc",
         "arch",
+        "cpu_flags",
     ],
 )
 def test_catalog_compatibility_requires_source_transform_hardware_and_abi(
@@ -442,17 +737,18 @@ def test_catalog_compatibility_requires_source_transform_hardware_and_abi(
     identity = "\n".join(
         f"{key}={value}"
         for key, value in {
-            "publication_schema": "3",
+            "publication_schema": "4",
             "version": "v0.4.1",
             "source_sha256": "a" * 64,
             "fit_cli_patch_sha256": "b" * 64,
-            "build_profile": "portable",
+            "build_profile": "cuda-native-cpu-v4-artifact",
             "compute_capabilities": "8.0",
             "compiled_cuda_architectures": "80",
             "cmake_cuda_architectures": "80",
             "cuda_toolkit": "13.0.88",
             "profile": "llamacpp-ampere-a100",
             "compiler": "GNU-11.5.0",
+            "cpu_flags": "avx,avx2,f16c,fma,sse2",
             "os_id": "rhel",
             "os_major": "9",
             "arch": "x86_64",
@@ -472,6 +768,7 @@ def test_catalog_compatibility_requires_source_transform_hardware_and_abi(
         "os_major": "8",
         "glibc": "2.28",
         "arch": "aarch64",
+        "cpu_flags": "avx,f16c,fma,sse2",
     }[mismatch]
     assert not artifacts.compatible(identity, host)
 
