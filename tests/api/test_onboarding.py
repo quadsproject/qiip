@@ -296,7 +296,7 @@ class TestSingleToken:
         ("payload", "status"),
         [
             ({"name": "x", "models": ["org/unknown"]}, 400),
-            ({"name": "x", "models": []}, 422),
+            ({"name": "x", "models": []}, 201),
             ({"name": "   ", "models": [MODEL_A]}, 422),
             ({"name": "", "models": [MODEL_A]}, 422),
         ],
@@ -1051,3 +1051,131 @@ def test_existing_setup_script_refuses_unconfigured_origin(
     )
     assert result.returncode != 0
     assert not (tmp_path / ".claude/settings.json").exists()
+
+
+class TestLeaderboard:
+    def test_ranks_non_admins_by_usage_and_excludes_admins(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        me = auth_store.list_users_with_stats()[0]
+        bob = auth_store.upsert_google_user(
+            google_sub="sub-bob", email="bob@example.com", name="Bob", picture=""
+        )
+        carol = auth_store.upsert_google_user(
+            google_sub="sub-carol", email="carol@example.com", name="Carol", picture=""
+        )
+        admin = auth_store.upsert_google_user(
+            google_sub="sub-admin", email="admin@example.com", name="Admin", picture=""
+        )
+        auth_store.set_user_admin(admin.id, True)
+        bob_token = auth_store.create_token(bob.id, "bob-ci")
+        carol_token = auth_store.create_token(carol.id, "carol-ci")
+        admin_token = auth_store.create_token(admin.id, "admin-ci")
+        auth_store.record_usage(
+            user_id=bob.id,
+            token_id=bob_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            total_tokens=2000,
+        )
+        auth_store.record_usage(
+            user_id=carol.id,
+            token_id=carol_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            total_tokens=1000,
+        )
+        auth_store.record_usage(
+            user_id=admin.id,
+            token_id=admin_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            total_tokens=999_000,
+        )
+
+        rows = user_client.get("/onboarding/leaderboard").json()
+
+        assert [row["id"] for row in rows] == [bob.id, carol.id, me.id]
+        assert "admin@example.com" not in {row["email"] for row in rows}
+        assert rows[0]["total_tokens"] == 2000
+        assert rows[1]["total_tokens"] == 1000
+        assert rows[2]["total_tokens"] == 0
+
+    def test_page_renders_for_signed_in_user(self, user_client: TestClient) -> None:
+        html = user_client.get("/leaderboard").text
+        assert "leaderboard.js" in html
+        assert "Usage leaderboard" in html
+
+    def test_anonymous_gets_signin(self, app: FastAPI) -> None:
+        response = TestClient(app).get("/leaderboard")
+        assert response.status_code == 200
+        assert "Google Auth" in response.text or "Local Admin" in response.text
+
+    def test_admin_is_redirected_to_dashboard(self, app: FastAPI) -> None:
+        client = TestClient(app)
+        client.post(
+            "/auth/local-admin",
+            json={"username": "test-admin", "password": "test-password"},
+        )
+        response = client.get("/leaderboard", follow_redirects=False)
+        assert response.status_code == 302
+        assert response.headers["location"] == "/dashboard"
+
+
+class TestConfigDownload:
+    def test_download_renders_harness_config_with_token(
+        self, user_client: TestClient
+    ) -> None:
+        _mint(user_client, [MODEL_A])
+        response = user_client.post(
+            "/onboarding/config", json={"harness": "opencode", "models": [MODEL_A]}
+        )
+        assert response.status_code == 200
+        assert response.headers["content-disposition"] == (
+            'attachment; filename="opencode.json"'
+        )
+        config = json.loads(response.text)
+        provider = config["provider"]["qiip"]
+        assert provider["options"]["baseURL"] == "http://testserver/v1"
+        assert provider["options"]["apiKey"].startswith("qiip_")
+        assert provider["models"][MODEL_A]["name"] == "model-a"
+
+    def test_download_requires_a_token(self, user_client: TestClient) -> None:
+        assert (
+            user_client.post(
+                "/onboarding/config",
+                json={"harness": "opencode", "models": [MODEL_A]},
+            ).status_code
+            == 404
+        )
+
+    def test_download_widens_token_scope(self, user_client: TestClient) -> None:
+        _mint(user_client, [MODEL_A])
+        response = user_client.post(
+            "/onboarding/config", json={"harness": "pi", "models": [MODEL_B]}
+        )
+        assert response.status_code == 200
+        state = user_client.get("/onboarding/state").json()
+        assert set(state["token"]["models"]) == {MODEL_A, MODEL_B}
+
+    def test_single_model_harness_rejects_two_models(
+        self, user_client: TestClient
+    ) -> None:
+        _mint(user_client, [MODEL_A])
+        assert (
+            user_client.post(
+                "/onboarding/config",
+                json={"harness": "claude", "models": [MODEL_A, MODEL_B]},
+            ).status_code
+            == 400
+        )
+
+    def test_unknown_model_is_refused(self, user_client: TestClient) -> None:
+        _mint(user_client, [MODEL_A])
+        assert (
+            user_client.post(
+                "/onboarding/config",
+                json={"harness": "opencode", "models": ["org/unknown"]},
+            ).status_code
+            == 400
+        )
