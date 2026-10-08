@@ -2,6 +2,27 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.2 (2026-10-08)
+
+### Bug Fixes
+
+- Address llama.cpp artifact review findings
+  ([`03736a1`](https://github.com/quadsproject/qiip/commit/03736a13d9f58ca2e49b1224ca004485d478d865))
+
+- Address native CPU and artifact runtime review
+  ([`556680c`](https://github.com/quadsproject/qiip/commit/556680c2327a83809fe897a304768f2f432f9faa))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`c55c4cd`](https://github.com/quadsproject/qiip/commit/c55c4cd47ba6761af1e820e81d67a472dfe758ed))
+
+### Features
+
+- Reuse verified llama.cpp builds with bounded source fallback
+  ([`2ebf719`](https://github.com/quadsproject/qiip/commit/2ebf7199b949abf54539af6692f893a1e22f1008))
+
+
 ## v0.2.0-dev.1 (2026-10-07)
 
 ### Bug Fixes
