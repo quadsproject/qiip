@@ -23,18 +23,22 @@ Setup first checks sealed local installations, then an optional checksum-pinned
 HTTP(S) artifact catalog. A matching build includes `llama-server`,
 `llama-fit-params`, `llama-quantize`, a compiled CUDA execution probe, and the
 CUDA/compiler shared libraries needed by those executables. The node-owned
-NVIDIA driver, libc, and dynamic loader are never bundled. The launch script
-resolves the selected runtime and loads its libraries from `lib/`.
+NVIDIA driver, libc, and dynamic loader are never bundled. Each executable embeds
+`$ORIGIN/../lib` as its RPATH, so direct invocations, diagnostics, and compatibility
+symlinks resolve the bundled library closure without `LD_LIBRARY_PATH` or a toolkit.
 
 The package identity records the source tag/digest, fit-CLI transformation
 digest, build profile, compiler version, full CUDA toolkit version, measured GPU
-architectures, resolved engine/probe compile targets, runtime profile, OS major version,
-machine architecture, and glibc version. A consumer requires the same source,
-transformation, build/runtime profile, OS major and machine architecture, a
-matching CUDA toolkit series, compiled coverage for every selected GPU architecture, and
-glibc at least as new as the producer's. Explicit CMake architecture overrides
+architectures, resolved engine/probe compile targets, runtime profile, OS major
+version, machine architecture, producer CPU feature flags, and glibc version.
+A consumer requires the same source, transformation, build/runtime profile,
+OS major and machine architecture, a matching CUDA toolkit series, compiled
+coverage for every selected GPU architecture, and glibc at least as new as the
+producer's. Every consumer CPU must support all recorded producer CPU features.
+Explicit CMake architecture overrides
 must match. Selected-profile installations can be reused across local compiler
-and toolkit patch updates. Host-specific CPU instruction flags are disabled.
+and toolkit patch updates. Missing or unreadable CPU features fail compatibility
+checks before executing an artifact.
 
 Both the catalog and archive must pass SHA-256 verification. Extraction rejects
 links, special files, traversal, duplicate paths, and unexpected files. Setup
@@ -63,9 +67,9 @@ python3 "$bundle/common/llamacpp_artifacts.py" publish \
 ```
 
 The publisher reruns the binary/CLI/CUDA checks, flushes a content-addressed
-archive, and atomically updates `catalog.json` under a publication lock. Its
-last output line contains the catalog SHA-256 and archive metadata. Repeating
-publication retains other profile entries. Serve the archives and catalog at
+archive with mode `0644`, and atomically updates `catalog.json` under a publication
+lock. Its last output line contains the catalog SHA-256 and archive metadata.
+Repeating publication retains other profile entries. Serve the archives and catalog at
 the chosen base URL, and configure the gateway with the catalog URL and digest:
 
 ```dotenv
@@ -78,7 +82,7 @@ Update the pinned catalog digest whenever its contents change. Publish archives
 before making a new catalog available. No production catalog or fleet GPU
 validation is claimed by the controlled regression fixtures. Runtime-profile
 validation status remains in `common/PROFILES.md`; the
-`cuda-portable-cpu-v3-artifact` build profile still requires producer and consumer
+`cuda-native-cpu-v4-artifact` build profile still requires producer and consumer
 validation on each representative fleet GPU configuration, including mixed GPU
 selections and any explicit architecture overrides, before publishing catalogs.
 
@@ -91,12 +95,16 @@ its committed SHA-256 before extraction, applies one digest-pinned CLI
 allowlist transformation, and compiles `llama-server`, `llama-fit-params`, and
 `llama-quantize` with `GGML_CUDA=ON`. The default `native` selection resolves to
 explicit numeric CMake targets for every selected GPU. The same targets compile
-the packaged CUDA probe and are recorded in its schema-3 identity. An override
+the packaged CUDA probe and are recorded in its schema-4 identity. An override
 via `AUTOLLAMACPP_CUDA_ARCHITECTURES` must use explicit numeric CMake targets
 (for example `80;90`, optionally suffixed `-real` or `-virtual`); unbounded
-`all`/`all-major` selections are rejected. The supporting CPU backend uses `GGML_NATIVE=OFF`: managed
-inference is CUDA-only, and the portable CPU profile avoids coupling builds to
-host-specific compiler and assembler feature support.
+`all`/`all-major` selections are rejected. The supporting CPU backend uses
+`GGML_NATIVE=ON`, allowing ggml to detect native instruction support without
+explicit SIMD overrides. Setup records the sorted `/proc/cpuinfo` flags of the
+producer, including AVX512, VNNI, or AMX when present. Source builds require
+uniform feature flags across producer CPUs; mixed CPU hosts can consume artifacts
+whose required features are present on every CPU. Earlier artifact schemas and
+build profiles need rebuilding before they can enter a new catalog.
 The build uses CMake's explicit Unix Makefiles generator with parallel jobs, so
 it depends only on the `make` package available from the standard RHEL
 repositories and does not require CodeReady Builder or `ninja-build`.
@@ -108,6 +116,7 @@ The fallback requires 12 GiB of build space and 4 GiB of installation space,
 adding the requirements when both paths share a filesystem. It checks the
 nearest existing installation ancestor, including on a fresh node. Setup tries
 the configured temporary directory, `/var/tmp`, then `/tmp` for available space.
+Both the CUDA probe and the engine build use the selected scratch directory.
 Artifact downloads check the archive's recorded compressed/unpacked sizes
 against both staging and installation capacity.
 
@@ -378,7 +387,7 @@ request), and `aggregate_context` (the unified pool).
 
 The pinned estimator already implements unified-KV memory accounting but
 does not expose that option in the `llama-fit-params` CLI allowlist. The
-versioned `cuda-portable-cpu-v3-artifact` build profile exposes the
+versioned `cuda-native-cpu-v4-artifact` build profile exposes the
 existing option so estimation and serving use the same KV mode. Its exact
 transformation digest is part of `BUILD-INFO` and the installation identity,
 and setup exercises every planner option against the built helper before

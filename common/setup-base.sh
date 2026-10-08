@@ -585,6 +585,10 @@ EOF
             *) arch_flags+=(-gencode "arch=compute_${sm},code=[sm_${sm},compute_${sm}]") ;;
         esac
     done
+    if [ -n "${1:-}" ]; then
+        # Retained artifact probes resolve the same bundled closure as the tools.
+        arch_flags+=(-Xlinker --disable-new-dtags -Xlinker -rpath -Xlinker "\$ORIGIN/../lib")
+    fi
     if ! "$nvcc" -o "${work_dir}/cuda_probe" "${work_dir}/cuda_probe.cu" "${arch_flags[@]}"; then
         rm -rf "$work_dir"
         echo "FATAL: nvcc failed to compile the CUDA execution probe" >&2

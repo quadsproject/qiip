@@ -48,7 +48,7 @@ LLAMACPP_INSTALL_ROOT="${AUTOLLAMACPP_INSTALL_ROOT:-/opt/llama.cpp}"
 QIIP_GENERATION_ROOT="${QIIP_GENERATION_ROOT:-/opt/qiip/llama_cpp}"
 LLAMACPP_LINK_DIR="${AUTOLLAMACPP_LINK_DIR:-/usr/local/bin}"
 LLAMACPP_CUDA_ARCHITECTURES="${AUTOLLAMACPP_CUDA_ARCHITECTURES:-native}"
-LLAMACPP_BUILD_PROFILE="cuda-portable-cpu-v3-artifact"
+LLAMACPP_BUILD_PROFILE="cuda-native-cpu-v4-artifact"
 LLAMACPP_FIT_PATCH_FROM=').set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));'
 LLAMACPP_FIT_PATCH_TO=').set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_FIT_PARAMS}));'
 LLAMACPP_FIT_PATCH_SHA256="58917efc78ca760a2a1dd162d84e6cf1930c5b62a8dd9710bb4579ca4f2d69dc"
@@ -211,13 +211,14 @@ llamacpp_artifact_tool() {
 
 llamacpp_host_identity() {
     [ -n "${OS_ID:-}" ] || detect_profile_os
-    local capabilities nvcc installed_toolkit=""
+    local capabilities nvcc cpu installed_toolkit=""
     capabilities=$(cuda_compute_capabilities)
+    cpu=$(llamacpp_artifact_tool cpu "${AUTOLLAMACPP_CPUINFO:-/proc/cpuinfo}")
     nvcc=$(find_nvcc) || nvcc=""
     if [ -n "$nvcc" ]; then
         installed_toolkit=$("$nvcc" --version | sed -n 's/.*V\([0-9][0-9.]*\).*/\1/p') || installed_toolkit=""
     fi
-    python3 -c 'import json,sys; print(json.dumps(dict(zip(sys.argv[1::2], sys.argv[2::2]))))' \
+    python3 -c 'import json,sys; print(json.dumps({**dict(zip(sys.argv[2::2], sys.argv[3::2])), **json.loads(sys.argv[1])}))' "$cpu" \
         version "$LLAMACPP_VERSION" source_sha256 "${LLAMACPP_SHA256,,}" \
         build_profile "$LLAMACPP_BUILD_PROFILE" fit_cli_patch_sha256 "$LLAMACPP_FIT_PATCH_SHA256" \
         compute_capabilities "${capabilities//$'\n'/,}" \
@@ -369,7 +370,8 @@ install_llamacpp() {
         return 1
     fi
     echo "[BUILD:fallback:${fallback_reason}]"
-    local plan jobs build_tmp target_plan compile_architectures compiled_architectures
+    local plan jobs build_tmp target_plan compile_architectures compiled_architectures cpu_flags
+    cpu_flags=$(python3 -c 'import json,sys; h=json.loads(sys.argv[1]); h["cpu_flags"] == h["build_cpu_flags"] or sys.exit("FATAL: native source builds require uniform CPU flags; use a compatible artifact for mixed CPUs"); print(h["build_cpu_flags"])' "$host") || return
     target_plan=$(llamacpp_artifact_tool targets "$LLAMACPP_CUDA_ARCHITECTURES" "$(cuda_compute_capabilities | paste -sd, -)")
     compile_architectures=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["cmake_cuda_architectures"])' "$target_plan")
     compiled_architectures=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["compiled_cuda_architectures"])' "$target_plan")
@@ -413,14 +415,14 @@ install_llamacpp() {
     fi
     compute_capabilities=$(cuda_compute_capabilities) || return
     compiler=$(g++ -dumpfullversion -dumpversion)
-    marker=$(printf 'publication_schema=3\nversion=%s\nsource_sha256=%s\nbuild_profile=%s\nfit_cli_patch_sha256=%s\ncompute_capabilities=%s\ncompiled_cuda_architectures=%s\ncmake_cuda_architectures=%s\ncuda_toolkit=%s\nprofile=%s\ncompiler=GNU-%s\nos_id=%s\nos_major=%s\narch=%s\nglibc=%s\n' \
+    marker=$(printf 'publication_schema=4\nversion=%s\nsource_sha256=%s\nbuild_profile=%s\nfit_cli_patch_sha256=%s\ncompute_capabilities=%s\ncompiled_cuda_architectures=%s\ncmake_cuda_architectures=%s\ncuda_toolkit=%s\nprofile=%s\ncompiler=GNU-%s\ncpu_flags=%s\nos_id=%s\nos_major=%s\narch=%s\nglibc=%s\n' \
         "$LLAMACPP_VERSION" \
         "${LLAMACPP_SHA256,,}" \
         "$LLAMACPP_BUILD_PROFILE" \
         "$LLAMACPP_FIT_PATCH_SHA256" \
         "${compute_capabilities//$'\n'/,}" \
         "$compiled_architectures" "$compile_architectures" \
-        "$cuda_toolkit" "${PROFILE_NAME:-unselected}" "$compiler" \
+        "$cuda_toolkit" "${PROFILE_NAME:-unselected}" "$compiler" "$cpu_flags" \
         "$OS_ID" "${OS_VERSION_ID%%.*}" "$OS_ARCH" "$GLIBC_VERSION")
     build_identity=$(printf '%s' "$marker" | sha256sum | cut -c1-16)
     install_dir="${LLAMACPP_INSTALL_ROOT%/}/${LLAMACPP_VERSION}-${build_identity}"
@@ -441,6 +443,7 @@ install_llamacpp() {
     # sequence in a dedicated subshell whose EXIT trap owns all cleanup.
     (
         set -e
+        INSTALL_TMP_DIR="$build_tmp"
         local work_dir archive source_dir build_dir server_bin fit_bin quantize_bin build_status
         work_dir=$(mktemp -d "${build_tmp%/}/auto-llamacpp.XXXXXX")
         # shellcheck disable=SC2317,SC2329  # Invoked indirectly by the EXIT trap.
@@ -483,6 +486,8 @@ install_llamacpp() {
             version_flags=(-DLLAMA_BUILD_NUMBER="${LLAMACPP_VERSION#b}")
         fi
         echo "[BUILD:configure:START]"
+        # DT_RPATH also resolves children of bundled CUDA libraries that have
+        # no RPATH of their own. Never retain absolute producer toolkit paths.
         cmake -S "$source_dir" -B "$build_dir" -G "Unix Makefiles" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER="$(command -v gcc)" \
@@ -490,14 +495,13 @@ install_llamacpp() {
             -DCMAKE_CUDA_HOST_COMPILER="$(command -v g++)" \
             -DCMAKE_CUDA_COMPILER="$CUDA_NVCC" \
             -DCMAKE_CUDA_ARCHITECTURES="$compile_architectures" \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            "-DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib" \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CUDA=ON \
-            -DGGML_NATIVE=OFF \
-            -DGGML_AVX=OFF \
-            -DGGML_AVX2=OFF \
-            -DGGML_AVX512=OFF \
-            -DGGML_FMA=OFF \
-            -DGGML_F16C=OFF \
+            -DGGML_NATIVE=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TOOLS=ON \
@@ -520,15 +524,13 @@ install_llamacpp() {
             echo "FATAL: llama.cpp build did not produce the required binaries" >&2
             exit 1
         fi
-        if [ "$(installed_llamacpp_version "$server_bin")" != "$LLAMACPP_VERSION" ]; then
-            echo "FATAL: built llama-server did not report ${LLAMACPP_VERSION}" >&2
-            exit 1
-        fi
-        verify_managed_server_cli "$server_bin"
-        verify_fit_params_cli "$fit_bin"
-
         install -m 755 "$server_bin" "$fit_bin" "$quantize_bin" "${staged}/bin/"
-        llamacpp_artifact_tool libraries "${staged}/bin" "${staged}/lib"
+        # Dependency discovery uses the producer toolkit only; installed tools
+        # resolve their bundled closure through the embedded relative RPATH.
+        local toolkit_root
+        toolkit_root=$(dirname "$(dirname "$(readlink -f "$CUDA_NVCC")")")
+        LD_LIBRARY_PATH="${toolkit_root}/lib64:${toolkit_root}/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            llamacpp_artifact_tool libraries "${staged}/bin" "${staged}/lib"
         printf '%s\n' "$marker" > "${staged}/BUILD-INFO"
         verify_llamacpp_binaries "$staged"
         verify_llamacpp_cuda "$staged"

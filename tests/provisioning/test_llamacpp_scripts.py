@@ -1017,6 +1017,8 @@ exec "$@"
 
     install_root = tmp_path / "install -- root"
     link_dir = tmp_path / "links -- bin"
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text("processor : 0\nflags : sse2 avx avx2 fma f16c\n")
     env = {
         **os.environ,
         "PATH": f"{fake_bin}:/usr/bin:/bin",
@@ -1029,6 +1031,7 @@ exec "$@"
         "AUTOLLAMACPP_INSTALL_ROOT": str(install_root),
         "AUTOLLAMACPP_LINK_DIR": str(link_dir),
         "AUTOLLAMACPP_NVCC": str(fake_bin / "nvcc"),
+        "AUTOLLAMACPP_CPUINFO": str(cpuinfo),
         "AUTOLLAMACPP_TEST_LOG": str(operation_log),
         "AUTOLLAMACPP_TEST_ARCHIVE": archive_content,
     }
@@ -1065,7 +1068,9 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     configure = next(line for line in operations if line.startswith("cmake <-S>"))
     assert "<-G> <Unix Makefiles>" in configure
     assert "<-DGGML_CUDA=ON>" in configure
-    assert "<-DGGML_NATIVE=OFF>" in configure
+    assert "<-DGGML_NATIVE=ON>" in configure
+    for feature in ("AVX", "AVX2", "AVX512", "FMA", "F16C"):
+        assert f"-DGGML_{feature}=" not in configure
     assert "<-DCMAKE_CUDA_ARCHITECTURES=80;90>" in configure
     assert "<-DBUILD_SHARED_LIBS=OFF>" in configure
     assert "<-DLLAMA_BUILD_TESTS=OFF>" in configure
@@ -1096,7 +1101,7 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     assert (link_dir / "llama-quantize").resolve().is_file()
     marker = (link_dir / "llama-server").resolve().parents[1] / "BUILD-INFO"
     marker_text = marker.read_text()
-    assert "build_profile=cuda-portable-cpu-v3-artifact" in marker_text
+    assert "build_profile=cuda-native-cpu-v4-artifact" in marker_text
     assert (
         "fit_cli_patch_sha256="
         "58917efc78ca760a2a1dd162d84e6cf1930c5b62a8dd9710bb4579ca4f2d69dc"
