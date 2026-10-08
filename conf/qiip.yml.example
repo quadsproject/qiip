@@ -204,9 +204,13 @@ redfish:
   verify_ssl: false
   # Per-lab and per-host BMC credential overrides. A hostname is matched to a
   # lab identifier (a dotted FQDN segment) as a dot-bounded substring; the
-  # longest identifier wins. A full FQDN under `hosts` is an exact override and
-  # beats any lab. Anything matching nothing falls back to bmc_username/
-  # bmc_password above, which must be set to use overrides. For example:
+  # longest identifier wins, equal lengths resolve lexicographically. A full
+  # node FQDN under `hosts` (the hostname placement passes to auth_for, not the
+  # BMC name that bmc_host_template renders, e.g. mgmt-...) is an exact
+  # override and beats any lab. Anything matching nothing falls back to
+  # bmc_username/bmc_password above, which must be set to use overrides. Keys
+  # are lowercased; surrounding whitespace, leading/trailing dots and
+  # case-duplicate keys are rejected at startup. For example:
   #   labs:
   #     rdu2.scalelab: { username: root, password: mypass1 }
   #     rdu3.labs.perfscale: { username: root, password: mypass2 }

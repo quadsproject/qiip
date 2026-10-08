@@ -710,14 +710,21 @@ class PlacementReconciler:
 
     async def _remote_work_blocker(self, hostname: str) -> str | None:
         """Why a launch must wait for the host itself, or ``None``."""
-        if await self._host_is_powered_off(hostname):
-            return None
         try:
             async with asyncio.timeout(_REMOTE_PROBE_TIMEOUT_SECONDS):
                 running = await self._provisioner.remote_lifecycle_processes(hostname)
         except Exception as exc:
             detail = str(exc) or type(exc).__name__
-            return f"could not verify that no earlier provisioning is running: {detail}"
+            error = (
+                f"could not verify that no earlier provisioning is running: {detail}"
+            )
+            # Reachable hosts never touch the BMC: power is read only when the
+            # probe fails. A host the BMC reports Off runs no earlier setup,
+            # so the failed probe does not block; anything else keeps the
+            # SSH error.
+            if await self._host_is_powered_off(hostname):
+                return None
+            return error
         if running:
             return "an earlier provisioning command is still running on the host"
         return None
@@ -725,9 +732,10 @@ class PlacementReconciler:
     async def _host_is_powered_off(self, hostname: str) -> bool:
         """True only when the BMC reports the host off; unknown reads as on.
 
-        A powered-off host runs no earlier setup, so the SSH probe is skipped
-        and provisioning powers it on. Redfish being off, a read error, or a
-        transitional state all fall back to the probe: unknown is never off.
+        Called only when the SSH probe failed. A host the BMC reports ``Off``
+        runs no earlier setup, so the failed probe does not block. Redfish
+        being unconfigured, a read error, a deadline, or a transitional state
+        all keep the SSH error: unknown is never read as off.
         """
         try:
             async with asyncio.timeout(_REMOTE_PROBE_TIMEOUT_SECONDS):

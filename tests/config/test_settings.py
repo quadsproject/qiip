@@ -817,6 +817,82 @@ class TestRedfishBmcCredentials:
         assert rs.bmc_credentials.labs == {}
         assert rs.bmc_credentials.hosts == {}
 
+    def test_keys_are_normalized(self) -> None:
+        rs = RedfishSettings.model_validate(
+            {
+                "bmc_username": "root",
+                "bmc_password": SecretStr("mypass1"),
+                "bmc_credentials": {
+                    "labs": {" RDU2.Scalelab ": {"username": "root", "password": "x"}},
+                    "hosts": {
+                        "A20-H10-000-R670.RDU2.SCALELAB.EXAMPLE.COM.": {
+                            "username": "root",
+                            "password": "y",
+                        }
+                    },
+                },
+            }
+        )
+        assert list(rs.bmc_credentials.labs) == ["rdu2.scalelab"]
+        assert list(rs.bmc_credentials.hosts) == [
+            "a20-h10-000-r670.rdu2.scalelab.example.com"
+        ]
+
+    @pytest.mark.parametrize(
+        ("key", "match"),
+        [
+            ("", "must not be empty"),
+            ("  ", "must not be empty"),
+            (".rdu2.scalelab", "starts with a dot"),
+            ("rdu2.scalelab.", "ends with a dot"),
+        ],
+        ids=["empty", "blank", "leading-dot", "trailing-dot"],
+    )
+    def test_lab_key_that_can_never_match_is_rejected(
+        self, key: str, match: str
+    ) -> None:
+        with pytest.raises(ValidationError, match=match):
+            RedfishSettings.model_validate(
+                {
+                    "bmc_username": "root",
+                    "bmc_password": SecretStr("mypass1"),
+                    "bmc_credentials": {
+                        "labs": {key: {"username": "root", "password": "x"}}
+                    },
+                }
+            )
+
+    def test_case_duplicate_keys_are_rejected(self) -> None:
+        with pytest.raises(
+            ValidationError, match="duplicates 'rdu2.scalelab' after normalization"
+        ):
+            RedfishSettings.model_validate(
+                {
+                    "bmc_username": "root",
+                    "bmc_password": SecretStr("mypass1"),
+                    "bmc_credentials": {
+                        "labs": {
+                            "rdu2.scalelab": {"username": "root", "password": "x"},
+                            "RDU2.SCALELAB": {"username": "root", "password": "y"},
+                        }
+                    },
+                }
+            )
+
+    def test_host_key_with_leading_dot_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="starts with a dot"):
+            RedfishSettings.model_validate(
+                {
+                    "bmc_username": "root",
+                    "bmc_password": SecretStr("mypass1"),
+                    "bmc_credentials": {
+                        "hosts": {
+                            ".a20.example.com": {"username": "root", "password": "x"}
+                        }
+                    },
+                }
+            )
+
 
 @pytest.mark.parametrize(
     "template",

@@ -192,6 +192,8 @@ class FakeProvisioner:
         # BMC power as placement reads it: an absent host is "unknown" (None).
         self.power_states: dict[str, str] = {}
         self.power_state_error: Exception | None = None
+        self.power_state_delay: float = 0.0
+        self.power_state_checks: list[str] = []
 
     async def try_reserve_host(self, hostname: str) -> HostLifecycleLease | None:
         return await self.lifecycle.try_acquire(hostname)
@@ -218,6 +220,9 @@ class FakeProvisioner:
         return node is not None, node
 
     async def power_state(self, hostname: str) -> str | None:
+        self.power_state_checks.append(hostname)
+        if self.power_state_delay:
+            await asyncio.sleep(self.power_state_delay)
         if self.power_state_error is not None:
             raise self.power_state_error
         return self.power_states.get(hostname)

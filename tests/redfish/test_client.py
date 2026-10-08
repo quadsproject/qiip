@@ -96,6 +96,27 @@ class TestBmcAuthResolver:
         )
         assert resolve("h.rdu2.scalelab.example.com") is narrow
 
+    def test_equal_length_identifiers_ignore_config_order(self) -> None:
+        """Both identifiers are nine characters and match the same host.
+
+        Selection must not depend on the order the labs are listed in, so
+        reversed configs return the same credential.
+        """
+        auth_a = httpx.BasicAuth("a", "a")
+        auth_b = httpx.BasicAuth("b", "b")
+        left = make_bmc_auth_resolver(
+            self.DEFAULT,
+            labs={"rdu3.labs": auth_a, "labs.perf": auth_b},
+            hosts={},
+        )
+        right = make_bmc_auth_resolver(
+            self.DEFAULT,
+            labs={"labs.perf": auth_b, "rdu3.labs": auth_a},
+            hosts={},
+        )
+        host = "node.rdu3.labs.perf.example.com"
+        assert left(host) is right(host)
+
 
 class TestGetPowerState:
     async def test_returns_on(self, httpx_mock: HTTPXMock) -> None:

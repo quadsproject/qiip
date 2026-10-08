@@ -1226,9 +1226,9 @@ class NodeProvisioner:
     async def power_state(self, hostname: str) -> str | None:
         """Current BMC power state, or ``None`` when Redfish is not configured.
 
-        Placement reads this before its SSH probe: a host the BMC reports
-        ``Off`` runs no earlier setup, so the probe is skipped and provisioning
-        powers it on. ``None`` keeps the probe-first behavior.
+        Placement reads this when its SSH probe fails: a host the BMC reports
+        ``Off`` runs no earlier setup, so the failed probe does not block and
+        provisioning powers it on. ``None`` keeps today's probe-first behavior.
         """
         if self._redfish_client is None:
             return None

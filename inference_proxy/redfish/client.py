@@ -66,21 +66,22 @@ def make_bmc_auth_resolver(
 
     Precedence: an exact full-FQDN override in ``hosts``, then a lab identifier
     in ``labs`` matched as a dot-bounded substring with the longest identifier
-    first (the most specific wins), then ``default``. Dot-padding both sides
-    keeps ``rdu2`` from matching ``rdu20``.
+    first (the most specific wins), then ``default``. Equal-length identifiers
+    are ordered lexicographically, so selection never depends on config order.
+    Dot-padding both sides keeps ``rdu2`` from matching ``rdu20``.
     """
     overrides = {host.rstrip(".").lower(): auth for host, auth in hosts.items()}
     identifiers = {ident.lower(): auth for ident, auth in labs.items()}
-    ordered = sorted(identifiers, key=len, reverse=True)
+    ordered = sorted(identifiers.items(), key=lambda item: (-len(item[0]), item[0]))
 
     def resolve(hostname: str) -> httpx.Auth:
         host = hostname.rstrip(".").lower()
         if host in overrides:
             return overrides[host]
         padded = f".{host}."
-        for ident in ordered:
+        for ident, auth in ordered:
             if f".{ident}." in padded:
-                return identifiers[ident]
+                return auth
         return default
 
     return resolve
