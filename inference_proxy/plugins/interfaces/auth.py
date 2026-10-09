@@ -16,11 +16,17 @@ _CALLBACK_CODE_PATTERN = re.compile(r"[a-z_]{1,32}")
 
 @dataclass(frozen=True, slots=True)
 class AuthIdentity:
-    """Verified identity claims returned by an SSO provider."""
+    """Verified identity claims returned by an SSO provider.
+
+    ``issuer`` is the OIDC ``iss`` of the provider that issued the subject
+    claim; user rows are keyed by (issuer, sub) so two providers can issue
+    the same opaque ``sub`` without colliding.
+    """
 
     sub: str
     email: str
     email_verified: bool
+    issuer: str
     name: str = ""
     picture: str = ""
 
@@ -47,7 +53,13 @@ class AuthPlugin(BasePlugin, ABC):
     code exchange) and returns a normalized :class:`AuthIdentity`; generic
     policy (email verification, hosted-domain allowlist, session, user
     upsert) stays in the auth router so it is provider-neutral.
+
+    ``label`` is the human-readable provider name shown on the sign-in
+    page (e.g. "Google Auth"); ``name`` stays the plugin's stable
+    identifier and is used in the ``/auth/login?provider=`` link.
     """
+
+    label: str = ""
 
     @abstractmethod
     def is_configured(self) -> bool:

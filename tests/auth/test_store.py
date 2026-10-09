@@ -1162,3 +1162,134 @@ class TestConfigTokenRaceRecovery:
             (user.id,),
         ).fetchone()[0]
         assert legacy == 1
+
+
+class TestIssuerScopedUsers:
+    """User rows are keyed by (issuer, sub) so a local provider can issue the
+    same opaque sub as Google without colliding (RFE #230)."""
+
+    _LOCAL_ISSUER = "http://oidc.localdomain/oidc"
+
+    def test_google_default_issuer(self, auth_store: AuthStore) -> None:
+        user = auth_store.upsert_google_user(**_GOOGLE)
+
+        assert user.issuer == store_module.GOOGLE_ISSUER
+
+    def test_same_sub_different_issuer_coexists(self, auth_store: AuthStore) -> None:
+        google = auth_store.upsert_google_user(**_GOOGLE)
+        local = auth_store.upsert_google_user(
+            google_sub="sub-123",
+            issuer=self._LOCAL_ISSUER,
+            email="alice@localdomain",
+            name="Alice",
+            picture="",
+        )
+
+        assert local.id != google.id
+        assert local.issuer == self._LOCAL_ISSUER
+        assert auth_store._conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 2
+
+    def test_same_issuer_sub_refreshes_email(self, auth_store: AuthStore) -> None:
+        first = auth_store.upsert_google_user(**_GOOGLE)
+        refreshed = auth_store.upsert_google_user(
+            google_sub="sub-123",
+            email="alice@example.com",
+            name="Alice Smith",
+            picture="",
+        )
+
+        assert refreshed.id == first.id
+        assert refreshed.name == "Alice Smith"
+        assert auth_store._conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
+
+    def test_email_rebind_moves_issuer(self, auth_store: AuthStore) -> None:
+        original = auth_store.upsert_google_user(**_GOOGLE)
+        migrated = auth_store.upsert_google_user(
+            google_sub="sub-local",
+            issuer=self._LOCAL_ISSUER,
+            email="alice@example.com",
+            name="Alice",
+            picture="",
+        )
+
+        assert migrated.id == original.id
+        assert migrated.issuer == self._LOCAL_ISSUER
+        assert migrated.google_sub == "sub-local"
+
+    def test_issuer_sub_is_unique(self, auth_store: AuthStore) -> None:
+        """The composite unique index rejects a second row for the same
+        (issuer, sub); the email-rebind fallback in upsert keeps the first
+        identity instead of raising."""
+        first = auth_store.upsert_google_user(
+            google_sub="sub-123",
+            issuer=self._LOCAL_ISSUER,
+            email="alice@localdomain",
+            name="Alice",
+            picture="",
+        )
+        second = auth_store.upsert_google_user(
+            google_sub="sub-123",
+            issuer=self._LOCAL_ISSUER,
+            email="bob@localdomain",
+            name="Bob",
+            picture="",
+        )
+
+        assert second.id == first.id
+        # (issuer, sub) is the identity key: re-login refreshes the mutable
+        # email/name claims on the same row.
+        assert second.email == "bob@localdomain"
+        assert second.name == "Bob"
+        # The composite index itself is authoritative.
+        with pytest.raises(sqlite3.IntegrityError):
+            auth_store._conn.execute(
+                "INSERT INTO users (google_sub, issuer, email, name, picture, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("sub-123", self._LOCAL_ISSUER, "carol@localdomain", "Carol", "", _utcnow().isoformat(), _utcnow().isoformat()),
+            )
+
+    def test_pre_existing_db_backfills_google_issuer(self, tmp_path: Path) -> None:
+        """A v2-era database (single-column UNIQUE(google_sub), no issuer)
+        migrates on open: the table is rebuilt with the composite key and
+        existing rows are backfilled with the Google issuer."""
+        db_path = tmp_path / "legacy-issuer.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE users (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                google_sub  TEXT    NOT NULL UNIQUE,
+                email       TEXT    NOT NULL UNIQUE,
+                name        TEXT    NOT NULL DEFAULT '',
+                picture     TEXT    NOT NULL DEFAULT '',
+                created_at  TEXT    NOT NULL,
+                updated_at  TEXT    NOT NULL
+            )
+            """
+        )
+        now = _utcnow().isoformat()
+        conn.execute(
+            "INSERT INTO users (google_sub, email, name, picture, created_at, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("sub-legacy", "legacy@example.com", "", "", now, now),
+        )
+        conn.commit()
+        conn.close()
+
+        store = AuthStore(db_path)
+        try:
+            user = store.get_user(1)
+            assert user is not None
+            assert user.issuer == store_module.GOOGLE_ISSUER
+            # The composite unique index replaced the single-column constraint:
+            # the same sub under a different issuer is now allowed.
+            local = store.upsert_google_user(
+                google_sub="sub-legacy",
+                issuer=self._LOCAL_ISSUER,
+                email="legacy@localdomain",
+                name="Local",
+                picture="",
+            )
+            assert local.id != user.id
+        finally:
+            store.close()

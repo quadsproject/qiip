@@ -1,0 +1,33 @@
+# QIIP toy OIDC provider (local test auth; opt-in).
+#
+# Deployed unit: /etc/systemd/system/qiip-oidc.service
+#
+# Layout assumed (matches the stage/dev deployment convention in
+# systemd/inference-proxy.service):
+#   /opt/inference-proxy/oidc-provider   this provider (vendored)
+#   /opt/inference-proxy/.env            OIDC_* overrides (optional)
+#
+# Not enabled by default: the local auth option is opt-in (see
+# docs/user-guide.md). Serve it behind nginx at /oidc/; qiip's
+# auth.internal_oidc plugin points at this provider via server_metadata_url.
+# Runs as root like the gateway (test-only software).
+
+[Unit]
+Description=QIIP toy OIDC provider (local test)
+Documentation=https://github.com/quadsproject/qiip
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/inference-proxy/oidc-provider
+EnvironmentFile=-/opt/inference-proxy/.env
+Environment=OIDC_USERS_FILE=/opt/inference-proxy/oidc-provider/users.txt
+Environment=OIDC_KEY_FILE=/opt/inference-proxy/oidc-provider/key.pem
+ExecStart=/opt/inference-proxy/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 8081
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
