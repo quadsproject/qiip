@@ -318,8 +318,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.plugin_manager = plugin_manager
             auth_plugins = plugin_manager.get_plugins_by_type(AuthPlugin)
             if len(auth_plugins) > 1:
-                logger.warning(
-                    "multiple auth plugins loaded; using the first",
+                logger.info(
+                    "multiple auth plugins loaded; provider-less /auth/login "
+                    "uses the first",
                     plugins=[plugin.name for plugin in auth_plugins],
                 )
             auth_plugin = auth_plugins[0] if auth_plugins else None

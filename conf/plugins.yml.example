@@ -22,3 +22,11 @@ plugins:
   config:
     auth.google:
       enabled: true
+    # Opt-in local OIDC provider (test/dev auth, or small local installs).
+    # Off by default: with this block absent/disabled the sign-in page shows
+    # only Local Admin and Google Auth. To enable, set enabled: true and the
+    # provider discovery URL, and configure INFERENCE_PROXY_OAUTH__CLIENT_ID
+    # / CLIENT_SECRET / REDIRECT_URI (the same triple Google uses).
+    auth.internal_oidc:
+      enabled: false
+      # server_metadata_url: https://<host>/oidc/.well-known/openid-configuration
