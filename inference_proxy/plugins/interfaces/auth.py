@@ -78,3 +78,16 @@ class AuthPlugin(BasePlugin, ABC):
         Raises ``AuthCallbackError`` with a short error code when the
         provider rejects or fails the exchange.
         """
+
+    def verify_local_credentials(
+        self, username: str, password: str, admin_username: str
+    ) -> str | None:
+        """Return the canonical local-account email for valid local credentials.
+
+        Providers that manage a local user list (e.g. ``auth.internal_oidc``)
+        check ``username``/``password`` against it; providers without a local
+        list (Google) return ``None``. Entries matching ``admin_username`` are
+        never local accounts: qiip's configured admin password wins, so the
+        auth router checks the admin credentials before calling this.
+        """
+        return None

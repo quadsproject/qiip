@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -202,3 +203,79 @@ class TestInternalOidcPluginFlow:
             await plugin.complete_login(_request())
 
         assert exc_info.value.code == "no_profile"
+
+
+class TestLocalUserList:
+    """Local Login validates the provider's plaintext user list (RFE #230)."""
+
+    @staticmethod
+    def _plugin(tmp_path: Path, users: str, **overrides: object) -> InternalOidcPlugin:
+        users_file = tmp_path / "users.txt"
+        users_file.write_text(users)
+        config: dict[str, object] = {
+            "enabled": True,
+            "server_metadata_url": _LOCAL_ISSUER + "/.well-known/openid-configuration",
+            "users_file": str(users_file),
+        }
+        config.update(overrides)
+        return InternalOidcPlugin(config)
+
+    def test_returns_email_for_bare_username(self, tmp_path: Path) -> None:
+        plugin = self._plugin(tmp_path, "alice:secret\n")
+
+        assert (
+            plugin.verify_local_credentials("alice", "secret", "admin")
+            == "alice@localdomain"
+        )
+
+    def test_respects_configured_domain(self, tmp_path: Path) -> None:
+        plugin = self._plugin(tmp_path, "alice:secret\n", domain="somelab.example.com")
+
+        assert (
+            plugin.verify_local_credentials("alice", "secret", "admin")
+            == "alice@somelab.example.com"
+        )
+
+    def test_full_email_entries_used_as_is(self, tmp_path: Path) -> None:
+        plugin = self._plugin(tmp_path, "carol@other.example.com:secret\n")
+
+        assert (
+            plugin.verify_local_credentials(
+                "carol@other.example.com", "secret", "admin"
+            )
+            == "carol@other.example.com"
+        )
+
+    def test_wrong_password_rejected(self, tmp_path: Path) -> None:
+        plugin = self._plugin(tmp_path, "alice:secret\n")
+
+        assert plugin.verify_local_credentials("alice", "wrong", "admin") is None
+
+    def test_admin_username_entry_is_ignored(self, tmp_path: Path) -> None:
+        plugin = self._plugin(tmp_path, "admin:file-password\nalice:secret\n")
+
+        # qiip's configured admin password wins; the file entry is ignored.
+        assert (
+            plugin.verify_local_credentials("admin", "file-password", "admin") is None
+        )
+        # And the file entry cannot shadow a real local user.
+        assert plugin.verify_local_credentials("alice", "secret", "admin") is not None
+
+    def test_returns_none_without_users_file(self) -> None:
+        plugin = InternalOidcPlugin({"enabled": True})
+
+        assert plugin.verify_local_credentials("alice", "secret", "admin") is None
+
+    def test_issuer_derived_from_metadata_url(self) -> None:
+        plugin = InternalOidcPlugin(
+            {
+                "enabled": True,
+                "server_metadata_url": _LOCAL_ISSUER
+                + "/.well-known/openid-configuration",
+            }
+        )
+        plugin._server_metadata_url = (
+            _LOCAL_ISSUER + "/.well-known/openid-configuration"
+        )
+
+        assert plugin.issuer == _LOCAL_ISSUER

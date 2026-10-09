@@ -30,3 +30,11 @@ plugins:
     auth.internal_oidc:
       enabled: false
       # server_metadata_url: https://<host>/oidc/.well-known/openid-configuration
+      # Local Login form (sign-in page replaces the Local Admin form with
+      # "Local Login" when this provider is enabled):
+      #   - the configured admin username/password is checked first and wins
+      #   - any other username/password is checked against users_file (same
+      #     format as the toy provider's users.txt; entries whose username is
+      #     the admin username are ignored)
+      # users_file: /etc/qiip/oidc-users.txt
+      # domain: localdomain   # suffix appended to bare usernames
