@@ -530,7 +530,7 @@ class TestLifespanRegistryIntegration:
             bmc_host_template="mgmt-{hostname}",
             system_id="1",
             hostname_policy=ANY,
-            auth=ANY,
+            auth_for=ANY,
             poll_timeout=60.0,
             poll_interval=5.0,
         )
