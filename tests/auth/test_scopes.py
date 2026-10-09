@@ -25,6 +25,7 @@ def _user(email: str = "alice@example.com", *, is_admin: bool = False) -> User:
     return User(
         id=1,
         google_sub="sub-1",
+        issuer="https://accounts.google.com",
         email=email,
         name="Alice",
         picture="",

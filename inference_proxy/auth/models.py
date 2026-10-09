@@ -14,18 +14,21 @@ from inference_proxy.models.admin import _HOSTNAME_RE
 
 
 class User(BaseModel):
-    """A Google-authenticated user row.
+    """An SSO-authenticated user row.
 
-    ``google_sub`` is the OIDC subject claim: the stable, per-account
-    identifier that never changes even when the user's email does.
-    ``is_admin`` is the admin-role designation granted by an existing
-    admin (HTTP Basic holder) through the admin page.
+    ``google_sub`` is the OIDC subject claim (stable per account, never
+    reissued); ``issuer`` is the provider that issued it. Together they form
+    the row's unique identity key, so Google and a local OIDC provider can
+    issue the same opaque ``sub`` without colliding. ``is_admin`` is the
+    admin-role designation granted by an existing admin (HTTP Basic holder)
+    through the admin page.
     """
 
     model_config = ConfigDict(frozen=True)
 
     id: int
     google_sub: str
+    issuer: str
     email: str
     name: str
     picture: str

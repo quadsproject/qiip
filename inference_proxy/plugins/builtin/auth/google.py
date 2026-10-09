@@ -30,6 +30,7 @@ from inference_proxy.plugins.manager import PluginManager
 logger = structlog.get_logger()
 
 _GOOGLE_DISCOVERY_URL = "https://accounts.google.com/.well-known/openid-configuration"
+_GOOGLE_ISSUER = "https://accounts.google.com"
 
 
 def build_google_oauth(settings: OAuthSettings) -> OAuth:
@@ -56,6 +57,7 @@ class GoogleAuthPlugin(AuthPlugin):
     version = "1.0.0"
     description = "Google OAuth (OpenID Connect) sign-in"
     author = "QUADS project"
+    label = "Google Auth"
 
     def __init__(self, config: dict[str, object] | None = None) -> None:
         super().__init__(config)
@@ -118,6 +120,7 @@ class GoogleAuthPlugin(AuthPlugin):
             sub=sub,
             email=email,
             email_verified=userinfo.get("email_verified") is True,
+            issuer=_GOOGLE_ISSUER,
             name=name if isinstance(name, str) else "",
             picture=picture if isinstance(picture, str) else "",
         )

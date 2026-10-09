@@ -35,14 +35,17 @@
                 </details>
                 {% endif %}
                 {% if oauth_enabled %}
-                <a class="btn signin-option" href="/auth/login">Google Auth</a>
+                <a class="btn signin-option" href="/auth/login?provider=google">Google Auth</a>
                 {% endif %}
-                {% if not sessions_available and not oauth_enabled %}
+                {% if local_auth_enabled %}
+                <a class="btn signin-option" href="/auth/login?provider=internal_oidc">Local Auth</a>
+                {% endif %}
+                {% if not sessions_available and not oauth_enabled and not local_auth_enabled %}
                 <p class="muted-status">Browser sign-in is not configured on this gateway. Use the
                     HTTP Basic admin credentials (from <code>INFERENCE_PROXY_ADMIN__*</code> in your
                     <code>.env</code>) with scripts and <code>curl</code>; configure
                     <code>auth.session_secret</code> for the local-admin form or the OAuth
-                    integration for Google sign-in.</p>
+                    integration for Google or the local OIDC provider sign-in.</p>
                 {% endif %}
             </div>
         </div>

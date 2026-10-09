@@ -55,10 +55,11 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Hardware-aware model recommendations** -- runs llmfit via SSH on a target host to produce ranked, runtime-normalized recommendations with fit levels, throughput, memory estimates, and typed GGUF sources; auto-installs the binary on first use
 - **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
 - **Admin authentication** -- HTTP Basic credentials or a signed-in admin-role session (local-admin form or Google OAuth) on all `/admin/*` endpoints; browser pages gate with a sign-in page instead of 401ing
-- **Fleet sign-in gate** -- anonymous visitors to the fleet dashboard get a sign-in page with two choices: **Local Admin** (a collapsible option that expands to an in-page username/password form establishing a signed session cookie — no browser Basic challenge popup; HTTP Basic still works for scripts and SSE) and **Google Auth** (same flow as the profile page)
+- **Fleet sign-in gate** -- anonymous visitors to the fleet dashboard get a sign-in page with two choices: **Local Admin** (a collapsible option that expands to an in-page username/password form establishing a signed session cookie — no browser Basic challenge popup; HTTP Basic still works for scripts and SSE) and **Google Auth** (same flow as the profile page). When the opt-in **Local Auth** option is enabled (see [User authentication](#user-authentication-google-oauth)) a third provider button appears
 - **Admin roles** -- the HTTP Basic admin user (bootstrap authority) can grant or revoke the admin role to Google-authenticated users on the token dashboard (`/dashboard/tokens`); role admins then reach the admin surface through their session and see admin-only servers
 - **Admin-only inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). At `/v1` they are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with an `admin_only` badge in the admin fleet view. Token usage from admin-only servers is tracked on the token summary pages exactly like any other node
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
+- **Local OAuth (opt-in)** -- a vendored toy OpenID Connect provider (`oidc-provider/`, test-only) plus the `auth.internal_oidc` plugin let a small install maintain a local user list instead of Google. Off by default; enabling it adds a **Local Auth** button next to Google Auth on the sign-in page. User rows are keyed by (provider issuer, subject) so Google and local accounts coexist. See [Local OIDC provider](#local-oidc-provider-opt-in)
 - **Self-service onboarding** -- signed-in normal users land on `/start`: one question per screen (name a token, pick a coding tool, pick models) ending in a short-lived `curl ... | bash` line that writes the tool's config; returning users see their single token and its models. See [Self-service onboarding](#self-service-onboarding-start)
 - **Usage leaderboard** -- signed-in users get a simple dashboard at `/leaderboard`: every non-admin user ranked by token usage (admin tokens and usage never appear), plus the viewer's own token manager (create replaces, delete revokes) and a per-harness config download with optional model and harness pickers (RFE #156)
 - **Per-token model scope** -- a token minted by the onboarding flow may only request the models chosen for it; other models are refused on `/v1` with `403 model_not_permitted`, and `/v1/models` lists only the token's models
@@ -93,6 +94,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Server launch](#server-launch)
   - [Admin authentication](#admin-authentication)
   - [User authentication (Google OAuth)](#user-authentication-google-oauth)
+  - [Local OIDC provider (opt-in)](#local-oidc-provider-opt-in)
   - [Self-service onboarding (`/start`)](#self-service-onboarding-start)
   - [etcd](#etcd)
   - [Routing](#routing)
@@ -393,8 +395,8 @@ Public endpoints:
 | `GET` | `/start` | Onboarding wizard and token home for signed-in normal users; anonymous visitors get the sign-in page, admins are redirected to `/dashboard` |
 | `GET` | `/leaderboard` | Leaderboard and token dashboard for signed-in normal users (admins are redirected to `/dashboard`): non-admin usage ranking, the viewer's own tokens (create/delete), and a per-harness config download |
 | `GET` | `/s/{id}` | Setup script for a live onboarding link. The id is the credential: 15 minute life, not logged. A dead link returns a script that explains and exits 1 |
-| `GET` | `/auth/login` | Start Google OAuth sign-in (302 to Google) |
-| `GET` | `/auth/callback` | Google redirect target; signs the session cookie |
+| `GET` | `/auth/login` | Start provider OAuth sign-in (302 to the provider; `?provider=google` or `?provider=internal_oidc` selects it, default is the first configured provider) |
+| `GET` | `/auth/callback` | Provider redirect target; signs the session cookie |
 | `GET` | `/auth/local-admin` | Local admin login page entry (302 to `/dashboard`; the sign-in form POSTs here) |
 | `POST` | `/auth/local-admin` | Sign in as the local admin via the form; sets the session cookie and 302s to `/dashboard` |
 | `POST` | `/auth/logout` | Clear the session cookie |
@@ -944,8 +946,9 @@ Enablement and guardrails:
   are validated all-or-none. `auth.session_secret` is then required, and
   `auth.enforce_api_tokens` is only allowed while OAuth is enabled (users need a
   way to mint tokens).
-- Google user accounts are keyed by their stable `sub` claim, so a renamed email
-  still resolves to the same account.
+- User accounts are keyed by (provider issuer, OIDC `sub`) claim, so a renamed
+  email still resolves to the same account and a local provider can issue the
+  same opaque `sub` as Google without colliding.
 - `/v1` behavior (AUTH-03): a valid `qiip_...` bearer token is always
   accepted and attributes usage. What happens without a usable token is set
   by `auth.enforce_api_tokens`. With it `false` (the default), an absent,
@@ -1011,6 +1014,52 @@ SSO whitelist (per-domain user filtering):
 - The whitelist governs the user identity, not anonymous traffic: while
   `enforce_api_tokens` is `false`, `/v1` still accepts requests without a
   token. Combine both flags to fully gate inference.
+
+### Local OIDC provider (opt-in)
+
+For developer testing and small installations, qiip ships a toy OpenID
+Connect provider (`oidc-provider/`, vendored) and the `auth.internal_oidc`
+plugin. It replaces `accounts.google.com` with a network-local provider whose
+users live in a plaintext `username:password` file. Test-only: in-memory
+codes/tokens, no refresh tokens or PKCE.
+
+Enabling it adds a third button, **Local Auth**, to the sign-in page; with it
+disabled (the default) the page is unchanged. Both providers can be enabled
+at once — user rows are keyed by (issuer, sub) so accounts never collide.
+
+1. Configure the plugin (default disabled) — `conf/plugins.yml`:
+
+   ```yaml
+   plugins:
+     config:
+       auth.internal_oidc:
+         enabled: true
+         server_metadata_url: https://<host>/oidc/.well-known/openid-configuration
+   ```
+
+   The `INFERENCE_PROXY_OAUTH__CLIENT_ID` / `CLIENT_SECRET` / `REDIRECT_URI`
+   triple (same as Google) supplies the OAuth client credentials.
+2. Start the provider and point nginx at `/oidc/` (git checkout:
+   `cp oidc-provider/users.txt.example oidc-provider/users.txt`, edit it,
+   then `systemctl enable --now qiip-oidc`; the included nginx template
+   already proxies `/oidc/`). Set `OIDC_DOMAIN` to your site domain (e.g.
+   `somelab.example.com`) so bare usernames sign in as
+   `user1@somelab.example.com`; full emails in `users.txt` are used
+   as-is. Keep `INFERENCE_PROXY_OAUTH__ALLOWED_DOMAINS` (or leave it empty)
+   in sync with that domain.
+3. Sign in: `/auth/login?provider=internal_oidc` → provider password form →
+   callback. The provider appends `OIDC_DOMAIN` to bare usernames; qiip's
+   `oauth.allowed_domains` (when set) must match that domain.
+
+RPM install layout: provider at `/usr/share/qiip/oidc-provider/`, the user
+list at `/etc/qiip/oidc-users.txt` (0600, `%config(noreplace)` — `sudo vi
+/etc/qiip/oidc-users.txt && sudo systemctl restart qiip-oidc` to change
+users), `OIDC_*` overrides in `/etc/qiip/oidc.env`, and the RSA signing key
+under `/var/lib/qiip/oidc/`. The `qiip-oidc.service` unit is installed but
+not enabled by default. The packaged nginx template already proxies
+`/oidc/`; upgrades never clobber an edited `/etc/nginx/nginx.conf`, so an
+existing install must add that `location /oidc/` block (copied from
+`/usr/share/qiip/nginx/nginx.conf`) once.
 
 Endpoint scoping (per-token pins and owner isolation):
 

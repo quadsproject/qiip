@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import secrets
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, MagicMock
 
@@ -423,3 +424,41 @@ class TestAdminBasicAuthentication:
         mock_provisioner.validate_endpoint.assert_not_called()
         mock_provisioner.try_reserve_host.assert_not_awaited()
         mock_provisioner.fire_background.assert_not_called()
+
+
+class TestLocalAuthSigninOption:
+    """The opt-in local OIDC provider adds a third sign-in button only when
+    the plugin is loaded and configured (RFE #230); the default page is
+    unchanged."""
+
+    async def test_hidden_when_plugin_not_loaded(
+        self,
+        app: FastAPI,
+    ) -> None:
+        response = await _request(app, "GET", "/dashboard")
+
+        assert response.status_code == 200
+        assert "Local Auth" not in response.text
+
+    async def test_shown_when_local_plugin_configured(
+        self,
+        app: FastAPI,
+    ) -> None:
+        from inference_proxy.plugins.builtin.auth.internal_oidc import (
+            InternalOidcPlugin,
+        )
+
+        plugin = InternalOidcPlugin()
+        plugin._client = object()  # configured client marker (is_configured)
+        app.state.plugin_manager = SimpleNamespace(
+            get_plugin=lambda name: plugin if name == "auth.internal_oidc" else None,
+            get_plugins_by_type=lambda plugin_type: [plugin],
+        )
+
+        response = await _request(app, "GET", "/dashboard")
+
+        assert response.status_code == 200
+        assert "Local Auth" in response.text
+        assert "/auth/login?provider=internal_oidc" in response.text
+        # The opt-in provider is not enabled here, so Google stays gated off.
+        assert "Google Auth" not in response.text

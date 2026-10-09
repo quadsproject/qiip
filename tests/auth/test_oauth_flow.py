@@ -33,6 +33,42 @@ class _RecordingPlugin(FakeAuthPlugin):
         return await super().start_login(request, redirect_uri)
 
 
+class _NamedPlugin(FakeAuthPlugin):
+    """FakeAuthPlugin with a chosen provider name and call counters."""
+
+    def __init__(
+        self,
+        name: str,
+        userinfo: dict[str, object] | None = None,
+        error: str | None = None,
+    ) -> None:
+        super().__init__(userinfo, error)
+        self.name = name
+        self.start_login_calls = 0
+        self.complete_login_calls = 0
+
+    async def start_login(self, request: Request, redirect_uri: str):  # type: ignore[no-untyped-def]
+        self.start_login_calls += 1
+        return await super().start_login(request, redirect_uri)
+
+    async def complete_login(self, request: Request):  # type: ignore[no-untyped-def]
+        self.complete_login_calls += 1
+        return await super().complete_login(request)
+
+
+class _PluginManager:
+    """Minimal PluginManager stand-in for provider selection tests."""
+
+    def __init__(self, plugins: list[FakeAuthPlugin]) -> None:
+        self.plugins = plugins
+
+    def get_plugins_by_type(self, plugin_type: object) -> list[FakeAuthPlugin]:
+        return self.plugins
+
+    def get_plugin(self, name: str) -> FakeAuthPlugin | None:
+        return next((p for p in self.plugins if p.name == name), None)
+
+
 def _client_with_auth(
     app: FastAPI,
     auth: object,
@@ -163,6 +199,66 @@ class TestOAuthLogin:
 
         assert response.status_code == 404
 
+    def test_callback_resolves_provider_that_started_flow(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+    ) -> None:
+        """Provider selection: /auth/login?provider=... records the choice in
+        the session and the provider-less callback lands on the same plugin,
+        so the user row is keyed by that provider's issuer."""
+        oauth = OAuthSettings(
+            client_id="my-qiip-client",
+            client_secret=SecretStr("s3cret"),
+            redirect_uri="https://proxy.example.com/auth/callback",
+        )
+        settings = test_settings.model_copy(update={"oauth": oauth})
+        app.dependency_overrides[get_settings] = lambda: settings
+
+        google = _NamedPlugin(
+            "google",
+            userinfo={
+                "sub": "g-1",
+                "email": "alice@example.com",
+                "email_verified": True,
+                "iss": "https://accounts.google.com",
+            },
+        )
+        local = _NamedPlugin(
+            "internal_oidc",
+            userinfo={
+                "sub": "l-1",
+                "email": "carol@localdomain",
+                "email_verified": True,
+                "iss": "http://oidc.localdomain/oidc",
+            },
+        )
+        client = TestClient(app)
+        # Lifespan rebuilt the plugin manager; install the scripted one after.
+        app.state.plugin_manager = _PluginManager([google, local])
+
+        login = client.get(
+            "/auth/login?provider=internal_oidc", follow_redirects=False
+        )
+        assert login.status_code == 302
+        assert local.start_login_calls == 1
+        assert google.start_login_calls == 0
+
+        callback = client.get(
+            "/auth/callback?code=code&state=state", follow_redirects=False
+        )
+        assert callback.status_code == 302
+        assert callback.headers["location"] == "/start"
+        assert local.complete_login_calls == 1
+        assert google.complete_login_calls == 0
+
+        store: AuthStore = app.state.auth_store
+        users = store.list_users_with_stats()
+        assert [user.email for user in users] == ["carol@localdomain"]
+        created = store.get_user(users[0].id)
+        assert created is not None
+        assert created.issuer == "http://oidc.localdomain/oidc"
+
 
 class TestOAuthCallback:
     def test_callback_empty_identity_rejected(
@@ -176,7 +272,9 @@ class TestOAuthCallback:
 
         class EmptyIdentityPlugin(FakeAuthPlugin):
             async def complete_login(self, request: object) -> AuthIdentity:
-                return AuthIdentity(sub="", email="", email_verified=True)
+                return AuthIdentity(
+                    sub="", email="", email_verified=True, issuer=""
+                )
 
         app.dependency_overrides[get_auth_plugin] = lambda: EmptyIdentityPlugin()
         client = TestClient(app)

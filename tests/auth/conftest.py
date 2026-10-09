@@ -73,10 +73,12 @@ class FakeAuthPlugin(AuthPlugin):
             raise AuthCallbackError("no_profile")
         name = info.get("name")
         picture = info.get("picture")
+        issuer = info.get("iss", "https://accounts.google.com")
         return AuthIdentity(
             sub=sub,
             email=email,
             email_verified=info.get("email_verified") is True,
+            issuer=issuer if isinstance(issuer, str) else "https://accounts.google.com",
             name=name if isinstance(name, str) else "",
             picture=picture if isinstance(picture, str) else "",
         )

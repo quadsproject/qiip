@@ -45,10 +45,15 @@ from inference_proxy.auth.models import (
 
 logger = structlog.get_logger()
 
+# The OIDC issuer of Google accounts. User rows created before the issuer
+# column existed are backfilled with this value (see _migrate).
+GOOGLE_ISSUER = "https://accounts.google.com"
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    google_sub  TEXT    NOT NULL UNIQUE,
+    google_sub  TEXT    NOT NULL,
+    issuer      TEXT    NOT NULL DEFAULT 'https://accounts.google.com',
     email       TEXT    NOT NULL UNIQUE,
     name        TEXT    NOT NULL DEFAULT '',
     picture     TEXT    NOT NULL DEFAULT '',
@@ -264,6 +269,38 @@ class AuthStore:
             self._conn.execute(
                 "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"
             )
+        if "issuer" not in user_columns:
+            # Rebuild users so the pre-existing single-column UNIQUE(google_sub)
+            # is replaced by the (issuer, google_sub) key (SQLite cannot drop
+            # an inline UNIQUE in place). Every existing row was created by the
+            # Google provider, so they are backfilled with the Google issuer.
+            self._conn.executescript(
+                f"""
+                ALTER TABLE users RENAME TO users_legacy_issuer;
+                CREATE TABLE users (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    google_sub  TEXT    NOT NULL,
+                    issuer      TEXT    NOT NULL DEFAULT '{GOOGLE_ISSUER}',
+                    email       TEXT    NOT NULL UNIQUE,
+                    name        TEXT    NOT NULL DEFAULT '',
+                    picture     TEXT    NOT NULL DEFAULT '',
+                    is_admin    INTEGER NOT NULL DEFAULT 0,
+                    created_at  TEXT    NOT NULL,
+                    updated_at  TEXT    NOT NULL
+                );
+                INSERT INTO users
+                    (id, google_sub, issuer, email, name, picture, is_admin,
+                     created_at, updated_at)
+                SELECT id, google_sub, '{GOOGLE_ISSUER}', email,
+                       name, picture, is_admin, created_at, updated_at
+                  FROM users_legacy_issuer;
+                DROP TABLE users_legacy_issuer;
+                """
+            )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_issuer_sub "
+            "ON users(issuer, google_sub)"
+        )
         if "purpose" not in token_columns:
             self._conn.execute("ALTER TABLE tokens ADD COLUMN purpose TEXT")
         if "model_scope" not in token_columns:
@@ -302,52 +339,59 @@ class AuthStore:
         self,
         *,
         google_sub: str,
+        issuer: str = GOOGLE_ISSUER,
         email: str,
         name: str,
         picture: str,
     ) -> User:
-        """Create or refresh a user row keyed by the OIDC ``sub`` claim.
+        """Create or refresh a user row keyed by (issuer, ``sub`` claim).
 
-        Falls back to the email-unique index when a Google account appears
-        under a new ``sub`` (rare account-migration case): the existing row
-        is rebound to the new subject.
+        Rows are keyed by the OIDC (issuer, sub) pair so two providers can
+        issue the same opaque ``sub`` without colliding. Falls back to the
+        email-unique index when an account appears under a new issuer or
+        ``sub`` (rare account-migration case): the existing row is rebound
+        to the new identity.
         """
         now = _iso(_utcnow())
         with self._lock:
             existing = self._conn.execute(
-                "SELECT id FROM users WHERE google_sub = ?", (google_sub,)
+                "SELECT id FROM users WHERE issuer = ? AND google_sub = ?",
+                (issuer, google_sub),
             ).fetchone()
             if existing is None:
                 try:
                     self._conn.execute(
                         """
                         INSERT INTO users
-                            (google_sub, email, name, picture, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                            (google_sub, issuer, email, name, picture,
+                             created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
                         """,
-                        (google_sub, email, name, picture, now, now),
+                        (google_sub, issuer, email, name, picture, now, now),
                     )
                 except sqlite3.IntegrityError:
                     self._conn.execute(
                         """
                         UPDATE users
-                           SET google_sub = ?, name = ?, picture = ?, updated_at = ?
+                           SET google_sub = ?, issuer = ?, name = ?,
+                               picture = ?, updated_at = ?
                          WHERE email = ?
                         """,
-                        (google_sub, name, picture, now, email),
+                        (google_sub, issuer, name, picture, now, email),
                     )
             else:
                 self._conn.execute(
                     """
                     UPDATE users
                        SET email = ?, name = ?, picture = ?, updated_at = ?
-                     WHERE google_sub = ?
+                     WHERE issuer = ? AND google_sub = ?
                     """,
-                    (email, name, picture, now, google_sub),
+                    (email, name, picture, now, issuer, google_sub),
                 )
             self._conn.commit()
             row = self._conn.execute(
-                "SELECT * FROM users WHERE google_sub = ?", (google_sub,)
+                "SELECT * FROM users WHERE issuer = ? AND google_sub = ?",
+                (issuer, google_sub),
             ).fetchone()
             user = self._user_from_row(row)
             if user is None:  # pragma: no cover - defensive
@@ -1209,6 +1253,7 @@ class AuthStore:
         return User(
             id=row["id"],
             google_sub=row["google_sub"],
+            issuer=row["issuer"],
             email=row["email"],
             name=row["name"],
             picture=row["picture"],

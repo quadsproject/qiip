@@ -288,3 +288,91 @@ class TestGetApiAuthAdminBypass:
                 auth_store,
                 FakeAllowlist(allowed=False),
             )
+
+
+class _GoogleAuthPlugin(FakeAuthPlugin):
+    """Named fake so provider selection can be exercised."""
+
+    name = "google"
+
+
+class _LocalOidcPlugin(FakeAuthPlugin):
+    """Named fake so provider selection can be exercised."""
+
+    name = "internal_oidc"
+
+
+class _FakePluginManager:
+    """Minimal PluginManager stand-in (get_plugins_by_type + get_plugin)."""
+
+    def __init__(self, plugins: list[FakeAuthPlugin]) -> None:
+        self.plugins = plugins
+
+    def get_plugins_by_type(self, plugin_type: object) -> list[FakeAuthPlugin]:
+        return self.plugins
+
+    def get_plugin(self, name: str) -> FakeAuthPlugin | None:
+        return next((p for p in self.plugins if p.name == name), None)
+
+
+def _request_with_manager(plugins: list[FakeAuthPlugin]) -> MagicMock:
+    app = FastAPI()
+    app.state.plugin_manager = _FakePluginManager(plugins)
+    request = MagicMock()
+    request.app = app
+    request.session = {}
+    return request
+
+
+class TestGetAuthPluginProviderSelection:
+    def test_404_when_no_provider_configured(self) -> None:
+        request = _request_with_manager([])
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_auth_plugin(request)
+        assert exc_info.value.status_code == 404
+
+    def test_unconfigured_plugin_is_skipped(self) -> None:
+        disabled = _LocalOidcPlugin(error="unconfigured")
+        request = _request_with_manager([disabled])
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_auth_plugin(request, provider="internal_oidc")
+        assert exc_info.value.status_code == 404
+
+    def test_selects_provider_by_name(self) -> None:
+        google = _GoogleAuthPlugin()
+        local = _LocalOidcPlugin()
+        request = _request_with_manager([google, local])
+
+        assert get_auth_plugin(request, provider="internal_oidc") is local
+        assert get_auth_plugin(request, provider="google") is google
+
+    def test_unknown_provider_is_404(self) -> None:
+        request = _request_with_manager([_GoogleAuthPlugin()])
+
+        with pytest.raises(HTTPException) as exc_info:
+            get_auth_plugin(request, provider="internal_oidc")
+        assert exc_info.value.status_code == 404
+
+    def test_session_marker_selects_provider(self) -> None:
+        google = _GoogleAuthPlugin()
+        local = _LocalOidcPlugin()
+        request = _request_with_manager([google, local])
+        request.session["auth_provider"] = "internal_oidc"
+
+        assert get_auth_plugin(request) is local
+
+    def test_stale_marker_falls_back_to_first(self) -> None:
+        google = _GoogleAuthPlugin()
+        request = _request_with_manager([google])
+        request.session["auth_provider"] = "internal_oidc"
+
+        assert get_auth_plugin(request) is google
+
+    def test_without_marker_uses_first_configured(self) -> None:
+        google = _GoogleAuthPlugin()
+        local = _LocalOidcPlugin()
+        request = _request_with_manager([google, local])
+
+        assert get_auth_plugin(request) is google

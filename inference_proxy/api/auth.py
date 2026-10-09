@@ -33,6 +33,7 @@ from inference_proxy.auth.allowlist import (
     enforce_allowlist,
 )
 from inference_proxy.auth.dependencies import (
+    AUTH_PROVIDER_SESSION_KEY,
     get_auth_plugin,
     get_auth_store,
     get_sso_allowlist,
@@ -183,6 +184,10 @@ async def oauth_login(
         raise HTTPException(
             status_code=503, detail="OAuth redirect URI is not configured"
         )
+    # Record which provider started the flow so the provider-less callback
+    # (redirect_uri carries no hint) resolves the same plugin that issued
+    # the authorization request.
+    request.session[AUTH_PROVIDER_SESSION_KEY] = auth.name
     return await auth.start_login(request, redirect_uri)
 
 
@@ -236,11 +241,14 @@ async def oauth_callback(
             logger.warning("oauth callback user not whitelisted", email=email)
             return _error_redirect("not_whitelisted")
 
-    # ponytail: google is the only provider; scope the stored subject by
-    # issuer when a second auth provider lands (store keyed by google_sub).
+    # User rows are keyed by (issuer, sub) so Google and a local OIDC
+    # provider can issue the same opaque sub without colliding. The email
+    # unique index still rebinds an account that moves providers or changes
+    # its sub (see AuthStore.upsert_google_user).
     user = await asyncio.to_thread(
         store.upsert_google_user,
         google_sub=identity.sub,
+        issuer=identity.issuer,
         email=email,
         name=identity.name,
         picture=identity.picture,

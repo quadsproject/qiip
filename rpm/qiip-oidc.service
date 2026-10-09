@@ -1,0 +1,32 @@
+# QIIP toy OIDC provider (local test auth; opt-in; RPM install).
+#
+# RPM layout:
+#   /usr/share/qiip/oidc-provider   provider app (read-only)
+#   /etc/qiip/oidc-users.txt        user list (0600, %config noreplace)
+#   /etc/qiip/oidc.env              OIDC_* overrides (0600)
+#   /var/lib/qiip/oidc/key.pem      RSA signing key (created on first start)
+#
+# Not enabled by default: the local auth option is opt-in (see
+# docs/user-guide.md). nginx serves it at /oidc/; qiip's auth.internal_oidc
+# plugin points at this provider via server_metadata_url. Runs as root like
+# the gateway (test-only software).
+
+[Unit]
+Description=QIIP toy OIDC provider (local test)
+Documentation=https://github.com/quadsproject/qiip
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/usr/share/qiip/oidc-provider
+EnvironmentFile=-/etc/qiip/oidc.env
+Environment=OIDC_USERS_FILE=/etc/qiip/oidc-users.txt
+Environment=OIDC_KEY_FILE=/var/lib/qiip/oidc/key.pem
+ExecStart=/usr/bin/python3 -m uvicorn app:app --host 127.0.0.1 --port 8081
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
