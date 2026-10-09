@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.4 (2026-10-09)
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`4f2d2ef`](https://github.com/quadsproject/qiip/commit/4f2d2efb0abfee4d0d36bcdbd04efb0f9a941047))
+
+### Features
+
+- Auto-rediscover self-setup model drift in health cycle
+  ([`6c66d25`](https://github.com/quadsproject/qiip/commit/6c66d25813fec78dc7da675fa943f8489f9392b7))
+
+
 ## v0.2.0-dev.3 (2026-10-08)
 
 ### Chores
