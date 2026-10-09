@@ -1102,6 +1102,132 @@ async def test_a_first_launch_is_blocked_and_its_share_goes_to_another_host(
 
 
 @pytest.mark.asyncio
+async def test_a_powered_off_host_is_not_blocked_when_the_ssh_probe_fails() -> None:
+    """Off means no earlier setup can run: the failed probe does not block.
+
+    The probe runs first (power is read only on a failed probe), then the BMC
+    read shows Off and the launch proceeds.
+    """
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.power_states["l4-00"] = "Off"
+    rig.provisioner.remote_check_errors["l4-00"] = TimeoutError("ssh probe timed out")
+    rig.provisioner.remote_processes["l4-00"] = list(_SETUP_RUNNING)
+    await rig.run()
+    assert "l4-00" in _placed(rig)
+    assert "l4-00" not in _skips(rig)
+    # The probe runs for the readiness pass and again under the launch lease;
+    # power is read only on those failed probes.
+    assert rig.provisioner.remote_checks == ["l4-00", "l4-00"]
+    assert rig.provisioner.power_state_checks == ["l4-00", "l4-00"]
+
+
+@pytest.mark.asyncio
+async def test_a_powered_on_host_still_runs_the_ssh_probe() -> None:
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.power_states["l4-00"] = "On"
+    rig.provisioner.remote_processes["l4-00"] = list(_SETUP_RUNNING)
+    await rig.run()
+    assert rig.provisioner.calls == []
+    assert "l4-00" in rig.provisioner.remote_checks
+    assert rig.provisioner.power_state_checks == [], "a reachable host is not read"
+    assert _skips(rig)["l4-00"] == (
+        "blocked: an earlier provisioning command is still running on the host"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_reachable_host_is_never_asked_about_power() -> None:
+    """SSH succeeds: the BMC is not touched for the launch decision."""
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.power_state_error = ConnectionError("bmc unreachable")
+    rig.provisioner.remote_processes["l4-00"] = list(_SETUP_RUNNING)
+    await rig.run()
+    assert rig.provisioner.power_state_checks == []
+    assert _skips(rig)["l4-00"] == (
+        "blocked: an earlier provisioning command is still running on the host"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_power_state_falls_back_to_the_ssh_probe() -> None:
+    """Unknown is never read as off: a failed BMC read keeps the SSH error."""
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.remote_check_errors["l4-00"] = TimeoutError("ssh probe timed out")
+    rig.provisioner.power_state_error = ConnectionError("bmc unreachable")
+    await rig.run()
+    assert rig.provisioner.power_state_checks == ["l4-00"]
+    assert _skips(rig)["l4-00"].startswith("blocked: ")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["PoweringOn", "PoweringOff"])
+async def test_a_transitional_power_state_keeps_the_probe_error(state: str) -> None:
+    """Transitional is not off: the failed probe still blocks the launch."""
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.remote_check_errors["l4-00"] = TimeoutError("ssh probe timed out")
+    rig.provisioner.power_states["l4-00"] = state
+    await rig.run()
+    assert "l4-00" in rig.provisioner.remote_checks
+    assert _skips(rig)["l4-00"].startswith("blocked: ")
+
+
+@pytest.mark.asyncio
+async def test_a_power_read_past_the_deadline_keeps_the_probe_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A BMC read that hangs past the probe deadline is not read as off."""
+    monkeypatch.setattr(
+        "inference_proxy.placement.reconciler._REMOTE_PROBE_TIMEOUT_SECONDS", 0.01
+    )
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.remote_check_errors["l4-00"] = TimeoutError("ssh probe timed out")
+    rig.provisioner.power_states["l4-00"] = "Off"  # would be off if the read landed
+    rig.provisioner.power_state_delay = 0.2
+    await rig.run()
+    assert _skips(rig)["l4-00"].startswith("blocked: ")
+    assert "l4-00" in rig.provisioner.remote_checks
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_failed_claim_launches_a_host_the_bmc_reports_off() -> None:
+    """Prod case from #224: a failed claim blocked by an SSH TimeoutError.
+
+    The BMC reports Off, so the failed probe does not block the retry: the
+    launch gate starts one more attempt and the blocked error is replaced.
+    """
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    now = rig.clock()
+    await ClaimStore(rig.etcd).create(
+        PlacementClaim(
+            claim_id="a" * 32,
+            hostname="l4-00",
+            profile_id="qwen3.8-27b-24g",
+            profile_version=1,
+            gpu_class="l4",
+            state=ClaimState.FAILED,
+            attempts=1,
+            holder="a" * 32,
+            created_at=now,
+            updated_at=now,
+            heartbeat_at=now,
+            retry_at=now - timedelta(seconds=1),
+            last_error=(
+                "blocked: could not verify that no earlier provisioning is "
+                "running: TimeoutError"
+            ),
+        )
+    )
+    rig.provisioner.power_states["l4-00"] = "Off"
+    rig.provisioner.remote_check_errors["l4-00"] = TimeoutError("ssh probe timed out")
+    rig.provisioner.failures["l4-00"] = ["retry failed"]
+    await rig.run()
+    retried = (await rig.claims())["l4-00"]
+    assert (retried.state, retried.attempts) == (ClaimState.FAILED, 2)
+    assert retried.last_error == "retry failed"
+    assert len(rig.provisioner.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_deferred_host_that_leaves_the_inventory_is_forgotten() -> None:
     rig = Rig(_l4s(1), retry_backoff_seconds=60)
     rig.provisioner.remote_processes["l4-00"] = list(_SETUP_RUNNING)

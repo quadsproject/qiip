@@ -1236,6 +1236,17 @@ class NodeProvisioner:
                 lease.release()
             logger.info("startup_reconcile_finished", hostname=hostname)
 
+    async def power_state(self, hostname: str) -> str | None:
+        """Current BMC power state, or ``None`` when Redfish is not configured.
+
+        Placement reads this when its SSH probe fails: a host the BMC reports
+        ``Off`` runs no earlier setup, so the failed probe does not block and
+        provisioning powers it on. ``None`` keeps today's probe-first behavior.
+        """
+        if self._redfish_client is None:
+            return None
+        return await self._redfish_client.get_power_state(hostname)
+
     async def _power_on_if_needed(self, hostname: str) -> None:
         """Power on the host via Redfish if configured (D-01, D-06, D-07).
 

@@ -953,6 +953,80 @@ class AuthSettings(BaseModel):
         return value
 
 
+class BmcCredential(BaseModel):
+    """A single BMC username/password pair."""
+
+    username: str
+    password: SecretStr
+
+
+class BmcCredentials(BaseModel):
+    """Per-lab and per-host BMC credential overrides.
+
+    ``labs`` maps a hostname identifier, a dotted FQDN segment such as
+    ``rdu2.scalelab``, to its credentials. ``hosts`` maps a full node FQDN (not
+    the BMC hostname that ``bmc_host_template`` renders, such as ``mgmt-...``)
+    to an exact override that wins over any lab. A hostname matching nothing
+    here falls back to ``redfish.bmc_username`` / ``bmc_password``.
+    """
+
+    labs: dict[str, BmcCredential] = Field(
+        default_factory=dict,
+        description="Hostname identifier -> BMC credentials.",
+    )
+    hosts: dict[str, BmcCredential] = Field(
+        default_factory=dict,
+        description="Full node FQDN -> BMC credentials (highest precedence).",
+    )
+
+    @model_validator(mode="after")
+    def keys_are_normalized(self) -> Self:
+        """Normalize keys and reject keys that can never match a hostname.
+
+        Matching is done against a lowercased hostname on dot boundaries, so
+        surrounding whitespace and case are folded here. A key that strips to
+        empty, starts with a dot, or (for ``labs``) ends with one can never
+        match, and keys that differ only by case or whitespace silently shadow
+        the last one; all of these are startup errors instead of quiet misses.
+        """
+        self.labs = _normalized_keys(self.labs, section="labs", trailing_dot=False)
+        self.hosts = _normalized_keys(self.hosts, section="hosts", trailing_dot=True)
+        return self
+
+
+def _normalized_keys(
+    values: dict[str, BmcCredential],
+    *,
+    section: str,
+    trailing_dot: bool,
+) -> dict[str, BmcCredential]:
+    normalized: dict[str, BmcCredential] = {}
+    for key, credential in values.items():
+        cleaned = key.strip()
+        if not cleaned:
+            raise ValueError(
+                f"redfish.bmc_credentials.{section} keys must not be empty"
+            )
+        if cleaned.startswith("."):
+            raise ValueError(
+                f"redfish.bmc_credentials.{section} key {key!r} starts with a dot "
+                "and can never match a hostname"
+            )
+        if not trailing_dot and cleaned.endswith("."):
+            raise ValueError(
+                f"redfish.bmc_credentials.{section} key {key!r} ends with a dot "
+                "and can never match a hostname"
+            )
+        folded = cleaned.lower().rstrip(".") if trailing_dot else cleaned.lower()
+        if folded in normalized:
+            raise ValueError(
+                f"redfish.bmc_credentials.{section} key {key!r} duplicates "
+                f"{folded!r} after normalization"
+            )
+        normalized[folded] = credential
+    return normalized
+
+
 class RedfishSettings(BaseModel):
     """Redfish BMC configuration.
 
@@ -969,6 +1043,7 @@ class RedfishSettings(BaseModel):
     power_poll_timeout: float = 60.0
     power_poll_interval: float = 5.0
     verify_ssl: bool = False  # D-05: always False for self-signed BMC certs
+    bmc_credentials: BmcCredentials = Field(default_factory=BmcCredentials)
 
     @field_validator("bmc_host_template")
     @classmethod
@@ -1011,6 +1086,17 @@ class RedfishSettings(BaseModel):
         if self.bmc_username is not None and self.bmc_password is None:
             raise ValueError(
                 "redfish.bmc_password must be configured with bmc_username"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def credentials_require_default(self) -> Self:
+        """Per-lab/host overrides need the default pair they fall back to."""
+        overrides = self.bmc_credentials.labs or self.bmc_credentials.hosts
+        if overrides and self.bmc_username is None:
+            raise ValueError(
+                "redfish.bmc_credentials requires bmc_username and bmc_password, "
+                "the default used when no host or lab matches"
             )
         return self
 
