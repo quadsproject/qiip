@@ -64,7 +64,9 @@ def _request() -> MagicMock:
 
 
 def _configured_settings(
-    test_settings: Settings, *, metadata_url: str = _LOCAL_ISSUER + "/.well-known/openid-configuration"
+    test_settings: Settings,
+    *,
+    metadata_url: str = _LOCAL_ISSUER + "/.well-known/openid-configuration",
 ) -> Settings:
     oauth = OAuthSettings(
         client_id="my-qiip-client",
@@ -81,7 +83,9 @@ def _configured_settings(
             }
         }
     )
-    return test_settings.model_copy(deep=True, update={"oauth": oauth, "plugins": plugins})
+    return test_settings.model_copy(
+        deep=True, update={"oauth": oauth, "plugins": plugins}
+    )
 
 
 def _plugin(settings: Settings) -> InternalOidcPlugin:
@@ -109,9 +113,7 @@ class TestInternalOidcPluginInitialize:
 
         assert manager.get_plugin("auth.internal_oidc") is None
 
-    def test_refuses_when_metadata_url_missing(
-        self, test_settings: Settings
-    ) -> None:
+    def test_refuses_when_metadata_url_missing(self, test_settings: Settings) -> None:
         oauth = OAuthSettings(
             client_id="my-qiip-client",
             client_secret=SecretStr("s3cret"),
@@ -131,7 +133,8 @@ class TestInternalOidcPluginInitialize:
         plugin = InternalOidcPlugin(
             {
                 "enabled": True,
-                "server_metadata_url": _LOCAL_ISSUER + "/.well-known/openid-configuration",
+                "server_metadata_url": _LOCAL_ISSUER
+                + "/.well-known/openid-configuration",
             }
         )
 

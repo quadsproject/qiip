@@ -1245,7 +1245,15 @@ class TestIssuerScopedUsers:
             auth_store._conn.execute(
                 "INSERT INTO users (google_sub, issuer, email, name, picture, "
                 "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                ("sub-123", self._LOCAL_ISSUER, "carol@localdomain", "Carol", "", _utcnow().isoformat(), _utcnow().isoformat()),
+                (
+                    "sub-123",
+                    self._LOCAL_ISSUER,
+                    "carol@localdomain",
+                    "Carol",
+                    "",
+                    _utcnow().isoformat(),
+                    _utcnow().isoformat(),
+                ),
             )
 
     def test_pre_existing_db_backfills_google_issuer(self, tmp_path: Path) -> None:
