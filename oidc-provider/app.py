@@ -28,7 +28,9 @@ from fastapi.responses import (
     Response,
 )
 
-BASE = os.environ.get("OIDC_BASE_URL", "https://your-qiip-host.localdomain/oidc").rstrip("/")
+BASE = os.environ.get(
+    "OIDC_BASE_URL", "https://your-qiip-host.localdomain/oidc"
+).rstrip("/")
 PREFIX = os.environ.get("OIDC_BASE_PATH", "/oidc")
 CLIENT_ID = os.environ.get("OIDC_CLIENT_ID", "my-qiip-client")
 CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET", "change-me")
@@ -48,11 +50,10 @@ TOKEN_TTL = 600
 # RSA signing key (persisted; regenerated if the file is missing)
 # ---------------------------------------------------------------------------
 
+
 def _load_or_create_key() -> tuple[object, str]:
     if KEY_FILE.exists():
-        key = serialization.load_pem_private_key(
-            KEY_FILE.read_bytes(), password=None
-        )
+        key = serialization.load_pem_private_key(KEY_FILE.read_bytes(), password=None)
         return key, "local"
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -73,8 +74,13 @@ _PRIVATE_KEY, KID = _load_or_create_key()
 def _jwk() -> dict:
     pub = _PRIVATE_KEY.public_key()
     numbers = pub.public_numbers()
+
     def b64url(n: int) -> str:
-        return base64.urlsafe_b64encode(n.to_bytes((n.bit_length() + 7) // 8, "big")).rstrip(b"=").decode()
+        return (
+            base64.urlsafe_b64encode(n.to_bytes((n.bit_length() + 7) // 8, "big"))
+            .rstrip(b"=")
+            .decode()
+        )
 
     return {
         "kty": "RSA",
@@ -87,14 +93,13 @@ def _jwk() -> dict:
 
 
 def _sign_id_token(claims: dict) -> str:
-    return jwt.encode(
-        claims, _PRIVATE_KEY, algorithm="RS256", headers={"kid": KID}
-    )
+    return jwt.encode(claims, _PRIVATE_KEY, algorithm="RS256", headers={"kid": KID})
 
 
 # ---------------------------------------------------------------------------
 # User store: USERS_FILE, one "username:password" per line (# comments allowed)
 # ---------------------------------------------------------------------------
+
 
 def load_users() -> dict[str, str]:
     users: dict[str, str] = {}
@@ -127,8 +132,10 @@ def user_email(name: str) -> str:
 
 
 # In-memory state (single worker).
-_codes: dict[str, dict] = {}       # code -> {username, client_id, redirect_uri, nonce, expires}
-_tokens: dict[str, dict] = {}      # access_token -> {username, expires}
+_codes: dict[
+    str, dict
+] = {}  # code -> {username, client_id, redirect_uri, nonce, expires}
+_tokens: dict[str, dict] = {}  # access_token -> {username, expires}
 
 app = FastAPI(title="qiip toy oidc", openapi_url=None, docs_url=None, redoc_url=None)
 
@@ -165,7 +172,9 @@ def jwks() -> JSONResponse:
 
 @app.get(f"{PREFIX}/qiip.svg")
 def qiip_mark() -> Response:
-    return FileResponse(Path(__file__).with_name("qiip.svg"), media_type="image/svg+xml")
+    return FileResponse(
+        Path(__file__).with_name("qiip.svg"), media_type="image/svg+xml"
+    )
 
 
 # Styling mirrors qiip's dashboard.css: same :root/[data-theme="dark"] token
@@ -409,16 +418,32 @@ def authorize(
     nonce: str = "",
 ) -> Response:
     if response_type != "code":
-        return RedirectResponse(_oidc_error(redirect_uri, state, "unsupported_response_type"), status_code=302)
+        return RedirectResponse(
+            _oidc_error(redirect_uri, state, "unsupported_response_type"),
+            status_code=302,
+        )
     if client_id != CLIENT_ID:
-        return RedirectResponse(_oidc_error(redirect_uri, state, "unauthorized_client"), status_code=302)
+        return RedirectResponse(
+            _oidc_error(redirect_uri, state, "unauthorized_client"), status_code=302
+        )
     if redirect_uri != APP_REDIRECT_URI:
-        return RedirectResponse(_oidc_error(redirect_uri, state, "invalid_request") + "&error_description=bad_redirect_uri", status_code=302)
+        return RedirectResponse(
+            _oidc_error(redirect_uri, state, "invalid_request")
+            + "&error_description=bad_redirect_uri",
+            status_code=302,
+        )
     # Plaintext redirect (no OAuth parameter leakage beyond code/state).
     html = _LOGIN_FORM.format(
-        domain=DOMAIN, prefix=PREFIX, css=_CSS, toggle_js=_TOGGLE_JS, error="",
-        client_id=client_id, redirect_uri=redirect_uri,
-        state=state, scope=scope, nonce=nonce,
+        domain=DOMAIN,
+        prefix=PREFIX,
+        css=_CSS,
+        toggle_js=_TOGGLE_JS,
+        error="",
+        client_id=client_id,
+        redirect_uri=redirect_uri,
+        state=state,
+        scope=scope,
+        nonce=nonce,
     )
     return HTMLResponse(html)
 
@@ -437,10 +462,16 @@ async def login(
     name = check_login(username, password)
     if name is None:
         html = _LOGIN_FORM.format(
-            domain=DOMAIN, prefix=PREFIX, css=_CSS, toggle_js=_TOGGLE_JS,
+            domain=DOMAIN,
+            prefix=PREFIX,
+            css=_CSS,
+            toggle_js=_TOGGLE_JS,
             error='<p class="signin-notice">Invalid username or password.</p>',
-            client_id=client_id, redirect_uri=redirect_uri,
-            state=state, scope=scope, nonce=nonce,
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            state=state,
+            scope=scope,
+            nonce=nonce,
         )
         return HTMLResponse(html, status_code=401)
     code = secrets.token_urlsafe(24)
@@ -452,8 +483,12 @@ async def login(
         "expires": time.time() + 300,
     }
     from urllib.parse import urlencode
+
     sep = "&" if "?" in redirect_uri else "?"
-    return RedirectResponse(f"{redirect_uri}{sep}{urlencode({'code': code, 'state': state})}", status_code=302)
+    return RedirectResponse(
+        f"{redirect_uri}{sep}{urlencode({'code': code, 'state': state})}",
+        status_code=302,
+    )
 
 
 @app.post(f"{PREFIX}/token")
@@ -464,6 +499,7 @@ async def token(request: Request) -> JSONResponse:
     client_secret = form.get("client_secret") or ""
     if auth.lower().startswith("basic "):
         import base64 as b64
+
         try:
             decoded = b64.b64decode(auth.split(" ", 1)[1]).decode()
             client_id, _, client_secret = decoded.partition(":")
@@ -480,7 +516,10 @@ async def token(request: Request) -> JSONResponse:
         return _token_error("invalid_grant")
     if entry["client_id"] != client_id:
         return _token_error("invalid_grant")
-    if form.get("redirect_uri") is not None and form.get("redirect_uri") != entry["redirect_uri"]:
+    if (
+        form.get("redirect_uri") is not None
+        and form.get("redirect_uri") != entry["redirect_uri"]
+    ):
         return _token_error("invalid_grant")
 
     username = entry["username"]
@@ -500,7 +539,11 @@ async def token(request: Request) -> JSONResponse:
         }
     )
     access_token = secrets.token_urlsafe(32)
-    _tokens[access_token] = {"username": username, "email": email, "expires": now + TOKEN_TTL}
+    _tokens[access_token] = {
+        "username": username,
+        "email": email,
+        "expires": now + TOKEN_TTL,
+    }
     return JSONResponse(
         {
             "access_token": access_token,
@@ -535,6 +578,7 @@ def _token_error(code: str) -> JSONResponse:
 
 def _oidc_error(redirect_uri: str, state: str, code: str) -> str:
     from urllib.parse import urlencode
+
     sep = "&" if "?" in redirect_uri else "?"
     return f"{redirect_uri}{sep}{urlencode({'error': code, 'state': state})}"
 

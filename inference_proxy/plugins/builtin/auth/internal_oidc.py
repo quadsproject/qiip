@@ -67,7 +67,9 @@ class InternalOidcPlugin(AuthPlugin):
             return False
         metadata_url = str(self.config.get("server_metadata_url") or "")
         if not metadata_url:
-            logger.info("internal_oidc auth plugin disabled (server_metadata_url not configured)")
+            logger.info(
+                "internal_oidc auth plugin disabled (server_metadata_url not configured)"
+            )
             return False
         oauth_settings = plugin_manager.settings.oauth
         client_secret = oauth_settings.client_secret
@@ -98,17 +100,13 @@ class InternalOidcPlugin(AuthPlugin):
         """Start the local provider Authorization Code flow (302)."""
         return cast(
             RedirectResponse,
-            await self._require_client().oidc.authorize_redirect(
-                request, redirect_uri
-            ),
+            await self._require_client().oidc.authorize_redirect(request, redirect_uri),
         )
 
     async def complete_login(self, request: Request) -> AuthIdentity:
         """Exchange the callback code for claims and return a normalized identity."""
         try:
-            token = await self._require_client().oidc.authorize_access_token(
-                request
-            )
+            token = await self._require_client().oidc.authorize_access_token(request)
         except OAuthError as exc:
             logger.warning(
                 "internal oidc callback rejected",

@@ -237,9 +237,7 @@ class TestOAuthLogin:
         # Lifespan rebuilt the plugin manager; install the scripted one after.
         app.state.plugin_manager = _PluginManager([google, local])
 
-        login = client.get(
-            "/auth/login?provider=internal_oidc", follow_redirects=False
-        )
+        login = client.get("/auth/login?provider=internal_oidc", follow_redirects=False)
         assert login.status_code == 302
         assert local.start_login_calls == 1
         assert google.start_login_calls == 0
@@ -272,9 +270,7 @@ class TestOAuthCallback:
 
         class EmptyIdentityPlugin(FakeAuthPlugin):
             async def complete_login(self, request: object) -> AuthIdentity:
-                return AuthIdentity(
-                    sub="", email="", email_verified=True, issuer=""
-                )
+                return AuthIdentity(sub="", email="", email_verified=True, issuer="")
 
         app.dependency_overrides[get_auth_plugin] = lambda: EmptyIdentityPlugin()
         client = TestClient(app)
