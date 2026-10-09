@@ -152,7 +152,7 @@ def _real_redfish_client(http_client: httpx.AsyncClient) -> RedfishClient:
         "mgmt-{hostname}",
         "1",
         hostname_policy=policy,
-        auth=auth,
+        auth_for=lambda _hostname: auth,
     )
 
 

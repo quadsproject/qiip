@@ -708,6 +708,9 @@ select arbitrary downloaded models.
   starts the count again, so a healthy node that later loses its record is
   rebuilt rather than exhausted. QIIP is a single-gateway service: the claim's compare-and-swap is a
   safeguard against an accidental second gateway, not support for running two.
+  With Redfish configured, a free host the BMC reports off is not blocked by
+  the failed probe: placement launches it and provisioning powers it on. To
+  keep a free host off, list it in `placement.exclude_hosts`.
 - **Files.** Profiles reference exact Hugging Face revisions. Download them with
   the existing `POST /admin/models/download`. A missing file is reported and
   only blocks its own profile; it never stops the gateway from starting.
@@ -1443,6 +1446,18 @@ fragment.
 self-signed certificates. Credentials are attached per request only after the
 node hostname passes the allowlist and the validated template resolves the BMC
 destination.
+
+Per-lab and per-host credential overrides live in `redfish.bmc_credentials`
+(JSON via `INFERENCE_PROXY_REDFISH__BMC_CREDENTIALS`, or natively in
+`conf/qiip.yml`). `hosts` maps a full node FQDN to an exact override that wins
+over any lab; `labs` maps a dotted FQDN segment such as `rdu2.scalelab`,
+matched as a dot-bounded substring with the longest identifier first and equal
+lengths resolved lexicographically. A hostname matching neither falls back to
+`bmc_username`/`bmc_password`, which must be set when overrides are used. Keys
+are lowercased and surrounding whitespace is stripped; a key that is empty,
+has a leading dot, ends with a dot on a `labs` entry (a trailing dot on a
+`hosts` entry is stripped), or duplicates another after normalization is
+rejected at startup.
 
 ## Architecture
 
