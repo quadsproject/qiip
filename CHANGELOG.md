@@ -2,6 +2,38 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.5 (2026-10-09)
+
+### Bug Fixes
+
+- Address review findings on redfish power gate and bmc resolver
+  ([#228](https://github.com/quadsproject/qiip/pull/228),
+  [`9e5339c`](https://github.com/quadsproject/qiip/commit/9e5339c9fdf8981d91a4bcbbdbf83c689e2603c1))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`69de6a4`](https://github.com/quadsproject/qiip/commit/69de6a4fd07976744e7a744955ddba3755e50d99))
+
+### Documentation
+
+- Describe bmc credential key normalization accurately
+  ([#228](https://github.com/quadsproject/qiip/pull/228),
+  [`9e5339c`](https://github.com/quadsproject/qiip/commit/9e5339c9fdf8981d91a4bcbbdbf83c689e2603c1))
+
+### Features
+
+- Power on new nodes via redfish and resolve bmc creds per lab
+  ([#228](https://github.com/quadsproject/qiip/pull/228),
+  [`9e5339c`](https://github.com/quadsproject/qiip/commit/9e5339c9fdf8981d91a4bcbbdbf83c689e2603c1))
+
+### Testing
+
+- Guard nested BmcCredential password secrecy in repr
+  ([#228](https://github.com/quadsproject/qiip/pull/228),
+  [`9e5339c`](https://github.com/quadsproject/qiip/commit/9e5339c9fdf8981d91a4bcbbdbf83c689e2603c1))
+
+
 ## v0.2.0-dev.4 (2026-10-09)
 
 ### Chores
