@@ -23,11 +23,11 @@
             <div class="signin-options">
                 {% if sessions_available %}
                 <details class="signin-admin">
-                    <summary class="btn signin-option">Local Admin</summary>
+                    <summary class="btn signin-option">{% if local_auth_enabled %}Local Login{% else %}Local Admin{% endif %}</summary>
                     <form method="post" action="/auth/local-admin" class="signin-form">
-                        <label class="signin-label" for="signin-username">Local Admin</label>
+                        <label class="signin-label" for="signin-username">{% if local_auth_enabled %}Local Login{% else %}Local Admin{% endif %}</label>
                         <input class="signin-input" type="text" id="signin-username" name="username"
-                               placeholder="Admin username" required autocomplete="username">
+                               placeholder="Username" required autocomplete="username">
                         <input class="signin-input" type="password" name="password"
                                placeholder="Password" required autocomplete="current-password">
                         <button type="submit" class="btn btn-primary">Sign in</button>
@@ -37,14 +37,11 @@
                 {% if oauth_enabled %}
                 <a class="btn signin-option" href="/auth/login?provider=google">Google Auth</a>
                 {% endif %}
-                {% if local_auth_enabled %}
-                <a class="btn signin-option" href="/auth/login?provider=internal_oidc">Local Auth</a>
-                {% endif %}
-                {% if not sessions_available and not oauth_enabled and not local_auth_enabled %}
+                {% if not sessions_available and not oauth_enabled %}
                 <p class="muted-status">Browser sign-in is not configured on this gateway. Use the
                     HTTP Basic admin credentials (from <code>INFERENCE_PROXY_ADMIN__*</code> in your
                     <code>.env</code>) with scripts and <code>curl</code>; configure
-                    <code>auth.session_secret</code> for the local-admin form or the OAuth
+                    <code>auth.session_secret</code> for the local login form or the OAuth
                     integration for Google or the local OIDC provider sign-in.</p>
                 {% endif %}
             </div>

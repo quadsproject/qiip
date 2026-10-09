@@ -11,6 +11,8 @@ is unchanged from the Google-only deployment.
 
 from __future__ import annotations
 
+import hmac
+from pathlib import Path
 from typing import cast
 
 import structlog
@@ -33,9 +35,20 @@ logger = structlog.get_logger()
 # own registry (registered as ``google``).
 _CLIENT_NAME = "oidc"
 
+# Standard OIDC metadata suffix; the issuer is the metadata URL without it
+# (true for both the vendored provider and common OIDC deployments).
+_METADATA_SUFFIX = "/.well-known/openid-configuration"
+_DEFAULT_DOMAIN = "localdomain"
+
 
 class InternalOidcPlugin(AuthPlugin):
-    """OpenID Connect sign-in against a network-local provider."""
+    """OpenID Connect sign-in against a network-local provider.
+
+    Also validates the provider's local user list for the sign-in page's
+    ``Local Login`` form when ``users_file`` is configured: qiip checks a
+    username/password against the same plaintext list the toy provider serves
+    (admin username is never a local account; qiip's admin password wins).
+    """
 
     name = "internal_oidc"
     version = "1.0.0"
@@ -47,6 +60,11 @@ class InternalOidcPlugin(AuthPlugin):
         super().__init__(config)
         self._client: OAuth | None = None
         self._server_metadata_url: str = ""
+        raw_users_file = self.config.get("users_file")
+        self._users_file: Path | None = (
+            Path(str(raw_users_file)).expanduser() if raw_users_file else None
+        )
+        self._domain = str(self.config.get("domain", _DEFAULT_DOMAIN)).strip()
 
     def initialize(self, plugin_manager: PluginManager | None = None) -> bool:
         """Build the OIDC client when opted in with credentials + provider URL.
@@ -138,6 +156,51 @@ class InternalOidcPlugin(AuthPlugin):
             name=name if isinstance(name, str) else "",
             picture=picture if isinstance(picture, str) else "",
         )
+
+    @property
+    def issuer(self) -> str:
+        """Return the provider issuer (metadata URL without the OIDC suffix).
+
+        Used to key users created by the Local Login form with the same
+        (issuer, sub) identity the provider flow produces.
+        """
+        return self._server_metadata_url.removesuffix(_METADATA_SUFFIX)
+
+    def verify_local_credentials(
+        self, username: str, password: str, admin_username: str
+    ) -> str | None:
+        """Return the canonical email for valid local credentials, else None.
+
+        Reads the configured ``users_file`` (``username:password`` per line,
+        ``#`` comments), mirroring the toy provider's rules: bare names are
+        matched literally and mapped to ``name@domain``; entries that already
+        contain ``@`` are used as-is. An entry whose username equals the
+        configured admin username is never a local account — it is ignored
+        because qiip's admin password wins (checked by the caller first).
+        """
+        if self._users_file is None:
+            return None
+        try:
+            lines = self._users_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            logger.warning(
+                "local oauth users file unreadable", users_file=str(self._users_file)
+            )
+            return None
+        users: dict[str, str] = {}
+        for line in lines:
+            name, _, secret = line.partition(":")
+            name = name.strip().lower()
+            if not name or name.startswith("#") or not secret:
+                continue
+            if name == admin_username.strip().lower():
+                continue  # admin username is never a local account
+            users[name] = secret
+        name = username.strip().lower()
+        stored = users.get(name)
+        if stored is None or not hmac.compare_digest(stored, password):
+            return None
+        return name if "@" in name else f"{name}@{self._domain}"
 
     def _require_client(self) -> OAuth:
         if self._client is None:
