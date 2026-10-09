@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import secrets
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import ANY, MagicMock
@@ -427,9 +428,8 @@ class TestAdminBasicAuthentication:
 
 
 class TestLocalAuthSigninOption:
-    """The opt-in local OIDC provider adds a third sign-in button only when
-    the plugin is loaded and configured (RFE #230); the default page is
-    unchanged."""
+    """The opt-in local OIDC provider turns the local form into ``Local Login``
+    (RFE #230); without it the page keeps ``Local Admin`` exactly as before."""
 
     async def test_hidden_when_plugin_not_loaded(
         self,
@@ -438,9 +438,11 @@ class TestLocalAuthSigninOption:
         response = await _request(app, "GET", "/dashboard")
 
         assert response.status_code == 200
+        assert "Local Login" not in response.text
+        assert "Local Admin" in response.text
         assert "Local Auth" not in response.text
 
-    async def test_shown_when_local_plugin_configured(
+    async def test_shown_as_local_login_when_local_plugin_configured(
         self,
         app: FastAPI,
     ) -> None:
@@ -458,7 +460,125 @@ class TestLocalAuthSigninOption:
         response = await _request(app, "GET", "/dashboard")
 
         assert response.status_code == 200
-        assert "Local Auth" in response.text
-        assert "/auth/login?provider=internal_oidc" in response.text
+        # Local Login replaces the Local Admin form; the OIDC provider button
+        # is folded into it (admin username first, user list second).
+        assert "Local Login" in response.text
+        assert "Local Admin" not in response.text
+        assert "Local Auth" not in response.text
+        assert "/auth/login?provider=internal_oidc" not in response.text
         # The opt-in provider is not enabled here, so Google stays gated off.
         assert "Google Auth" not in response.text
+
+
+class TestLocalLoginForm:
+    """POST /auth/local-admin drives the merged Local Login form: the
+    configured admin username wins, every other username is checked against
+    the local oauth user list (admin-named entries are ignored)."""
+
+    @staticmethod
+    def _local_plugin(tmp_path: Path, users: str) -> SimpleNamespace:
+        from inference_proxy.plugins.builtin.auth.internal_oidc import (
+            InternalOidcPlugin,
+        )
+
+        users_file = tmp_path / "users.txt"
+        users_file.write_text(users)
+        plugin = InternalOidcPlugin(
+            {
+                "enabled": True,
+                "server_metadata_url": (
+                    "https://oidc.localdomain/oidc/.well-known/openid-configuration"
+                ),
+                "users_file": str(users_file),
+                "domain": "localdomain",
+            }
+        )
+        plugin._client = object()  # configured client marker (is_configured)
+        plugin._server_metadata_url = (
+            "https://oidc.localdomain/oidc/.well-known/openid-configuration"
+        )
+        return SimpleNamespace(
+            get_plugin=lambda name: plugin if name == "auth.internal_oidc" else None,
+            get_plugins_by_type=lambda plugin_type: [plugin],
+        )
+
+    def test_local_user_signs_in_and_gets_user_row(
+        self,
+        app: FastAPI,
+        tmp_path: Path,
+    ) -> None:
+        client = TestClient(app)
+        # Lifespan rebuilt the plugin manager; install the scripted one after.
+        app.state.plugin_manager = self._local_plugin(
+            tmp_path, "# comment\nalice:secret\n"
+        )
+
+        ok = client.post(
+            "/auth/local-admin",
+            json={"username": "alice", "password": "secret"},
+            follow_redirects=False,
+        )
+
+        assert ok.status_code == 302
+        assert ok.headers["location"] == "/start"
+        me = client.get("/auth/me")
+        assert me.status_code == 200
+        assert me.json()["email"] == "alice@localdomain"
+        store: AuthStore = app.state.auth_store
+        created = next(
+            (
+                u
+                for u in store.list_users_with_stats()
+                if u.email == "alice@localdomain"
+            ),
+            None,
+        )
+        assert created is not None
+        user = store.get_user(created.id)
+        assert user is not None
+        assert user.issuer == "https://oidc.localdomain/oidc"
+        assert user.google_sub == "alice@localdomain"
+
+    def test_admin_duplicate_entry_is_ignored(
+        self,
+        app: FastAPI,
+        tmp_path: Path,
+    ) -> None:
+        client = TestClient(app)
+        app.state.plugin_manager = self._local_plugin(
+            tmp_path,
+            "test-admin:admin-file-password\nalice:secret\n",
+        )
+
+        # The file's admin entry must not work: qiip's admin password wins.
+        rejected = client.post(
+            "/auth/local-admin",
+            json={"username": "test-admin", "password": "admin-file-password"},
+            follow_redirects=False,
+        )
+        assert rejected.status_code == 401
+
+        # And the configured admin credentials still sign in as admin.
+        admin = client.post(
+            "/auth/local-admin",
+            json={"username": "test-admin", "password": "test-password"},
+            follow_redirects=False,
+        )
+        assert admin.status_code == 302
+        assert admin.headers["location"] == "/dashboard"
+
+    def test_local_user_with_wrong_password_rejected(
+        self,
+        app: FastAPI,
+        tmp_path: Path,
+    ) -> None:
+        client = TestClient(app)
+        app.state.plugin_manager = self._local_plugin(tmp_path, "alice:secret\n")
+
+        bad = client.post(
+            "/auth/local-admin",
+            json={"username": "alice", "password": "wrong"},
+        )
+
+        assert bad.status_code == 401
+        assert bad.json()["detail"] == "Invalid username or password"

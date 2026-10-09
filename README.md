@@ -1035,6 +1035,8 @@ at once — user rows are keyed by (issuer, sub) so accounts never collide.
        auth.internal_oidc:
          enabled: true
          server_metadata_url: https://<host>/oidc/.well-known/openid-configuration
+         users_file: /etc/qiip/oidc-users.txt   # Local Login user list
+         domain: localdomain                    # suffix for bare usernames
    ```
 
    The `INFERENCE_PROXY_OAUTH__CLIENT_ID` / `CLIENT_SECRET` / `REDIRECT_URI`
@@ -1047,9 +1049,17 @@ at once — user rows are keyed by (issuer, sub) so accounts never collide.
    `user1@somelab.example.com`; full emails in `users.txt` are used
    as-is. Keep `INFERENCE_PROXY_OAUTH__ALLOWED_DOMAINS` (or leave it empty)
    in sync with that domain.
-3. Sign in: `/auth/login?provider=internal_oidc` → provider password form →
-   callback. The provider appends `OIDC_DOMAIN` to bare usernames; qiip's
-   `oauth.allowed_domains` (when set) must match that domain.
+3. Sign in: with the provider enabled the sign-in page's local form is
+   labelled **Local Login** (it replaces the Local Admin form; the separate
+   Local Auth provider button is folded into it):
+   - the configured admin username/password is checked first and always
+     wins — a same-named entry in `users_file` is ignored;
+   - any other username/password is checked against `users_file` (the same
+     plaintext list the toy provider serves) and signs the matching local
+     user in;
+   - the external OAuth link (`/auth/login?provider=internal_oidc` →
+     provider password form → callback) still works for direct links, and
+     `oauth.allowed_domains` (when set) must match the provider domain.
 
 RPM install layout: provider at `/usr/share/qiip/oidc-provider/`, the user
 list at `/etc/qiip/oidc-users.txt` (0600, `%config(noreplace)` — `sudo vi

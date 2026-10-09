@@ -100,6 +100,11 @@ def _sign_id_token(claims: dict) -> str:
 # User store: USERS_FILE, one "username:password" per line (# comments allowed)
 # ---------------------------------------------------------------------------
 
+# A local user whose username equals qiip's configured admin username is never
+# a provider account: qiip's admin password wins. Setting OIDC_ADMIN_USERNAME
+# makes this provider ignore that entry too (mirrors qiip's local login).
+ADMIN_USERNAME = os.environ.get("OIDC_ADMIN_USERNAME", "").strip().lower()
+
 
 def load_users() -> dict[str, str]:
     users: dict[str, str] = {}
@@ -111,8 +116,9 @@ def load_users() -> dict[str, str]:
             continue
         name, _, password = line.partition(":")
         name = name.strip().lower()
-        if name:
-            users[name] = password
+        if not name or name == ADMIN_USERNAME:
+            continue
+        users[name] = password
     return users
 
 
