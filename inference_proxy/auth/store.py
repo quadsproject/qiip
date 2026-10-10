@@ -284,16 +284,29 @@ class AuthStore:
             users_have_rows = (
                 self._conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
             )
-            if not users_have_rows:
-                self._conn.execute(
-                    "INSERT INTO users"
-                    " (id, google_sub, issuer, email, name, picture, is_admin,"
-                    "  created_at, updated_at)"
-                    " SELECT id, google_sub, issuer, email, name, picture,"
-                    "        is_admin, created_at, updated_at"
-                    "   FROM users_legacy_issuer"
-                )
             with self._conn:
+                if not users_have_rows:
+                    # users_legacy_issuer is the pre-issuer table renamed by
+                    # the old draft: it has NO issuer column, so backfill the
+                    # Google issuer here (same value the rebuild uses). The
+                    # is_admin column may also be missing for databases that
+                    # predate it, in which case the rows were never admins.
+                    legacy_columns = {
+                        row["name"]
+                        for row in self._conn.execute(
+                            "PRAGMA table_info(users_legacy_issuer)"
+                        ).fetchall()
+                    }
+                    is_admin_expr = "is_admin" if "is_admin" in legacy_columns else "0"
+                    self._conn.execute(
+                        "INSERT INTO users"
+                        " (id, google_sub, issuer, email, name, picture, is_admin,"
+                        "  created_at, updated_at)"
+                        " SELECT id, google_sub, ?, email, name, picture,"
+                        f"        {is_admin_expr}, created_at, updated_at"
+                        "   FROM users_legacy_issuer",
+                        (GOOGLE_ISSUER,),
+                    )
                 self._conn.execute("DROP TABLE users_legacy_issuer")
             logger.info("auth store recovered interrupted issuer migration (legacy)")
         if self._table_exists("users_new"):
