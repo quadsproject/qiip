@@ -1072,7 +1072,11 @@ so accounts never collide.
    environment file (`/opt/inference-proxy/.env` for the checkout unit,
    `/etc/qiip/qiip.env` for the RPM unit) and restart
    `inference-proxy`; with an internal CA, install the CA into the
-   system trust store instead.
+   system trust store instead. Note that a global `SSL_CERT_FILE`
+   *replaces* the trust store for every server-side fetch, so a
+   deployment that also enables Google OAuth must use the internal-CA
+   route (or verify Google's endpoints manually); the local provider
+   paths alone work fine with `SSL_CERT_FILE`.
 3. Sign in: with the provider enabled the sign-in page's local form is
    labelled **Local Login** (it replaces the Local Admin form; there is no
    separate Local Auth button — the external flow is reachable only by
