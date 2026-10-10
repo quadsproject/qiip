@@ -222,7 +222,7 @@ async def _enforce_sso_whitelist(
     """
     if not settings.auth.enforce_sso_whitelist:
         return
-    if is_full_access(auth.user.email, settings):
+    if is_full_access(auth.user.email, auth.user.issuer, settings):
         return
     try:
         allowed = await enforce_allowlist(auth.user.email, allowlist)

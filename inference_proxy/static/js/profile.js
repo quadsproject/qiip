@@ -15,6 +15,8 @@
     not_whitelisted: "This account is not on the gateway whitelist.",
     allowlist_unavailable:
       "The whitelist service is unavailable. Please try again later.",
+    account_conflict:
+      "This email is already linked to another sign-in provider.",
   };
 
   const $ = (id) => document.getElementById(id);

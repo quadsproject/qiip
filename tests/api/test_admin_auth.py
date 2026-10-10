@@ -490,7 +490,6 @@ class TestLocalLoginForm:
                     "https://oidc.localdomain/oidc/.well-known/openid-configuration"
                 ),
                 "users_file": str(users_file),
-                "domain": "localdomain",
             }
         )
         plugin._client = object()  # configured client marker (is_configured)
@@ -582,3 +581,35 @@ class TestLocalLoginForm:
 
         assert bad.status_code == 401
         assert bad.json()["detail"] == "Invalid username or password"
+
+    def test_local_user_blocked_by_allowed_domains(
+        self,
+        app: FastAPI,
+        tmp_path: Path,
+        test_settings: Settings,
+    ) -> None:
+        """The local login form obeys the same allowed-domains gate as OIDC:
+        a merged local user whose email domain is not listed gets a 403, not
+        a user row (full-Google integration parity, RFE #230)."""
+        client = TestClient(app)
+        app.state.plugin_manager = self._local_plugin(tmp_path, "alice:secret\n")
+
+        restricted = test_settings.model_copy(
+            deep=True,
+            update={
+                "oauth": test_settings.oauth.model_copy(
+                    update={"allowed_domains": ["corp.example.com"]}
+                )
+            },
+        )
+        app.dependency_overrides[get_settings] = lambda: restricted
+
+        blocked = client.post(
+            "/auth/local-admin",
+            json={"username": "alice", "password": "secret"},
+        )
+
+        assert blocked.status_code == 403
+        assert blocked.json()["detail"] == (
+            "This account is not in the allowed domains for this gateway."
+        )

@@ -28,7 +28,7 @@ from pathlib import Path
 
 import structlog
 
-from inference_proxy.auth._constants import TOKEN_PREFIX
+from inference_proxy.auth._constants import GOOGLE_ISSUER, TOKEN_PREFIX
 from inference_proxy.auth.models import (
     AdminTokenView,
     AdminUserStats,
@@ -45,9 +45,20 @@ from inference_proxy.auth.models import (
 
 logger = structlog.get_logger()
 
-# The OIDC issuer of Google accounts. User rows created before the issuer
-# column existed are backfilled with this value (see _migrate).
-GOOGLE_ISSUER = "https://accounts.google.com"
+
+class AccountConflictError(Exception):
+    """A user row with the same email exists under another issuer.
+
+    Raised when the email-unique fallback cannot rebind because the row
+    belongs to a different provider; the login is refused rather than
+    silently moving an account (and its admin role and tokens) between
+    issuers.
+    """
+
+    def __init__(self, email: str) -> None:
+        super().__init__(f"email {email!r} is claimed by another issuer")
+        self.email = email
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -249,6 +260,55 @@ class AuthStore:
             self._migrate()
         logger.info("auth store opened", db_path=str(db_path))
 
+    def _table_exists(self, name: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        return row is not None
+
+    def _recover_interrupted_issuer_migration(self) -> None:
+        """Repair a users rebuild interrupted by a crash, pre-issuer check.
+
+        Two historical shapes exist:
+        * ``users_legacy_issuer`` -- the first draft renamed ``users`` out
+          of the way, so a crash after the RENAME left the live rows there
+          while ``_SCHEMA`` recreated an empty ``users`` below the issuer
+          check (rows stranded, migration silently skipped). If ``users``
+          already has rows the copy finished and only the DROP is missing.
+        * ``users_new`` -- the current draft builds the replacement beside
+          ``users``; a crash after ``DROP TABLE users`` but before the
+          rename leaves the rows in ``users_new`` behind an empty ``users``.
+        """
+        if self._table_exists("users_legacy_issuer"):
+            users_have_rows = (
+                self._conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+            )
+            if not users_have_rows:
+                self._conn.execute(
+                    "INSERT INTO users"
+                    " (id, google_sub, issuer, email, name, picture, is_admin,"
+                    "  created_at, updated_at)"
+                    " SELECT id, google_sub, issuer, email, name, picture,"
+                    "        is_admin, created_at, updated_at"
+                    "   FROM users_legacy_issuer"
+                )
+            with self._conn:
+                self._conn.execute("DROP TABLE users_legacy_issuer")
+            logger.info("auth store recovered interrupted issuer migration (legacy)")
+        if self._table_exists("users_new"):
+            users_have_rows = (
+                self._conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
+            )
+            if users_have_rows:
+                with self._conn:
+                    self._conn.execute("DROP TABLE users_new")
+            else:
+                with self._conn:
+                    self._conn.execute("DROP TABLE users")
+                    self._conn.execute("ALTER TABLE users_new RENAME TO users")
+            logger.info("auth store recovered interrupted issuer migration (new)")
+
     def _migrate(self) -> None:
         """Apply additive migrations to pre-existing databases.
 
@@ -265,37 +325,60 @@ class AuthStore:
             row["name"]
             for row in self._conn.execute("PRAGMA table_info(users)").fetchall()
         }
-        if "is_admin" not in user_columns:
+        if "is_admin" not in user_columns and "issuer" not in user_columns:
+            # Pre-issuer schema (the rebuild below creates the column too).
             self._conn.execute(
                 "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"
             )
+        # Repair any users rebuild interrupted by a crash before deciding
+        # what the live users table looks like (see _recover_interrupted_issuer_migration).
+        self._recover_interrupted_issuer_migration()
+        user_columns = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(users)").fetchall()
+        }
         if "issuer" not in user_columns:
             # Rebuild users so the pre-existing single-column UNIQUE(google_sub)
             # is replaced by the (issuer, google_sub) key (SQLite cannot drop
             # an inline UNIQUE in place). Every existing row was created by the
             # Google provider, so they are backfilled with the Google issuer.
-            self._conn.executescript(
-                f"""
-                ALTER TABLE users RENAME TO users_legacy_issuer;
-                CREATE TABLE users (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    google_sub  TEXT    NOT NULL,
-                    issuer      TEXT    NOT NULL DEFAULT '{GOOGLE_ISSUER}',
-                    email       TEXT    NOT NULL UNIQUE,
-                    name        TEXT    NOT NULL DEFAULT '',
-                    picture     TEXT    NOT NULL DEFAULT '',
-                    is_admin    INTEGER NOT NULL DEFAULT 0,
-                    created_at  TEXT    NOT NULL,
-                    updated_at  TEXT    NOT NULL
-                );
-                INSERT INTO users
-                    (id, google_sub, issuer, email, name, picture, is_admin,
-                     created_at, updated_at)
-                SELECT id, google_sub, '{GOOGLE_ISSUER}', email,
-                       name, picture, is_admin, created_at, updated_at
-                  FROM users_legacy_issuer;
-                DROP TABLE users_legacy_issuer;
-                """
+            # The replacement table is built beside `users` and renamed INTO
+            # place, all in one transaction: the child tables' REFERENCES
+            # users(id) clauses are never rewritten (ALTER TABLE RENAME only
+            # touches references to the renamed name), and a crash can no
+            # longer leave an empty users table with the rows stranded.
+            self._conn.execute("DROP TABLE IF EXISTS users_new")
+            with self._conn:
+                # GOOGLE_ISSUER is a module constant, so interpolating it into
+                # the DDL is safe; SQLite does not accept bound parameters in
+                # CREATE TABLE ... DEFAULT expressions.
+                self._conn.execute(
+                    f"CREATE TABLE users_new ("
+                    f" id          INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    f" google_sub  TEXT    NOT NULL,"
+                    f" issuer      TEXT    NOT NULL DEFAULT '{GOOGLE_ISSUER}',"
+                    f" email       TEXT    NOT NULL UNIQUE,"
+                    f" name        TEXT    NOT NULL DEFAULT '',"
+                    f" picture     TEXT    NOT NULL DEFAULT '',"
+                    f" is_admin    INTEGER NOT NULL DEFAULT 0,"
+                    f" created_at  TEXT    NOT NULL,"
+                    f" updated_at  TEXT    NOT NULL"
+                    f")",
+                )
+                self._conn.execute(
+                    "INSERT INTO users_new"
+                    " (id, google_sub, issuer, email, name, picture, is_admin,"
+                    "  created_at, updated_at)"
+                    " SELECT id, google_sub, ?, email, name, picture, is_admin,"
+                    "        created_at, updated_at"
+                    "   FROM users",
+                    (GOOGLE_ISSUER,),
+                )
+                self._conn.execute("DROP TABLE users")
+                self._conn.execute("ALTER TABLE users_new RENAME TO users")
+            logger.info(
+                "auth store migrated users to (issuer, google_sub) key",
+                issuer=GOOGLE_ISSUER,
             )
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_issuer_sub "
@@ -348,9 +431,12 @@ class AuthStore:
 
         Rows are keyed by the OIDC (issuer, sub) pair so two providers can
         issue the same opaque ``sub`` without colliding. Falls back to the
-        email-unique index when an account appears under a new issuer or
-        ``sub`` (rare account-migration case): the existing row is rebound
-        to the new identity.
+        email-unique index when an account appears under a new ``sub`` from
+        the *same* issuer (rare account-migration case): the existing row is
+        rebound to the new subject. A row whose email belongs to another
+        issuer is never rebound -- that would silently move the account
+        (admin role and tokens included) between providers -- and raises
+        :class:`AccountConflictError` so both sign-in paths refuse it.
         """
         now = _iso(_utcnow())
         with self._lock:
@@ -370,15 +456,18 @@ class AuthStore:
                         (google_sub, issuer, email, name, picture, now, now),
                     )
                 except sqlite3.IntegrityError:
-                    self._conn.execute(
+                    rebound = self._conn.execute(
                         """
                         UPDATE users
                            SET google_sub = ?, issuer = ?, name = ?,
                                picture = ?, updated_at = ?
-                         WHERE email = ?
+                         WHERE email = ? AND issuer = ?
                         """,
-                        (google_sub, issuer, name, picture, now, email),
+                        (google_sub, issuer, name, picture, now, email, issuer),
                     )
+                    if rebound.rowcount != 1:
+                        self._conn.rollback()
+                        raise AccountConflictError(email) from None
             else:
                 self._conn.execute(
                     """

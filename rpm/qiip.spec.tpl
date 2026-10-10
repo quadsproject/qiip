@@ -38,6 +38,10 @@ Requires:       hostname
 # pin 3.5.21. Installed but not started/required at runtime for a remote
 # cluster, matching the "gateway starts during an etcd outage" contract.
 Requires:       etcd >= 3.5.0
+# The vendored toy OIDC provider (oidc-provider/app.py) imports cryptography
+# directly for RS256 key generation; only transitively available through
+# authlib, so declare it explicitly.
+Requires:       python3-cryptography
 @CONFLICTS@
 
 %description
@@ -182,6 +186,9 @@ else
     echo "qiip: nginx -t failed; fix /etc/nginx/nginx.conf then run systemctl enable --now nginx" >&2
 fi
 %systemd_post inference-proxy.service
+# The OIDC provider stays opt-in: %systemd_post only registers the unit
+# (never enables it), restarts on upgrade, and stops it on removal.
+%systemd_post qiip-oidc.service
 # First install: also start the gateway (the macro above only enables), so
 # nginx does not sit on a dead upstream. Upgrades leave the running state alone.
 if [ "${1:-1}" -eq 1 ] && systemctl is-enabled --quiet inference-proxy.service 2>/dev/null; then
@@ -191,16 +198,13 @@ fi
 
 %preun
 %systemd_preun inference-proxy.service
+%systemd_preun qiip-oidc.service
 
 %postun
 # Restart (not just re-enable) on upgrade so a dnf upgrade replaces the
 # running process instead of leaving the old one alive.
 %systemd_postun_with_restart inference-proxy.service
-# The OIDC provider is opt-in (never enabled by the package); a removed
-# package must not leave a dangling enable link behind.
-if [ "$1" -eq 0 ] && systemctl is-enabled --quiet qiip-oidc.service 2>/dev/null; then
-    systemctl disable qiip-oidc.service >/dev/null 2>&1 || :
-fi
+%systemd_postun_with_restart qiip-oidc.service
 
 %changelog
 * @DATE@ quads project maintainers <noreply@github.com> - @VERSION@-@RELEASE@

@@ -27,11 +27,7 @@ from fastapi.responses import RedirectResponse, Response
 from pydantic import BaseModel, ValidationError
 
 from inference_proxy.api.templating import USER_HOME
-from inference_proxy.auth.allowlist import (
-    AllowlistUnavailableError,
-    SSOAllowlist,
-    enforce_allowlist,
-)
+from inference_proxy.auth.allowlist import SSOAllowlist
 from inference_proxy.auth.dependencies import (
     AUTH_PROVIDER_SESSION_KEY,
     get_auth_plugin,
@@ -40,7 +36,6 @@ from inference_proxy.auth.dependencies import (
     require_profile_user,
 )
 from inference_proxy.auth.models import PublicUser, User
-from inference_proxy.auth.scopes import is_full_access
 from inference_proxy.auth.session import (
     clear_local_admin_session,
     clear_session_user,
@@ -48,7 +43,8 @@ from inference_proxy.auth.session import (
     set_local_admin_session,
     set_session_user,
 )
-from inference_proxy.auth.store import AuthStore
+from inference_proxy.auth.signin_policy import check_signin_policy
+from inference_proxy.auth.store import AccountConflictError, AuthStore
 from inference_proxy.config.dependencies import (
     _credentials_match,
     get_settings,
@@ -60,6 +56,15 @@ from inference_proxy.plugins.interfaces.auth import AuthCallbackError, AuthPlugi
 logger = structlog.get_logger()
 
 auth_router = APIRouter(prefix="/auth", tags=["auth"])
+
+# Sign-in policy rejections surface as 403 details on the local form (the
+# codes come from check_signin_policy; the OIDC callback redirects instead).
+_POLICY_ERROR_MESSAGES = {
+    "unverified_email": "This account has an unverified email address and cannot sign in.",
+    "domain_not_allowed": "This account is not in the allowed domains for this gateway.",
+    "allowlist_unavailable": "The whitelist service is unavailable. Please try again later.",
+    "not_whitelisted": "This account is not on the gateway whitelist.",
+}
 
 _PROFILE_HOME = "/profile"
 _DASHBOARD_HOME = "/dashboard"
@@ -121,6 +126,7 @@ async def local_admin_login(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[AuthStore, Depends(get_auth_store)],
+    allowlist: Annotated[SSOAllowlist | None, Depends(get_sso_allowlist)] = None,
 ) -> Response:
     """Sign in through the sign-in page's local form.
 
@@ -169,17 +175,40 @@ async def local_admin_login(
         logger.info("local admin signed in")
         return RedirectResponse(_DASHBOARD_HOME, status_code=302)
 
-    # Local oauth user list (opt-in local provider).
+    # Local oauth user list (opt-in local provider). The local user list is
+    # an operator-curated trust list, so its accounts pass the email
+    # verification gate; the hosted-domain and SSO-whitelist gates still
+    # apply (same policy as the OIDC callback).
     identity = _local_login_identity(request, username, password, settings)
     if identity is not None:
-        user = await asyncio.to_thread(
-            store.upsert_google_user,
-            google_sub=identity[0],
-            issuer=identity[1],
-            email=identity[0],
-            name=username,
-            picture="",
+        policy_error = await check_signin_policy(
+            identity[0], identity[1], True, settings, allowlist
         )
+        if policy_error is not None:
+            logger.warning(
+                "local login policy rejected", email=identity[0], code=policy_error
+            )
+            raise HTTPException(
+                status_code=403, detail=_POLICY_ERROR_MESSAGES[policy_error]
+            )
+        try:
+            user = await asyncio.to_thread(
+                store.upsert_google_user,
+                google_sub=identity[0],
+                issuer=identity[1],
+                email=identity[0],
+                name=username,
+                picture="",
+            )
+        except AccountConflictError as exc:
+            # The username is valid but its email is already taken by an
+            # account from another provider; refuse rather than migrating
+            # the account (admin role and tokens) across providers.
+            logger.warning("local login provider conflict", email=exc.email)
+            raise HTTPException(
+                status_code=409,
+                detail="This email is already linked to another sign-in provider",
+            ) from None
         set_session_user(request, user.id, settings.auth.session_ttl_seconds)
         logger.info("local oauth user signed in", user_id=user.id, email=identity[0])
         home = _PROFILE_HOME if user.is_admin else USER_HOME
@@ -268,38 +297,30 @@ async def oauth_callback(
         logger.warning("oauth callback empty identity")
         return _error_redirect("no_profile")
 
-    if settings.auth.require_email_verification and not identity.email_verified:
-        logger.warning("oauth callback unverified email", email=email)
-        return _error_redirect("unverified_email")
-
-    allowed_domains = [domain.lower() for domain in settings.oauth.allowed_domains]
-    domain = email.rsplit("@", 1)[-1].lower() if "@" in email else ""
-    if allowed_domains and domain not in allowed_domains:
-        logger.warning("oauth callback domain not allowed", email=email)
-        return _error_redirect("domain_not_allowed")
-
-    if settings.auth.enforce_sso_whitelist and not is_full_access(email, settings):
-        try:
-            allowed = await enforce_allowlist(email, allowlist)
-        except AllowlistUnavailableError:
-            logger.warning("oauth callback whitelist unavailable", email=email)
-            return _error_redirect("allowlist_unavailable")
-        if not allowed:
-            logger.warning("oauth callback user not whitelisted", email=email)
-            return _error_redirect("not_whitelisted")
+    policy_error = await check_signin_policy(
+        email, identity.issuer, identity.email_verified, settings, allowlist
+    )
+    if policy_error is not None:
+        logger.warning("oauth callback policy rejected", email=email, code=policy_error)
+        return _error_redirect(policy_error)
 
     # User rows are keyed by (issuer, sub) so Google and a local OIDC
     # provider can issue the same opaque sub without colliding. The email
-    # unique index still rebinds an account that moves providers or changes
-    # its sub (see AuthStore.upsert_google_user).
-    user = await asyncio.to_thread(
-        store.upsert_google_user,
-        google_sub=identity.sub,
-        issuer=identity.issuer,
-        email=email,
-        name=identity.name,
-        picture=identity.picture,
-    )
+    # unique index rebinds an account that changes sub *within the same
+    # issuer*; a row whose email belongs to another issuer is never moved
+    # (see AuthStore.upsert_google_user) and the login is refused.
+    try:
+        user = await asyncio.to_thread(
+            store.upsert_google_user,
+            google_sub=identity.sub,
+            issuer=identity.issuer,
+            email=email,
+            name=identity.name,
+            picture=identity.picture,
+        )
+    except AccountConflictError as exc:
+        logger.warning("oauth callback provider conflict", email=exc.email)
+        return _error_redirect("account_conflict")
     set_session_user(request, user.id, settings.auth.session_ttl_seconds)
     logger.info("user signed in", user_id=user.id, email=email)
     home = _PROFILE_HOME if user.is_admin else USER_HOME

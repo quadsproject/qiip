@@ -11,11 +11,33 @@ from fastapi.responses import RedirectResponse
 from pydantic import SecretStr
 
 from inference_proxy.config.settings import OAuthSettings, Settings
+from inference_proxy.plugins.builtin.auth import internal_oidc as internal_oidc_module
 from inference_proxy.plugins.builtin.auth.internal_oidc import InternalOidcPlugin
 from inference_proxy.plugins.interfaces.auth import AuthCallbackError, AuthIdentity
 from inference_proxy.plugins.manager import PluginManager
 
 _LOCAL_ISSUER = "http://oidc.localdomain/oidc"
+
+
+@pytest.fixture(autouse=True)
+def _fake_discovery(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Keep initialize() off the network; tests opt into metadata per test."""
+
+    class _DiscoveryResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return holder.get("metadata", {})
+
+    holder: dict[str, object] = {}
+    monkeypatch.setattr(
+        internal_oidc_module.httpx,
+        "get",
+        lambda url, **kwargs: _DiscoveryResponse(),
+    )
+    return holder
+
 
 _VALID_USERINFO: dict[str, object] = {
     "iss": _LOCAL_ISSUER,
@@ -228,12 +250,34 @@ class TestLocalUserList:
             == "alice@localdomain"
         )
 
-    def test_respects_configured_domain(self, tmp_path: Path) -> None:
-        plugin = self._plugin(tmp_path, "alice:secret\n", domain="somelab.example.com")
+    def test_uses_domain_from_discovery(
+        self, tmp_path: Path, _fake_discovery: dict[str, object]
+    ) -> None:
+        """The provider's discovery ``user_email_domain`` is the single
+        source (review #231): no separate ``domain`` config to drift."""
+        _fake_discovery["metadata"] = {
+            "user_email_domain": "somelab.example.com",
+            "issuer": _LOCAL_ISSUER,
+        }
+        plugin = self._plugin(tmp_path, "alice:secret\n")
+        plugin._server_metadata_url = (
+            _LOCAL_ISSUER + "/.well-known/openid-configuration"
+        )
 
+        assert plugin._fetch_email_domain() == "somelab.example.com"
         assert (
             plugin.verify_local_credentials("alice", "secret", "admin")
             == "alice@somelab.example.com"
+        )
+
+    def test_domain_config_key_is_ignored(self, tmp_path: Path) -> None:
+        # Regression: the old ``domain`` config key must not influence the
+        # mapping anymore; without discovery the default applies.
+        plugin = self._plugin(tmp_path, "alice:secret\n", domain="ignored.example.com")
+
+        assert (
+            plugin.verify_local_credentials("alice", "secret", "admin")
+            == "alice@localdomain"
         )
 
     def test_full_email_entries_used_as_is(self, tmp_path: Path) -> None:
@@ -250,6 +294,16 @@ class TestLocalUserList:
         plugin = self._plugin(tmp_path, "alice:secret\n")
 
         assert plugin.verify_local_credentials("alice", "wrong", "admin") is None
+
+    def test_non_ascii_password_compared_as_utf8(self, tmp_path: Path) -> None:
+        # compare_digest rejects non-ASCII str; the plugin must compare bytes.
+        plugin = self._plugin(tmp_path, "bob:pa55wörd\n")
+
+        assert (
+            plugin.verify_local_credentials("bob", "pa55wörd", "admin")
+            == "bob@localdomain"
+        )
+        assert plugin.verify_local_credentials("bob", "pa55word", "admin") is None
 
     def test_admin_username_entry_is_ignored(self, tmp_path: Path) -> None:
         plugin = self._plugin(tmp_path, "admin:file-password\nalice:secret\n")

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import hmac
+import html
 import os
 import secrets
 import time
@@ -128,7 +129,9 @@ def check_login(username: str, password: str) -> str | None:
     name = username.strip().lower()
     if name not in users:
         return None
-    if not hmac.compare_digest(users[name], password):
+    # compare_digest only accepts ASCII str or bytes: non-ASCII passwords
+    # (UTF-8) must be compared as bytes or they raise TypeError.
+    if not hmac.compare_digest(users[name].encode("utf-8"), password.encode("utf-8")):
         return None
     return name
 
@@ -165,6 +168,10 @@ def discovery() -> JSONResponse:
                 "client_secret_post",
             ],
             "scopes_supported": ["openid", "email", "profile"],
+            # Non-standard claim consumed by qiip's internal_oidc plugin so
+            # the Local Login form and this provider mint identical emails
+            # for the same bare username (single source; OIDC_DOMAIN).
+            "user_email_domain": DOMAIN,
             "claims_supported": ["sub", "email", "email_verified", "name"],
             "code_challenge_methods_supported": [],
         }
@@ -178,6 +185,10 @@ def jwks() -> JSONResponse:
 
 @app.get(f"{PREFIX}/qiip.svg")
 def qiip_mark() -> Response:
+    # Derived copy of assets/qiip.svg (same artwork, cropped to 56x46 and
+    # flattened to the brand teal for the login card). Kept in-tree so the
+    # vendored provider is self-contained: the RPM installs it standalone
+    # under /usr/share/qiip/oidc-provider without the gateway package.
     return FileResponse(
         Path(__file__).with_name("qiip.svg"), media_type="image/svg+xml"
     )
@@ -414,6 +425,42 @@ _LOGIN_FORM = """<!doctype html>
 </body></html>"""
 
 
+_ERROR_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QIIP - OIDC error</title>
+<style>{css}</style>
+</head>
+<body>
+<main class="signin-page">
+<div class="signin-card">
+<img class="signin-mark" src="{prefix}/qiip.svg" alt="QIIP" width="56" height="46">
+<h1>Sign-in request rejected</h1>
+<p class="signin-notice">{error}</p>
+</div>
+</main>
+</body></html>"""
+
+
+def _bad_request(error: str) -> HTMLResponse:
+    """Render a 400 page for invalid authorize/login requests.
+
+    Validation failures must never redirect to a caller-supplied URI (open
+    redirect, review #231): only a validated ``redirect_uri`` may receive
+    an OAuth error redirect.
+    """
+    return HTMLResponse(
+        _ERROR_PAGE.format(
+            prefix=PREFIX,
+            css=_CSS,
+            error=html.escape(error, quote=True),
+        ),
+        status_code=400,
+    )
+
+
 @app.get(f"{PREFIX}/authorize")
 def authorize(
     response_type: str = "",
@@ -424,34 +471,29 @@ def authorize(
     nonce: str = "",
 ) -> Response:
     if response_type != "code":
-        return RedirectResponse(
-            _oidc_error(redirect_uri, state, "unsupported_response_type"),
-            status_code=302,
+        return _bad_request(
+            "unsupported_response_type: only the authorization code flow is supported."
         )
     if client_id != CLIENT_ID:
-        return RedirectResponse(
-            _oidc_error(redirect_uri, state, "unauthorized_client"), status_code=302
-        )
+        return _bad_request("unauthorized_client: unknown client_id.")
     if redirect_uri != APP_REDIRECT_URI:
-        return RedirectResponse(
-            _oidc_error(redirect_uri, state, "invalid_request")
-            + "&error_description=bad_redirect_uri",
-            status_code=302,
+        return _bad_request(
+            "invalid_request: redirect_uri does not match the registered callback."
         )
     # Plaintext redirect (no OAuth parameter leakage beyond code/state).
-    html = _LOGIN_FORM.format(
+    page = _LOGIN_FORM.format(
         domain=DOMAIN,
         prefix=PREFIX,
         css=_CSS,
         toggle_js=_TOGGLE_JS,
         error="",
-        client_id=client_id,
-        redirect_uri=redirect_uri,
-        state=state,
-        scope=scope,
-        nonce=nonce,
+        client_id=html.escape(client_id, quote=True),
+        redirect_uri=html.escape(redirect_uri, quote=True),
+        state=html.escape(state, quote=True),
+        scope=html.escape(scope, quote=True),
+        nonce=html.escape(nonce, quote=True),
     )
-    return HTMLResponse(html)
+    return HTMLResponse(page)
 
 
 @app.post(f"{PREFIX}/login")
@@ -465,21 +507,28 @@ async def login(
     scope: str = Form(""),
     nonce: str = Form(""),
 ) -> Response:
+    # Re-validate the (caller-supplied) client and callback before doing
+    # anything: the success redirect must never go to an unregistered URI
+    # (open redirect, review #231). Only validated values are echoed back.
+    if client_id != CLIENT_ID or redirect_uri != APP_REDIRECT_URI:
+        return _bad_request(
+            "invalid_request: client_id or redirect_uri is not registered."
+        )
     name = check_login(username, password)
     if name is None:
-        html = _LOGIN_FORM.format(
+        page = _LOGIN_FORM.format(
             domain=DOMAIN,
             prefix=PREFIX,
             css=_CSS,
             toggle_js=_TOGGLE_JS,
             error='<p class="signin-notice">Invalid username or password.</p>',
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            state=state,
-            scope=scope,
-            nonce=nonce,
+            client_id=html.escape(client_id, quote=True),
+            redirect_uri=html.escape(redirect_uri, quote=True),
+            state=html.escape(state, quote=True),
+            scope=html.escape(scope, quote=True),
+            nonce=html.escape(nonce, quote=True),
         )
-        return HTMLResponse(html, status_code=401)
+        return HTMLResponse(page, status_code=401)
     code = secrets.token_urlsafe(24)
     _codes[code] = {
         "username": name,
@@ -511,7 +560,11 @@ async def token(request: Request) -> JSONResponse:
             client_id, _, client_secret = decoded.partition(":")
         except Exception:
             pass
-    if client_id != CLIENT_ID or not hmac.compare_digest(client_secret, CLIENT_SECRET):
+    # Non-ASCII secrets must be compared as UTF-8 bytes (compare_digest
+    # rejects non-ASCII str, review #231).
+    if client_id != CLIENT_ID or not hmac.compare_digest(
+        client_secret.encode("utf-8"), CLIENT_SECRET.encode("utf-8")
+    ):
         return _token_error("invalid_client")
     grant_type = form.get("grant_type", "")
     code = form.get("code", "")
@@ -522,10 +575,9 @@ async def token(request: Request) -> JSONResponse:
         return _token_error("invalid_grant")
     if entry["client_id"] != client_id:
         return _token_error("invalid_grant")
-    if (
-        form.get("redirect_uri") is not None
-        and form.get("redirect_uri") != entry["redirect_uri"]
-    ):
+    # The redirect_uri is required and must match the one the code was
+    # issued for (review #231), not merely checked when present.
+    if form.get("redirect_uri") != entry["redirect_uri"]:
         return _token_error("invalid_grant")
 
     username = entry["username"]
@@ -580,13 +632,6 @@ def userinfo(request: Request) -> JSONResponse:
 
 def _token_error(code: str) -> JSONResponse:
     return JSONResponse({"error": code}, status_code=400)
-
-
-def _oidc_error(redirect_uri: str, state: str, code: str) -> str:
-    from urllib.parse import urlencode
-
-    sep = "&" if "?" in redirect_uri else "?"
-    return f"{redirect_uri}{sep}{urlencode({'error': code, 'state': state})}"
 
 
 if __name__ == "__main__":
