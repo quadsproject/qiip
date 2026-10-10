@@ -1374,6 +1374,36 @@ class TestAdminFullAccessSetting:
         assert AuthSettings().admin_only_tokens_full_access == []
 
 
+class TestAdminFullAccessByIssuerSetting:
+    """admin_only_tokens_full_access_by_issuer validation (review #231)."""
+
+    def test_default_is_empty(self) -> None:
+        assert AuthSettings().admin_only_tokens_full_access_by_issuer == {}
+
+    def test_issuer_and_emails_normalized(self) -> None:
+        auth = AuthSettings(
+            admin_only_tokens_full_access_by_issuer={
+                " https://local.oidc/ ": [" Ops@example.com ", "alice@example.com"],
+            }
+        )
+        assert auth.admin_only_tokens_full_access_by_issuer == {
+            "https://local.oidc/": ["ops@example.com", "alice@example.com"],
+        }
+
+    def test_bad_issuer_keys_rejected(self) -> None:
+        for bad in ("", "  ", "not a url", "example.com", "ftp://example.com"):
+            with pytest.raises(ValidationError, match="issuer"):
+                AuthSettings(admin_only_tokens_full_access_by_issuer={bad: ["a@b.com"]})
+
+    def test_bad_emails_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="full_access"):
+            AuthSettings(
+                admin_only_tokens_full_access_by_issuer={
+                    "https://local.oidc/": ["not-an-email"],
+                }
+            )
+
+
 class TestSSOWhitelistDefaultDomain:
     """sso_whitelist_default_domain validation (RFE)."""
 

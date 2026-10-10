@@ -69,7 +69,9 @@ async def enforce_mint_allowlist(
     list bypasses it. Admin-role users must still pass, otherwise the use
     time check (auth/dependencies.py) would 401 every call of the new token.
     """
-    if not settings.auth.enforce_sso_whitelist or is_full_access(user.email, settings):
+    if not settings.auth.enforce_sso_whitelist or is_full_access(
+        user.email, user.issuer, settings
+    ):
         return
     try:
         allowed = await enforce_allowlist(user.email, allowlist)
@@ -152,7 +154,7 @@ async def create_token(
     may route to: an unknown hostname is rejected (400) and a node owned by
     someone else is rejected (403). Admins may pin any registered node.
     """
-    admin = has_admin_access(user.email, settings, is_admin=user.is_admin)
+    admin = has_admin_access(user.email, user.issuer, settings, is_admin=user.is_admin)
     if not admin:
         # Normal users own exactly one model-scoped token, minted on /start.
         # Minting here (including the agent-config key) would hand them a
@@ -217,7 +219,9 @@ async def list_pickable_endpoints(
 ) -> list[dict[str, str]]:
     """List endpoints the signed-in user may pin a token to."""
     nodes = registry.get_all()
-    pickable = pickable_endpoints(user.email, settings, nodes, is_admin=user.is_admin)
+    pickable = pickable_endpoints(
+        user.email, user.issuer, settings, nodes, is_admin=user.is_admin
+    )
     by_id = {node.node_id: node for node in nodes}
     return [{"node_id": node_id, "model": by_id[node_id].model} for node_id in pickable]
 

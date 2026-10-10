@@ -110,7 +110,7 @@ async def require_normal_user(
     pinned and agent-config tokens on /profile, so the flow must never run
     for them.
     """
-    if has_admin_access(user.email, settings, is_admin=user.is_admin):
+    if has_admin_access(user.email, user.issuer, settings, is_admin=user.is_admin):
         raise HTTPException(
             status_code=403, detail="Admins manage tokens from the profile page"
         )
@@ -143,7 +143,9 @@ def _available_models(
     """Model ids the user can reach right now, sorted and de-duplicated."""
     nodes = registry.get_all()
     pickable = set(
-        pickable_endpoints(user.email, settings, nodes, is_admin=user.is_admin)
+        pickable_endpoints(
+            user.email, user.issuer, settings, nodes, is_admin=user.is_admin
+        )
     )
     models: set[str] = set()
     for node in nodes:
@@ -176,7 +178,9 @@ def _model_details(
     """Describe verified profile runtimes, never infer capabilities from a name."""
     nodes = registry.get_all()
     pickable = set(
-        pickable_endpoints(user.email, settings, nodes, is_admin=user.is_admin)
+        pickable_endpoints(
+            user.email, user.issuer, settings, nodes, is_admin=user.is_admin
+        )
     )
     profiles = {(p.profile_id, p.version): p for p in BUILTIN_PROFILES}
     details: dict[str, dict[str, object]] = {}
