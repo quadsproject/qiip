@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from fastapi import Request
 from fastapi.responses import RedirectResponse
 
+from inference_proxy.auth._constants import GOOGLE_ISSUER
 from inference_proxy.plugins.base import BasePlugin
 
 _CALLBACK_CODE_PATTERN = re.compile(r"[a-z_]{1,32}")
@@ -20,13 +21,15 @@ class AuthIdentity:
 
     ``issuer`` is the OIDC ``iss`` of the provider that issued the subject
     claim; user rows are keyed by (issuer, sub) so two providers can issue
-    the same opaque ``sub`` without colliding.
+    the same opaque ``sub`` without colliding. It defaults to the Google
+    issuer so an external plugin built before the field existed keeps
+    producing Google keyed rows (no TypeError, review #231).
     """
 
     sub: str
     email: str
     email_verified: bool
-    issuer: str
+    issuer: str = GOOGLE_ISSUER
     name: str = ""
     picture: str = ""
 

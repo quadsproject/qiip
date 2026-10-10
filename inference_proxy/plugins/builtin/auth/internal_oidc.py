@@ -15,6 +15,7 @@ import hmac
 from pathlib import Path
 from typing import cast
 
+import httpx
 import structlog
 from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import Request
@@ -64,7 +65,10 @@ class InternalOidcPlugin(AuthPlugin):
         self._users_file: Path | None = (
             Path(str(raw_users_file)).expanduser() if raw_users_file else None
         )
-        self._domain = str(self.config.get("domain", _DEFAULT_DOMAIN)).strip()
+        # Provider email domain, resolved from its discovery document so the
+        # Local Login form and the OIDC flow mint identical emails (single
+        # source; the old ``domain`` config key is gone).
+        self._domain: str | None = None
 
     def initialize(self, plugin_manager: PluginManager | None = None) -> bool:
         """Build the OIDC client when opted in with credentials + provider URL.
@@ -106,7 +110,46 @@ class InternalOidcPlugin(AuthPlugin):
         )
         self._client = oauth
         self._server_metadata_url = metadata_url
+        self._fetch_email_domain()
         return True
+
+    def _fetch_email_domain(self) -> str | None:
+        """Read ``user_email_domain`` from the provider discovery document.
+
+        The vendored provider publishes its ``OIDC_DOMAIN`` there, so the
+        Local Login form and the OIDC flow mint identical emails for the
+        same bare username from one source (review #231). A missing or
+        unfetchable document leaves the plain ``localdomain`` fallback;
+        providers that only ever mint full emails are unaffected.
+        """
+        try:
+            response = httpx.get(self._server_metadata_url, timeout=10.0)
+            response.raise_for_status()
+            raw = response.json().get("user_email_domain")
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning(
+                "internal oidc discovery unavailable; bare usernames use the "
+                "default email domain",
+                url=self._server_metadata_url,
+                error=str(exc),
+            )
+            self._domain = None
+            return None
+        domain = str(raw).strip() if isinstance(raw, str) else ""
+        if not domain:
+            logger.warning(
+                "internal oidc discovery has no user_email_domain; bare "
+                "usernames use the default email domain",
+                url=self._server_metadata_url,
+            )
+            self._domain = None
+            return None
+        self._domain = domain
+        return domain
+
+    def _email_domain(self) -> str:
+        """Return the provider email domain, or the default when unknown."""
+        return self._domain or _DEFAULT_DOMAIN
 
     def is_configured(self) -> bool:
         """Return True when the provider client was built during initialize."""
@@ -198,9 +241,13 @@ class InternalOidcPlugin(AuthPlugin):
             users[name] = secret
         name = username.strip().lower()
         stored = users.get(name)
-        if stored is None or not hmac.compare_digest(stored, password):
+        if stored is None:
             return None
-        return name if "@" in name else f"{name}@{self._domain}"
+        # compare_digest only accepts ASCII str or bytes: non-ASCII passwords
+        # (UTF-8) must be compared as bytes or they raise TypeError.
+        if not hmac.compare_digest(stored.encode("utf-8"), password.encode("utf-8")):
+            return None
+        return name if "@" in name else f"{name}@{self._email_domain()}"
 
     def _require_client(self) -> OAuth:
         if self._client is None:

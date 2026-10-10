@@ -39,7 +39,12 @@ auth:
   sso_whitelist_extra_domains: []
   # Emails whose tokens are exempt from endpoint scoping and owner isolation
   # (and from the SSO whitelist gate); they may pin tokens to any endpoint.
+  # Google accounts only. Other issuers (e.g. the local OIDC provider) are
+  # granted per issuer URL below.
   admin_only_tokens_full_access: []
+  # Per-issuer grants: issuer URL (the provider's OIDC "iss") -> emails to
+  # grant the same full-access scope as the list above.
+  admin_only_tokens_full_access_by_issuer: {}
 
 oauth:
   # Google OAuth (set all three credentials to enable; any partial set fails

@@ -10,33 +10,48 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from inference_proxy.auth._constants import GOOGLE_ISSUER
 from inference_proxy.auth.models import TokenAuth
 from inference_proxy.config.settings import Settings
 from inference_proxy.models.node import Node
 
 
-def is_full_access(email: str, settings: Settings) -> bool:
-    """Return True when *email* is on the admin full-access trust list."""
-    listed = settings.auth.admin_only_tokens_full_access
-    if not listed:
-        return False
+def is_full_access(email: str, issuer: str, settings: Settings) -> bool:
+    """Return True when (email, issuer) is on the admin full-access list.
+
+    The plain ``admin_only_tokens_full_access`` list keeps its pre-local
+    OIDC meaning and grants Google accounts only, so a local identity
+    asserting a listed email gains no scope (review #231). Other issuers
+    are granted explicitly through
+    ``admin_only_tokens_full_access_by_issuer``, keyed by their ``iss``
+    URL.
+    """
     normalized = email.lower()
-    return any(item.lower() == normalized for item in listed)
+    if issuer == GOOGLE_ISSUER and any(
+        item.lower() == normalized
+        for item in settings.auth.admin_only_tokens_full_access
+    ):
+        return True
+    per_issuer = settings.auth.admin_only_tokens_full_access_by_issuer.get(issuer)
+    if not per_issuer:
+        return False
+    return any(item.lower() == normalized for item in per_issuer)
 
 
 def has_admin_access(
     email: str,
+    issuer: str,
     settings: Settings,
     *,
     is_admin: bool = False,
 ) -> bool:
-    """Return True when *email* holds admin scope for inference routing.
+    """Return True when (email, issuer) holds admin scope for routing.
 
-    Admin scope is the full-access trust list OR the admin role; scope
-    resolvers, the endpoint picker, and the token-mint surface all treat
-    them identically so the predicate never diverges.
+    Admin scope is the (issuer-scoped) full-access trust list OR the admin
+    role; scope resolvers, the endpoint picker, and the token-mint surface
+    all treat them identically so the predicate never diverges.
     """
-    return is_full_access(email, settings) or is_admin
+    return is_full_access(email, issuer, settings) or is_admin
 
 
 def allowed_node_ids(
@@ -69,7 +84,9 @@ def scope_owner(auth: TokenAuth | None, settings: Settings) -> str | None:
     """
     if auth is None:
         return ""
-    if has_admin_access(auth.user.email, settings, is_admin=auth.user.is_admin):
+    if has_admin_access(
+        auth.user.email, auth.user.issuer, settings, is_admin=auth.user.is_admin
+    ):
         return None
     return auth.user.email.lower()
 
@@ -89,13 +106,16 @@ def auth_scope(
         return (None, "")
     scope = auth.token.endpoint_scope
     allowed = frozenset(scope) if scope is not None else None
-    if has_admin_access(auth.user.email, settings, is_admin=auth.user.is_admin):
+    if has_admin_access(
+        auth.user.email, auth.user.issuer, settings, is_admin=auth.user.is_admin
+    ):
         return (allowed, None)
     return (allowed, auth.user.email.lower())
 
 
 def pickable_endpoints(
     user_email: str,
+    issuer: str,
     settings: Settings,
     nodes: Iterable[Node],
     *,
@@ -105,9 +125,10 @@ def pickable_endpoints(
 
     A user may pin unowned nodes and nodes they own; admins may pin
     anything, including admin-only servers. Admin-only servers are never
-    pickable by non-admin callers.
+    pickable by non-admin callers. The full-access grant is issuer-scoped
+    like every other admin check (see :func:`is_full_access`).
     """
-    admin = has_admin_access(user_email, settings, is_admin=is_admin)
+    admin = has_admin_access(user_email, issuer, settings, is_admin=is_admin)
     email = user_email.lower()
     pickable = []
     for node in nodes:

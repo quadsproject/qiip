@@ -19,6 +19,7 @@ from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import Request
 from fastapi.responses import RedirectResponse
 
+from inference_proxy.auth._constants import GOOGLE_ISSUER
 from inference_proxy.config.settings import OAuthSettings
 from inference_proxy.plugins.interfaces.auth import (
     AuthCallbackError,
@@ -30,7 +31,6 @@ from inference_proxy.plugins.manager import PluginManager
 logger = structlog.get_logger()
 
 _GOOGLE_DISCOVERY_URL = "https://accounts.google.com/.well-known/openid-configuration"
-_GOOGLE_ISSUER = "https://accounts.google.com"
 
 
 def build_google_oauth(settings: OAuthSettings) -> OAuth:
@@ -120,7 +120,7 @@ class GoogleAuthPlugin(AuthPlugin):
             sub=sub,
             email=email,
             email_verified=userinfo.get("email_verified") is True,
-            issuer=_GOOGLE_ISSUER,
+            issuer=GOOGLE_ISSUER,
             name=name if isinstance(name, str) else "",
             picture=picture if isinstance(picture, str) else "",
         )

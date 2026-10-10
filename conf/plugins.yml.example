@@ -37,4 +37,8 @@ plugins:
       #     format as the toy provider's users.txt; entries whose username is
       #     the admin username are ignored)
       # users_file: /etc/qiip/oidc-users.txt
-      # domain: localdomain   # suffix appended to bare usernames
+      # The email suffix for bare usernames comes from the provider's
+      # discovery document ("user_email_domain", published by the vendored
+      # provider from OIDC_DOMAIN) so the form and the OIDC flow agree;
+      # there is no per-plugin domain setting. Providers that advertise no
+      # such claim map bare usernames to the default localdomain.

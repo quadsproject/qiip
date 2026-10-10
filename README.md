@@ -55,11 +55,11 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Hardware-aware model recommendations** -- runs llmfit via SSH on a target host to produce ranked, runtime-normalized recommendations with fit levels, throughput, memory estimates, and typed GGUF sources; auto-installs the binary on first use
 - **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
 - **Admin authentication** -- HTTP Basic credentials or a signed-in admin-role session (local-admin form or Google OAuth) on all `/admin/*` endpoints; browser pages gate with a sign-in page instead of 401ing
-- **Fleet sign-in gate** -- anonymous visitors to the fleet dashboard get a sign-in page with two choices: **Local Admin** (a collapsible option that expands to an in-page username/password form establishing a signed session cookie — no browser Basic challenge popup; HTTP Basic still works for scripts and SSE) and **Google Auth** (same flow as the profile page). When the opt-in **Local Auth** option is enabled (see [User authentication](#user-authentication-google-oauth)) a third provider button appears
+- **Fleet sign-in gate** -- anonymous visitors to the fleet dashboard get a sign-in page with two choices: **Local Admin** (a collapsible option that expands to an in-page username/password form establishing a signed session cookie — no browser Basic challenge popup; HTTP Basic still works for scripts and SSE) and **Google Auth** (same flow as the profile page). When the opt-in local OIDC provider is enabled (see [Local OIDC provider](#local-oidc-provider-opt-in)) the **Local Admin** option becomes **Local Login**: the same form, but non-admin usernames are checked against the provider's user list
 - **Admin roles** -- the HTTP Basic admin user (bootstrap authority) can grant or revoke the admin role to Google-authenticated users on the token dashboard (`/dashboard/tokens`); role admins then reach the admin surface through their session and see admin-only servers
 - **Admin-only inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). At `/v1` they are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with an `admin_only` badge in the admin fleet view. Token usage from admin-only servers is tracked on the token summary pages exactly like any other node
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
-- **Local OAuth (opt-in)** -- a vendored toy OpenID Connect provider (`oidc-provider/`, test-only) plus the `auth.internal_oidc` plugin let a small install maintain a local user list instead of Google. Off by default; enabling it adds a **Local Auth** button next to Google Auth on the sign-in page. User rows are keyed by (provider issuer, subject) so Google and local accounts coexist. See [Local OIDC provider](#local-oidc-provider-opt-in)
+- **Local OAuth (opt-in)** -- a vendored toy OpenID Connect provider (`oidc-provider/`, test-only) plus the `auth.internal_oidc` plugin let a small install maintain a local user list instead of Google. Off by default; enabling it turns the sign-in page's **Local Admin** option into **Local Login** (no separate provider button; the OIDC flow stays reachable by direct link). User rows are keyed by (provider issuer, subject) so Google and local accounts coexist. See [Local OIDC provider](#local-oidc-provider-opt-in)
 - **Self-service onboarding** -- signed-in normal users land on `/start`: one question per screen (name a token, pick a coding tool, pick models) ending in a short-lived `curl ... | bash` line that writes the tool's config; returning users see their single token and its models. See [Self-service onboarding](#self-service-onboarding-start)
 - **Usage leaderboard** -- signed-in users get a simple dashboard at `/leaderboard`: every non-admin user ranked by token usage (admin tokens and usage never appear), plus the viewer's own token manager (create replaces, delete revokes) and a per-harness config download with optional model and harness pickers (RFE #156)
 - **Per-token model scope** -- a token minted by the onboarding flow may only request the models chosen for it; other models are refused on `/v1` with `403 model_not_permitted`, and `/v1/models` lists only the token's models
@@ -1023,9 +1023,14 @@ plugin. It replaces `accounts.google.com` with a network-local provider whose
 users live in a plaintext `username:password` file. Test-only: in-memory
 codes/tokens, no refresh tokens or PKCE.
 
-Enabling it adds a third button, **Local Auth**, to the sign-in page; with it
-disabled (the default) the page is unchanged. Both providers can be enabled
-at once — user rows are keyed by (issuer, sub) so accounts never collide.
+Enabling it turns the sign-in page's **Local Admin** form into a **Local
+Login** form — the same username/password form, with non-admin usernames
+checked against the provider's user list instead of just the admin
+account (there is no separate provider button; the external
+`/auth/login?provider=internal_oidc` flow stays reachable by direct
+link). With it disabled (the default) the page is unchanged. Both
+providers can be enabled at once — user rows are keyed by (issuer, sub)
+so accounts never collide.
 
 1. Configure the plugin (default disabled) — `conf/plugins.yml`:
 
@@ -1036,22 +1041,42 @@ at once — user rows are keyed by (issuer, sub) so accounts never collide.
          enabled: true
          server_metadata_url: https://<host>/oidc/.well-known/openid-configuration
          users_file: /etc/qiip/oidc-users.txt   # Local Login user list
-         domain: localdomain                    # suffix for bare usernames
+         # bare-username suffix comes from the provider's discovery document
    ```
 
    The `INFERENCE_PROXY_OAUTH__CLIENT_ID` / `CLIENT_SECRET` / `REDIRECT_URI`
    triple (same as Google) supplies the OAuth client credentials.
+   `users_file` must point at the SAME file the provider serves: the RPM
+   layout uses `/etc/qiip/oidc-users.txt`, a git checkout with the packaged
+   `systemd/qiip-oidc.service` uses `/opt/inference-proxy/oidc-provider/users.txt`
+   (the provider unit sets `OIDC_USERS_FILE` there) — otherwise the local
+   form and the OIDC flow check different lists.
+   The email suffix for bare usernames comes from the provider's discovery
+   document (`user_email_domain`, published from `OIDC_DOMAIN`, see step 2),
+   so both paths mint identical emails for the same username.
 2. Start the provider and point nginx at `/oidc/` (git checkout:
    `cp oidc-provider/users.txt.example oidc-provider/users.txt`, edit it,
    then `systemctl enable --now qiip-oidc`; the included nginx template
    already proxies `/oidc/`). Set `OIDC_DOMAIN` to your site domain (e.g.
    `somelab.example.com`) so bare usernames sign in as
    `user1@somelab.example.com`; full emails in `users.txt` are used
-   as-is. Keep `INFERENCE_PROXY_OAUTH__ALLOWED_DOMAINS` (or leave it empty)
-   in sync with that domain.
+   as-is (`OIDC_DOMAIN` goes in `/opt/inference-proxy/.env` for the git
+   checkout unit, `/etc/qiip/oidc.env` for the RPM unit; restart
+   `qiip-oidc` after editing). Keep
+   `INFERENCE_PROXY_OAUTH__ALLOWED_DOMAINS` (or leave it empty) in sync
+   with that domain.
+   The gateway fetches `server_metadata_url` and the token endpoint
+   server-side, so it must trust the nginx certificate: with the
+   self-signed pair from `gen-cert.sh`, put
+   `SSL_CERT_FILE=/etc/pki/tls/certs/<fqdn>.pem` in the gateway's
+   environment file (`/opt/inference-proxy/.env` for the checkout unit,
+   `/etc/qiip/qiip.env` for the RPM unit) and restart
+   `inference-proxy`; with an internal CA, install the CA into the
+   system trust store instead.
 3. Sign in: with the provider enabled the sign-in page's local form is
-   labelled **Local Login** (it replaces the Local Admin form; the separate
-   Local Auth provider button is folded into it):
+   labelled **Local Login** (it replaces the Local Admin form; there is no
+   separate Local Auth button — the external flow is reachable only by
+   direct link):
    - the configured admin username/password is checked first and always
      wins — a same-named entry in `users_file` is ignored;
    - any other username/password is checked against `users_file` (the same

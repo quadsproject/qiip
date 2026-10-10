@@ -12,7 +12,11 @@ import pytest
 
 import inference_proxy.auth.store as store_module
 from inference_proxy.auth.models import CreatedToken, User
-from inference_proxy.auth.store import AuthStore, _utcnow
+from inference_proxy.auth.store import (
+    AccountConflictError,
+    AuthStore,
+    _utcnow,
+)
 
 _GOOGLE = {
     "google_sub": "sub-123",
@@ -1202,19 +1206,28 @@ class TestIssuerScopedUsers:
         assert refreshed.name == "Alice Smith"
         assert auth_store._conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
 
-    def test_email_rebind_moves_issuer(self, auth_store: AuthStore) -> None:
+    def test_email_conflict_across_issuers_refused(
+        self,
+        auth_store: AuthStore,
+    ) -> None:
+        """An email owned by another issuer is never rebound (the admin role
+        and tokens must not silently move between providers)."""
         original = auth_store.upsert_google_user(**_GOOGLE)
-        migrated = auth_store.upsert_google_user(
-            google_sub="sub-local",
-            issuer=self._LOCAL_ISSUER,
-            email="alice@example.com",
-            name="Alice",
-            picture="",
-        )
+        with pytest.raises(AccountConflictError) as exc:
+            auth_store.upsert_google_user(
+                google_sub="sub-local",
+                issuer=self._LOCAL_ISSUER,
+                email="alice@example.com",
+                name="Alice",
+                picture="",
+            )
 
-        assert migrated.id == original.id
-        assert migrated.issuer == self._LOCAL_ISSUER
-        assert migrated.google_sub == "sub-local"
+        assert exc.value.email == "alice@example.com"
+        kept = auth_store.get_user(original.id)
+        assert kept is not None
+        assert kept.issuer == store_module.GOOGLE_ISSUER
+        assert kept.google_sub == "sub-123"
+        assert auth_store._conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
 
     def test_issuer_sub_is_unique(self, auth_store: AuthStore) -> None:
         """The composite unique index rejects a second row for the same
