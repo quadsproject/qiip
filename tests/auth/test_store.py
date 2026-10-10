@@ -1314,3 +1314,182 @@ class TestIssuerScopedUsers:
             assert local.id != user.id
         finally:
             store.close()
+
+    def test_migration_preserves_child_table_foreign_keys(self, tmp_path: Path) -> None:
+        """The rebuild must not rewrite child tables to reference a dropped
+        table: the rename-into-place variant keeps ``REFERENCES users``, and
+        PRAGMA foreign_key_check stays empty (review #231, ttlogan/sjug)."""
+        db_path = tmp_path / "fk-legacy.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE users (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                google_sub  TEXT    NOT NULL UNIQUE,
+                email       TEXT    NOT NULL UNIQUE,
+                name        TEXT    NOT NULL DEFAULT '',
+                picture     TEXT    NOT NULL DEFAULT '',
+                created_at  TEXT    NOT NULL,
+                updated_at  TEXT    NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE tokens (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name            TEXT    NOT NULL,
+                token_hash      TEXT    NOT NULL UNIQUE,
+                prefix          TEXT    NOT NULL,
+                created_at      TEXT    NOT NULL,
+                last_used_at    TEXT,
+                revoked         INTEGER NOT NULL DEFAULT 0,
+                endpoint_scope  TEXT,
+                purpose         TEXT,
+                model_scope     TEXT,
+                derive_nonce    TEXT
+            )
+            """
+        )
+        now = _utcnow().isoformat()
+        conn.execute(
+            "INSERT INTO users (google_sub, email, name, picture, created_at, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("sub-fk", "fk@example.com", "", "", now, now),
+        )
+        conn.execute(
+            "INSERT INTO tokens (user_id, name, token_hash, prefix, created_at) "
+            "VALUES (1, 'fk', 'h', 'qiip_', ?)",
+            (now,),
+        )
+        conn.commit()
+        conn.close()
+
+        store = AuthStore(db_path)
+        try:
+            tokens_ddl = store._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tokens'"
+            ).fetchone()[0]
+            assert "REFERENCES users(id)" in tokens_ddl
+            assert "users_legacy_issuer" not in tokens_ddl
+            assert store._conn.execute("PRAGMA foreign_key_check").fetchall() == []
+            # A child write still lands (the reference resolves to live users).
+            with store._conn:
+                store._conn.execute(
+                    "INSERT INTO tokens (user_id, name, token_hash, prefix, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (1, "fk2", "h2", "qiip_", _utcnow().isoformat()),
+                )
+        finally:
+            store.close()
+
+    def test_migration_recovers_leftover_legacy_table(self, tmp_path: Path) -> None:
+        """Crash after the old draft's RENAME (rows stranded in
+        users_legacy_issuer behind an empty recreated users) is repaired on
+        open: rows are restored and the leftover table dropped (review #231)."""
+        db_path = tmp_path / "legacy-rename-crash.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE users (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                google_sub  TEXT    NOT NULL UNIQUE,
+                email       TEXT    NOT NULL UNIQUE,
+                name        TEXT    NOT NULL DEFAULT '',
+                picture     TEXT    NOT NULL DEFAULT '',
+                created_at  TEXT    NOT NULL,
+                updated_at  TEXT    NOT NULL
+            )
+            """
+        )
+        now = _utcnow().isoformat()
+        conn.execute(
+            "INSERT INTO users (google_sub, email, name, picture, created_at, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            ("sub-crash", "crash@example.com", "", "", now, now),
+        )
+        conn.commit()
+        conn.close()
+        # Simulate the interrupted first draft: users is renamed out of the
+        # way and the next startup recreated an empty users (with issuer).
+        conn = sqlite3.connect(db_path)
+        conn.execute("ALTER TABLE users RENAME TO users_legacy_issuer")
+        conn.commit()
+        conn.close()
+
+        store = AuthStore(db_path)
+        try:
+            user = store.get_user(1)
+            assert user is not None
+            assert user.email == "crash@example.com"
+            assert user.issuer == store_module.GOOGLE_ISSUER
+            # The leftover draft table is gone, not just emptied.
+            assert store._table_exists("users_legacy_issuer") is False
+        finally:
+            store.close()
+
+    def test_migration_recovers_leftover_new_table(self, tmp_path: Path) -> None:
+        """Crash after DROP TABLE users but before the users_new rename is
+        repaired on open: users_new is renamed into place (review #231)."""
+        db_path = tmp_path / "new-table-crash.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE users (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                google_sub  TEXT    NOT NULL,
+                issuer      TEXT    NOT NULL DEFAULT 'https://accounts.google.com',
+                email       TEXT    NOT NULL UNIQUE,
+                name        TEXT    NOT NULL DEFAULT '',
+                picture     TEXT    NOT NULL DEFAULT '',
+                is_admin    INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT    NOT NULL,
+                updated_at  TEXT    NOT NULL
+            )
+            """
+        )
+        now = _utcnow().isoformat()
+        conn.execute(
+            "INSERT INTO users (google_sub, issuer, email, name, picture, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "sub-new",
+                store_module.GOOGLE_ISSUER,
+                "new@example.com",
+                "",
+                "",
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        # Simulate the crash shape: the rebuilt table exists with rows, an
+        # empty users sits in front of it.
+        conn = sqlite3.connect(db_path)
+        conn.execute("ALTER TABLE users RENAME TO users_new")
+        conn.execute(
+            "CREATE TABLE users ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " google_sub TEXT NOT NULL,"
+            " issuer TEXT NOT NULL DEFAULT 'https://accounts.google.com',"
+            " email TEXT NOT NULL UNIQUE,"
+            " name TEXT NOT NULL DEFAULT '',"
+            " picture TEXT NOT NULL DEFAULT '',"
+            " is_admin INTEGER NOT NULL DEFAULT 0,"
+            " created_at TEXT NOT NULL,"
+            " updated_at TEXT NOT NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        store = AuthStore(db_path)
+        try:
+            user = store.get_user(1)
+            assert user is not None
+            assert user.email == "new@example.com"
+            # users_new was renamed into place, not left behind.
+            assert store._table_exists("users_new") is False
+        finally:
+            store.close()
