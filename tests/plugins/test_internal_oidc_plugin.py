@@ -5,13 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from authlib.integrations.starlette_client import OAuthError
 from fastapi.responses import RedirectResponse
 from pydantic import SecretStr
 
 from inference_proxy.config.settings import OAuthSettings, Settings
-from inference_proxy.plugins.builtin.auth import internal_oidc as internal_oidc_module
 from inference_proxy.plugins.builtin.auth.internal_oidc import InternalOidcPlugin
 from inference_proxy.plugins.interfaces.auth import AuthCallbackError, AuthIdentity
 from inference_proxy.plugins.manager import PluginManager
@@ -19,24 +19,27 @@ from inference_proxy.plugins.manager import PluginManager
 _LOCAL_ISSUER = "http://oidc.localdomain/oidc"
 
 
+def _fake_get(url: str, **kwargs: object) -> object:
+    """Stand-in for httpx.get: returns a scripted discovery response."""
+    del url, kwargs
+    return _DiscoveryResponse()
+
+
+class _DiscoveryResponse:
+    _metadata: dict[str, object] = {}
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return dict(self._metadata)
+
+
 @pytest.fixture(autouse=True)
 def _fake_discovery(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """Keep initialize() off the network; tests opt into metadata per test."""
-
-    class _DiscoveryResponse:
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict[str, object]:
-            return holder.get("metadata", {})
-
-    holder: dict[str, object] = {}
-    monkeypatch.setattr(
-        internal_oidc_module.httpx,
-        "get",
-        lambda url, **kwargs: _DiscoveryResponse(),
-    )
-    return holder
+    monkeypatch.setattr(httpx, "get", _fake_get)
+    return _DiscoveryResponse._metadata
 
 
 _VALID_USERINFO: dict[str, object] = {
@@ -255,10 +258,8 @@ class TestLocalUserList:
     ) -> None:
         """The provider's discovery ``user_email_domain`` is the single
         source (review #231): no separate ``domain`` config to drift."""
-        _fake_discovery["metadata"] = {
-            "user_email_domain": "somelab.example.com",
-            "issuer": _LOCAL_ISSUER,
-        }
+        _fake_discovery["user_email_domain"] = "somelab.example.com"
+        _fake_discovery["issuer"] = _LOCAL_ISSUER
         plugin = self._plugin(tmp_path, "alice:secret\n")
         plugin._server_metadata_url = (
             _LOCAL_ISSUER + "/.well-known/openid-configuration"

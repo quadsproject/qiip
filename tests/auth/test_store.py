@@ -11,6 +11,7 @@ from typing import TypedDict
 import pytest
 
 import inference_proxy.auth.store as store_module
+from inference_proxy.auth._constants import GOOGLE_ISSUER
 from inference_proxy.auth.models import CreatedToken, User
 from inference_proxy.auth.store import (
     AccountConflictError,
@@ -1177,7 +1178,7 @@ class TestIssuerScopedUsers:
     def test_google_default_issuer(self, auth_store: AuthStore) -> None:
         user = auth_store.upsert_google_user(**_GOOGLE)
 
-        assert user.issuer == store_module.GOOGLE_ISSUER
+        assert user.issuer == GOOGLE_ISSUER
 
     def test_same_sub_different_issuer_coexists(self, auth_store: AuthStore) -> None:
         google = auth_store.upsert_google_user(**_GOOGLE)
@@ -1225,7 +1226,7 @@ class TestIssuerScopedUsers:
         assert exc.value.email == "alice@example.com"
         kept = auth_store.get_user(original.id)
         assert kept is not None
-        assert kept.issuer == store_module.GOOGLE_ISSUER
+        assert kept.issuer == GOOGLE_ISSUER
         assert kept.google_sub == "sub-123"
         assert auth_store._conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
 
@@ -1301,7 +1302,7 @@ class TestIssuerScopedUsers:
         try:
             user = store.get_user(1)
             assert user is not None
-            assert user.issuer == store_module.GOOGLE_ISSUER
+            assert user.issuer == GOOGLE_ISSUER
             # The composite unique index replaced the single-column constraint:
             # the same sub under a different issuer is now allowed.
             local = store.upsert_google_user(
@@ -1423,7 +1424,7 @@ class TestIssuerScopedUsers:
             user = store.get_user(1)
             assert user is not None
             assert user.email == "crash@example.com"
-            assert user.issuer == store_module.GOOGLE_ISSUER
+            assert user.issuer == GOOGLE_ISSUER
             # The leftover draft table is gone, not just emptied.
             assert store._table_exists("users_legacy_issuer") is False
         finally:
@@ -1455,7 +1456,7 @@ class TestIssuerScopedUsers:
             "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 "sub-new",
-                store_module.GOOGLE_ISSUER,
+                GOOGLE_ISSUER,
                 "new@example.com",
                 "",
                 "",
