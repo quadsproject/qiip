@@ -38,6 +38,10 @@ Requires:       hostname
 # pin 3.5.21. Installed but not started/required at runtime for a remote
 # cluster, matching the "gateway starts during an etcd outage" contract.
 Requires:       etcd >= 3.5.0
+# The vendored toy OIDC provider (oidc-provider/app.py) imports cryptography
+# directly for RS256 key generation; only transitively available through
+# authlib, so declare it explicitly.
+Requires:       python3-cryptography
 @CONFLICTS@
 
 %description
@@ -63,11 +67,21 @@ cp -a auto-vllm auto-llamacpp common conf nginx %{buildroot}%{_datadir}/qiip/
 chmod 0755 %{buildroot}%{_datadir}/qiip/nginx/gen-cert.sh \
     %{buildroot}%{_datadir}/qiip/nginx/nginx-deploy-conf.sh
 
+# Opt-in toy OIDC provider (local test auth; served at /oidc/ by nginx).
+install -d -m 0755 %{buildroot}%{_datadir}/qiip/oidc-provider
+install -m 0644 oidc-provider/app.py oidc-provider/qiip.svg \
+    %{buildroot}%{_datadir}/qiip/oidc-provider/
+install -m 0644 oidc-provider/users.txt.example \
+    %{buildroot}%{_datadir}/qiip/oidc-provider/users.txt.example
+
 install -d -m 0755 %{buildroot}%{_unitdir}
 install -m 0644 rpm/inference-proxy.service %{buildroot}%{_unitdir}/inference-proxy.service
+install -m 0644 rpm/qiip-oidc.service %{buildroot}%{_unitdir}/qiip-oidc.service
 
 # Writable runtime data location (matches the shipped unit's overrides).
 install -d -m 0755 %{buildroot}%{_localstatedir}/lib/qiip
+# The toy OIDC provider keeps its RSA signing key here.
+install -d -m 0755 %{buildroot}%{_localstatedir}/lib/qiip/oidc
 # Admin config: examples are never loaded (the loader matches .yml/.yaml),
 # and qiip.env is the secrets file the unit reads. Server tuning lives in
 # the server: YAML block (or INFERENCE_PROXY_SERVER__* overrides here).
@@ -82,6 +96,20 @@ EOF
 # qiip.env holds secrets (admin credentials, API keys); never ship it
 # world-readable.
 chmod 0600 %{buildroot}%{_sysconfdir}/qiip/qiip.env
+# Toy OIDC provider: the user list is the operator's to edit (0600,
+# %config noreplace), and overrides live in their own env file so
+# INFERENCE_PROXY_* secrets stay in qiip.env.
+install -m 0600 oidc-provider/users.txt.example \
+    %{buildroot}%{_sysconfdir}/qiip/oidc-users.txt
+cat > %{buildroot}%{_sysconfdir}/qiip/oidc.env <<'EOF'
+# OIDC_* overrides for the qiip-oidc provider (opt-in local auth).
+# OIDC_BASE_URL=https://<host>/oidc          # public issuer URL
+# OIDC_REDIRECT_URI=https://<host>/auth/callback
+# OIDC_DOMAIN=localdomain                   # email suffix appended to bare usernames
+# OIDC_CLIENT_ID=my-qiip-client              # must match INFERENCE_PROXY_OAUTH__CLIENT_ID
+# OIDC_CLIENT_SECRET=change-me               # must match INFERENCE_PROXY_OAUTH__CLIENT_SECRET
+EOF
+chmod 0600 %{buildroot}%{_sysconfdir}/qiip/oidc.env
 
 %check
 # The full suite runs in CI (Node 24 + pinned dev deps); %check is empty so
@@ -96,14 +124,22 @@ chmod 0600 %{buildroot}%{_sysconfdir}/qiip/qiip.env
 %{_datadir}/qiip/common
 %{_datadir}/qiip/conf
 %{_datadir}/qiip/nginx
+%dir %{_datadir}/qiip/oidc-provider
+%{_datadir}/qiip/oidc-provider/app.py
+%{_datadir}/qiip/oidc-provider/qiip.svg
+%{_datadir}/qiip/oidc-provider/users.txt.example
 %{_unitdir}/inference-proxy.service
+%{_unitdir}/qiip-oidc.service
 %dir %{_localstatedir}/lib/qiip
+%dir %{_localstatedir}/lib/qiip/oidc
 %dir %{_sysconfdir}/qiip
 %attr(0750,root,root) %dir %{_sysconfdir}/qiip/conf
 %config(noreplace) %{_sysconfdir}/qiip/conf/qiip.yml.example
 %config(noreplace) %{_sysconfdir}/qiip/conf/auth.yml.example
 %config(noreplace) %{_sysconfdir}/qiip/conf/plugins.yml.example
 %attr(0600,root,root) %config(noreplace) %{_sysconfdir}/qiip/qiip.env
+%attr(0600,root,root) %config(noreplace) %{_sysconfdir}/qiip/oidc-users.txt
+%attr(0600,root,root) %config(noreplace) %{_sysconfdir}/qiip/oidc.env
 
 %post
 # QUADS-style nginx integration: nginx is a hard dependency and is managed
@@ -150,6 +186,9 @@ else
     echo "qiip: nginx -t failed; fix /etc/nginx/nginx.conf then run systemctl enable --now nginx" >&2
 fi
 %systemd_post inference-proxy.service
+# The OIDC provider stays opt-in: %systemd_post only registers the unit
+# (never enables it), restarts on upgrade, and stops it on removal.
+%systemd_post qiip-oidc.service
 # First install: also start the gateway (the macro above only enables), so
 # nginx does not sit on a dead upstream. Upgrades leave the running state alone.
 if [ "${1:-1}" -eq 1 ] && systemctl is-enabled --quiet inference-proxy.service 2>/dev/null; then
@@ -159,11 +198,13 @@ fi
 
 %preun
 %systemd_preun inference-proxy.service
+%systemd_preun qiip-oidc.service
 
 %postun
 # Restart (not just re-enable) on upgrade so a dnf upgrade replaces the
 # running process instead of leaving the old one alive.
 %systemd_postun_with_restart inference-proxy.service
+%systemd_postun_with_restart qiip-oidc.service
 
 %changelog
 * @DATE@ quads project maintainers <noreply@github.com> - @VERSION@-@RELEASE@

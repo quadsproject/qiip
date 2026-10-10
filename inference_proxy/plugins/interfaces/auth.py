@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from fastapi import Request
 from fastapi.responses import RedirectResponse
 
+from inference_proxy.auth._constants import GOOGLE_ISSUER
 from inference_proxy.plugins.base import BasePlugin
 
 _CALLBACK_CODE_PATTERN = re.compile(r"[a-z_]{1,32}")
@@ -16,11 +17,19 @@ _CALLBACK_CODE_PATTERN = re.compile(r"[a-z_]{1,32}")
 
 @dataclass(frozen=True, slots=True)
 class AuthIdentity:
-    """Verified identity claims returned by an SSO provider."""
+    """Verified identity claims returned by an SSO provider.
+
+    ``issuer`` is the OIDC ``iss`` of the provider that issued the subject
+    claim; user rows are keyed by (issuer, sub) so two providers can issue
+    the same opaque ``sub`` without colliding. It defaults to the Google
+    issuer so an external plugin built before the field existed keeps
+    producing Google keyed rows (no TypeError, review #231).
+    """
 
     sub: str
     email: str
     email_verified: bool
+    issuer: str = GOOGLE_ISSUER
     name: str = ""
     picture: str = ""
 
@@ -47,7 +56,13 @@ class AuthPlugin(BasePlugin, ABC):
     code exchange) and returns a normalized :class:`AuthIdentity`; generic
     policy (email verification, hosted-domain allowlist, session, user
     upsert) stays in the auth router so it is provider-neutral.
+
+    ``label`` is the human-readable provider name shown on the sign-in
+    page (e.g. "Google Auth"); ``name`` stays the plugin's stable
+    identifier and is used in the ``/auth/login?provider=`` link.
     """
+
+    label: str = ""
 
     @abstractmethod
     def is_configured(self) -> bool:
@@ -66,3 +81,16 @@ class AuthPlugin(BasePlugin, ABC):
         Raises ``AuthCallbackError`` with a short error code when the
         provider rejects or fails the exchange.
         """
+
+    def verify_local_credentials(
+        self, username: str, password: str, admin_username: str
+    ) -> str | None:
+        """Return the canonical local-account email for valid local credentials.
+
+        Providers that manage a local user list (e.g. ``auth.internal_oidc``)
+        check ``username``/``password`` against it; providers without a local
+        list (Google) return ``None``. Entries matching ``admin_username`` are
+        never local accounts: qiip's configured admin password wins, so the
+        auth router checks the admin credentials before calling this.
+        """
+        return None

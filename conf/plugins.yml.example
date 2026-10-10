@@ -22,3 +22,23 @@ plugins:
   config:
     auth.google:
       enabled: true
+    # Opt-in local OIDC provider (test/dev auth, or small local installs).
+    # Off by default: with this block absent/disabled the sign-in page shows
+    # only Local Admin and Google Auth. To enable, set enabled: true and the
+    # provider discovery URL, and configure INFERENCE_PROXY_OAUTH__CLIENT_ID
+    # / CLIENT_SECRET / REDIRECT_URI (the same triple Google uses).
+    auth.internal_oidc:
+      enabled: false
+      # server_metadata_url: https://<host>/oidc/.well-known/openid-configuration
+      # Local Login form (sign-in page replaces the Local Admin form with
+      # "Local Login" when this provider is enabled):
+      #   - the configured admin username/password is checked first and wins
+      #   - any other username/password is checked against users_file (same
+      #     format as the toy provider's users.txt; entries whose username is
+      #     the admin username are ignored)
+      # users_file: /etc/qiip/oidc-users.txt
+      # The email suffix for bare usernames comes from the provider's
+      # discovery document ("user_email_domain", published by the vendored
+      # provider from OIDC_DOMAIN) so the form and the OIDC flow agree;
+      # there is no per-plugin domain setting. Providers that advertise no
+      # such claim map bare usernames to the default localdomain.

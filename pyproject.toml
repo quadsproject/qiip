@@ -19,6 +19,9 @@ dependencies = [
     "authlib>=1.3,<2.0",
     "itsdangerous>=2.1,<3.0",
     "pyyaml>=6.0",
+    # Vendored toy OIDC provider (oidc-provider/, opt-in local auth).
+    "pyjwt>=2.8,<3.0",
+    "python-multipart>=0.0.9,<1.0",
 ]
 
 [dependency-groups]

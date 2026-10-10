@@ -74,6 +74,10 @@ from inference_proxy.services.unified_nodes import UnifiedNodeService
 def test_settings(tmp_path: Path) -> Settings:
     """Return a Settings instance with test-safe defaults."""
     return Settings(
+        # Never inherit the developer's .env: OAuth creds there would enable
+        # oauth and trip the session_secret requirement, and allowed_domains
+        # would silently constrain every policy test.
+        _env_file=None,
         etcd=EtcdSettings(
             endpoints=["http://localhost:2379"], node_prefix="/test-nodes/"
         ),

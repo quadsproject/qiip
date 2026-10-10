@@ -832,12 +832,49 @@ class AuthSettings(BaseModel):
     sso_whitelist_extra_users: list[str] = Field(default_factory=list)
     sso_whitelist_extra_domains: list[str] = Field(default_factory=list)
     admin_only_tokens_full_access: list[str] = Field(default_factory=list)
+    admin_only_tokens_full_access_by_issuer: dict[str, list[str]] = Field(
+        default_factory=dict
+    )
 
     @field_validator("admin_only_tokens_full_access")
     @classmethod
     def admin_only_tokens_full_access_are_emails(cls, value: list[str]) -> list[str]:
-        """Require valid email addresses for the full-access trust list."""
+        """Require valid email addresses for the Google full-access list."""
         return _clean_emails(value, "auth.admin_only_tokens_full_access")
+
+    @field_validator("admin_only_tokens_full_access_by_issuer")
+    @classmethod
+    def admin_only_tokens_full_access_by_issuer_are_emails(
+        cls, value: dict[str, list[str]]
+    ) -> dict[str, list[str]]:
+        """Scope full-access email lists to specific OIDC issuers.
+
+        The plain ``admin_only_tokens_full_access`` list keeps its
+        pre-local-OIDC meaning (Google accounts only), so a local identity
+        asserting a listed email gains no scope. Other issuers (e.g. the
+        local OIDC provider) must be granted explicitly here by their
+        ``iss`` URL, which must be an absolute http(s) URL (RFC 8414).
+        """
+        cleaned: dict[str, list[str]] = {}
+        for issuer, emails in value.items():
+            normalized = issuer.strip()
+            if not normalized or any(
+                ord(char) < 32 or char.isspace() for char in normalized
+            ):
+                raise ValueError(
+                    "auth.admin_only_tokens_full_access_by_issuer "
+                    "keys must be OIDC issuer URLs"
+                )
+            parsed = urlsplit(normalized)
+            if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+                raise ValueError(
+                    "auth.admin_only_tokens_full_access_by_issuer "
+                    "keys must be absolute http(s) issuer URLs"
+                )
+            cleaned[normalized] = _clean_emails(
+                emails, "auth.admin_only_tokens_full_access_by_issuer"
+            )
+        return cleaned
 
     @field_validator("sso_whitelist_extra_users")
     @classmethod

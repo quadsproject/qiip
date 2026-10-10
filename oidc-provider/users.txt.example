@@ -1,0 +1,9 @@
+# Example users file for the toy OIDC provider.
+# Copy to users.txt next to app.py (git checkout), or to
+# /etc/qiip/oidc-users.txt (RPM install; see docs/user-guide.md), chmod 0600,
+# and edit before use.
+# Format: username:password   (bare names get the OIDC_DOMAIN suffix at login;
+# full emails like alice@somelab.example.com are used as-is)
+# EXAMPLE ONLY — replace these with your own test users.
+user1:user1
+user2:user2

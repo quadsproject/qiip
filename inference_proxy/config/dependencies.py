@@ -122,7 +122,7 @@ def session_user_has_full_access(request: Request, settings: Settings) -> bool:
     if store is None:
         return False
     user = store.get_user(user_id)
-    return user is not None and is_full_access(user.email, settings)
+    return user is not None and is_full_access(user.email, user.issuer, settings)
 
 
 def viewer_role(request: Request, settings: Settings) -> str | None:

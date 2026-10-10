@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from inference_proxy.config.settings import Settings
+from inference_proxy.plugins.interfaces.auth import AuthPlugin
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
 _STATIC_DIR = (_BASE_DIR / "static").resolve()
@@ -31,6 +32,20 @@ def static_asset_url(request: Request, path: str) -> str:
     return f"{request.url_for('static', path=path)}?v={digest}"
 
 
+def _local_auth_available(request: Request) -> bool:
+    """Return True when the opt-in local OIDC auth plugin is loaded and configured.
+
+    The plugin is opt-in (off unless ``plugins.config`` enables it and
+    supplies the provider discovery URL), so a default deployment renders
+    the sign-in page exactly as before.
+    """
+    manager = getattr(request.app.state, "plugin_manager", None)
+    if manager is None:
+        return False
+    plugin = manager.get_plugin("auth.internal_oidc")
+    return isinstance(plugin, AuthPlugin) and plugin.is_configured()
+
+
 def signin_response(
     request: Request,
     notice: str = "",
@@ -42,8 +57,10 @@ def signin_response(
 
     The local admin option is a username/password form (no native Basic
     challenge popup) and needs ``auth.session_secret``; the Google option
-    starts the OAuth flow and needs the OAuth integration enabled. Options
-    that would fail (404/503) are hidden and replaced by an HTTP-Basic hint.
+    starts the OAuth flow and needs the OAuth integration enabled; the
+    local OIDC option starts the local provider flow and needs the opt-in
+    auth.internal_oidc plugin loaded. Options that would fail (404/503) are
+    hidden and replaced by an HTTP-Basic hint.
     """
     return templates.TemplateResponse(
         request=request,
@@ -52,6 +69,7 @@ def signin_response(
             "notice": notice,
             "active_page": "dashboard",
             "oauth_enabled": oauth_enabled,
+            "local_auth_enabled": _local_auth_available(request),
             "sessions_available": sessions_available,
         },
     )

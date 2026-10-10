@@ -7,14 +7,16 @@
 
   const ERROR_MESSAGES = {
     login_failed: "Sign-in was not completed. Please try again.",
-    no_profile: "Google did not return a profile. Please try again.",
+    no_profile: "The provider did not return a profile. Please try again.",
     unverified_email:
-      "This Google account has an unverified email address and cannot sign in.",
+      "This account has an unverified email address and cannot sign in.",
     domain_not_allowed:
-      "This Google account is not in the allowed domains for this gateway.",
+      "This account is not in the allowed domains for this gateway.",
     not_whitelisted: "This account is not on the gateway whitelist.",
     allowlist_unavailable:
       "The whitelist service is unavailable. Please try again later.",
+    account_conflict:
+      "This email is already linked to another sign-in provider.",
   };
 
   const $ = (id) => document.getElementById(id);
@@ -393,7 +395,7 @@
   function showSignInRequired() {
     showToast("Your session expired \u2014 sign in again.", "warning");
     setGate(
-      "Sign in with your Google account to create API tokens for the inference API.",
+      "Sign in with a provider account to create API tokens for the inference API.",
       true,
     );
   }
@@ -417,12 +419,12 @@
       return;
     }
     if (resp.status === 503) {
-      setGate("Google sign-in is not configured on this gateway.", false);
+      setGate("Sign-in is not configured on this gateway.", false);
       return;
     }
     if (resp.status === 401) {
       setGate(
-        "Sign in with your Google account to create API tokens for the inference API.",
+        "Sign in with a provider account to create API tokens for the inference API.",
         true,
       );
       return;

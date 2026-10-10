@@ -6,11 +6,14 @@ Operators who run the gateway should read the README instead.
 
 ## Sign in
 
-Open `/start` in your browser and sign in with your Google account. Google
-OAuth must be enabled by the operator; if your domain is restricted, it has
-to be on the gateway allowlist. Once signed in you land on `/start`, your
-home page. Every operations page (`/dashboard`, `/models`, `/chat`,
-`/profile`, the admin pages) sends a normal user back there.
+Open `/start` in your browser and sign in with the provider the operator
+configured: a Google account (Google OAuth must be enabled by the operator;
+if your domain is restricted, it has to be on the gateway allowlist), or a
+local account on small installs that run the opt-in local OIDC provider
+(the Local Login form; the operator hands out the username/password). Once
+signed in you land on `/start`, your home page. Every operations page
+(`/dashboard`, `/models`, `/chat`, `/profile`, the admin pages) sends a
+normal user back there.
 
 ## Connect your tool the first time
 

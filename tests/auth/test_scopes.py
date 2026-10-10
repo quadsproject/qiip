@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from inference_proxy.auth._constants import GOOGLE_ISSUER
 from inference_proxy.auth.models import ApiToken, TokenAuth, User
 from inference_proxy.auth.scopes import (
     allowed_node_ids,
@@ -16,15 +17,32 @@ from inference_proxy.auth.scopes import (
 from inference_proxy.config.settings import AuthSettings, Settings
 from inference_proxy.models.node import Node
 
-
-def _settings(admins: list[str] | None = None) -> Settings:
-    return Settings(auth=AuthSettings(admin_only_tokens_full_access=admins or []))
+_LOCAL_ISSUER = "https://inference-proxy.localdomain/oidc"
 
 
-def _user(email: str = "alice@example.com", *, is_admin: bool = False) -> User:
+def _settings(
+    admins: list[str] | None = None,
+    by_issuer: dict[str, list[str]] | None = None,
+) -> Settings:
+    return Settings(
+        _env_file=None,
+        auth=AuthSettings(
+            admin_only_tokens_full_access=admins or [],
+            admin_only_tokens_full_access_by_issuer=by_issuer or {},
+        ),
+    )
+
+
+def _user(
+    email: str = "alice@example.com",
+    *,
+    is_admin: bool = False,
+    issuer: str = GOOGLE_ISSUER,
+) -> User:
     return User(
         id=1,
         google_sub="sub-1",
+        issuer=issuer,
         email=email,
         name="Alice",
         picture="",
@@ -57,28 +75,57 @@ def _auth(
 
 class TestIsFullAccess:
     def test_matches_case_insensitively(self) -> None:
-        assert is_full_access("Ops@Example.com", _settings(["ops@example.com"]))
+        assert is_full_access(
+            "Ops@Example.com", GOOGLE_ISSUER, _settings(["ops@example.com"])
+        )
 
     def test_not_listed(self) -> None:
-        assert not is_full_access("alice@example.com", _settings(["ops@example.com"]))
+        assert not is_full_access(
+            "alice@example.com", GOOGLE_ISSUER, _settings(["ops@example.com"])
+        )
 
     def test_empty_list(self) -> None:
-        assert not is_full_access("ops@example.com", _settings())
+        assert not is_full_access("ops@example.com", GOOGLE_ISSUER, _settings())
+
+    def test_google_list_does_not_grant_local_issuer(self) -> None:
+        """A local identity asserting a listed Google email gains no scope
+        (review #231): the plain list is Google-scoped only, so the local
+        provider cannot claim a Google trust-list account."""
+        settings = _settings(["ops@example.com"])
+        assert not is_full_access("ops@example.com", _LOCAL_ISSUER, settings)
+
+    def test_by_issuer_grants_local_account_only(self) -> None:
+        settings = _settings(by_issuer={_LOCAL_ISSUER: ["ops@example.com"]})
+        assert is_full_access("ops@example.com", _LOCAL_ISSUER, settings)
+        assert not is_full_access("ops@example.com", GOOGLE_ISSUER, settings)
+        assert not is_full_access("alice@example.com", _LOCAL_ISSUER, settings)
 
 
 class TestHasAdminAccess:
     def test_full_access_trust_list(self) -> None:
-        assert has_admin_access("ops@example.com", _settings(["ops@example.com"]))
+        assert has_admin_access(
+            "ops@example.com", GOOGLE_ISSUER, _settings(["ops@example.com"])
+        )
 
     def test_admin_role_only(self) -> None:
         # An admin-role user who is NOT on the trust list still holds admin
         # scope — the token-mint surface and picker must agree (RFE #107).
-        assert has_admin_access("alice@example.com", _settings(), is_admin=True)
+        assert has_admin_access(
+            "alice@example.com", GOOGLE_ISSUER, _settings(), is_admin=True
+        )
 
     def test_neither_is_not_admin(self) -> None:
-        assert not has_admin_access("alice@example.com", _settings())
+        assert not has_admin_access("alice@example.com", GOOGLE_ISSUER, _settings())
         assert not has_admin_access(
-            "alice@example.com", _settings(["ops@example.com"]), is_admin=False
+            "alice@example.com",
+            GOOGLE_ISSUER,
+            _settings(["ops@example.com"]),
+            is_admin=False,
+        )
+
+    def test_local_issuer_claim_is_not_admin(self) -> None:
+        assert not has_admin_access(
+            "ops@example.com", _LOCAL_ISSUER, _settings(["ops@example.com"])
         )
 
 
@@ -134,12 +181,15 @@ class TestPickableEndpoints:
         ]
 
     def test_user_pins_shared_and_own(self) -> None:
-        got = pickable_endpoints("alice@example.com", _settings(), self._nodes())
+        got = pickable_endpoints(
+            "alice@example.com", GOOGLE_ISSUER, _settings(), self._nodes()
+        )
         assert got == ["mine-1", "shared-1"]
 
     def test_admin_pins_everything(self) -> None:
         got = pickable_endpoints(
             "ops@example.com",
+            GOOGLE_ISSUER,
             _settings(["ops@example.com"]),
             self._nodes(),
         )
@@ -190,4 +240,6 @@ class TestEmptyScopeDistinctFromFull:
             endpoint="http://gpu01:8000",
             owner="Alice@Example.com",
         )
-        assert pickable_endpoints("alice@example.com", _settings(), [node]) == ["gpu01"]
+        assert pickable_endpoints(
+            "alice@example.com", GOOGLE_ISSUER, _settings(), [node]
+        ) == ["gpu01"]

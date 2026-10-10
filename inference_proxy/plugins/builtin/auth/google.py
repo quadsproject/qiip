@@ -19,6 +19,7 @@ from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import Request
 from fastapi.responses import RedirectResponse
 
+from inference_proxy.auth._constants import GOOGLE_ISSUER
 from inference_proxy.config.settings import OAuthSettings
 from inference_proxy.plugins.interfaces.auth import (
     AuthCallbackError,
@@ -56,6 +57,7 @@ class GoogleAuthPlugin(AuthPlugin):
     version = "1.0.0"
     description = "Google OAuth (OpenID Connect) sign-in"
     author = "QUADS project"
+    label = "Google Auth"
 
     def __init__(self, config: dict[str, object] | None = None) -> None:
         super().__init__(config)
@@ -118,6 +120,7 @@ class GoogleAuthPlugin(AuthPlugin):
             sub=sub,
             email=email,
             email_verified=userinfo.get("email_verified") is True,
+            issuer=GOOGLE_ISSUER,
             name=name if isinstance(name, str) else "",
             picture=picture if isinstance(picture, str) else "",
         )

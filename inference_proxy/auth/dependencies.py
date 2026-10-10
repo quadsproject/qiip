@@ -34,6 +34,11 @@ from inference_proxy.config.dependencies import get_settings
 from inference_proxy.config.settings import Settings
 from inference_proxy.plugins.interfaces.auth import AuthPlugin
 
+# Session key recording which auth provider started the current login flow.
+# It is set by /auth/login with the chosen provider and consumed by
+# /auth/callback (the callback URL itself carries no provider hint).
+AUTH_PROVIDER_SESSION_KEY = "auth_provider"
+
 
 def get_auth_store(request: Request) -> AuthStore:
     """Return the lifespan-created auth store from application state."""
@@ -43,12 +48,54 @@ def get_auth_store(request: Request) -> AuthStore:
     return store
 
 
-def get_auth_plugin(request: Request) -> AuthPlugin:
-    """Return the lifespan-loaded auth plugin, or 404 when unconfigured."""
-    plugin = getattr(request.app.state, "auth_plugin", None)
-    if not isinstance(plugin, AuthPlugin) or not plugin.is_configured():
+def get_auth_plugin(request: Request, provider: str | None = None) -> AuthPlugin:
+    """Return the configured auth plugin for this request, or 404.
+
+    ``provider`` names the plugin selected on the sign-in page
+    (``/auth/login?provider=<name>``). Without it, the provider stored in
+    the session when the flow started is reused so ``/auth/callback`` lands
+    on the same plugin that issued the authorization request; a stale or
+    missing marker falls back to the first loaded, configured plugin (the
+    historical single-provider behavior).
+    """
+    plugins = _configured_auth_plugins(request)
+    if not plugins:
         raise HTTPException(status_code=404, detail="OAuth is not configured")
-    return plugin
+
+    if provider is not None:
+        for plugin in plugins:
+            if plugin.name == provider:
+                return plugin
+        raise HTTPException(
+            status_code=404, detail=f"Auth provider is not configured: {provider}"
+        )
+
+    marker = request.session.get(AUTH_PROVIDER_SESSION_KEY)
+    if marker is not None:
+        for plugin in plugins:
+            if plugin.name == marker:
+                return plugin
+    return plugins[0]
+
+
+def _configured_auth_plugins(request: Request) -> list[AuthPlugin]:
+    """Return loaded, configured auth plugins, in manager load order."""
+    manager = getattr(request.app.state, "plugin_manager", None)
+    plugins: list[AuthPlugin] = []
+    if manager is not None:
+        plugins = [
+            plugin
+            for plugin in manager.get_plugins_by_type(AuthPlugin)
+            if isinstance(plugin, AuthPlugin) and plugin.is_configured()
+        ]
+    if plugins:
+        return plugins
+    # Fallback for deployments/tests without a plugin manager: the lifespan
+    # still records the single selected plugin.
+    auth_plugin = getattr(request.app.state, "auth_plugin", None)
+    if isinstance(auth_plugin, AuthPlugin) and auth_plugin.is_configured():
+        return [auth_plugin]
+    return []
 
 
 def get_sso_allowlist(request: Request) -> SSOAllowlist | None:
@@ -175,7 +222,7 @@ async def _enforce_sso_whitelist(
     """
     if not settings.auth.enforce_sso_whitelist:
         return
-    if is_full_access(auth.user.email, settings):
+    if is_full_access(auth.user.email, auth.user.issuer, settings):
         return
     try:
         allowed = await enforce_allowlist(auth.user.email, allowlist)
