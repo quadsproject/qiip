@@ -586,6 +586,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     claims=ClaimStore(etcd_client),
                     suspensions=suspensions,
                     lookahead_hours=(resolved_settings.quads.schedule_lookahead_hours),
+                    quads_stale_after_seconds=(
+                        resolved_settings.quads.stale_after_seconds
+                    ),
                 )
                 placement_reconciler.start()
                 app.state.placement_reconciler = placement_reconciler

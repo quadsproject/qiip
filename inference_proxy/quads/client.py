@@ -165,6 +165,32 @@ class QUADSClient:
                 f"invalid QUADS response from {path}: {exc}"
             ) from exc
 
+    async def get_pending_moves(self) -> set[str]:
+        """Hosts QUADS still has to move between clouds, normalized.
+
+        A host is listed from the moment its assignment ends until the release
+        job has moved it back to its default cloud, and that job powers the
+        host off on the way. Such a host is available by schedule but not yet
+        safe to provision.
+        """
+        path = "/api/v3/moves"
+        data = await self._get(path)
+        try:
+            if not isinstance(data, list):
+                raise _InvalidQUADSResponseError("pending moves must be a list")
+            pending: set[str] = set()
+            for raw in data:
+                if not isinstance(raw, dict) or not isinstance(raw.get("host"), str):
+                    raise _InvalidQUADSResponseError(
+                        "pending move entries must be objects naming a host"
+                    )
+                pending.add(canonical_hostname(raw["host"]))
+            return pending
+        except _InvalidQUADSResponseError as exc:
+            raise QUADSConnectionError(
+                f"invalid QUADS response from {path}: {exc}"
+            ) from exc
+
     async def _get(self, path: str, params: dict[str, str] | None = None) -> Any:
         """GET a JSON endpoint, wrapping errors in QUADSConnectionError."""
         url = f"{self._base_url}{path}"
