@@ -102,6 +102,13 @@ class FakeQuads:
     def __init__(self, available: list[str]) -> None:
         self.available = available
         self.fail = False
+        # Hosts QUADS is still moving back to their default cloud.
+        self.releasing: set[str] = set()
+        self.moves_fail = False
+        self.move_reads = 0
+        # Called on every pending-moves read, before the answer: a test's hook
+        # for a release that starts between planning and launch.
+        self.on_moves_read: Callable[[int], None] | None = None
 
     async def get_available(self, end: datetime | None = None) -> list[str]:
         assert end is not None, "placement must ask for the whole lookahead window"
@@ -109,11 +116,36 @@ class FakeQuads:
             raise ConnectionError("QUADS is down")
         return list(self.available)
 
+    async def get_pending_moves(self) -> set[str]:
+        self.move_reads += 1
+        if self.on_moves_read is not None:
+            self.on_moves_read(self.move_reads)
+        if self.moves_fail:
+            raise ConnectionError("QUADS is down")
+        return set(self.releasing)
+
 
 class FakePoller:
-    def __init__(self, hosts: list[QUADSHost]) -> None:
+    """A poller whose snapshot is as fresh as the rig's clock unless a test says."""
+
+    def __init__(
+        self, hosts: list[QUADSHost], clock: Callable[[], datetime] | None = None
+    ) -> None:
         self.hosts = hosts
-        self.last_sync: datetime | None = datetime(2026, 9, 19, tzinfo=UTC)
+        self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
+        self._last_sync: datetime | None = None
+        self._follow_clock = True
+
+    @property
+    def last_sync(self) -> datetime | None:
+        if self._follow_clock:
+            return self._clock()
+        return self._last_sync
+
+    @last_sync.setter
+    def last_sync(self, value: datetime | None) -> None:
+        self._follow_clock = False
+        self._last_sync = value
 
 
 class FakeArtifactIndex:

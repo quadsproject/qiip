@@ -541,6 +541,8 @@ class QUADSSettings(BaseModel):
     verify_ssl: bool = True
     schedule_check_interval: int = 300
     schedule_lookahead_hours: int = 24
+    # Placement makes no decision from an inventory snapshot older than this.
+    stale_after_seconds: int = Field(default=900, ge=60)
 
     @model_validator(mode="after")
     def server_timezone_matches_quads_clock(self) -> Self:

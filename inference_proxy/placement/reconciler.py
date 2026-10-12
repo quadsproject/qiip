@@ -93,6 +93,14 @@ logger = structlog.get_logger()
 # A process-list probe must not inherit the long setup command deadlines.
 _REMOTE_PROBE_TIMEOUT_SECONDS = 10.0
 
+# A fresh host found releasing at launch sits out this long; a release ends in
+# minutes, so the remote-work backoff would be far too long.
+_RELEASE_RECHECK_SECONDS = 60.0
+_RELEASE_PENDING_REASON = (
+    "waiting for QUADS to finish releasing the host (a move is pending)"
+)
+_RELEASE_UNKNOWN_REASON = "QUADS pending moves could not be read at launch"
+
 # Node states that mean a placement's server was registered and is being
 # health-checked. Automation never rebuilds one of these.
 _SERVING_NODE_STATUSES = frozenset(
@@ -165,6 +173,7 @@ class PlacementReconciler:
         profiles: Sequence[ModelProfile] = BUILTIN_PROFILES,
         clock: Callable[[], datetime] = utcnow,
         holder: str | None = None,
+        quads_stale_after_seconds: int = 900,
     ) -> None:
         self._settings = settings
         self._quads = quads_client
@@ -175,6 +184,7 @@ class PlacementReconciler:
         self._claims = claims
         self._suspensions = suspensions
         self._lookahead_hours = lookahead_hours
+        self._quads_stale_after = timedelta(seconds=quads_stale_after_seconds)
         self._profiles = tuple(profiles)
         self._clock = clock
         self._holder = holder or uuid.uuid4().hex
@@ -186,6 +196,8 @@ class PlacementReconciler:
         # Unclaimed hosts a launch was refused on: when to ask again, and why.
         # In memory on purpose: a restarted gateway simply asks the host again.
         self._deferred: dict[str, tuple[datetime, str]] = {}
+        # Launches refused at the launch-time QUADS re-check this pass, and why.
+        self._refused: dict[str, str] = {}
         self._status = PlacementStatus(enabled=settings.enabled, holder=self._holder)
 
     @property
@@ -250,8 +262,27 @@ class PlacementReconciler:
             self._status = status
             return status
 
+    def _quads_stale_reason(self) -> str | None:
+        """Why the poller's inventory is too old to decide from, or ``None``.
+
+        Read against the clock now, not the pass start: the snapshot keeps
+        ageing through the catalog scan, the claim reads and the host probes.
+        """
+        last_sync = self._poller.last_sync
+        if last_sync is None:
+            return "QUADS inventory has not synchronized yet"
+        age = self._clock() - last_sync
+        if age > self._quads_stale_after:
+            seconds = int(age.total_seconds())
+            return (
+                f"QUADS inventory is stale ({seconds}s old, last synchronized "
+                f"{last_sync:%Y-%m-%d %H:%M:%S} UTC)"
+            )
+        return None
+
     async def _reconcile(self) -> PlacementStatus:
         now = self._clock()
+        self._refused = {}
         base = PlacementStatus(
             enabled=self._settings.enabled, holder=self._holder, last_run_at=now
         )
@@ -283,11 +314,10 @@ class PlacementReconciler:
                 missing_artifacts=resolution.missing,
             )
         known_claims = tuple(item.claim for item in claims)
-        if self._poller.last_sync is None:
+        stale = self._quads_stale_reason()
+        if stale is not None:
             return failed(
-                "QUADS inventory has not synchronized yet",
-                missing_artifacts=resolution.missing,
-                claims=known_claims,
+                stale, missing_artifacts=resolution.missing, claims=known_claims
             )
         try:
             window_end = availability_window_end(self._lookahead_hours)
@@ -298,6 +328,15 @@ class PlacementReconciler:
         except Exception as exc:
             return failed(
                 f"QUADS availability is unknown: {exc}",
+                missing_artifacts=resolution.missing,
+                claims=known_claims,
+            )
+        try:
+            # Available by schedule, but QUADS is about to power these off.
+            releasing = await self._quads.get_pending_moves()
+        except Exception as exc:
+            return failed(
+                f"QUADS pending moves are unknown: {exc}",
                 missing_artifacts=resolution.missing,
                 claims=known_claims,
             )
@@ -323,7 +362,7 @@ class PlacementReconciler:
         hosts = {canonical_hostname(host.hostname): host for host in self._poller.hosts}
         blocked = {item.claim.hostname for item in settled} | set(unreadable)
         candidates, skipped = self._candidates(
-            available, blocked | suspended, planned, now
+            available, blocked | suspended, planned, now, releasing
         )
         skipped.extend(
             SkippedHost(host, "automatic placement suspended by an administrator")
@@ -353,6 +392,11 @@ class PlacementReconciler:
                 or claim.hostname not in available
             ):
                 continue
+            if claim.hostname in releasing:
+                # Neither a failed attempt nor a policy refusal: keep the claim
+                # as it is and ask again next pass.
+                skipped.append(SkippedHost(claim.hostname, _RELEASE_PENDING_REASON))
+                continue
             # A retry is a placement decision like any other: the same policy
             # applies, evaluated now, not as it stood when the host was claimed.
             refusal = self._policy_refusal(
@@ -378,6 +422,10 @@ class PlacementReconciler:
             if await self._launch(resolved, claim.hostname, claim.gpu_class, stored):
                 started.append(claim.hostname)
                 budget -= 1
+            elif claim.hostname in self._refused:
+                skipped.append(
+                    SkippedHost(claim.hostname, self._refused[claim.hostname])
+                )
 
         for assignment in plan.assignments:
             if budget <= 0:
@@ -390,6 +438,10 @@ class PlacementReconciler:
             ):
                 started.append(assignment.hostname)
                 budget -= 1
+            elif assignment.hostname in self._refused:
+                skipped.append(
+                    SkippedHost(assignment.hostname, self._refused[assignment.hostname])
+                )
             elif assignment.hostname in self._deferred:
                 skipped.append(
                     SkippedHost(
@@ -510,6 +562,7 @@ class PlacementReconciler:
         blocked: set[str],
         planned: Sequence[PlannedProfile],
         now: datetime,
+        releasing: set[str],
     ) -> tuple[list[Candidate], list[SkippedHost]]:
         candidates: list[Candidate] = []
         skipped: list[SkippedHost] = []
@@ -528,6 +581,9 @@ class PlacementReconciler:
             if reason is None:
                 if hostname not in available:
                     reason = "not free for the whole QUADS scheduling window"
+                elif hostname in releasing:
+                    # Before the probes: QUADS is about to power it off.
+                    reason = _RELEASE_PENDING_REASON
                 elif node is not None and not _is_free_pool_node(node):
                     reason = f"already has a {node.status.value} node record"
                 elif self._provisioner.host_operation_in_progress(hostname):
@@ -684,6 +740,24 @@ class PlacementReconciler:
         return await self._remote_work_blocker(
             hostname
         ) or await self._stored_node_blocker(hostname, existing)
+
+    async def _release_blocker(self, hostname: str) -> str | None:
+        """Why QUADS forbids touching *hostname* right now, or ``None``.
+
+        Unknown reads as pending: a release that cannot be ruled out is not
+        acted on.
+        """
+        try:
+            releasing = await self._quads.get_pending_moves()
+        except Exception as exc:
+            detail = str(exc) or type(exc).__name__
+            logger.warning(
+                "placement_release_check_failed", hostname=hostname, error=detail
+            )
+            return f"{_RELEASE_UNKNOWN_REASON}: {detail}"
+        if hostname in releasing:
+            return _RELEASE_PENDING_REASON
+        return None
 
     async def _stored_node_blocker(
         self, hostname: str, existing: StoredClaim | None
@@ -862,6 +936,23 @@ class PlacementReconciler:
                     retry_at=None,
                     last_error=existing.claim.last_error
                     or "the attempt limit was reached",
+                )
+                return False
+            # Re-check QUADS under the lease: the snapshot may have gone stale or
+            # an assignment may have ended since the pass planned. No attempt is
+            # made and an existing claim is left as it is.
+            refusal = self._quads_stale_reason() or await self._release_blocker(
+                hostname
+            )
+            if refusal is not None:
+                self._refused[hostname] = refusal
+                if existing is None:
+                    self._deferred[hostname] = (
+                        self._clock() + timedelta(seconds=_RELEASE_RECHECK_SECONDS),
+                        refusal,
+                    )
+                logger.info(
+                    "placement_launch_refused", hostname=hostname, reason=refusal
                 )
                 return False
             blocker = await self._launch_blocker(hostname, existing)
