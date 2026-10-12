@@ -2322,6 +2322,88 @@ class TestSetupQuadsRevalidation:
         response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
         assert response.status_code == 202
 
+    def test_returns_409_while_quads_is_still_releasing_the_host(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """Free by schedule, but the move that powers the host off has not run."""
+        mock_quads = AsyncMock()
+        mock_quads.get_available.return_value = ["gpu01"]
+        mock_quads.get_pending_moves.return_value = {"gpu01"}
+        app.dependency_overrides[get_quads_client] = lambda: mock_quads
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 409
+        assert "still releasing" in response.json()["detail"]
+        mock_provisioner.fire_background.assert_not_called()
+        mock_provisioner.provision.assert_not_awaited()
+
+    @pytest.mark.parametrize("outcome", ["pending", "unknown"])
+    def test_a_refused_retry_keeps_the_failed_node_record(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+        outcome: str,
+    ) -> None:
+        """The record a retry inherits owner and engine from must survive a 409."""
+        test_registry.add(
+            _make_node(node_id="gpu01", status=NodeStatus.FAILED, owner="alice")
+        )
+        mock_quads = AsyncMock()
+        mock_quads.get_available.return_value = ["gpu01"]
+        if outcome == "pending":
+            mock_quads.get_pending_moves.return_value = {"gpu01"}
+        else:
+            mock_quads.get_pending_moves.side_effect = QUADSConnectionError("down")
+        app.dependency_overrides[get_quads_client] = lambda: mock_quads
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == (409 if outcome == "pending" else 503)
+        mock_provisioner.cleanup_stale_node.assert_not_awaited()
+        mock_provisioner.fire_background.assert_not_called()
+        kept = test_registry.get("gpu01")
+        assert kept is not None and kept.owner == "alice"
+        assert kept.status is NodeStatus.FAILED
+
+    def test_returns_503_when_pending_moves_are_unknown(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_quads = AsyncMock()
+        mock_quads.get_available.return_value = ["gpu01"]
+        mock_quads.get_pending_moves.side_effect = QUADSConnectionError("timeout")
+        app.dependency_overrides[get_quads_client] = lambda: mock_quads
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 503
+        mock_provisioner.fire_background.assert_not_called()
+
+    def test_unmanaged_setup_skips_the_release_check(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_quads = AsyncMock()
+        mock_quads.get_pending_moves.return_value = {"gpu01"}
+        app.dependency_overrides[get_quads_client] = lambda: mock_quads
+
+        response = client.post(
+            "/admin/nodes/setup", json={"hostname": "gpu01", "managed": False}
+        )
+
+        assert response.status_code == 202
+        mock_quads.get_pending_moves.assert_not_awaited()
+
     def test_works_without_quads_configured(
         self,
         client: TestClient,

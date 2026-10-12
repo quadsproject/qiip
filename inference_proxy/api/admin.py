@@ -591,22 +591,8 @@ async def setup_node(
         except ProvisioningError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        if node is not None and node.status in _SETUP_RETRYABLE_STATUSES:
-            try:
-                await provisioner.cleanup_stale_node(hostname)
-            except Exception as exc:
-                logger.warning(
-                    "setup_stale_cleanup_failed",
-                    hostname=hostname,
-                    status=node.status.value,
-                    exc_info=True,
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Could not clean stale state for '{hostname}'",
-                ) from exc
-
-        # D-10/D-11: live QUADS re-validation (skip for unmanaged nodes).
+        # Live QUADS check for managed nodes, before the stale-node cleanup so a
+        # refusal keeps the record a retry inherits owner and engine from.
         if body.managed and quads_client is not None:
             lookahead_hours = settings.quads.schedule_lookahead_hours
             window_end = availability_window_end(lookahead_hours)
@@ -625,6 +611,36 @@ async def setup_node(
                         f"{lookahead_hours}-hour scheduling window"
                     ),
                 )
+            # A host with a pending move is about to be powered off by QUADS.
+            try:
+                releasing = await quads_client.get_pending_moves()
+            except QUADSConnectionError as exc:
+                raise HTTPException(
+                    status_code=503, detail="QUADS unavailable"
+                ) from exc
+            if hostname in releasing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"QUADS is still releasing host '{hostname}' (a move is "
+                        "pending); retry once the move has completed"
+                    ),
+                )
+
+        if node is not None and node.status in _SETUP_RETRYABLE_STATUSES:
+            try:
+                await provisioner.cleanup_stale_node(hostname)
+            except Exception as exc:
+                logger.warning(
+                    "setup_stale_cleanup_failed",
+                    hostname=hostname,
+                    status=node.status.value,
+                    exc_info=True,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Could not clean stale state for '{hostname}'",
+                ) from exc
 
         # The lease already closes the async TOCTOU window. Keep the legacy
         # single-worker guard for clear duplicate-setup responses.

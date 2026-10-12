@@ -700,6 +700,20 @@ using only the catalog models and their pinned configurations. Set
   restarts applies to existing claims, and a successful provision resets the
   count. Every launch, including the first on a host and the first after a
   claim reset, asks the host for running setup or start commands first.
+- **Placement waits for QUADS to finish releasing a host.** When an assignment
+  ends, QUADS reports the host available at once but runs the move back to its
+  default cloud minutes later, and that move powers the host off. Placement
+  now reads `GET /api/v3/moves` on every pass and again at launch, and a host
+  with a pending move is skipped as "waiting for QUADS to finish releasing the
+  host": no probe, no attempt spent, claim and error untouched, reconsidered
+  on the next pass. Manual managed setup (`POST /admin/nodes/setup`) answers
+  `409` for such a host and `503` when the moves cannot be read. The gateway
+  needs read access to `/api/v3/moves` (served by QUADS 3.0.2); a pass whose
+  moves read fails places nothing and reports it in `error`.
+- **New `quads.stale_after_seconds` (default 900).** A pass makes no decision
+  from a QUADS inventory snapshot older than this and reports the snapshot
+  age in `error`. The poller keeps its last good data through an outage; the
+  default allows two missed polls at the default interval.
 - **Before upgrading with placement enabled:** configure QUADS, download each profile's files
   with `POST /admin/models/download` at the revisions the catalog pins, check
   `GET /admin/placement` shows every profile's files as present, list any host

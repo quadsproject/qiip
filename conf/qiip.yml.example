@@ -164,6 +164,9 @@ quads:
   verify_ssl: true
   schedule_check_interval: 300
   schedule_lookahead_hours: 24
+  # Automatic placement makes no decision from an inventory snapshot older
+  # than this (the poller keeps its last good data through a QUADS outage).
+  stale_after_seconds: 900
 
 placement:
   # Automatic placement of catalog llama.cpp profiles on free single-GPU
