@@ -102,8 +102,9 @@ class FakeQuads:
     def __init__(self, available: list[str]) -> None:
         self.available = available
         self.fail = False
-        # Hosts QUADS is still moving back to their default cloud.
-        self.releasing: set[str] = set()
+        # Hosts QUADS has a move to run, reclaims and moves into a new
+        # assignment alike; the real endpoint is keyed the same way.
+        self.pending_moves: set[str] = set()
         self.moves_fail = False
         self.move_reads = 0
         # Called on every pending-moves read, before the answer: a test's hook
@@ -122,7 +123,7 @@ class FakeQuads:
             self.on_moves_read(self.move_reads)
         if self.moves_fail:
             raise ConnectionError("QUADS is down")
-        return set(self.releasing)
+        return set(self.pending_moves)
 
 
 class FakePoller:

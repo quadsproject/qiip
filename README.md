@@ -698,18 +698,19 @@ select arbitrary downloaded models.
   Free by schedule is not yet free in fact: when an assignment ends, QUADS
   lists the host as available at once but moves it back to its default cloud
   minutes later, and that move powers the host off. Placement therefore also
-  asks QUADS for its pending moves (`/api/v3/moves`) and leaves a host that is
-  still being released alone, before any probe, for fresh candidates and for
-  retries alike; the launch asks again under the lifecycle lease in case the
-  release started after the pass planned. Such a host is listed under skipped
-  hosts as "waiting for QUADS to finish releasing the host", keeps its claim,
-  error and attempt budget untouched, and is reconsidered on the next pass.
-  Manual managed setup answers `409` for the same host. This keeps placement
-  off a host with an observed pending move; it is not a reservation in QUADS,
-  so an assignment that ends in the seconds between the launch-time read and
-  the first command still relies on the powered-off recovery described under
-  Durability. A pass also makes no decision from an inventory snapshot older
-  than `quads.stale_after_seconds`, and a launch checks the bound again.
+  asks QUADS for its pending moves (`/api/v3/moves`) and leaves a host with a
+  pending move alone before any probe, for fresh candidates and for retries
+  alike; a host that only starts moving after the pass planned is refused at
+  the launch, which asks QUADS again under the lifecycle lease. Such a host is
+  listed under skipped hosts as "QUADS has a pending move for the host", keeps
+  its claim, error and attempt budget untouched, and is reconsidered on the
+  next pass. Manual managed setup answers `409` for the same host. This keeps
+  placement off a host with an observed pending move; it is not a reservation
+  in QUADS, so an assignment that ends in the seconds between the launch-time
+  read and the first command still relies on the powered-off recovery
+  described under Durability. A pass also makes no decision from an inventory
+  snapshot older than `quads.stale_after_seconds`, and a launch checks the
+  bound again.
 - **Durability.** Each placement is a persistent etcd claim at
   `/placement/claims/<host>`, written with compare-and-swap and refreshed by a
   heartbeat, so a gateway restart or an expired node lease does not hand a host

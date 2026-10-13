@@ -2317,18 +2317,19 @@ class TestSetupQuadsRevalidation:
     ) -> None:
         mock_quads = AsyncMock()
         mock_quads.get_available.return_value = ["gpu01"]
+        mock_quads.get_pending_moves.return_value = set()
         app.dependency_overrides[get_quads_client] = lambda: mock_quads
 
         response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
         assert response.status_code == 202
 
-    def test_returns_409_while_quads_is_still_releasing_the_host(
+    def test_returns_409_while_quads_has_a_pending_move_for_the_host(
         self,
         app: FastAPI,
         client: TestClient,
         mock_provisioner: MagicMock,
     ) -> None:
-        """Free by schedule, but the move that powers the host off has not run."""
+        """Free by schedule, but QUADS still has a pending move for the host."""
         mock_quads = AsyncMock()
         mock_quads.get_available.return_value = ["gpu01"]
         mock_quads.get_pending_moves.return_value = {"gpu01"}
@@ -2337,9 +2338,14 @@ class TestSetupQuadsRevalidation:
         response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
 
         assert response.status_code == 409
-        assert "still releasing" in response.json()["detail"]
+        assert "pending move" in response.json()["detail"]
         mock_provisioner.fire_background.assert_not_called()
         mock_provisioner.provision.assert_not_awaited()
+
+        # A retry once the move has cleared goes through.
+        mock_quads.get_pending_moves.return_value = set()
+        retry = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+        assert retry.status_code == 202
 
     @pytest.mark.parametrize("outcome", ["pending", "unknown"])
     def test_a_refused_retry_keeps_the_failed_node_record(

@@ -1718,13 +1718,13 @@ async def test_a_card_sharing_the_l4_chip_code_is_not_an_l4() -> None:
 async def test_a_host_quads_is_still_releasing_is_not_placed_or_probed() -> None:
     """The Oct 11 pattern: the schedule ended, the move has not run yet."""
     rig = Rig(_l4s(4))
-    rig.quads.releasing = {"l4-01"}
+    rig.quads.pending_moves = {"l4-01"}
 
     await rig.run()
 
     assert "l4-01" not in _placed(rig)
     assert set(_placed(rig)) == {"l4-00", "l4-02", "l4-03"}
-    assert _skips(rig)["l4-01"].startswith("waiting for QUADS to finish releasing")
+    assert _skips(rig)["l4-01"].startswith("QUADS has a pending move")
     assert "l4-01" not in rig.provisioner.remote_checks, "a doomed host was probed"
     assert "l4-01" not in rig.provisioner.power_state_checks
     assert "l4-01" not in await rig.claims()
@@ -1737,11 +1737,13 @@ async def test_a_host_quads_is_still_releasing_is_not_placed_or_probed() -> None
 @pytest.mark.asyncio
 async def test_a_released_host_is_placed_on_the_next_pass_without_a_backoff() -> None:
     rig = Rig(_l4s(2))
-    rig.quads.releasing = {"l4-01"}
+    rig.quads.pending_moves = {"l4-01"}
+
     await rig.run()
+
     assert "l4-01" not in _placed(rig)
 
-    rig.quads.releasing = set()
+    rig.quads.pending_moves = set()
     rig.clock.advance(rig.settings.interval_seconds)
     await rig.run()
 
@@ -1755,7 +1757,7 @@ async def test_a_failed_claim_waits_out_the_release_without_spending_anything() 
     rig = await _failed_once()
     before = (await rig.claims())["l4-00"]
     probes_before = len(rig.provisioner.remote_checks)
-    rig.quads.releasing = {"l4-00"}
+    rig.quads.pending_moves = {"l4-00"}
 
     await rig.run()
 
@@ -1766,9 +1768,9 @@ async def test_a_failed_claim_waits_out_the_release_without_spending_anything() 
     assert len(rig.provisioner.remote_checks) == probes_before, (
         "a doomed host was probed"
     )
-    assert _skips(rig)["l4-00"].startswith("waiting for QUADS to finish releasing")
+    assert _skips(rig)["l4-00"].startswith("QUADS has a pending move")
 
-    rig.quads.releasing = set()
+    rig.quads.pending_moves = set()
     await rig.run()
     assert (await rig.claims())["l4-00"].state is ClaimState.ACTIVE
     assert len(rig.provisioner.calls) == 2
@@ -1787,7 +1789,7 @@ async def test_a_release_that_starts_after_planning_is_caught_at_launch(
 
     def release_on_launch(read: int) -> None:
         # The pass-level read says free; the launch-time read says releasing.
-        rig.quads.releasing = {"l4-00"} if read >= reads_before + 2 else set()
+        rig.quads.pending_moves = {"l4-00"} if read >= reads_before + 2 else set()
 
     rig.quads.on_moves_read = release_on_launch
 
@@ -1796,19 +1798,18 @@ async def test_a_release_that_starts_after_planning_is_caught_at_launch(
     assert len(rig.provisioner.calls) == calls_before, (
         "setup started on a releasing host"
     )
-    assert rig.quads.move_reads == reads_before + 2
     # Refused at launch, not at planning: the pass still says why.
-    assert _skips(rig)["l4-00"].startswith("waiting for QUADS to finish releasing")
+    assert _skips(rig)["l4-00"].startswith("QUADS has a pending move")
     if retry:
         assert (await rig.claims())["l4-00"] == claim_before
     else:
         assert await rig.claims() == {}
         assert rig.reconciler.launch_blockers["l4-00"].startswith(
-            "waiting for QUADS to finish releasing"
+            "QUADS has a pending move"
         )
         # Sits out briefly, not for the remote-work backoff.
         rig.quads.on_moves_read = None
-        rig.quads.releasing = set()
+        rig.quads.pending_moves = set()
         rig.clock.advance(61)
         await rig.run()
         assert "l4-00" in _placed(rig)
@@ -1853,6 +1854,8 @@ async def test_a_stale_quads_snapshot_places_nothing_and_is_reported() -> None:
 
     assert _placed(rig) == {}
     assert "stale" in rig.reconciler.status.error
+    # Fail closed before touching QUADS: a stale pass reads no pending moves,
+    # so a QUADS moves outage cannot turn one doomed request per stale pass.
     assert rig.quads.move_reads == 0
 
     rig.poller.last_sync = rig.clock() - timedelta(seconds=900)

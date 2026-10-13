@@ -700,24 +700,36 @@ using only the catalog models and their pinned configurations. Set
   restarts applies to existing claims, and a successful provision resets the
   count. Every launch, including the first on a host and the first after a
   claim reset, asks the host for running setup or start commands first.
-- **Placement waits for QUADS to finish releasing a host.** When an assignment
-  ends, QUADS reports the host available at once but runs the move back to its
+- **Placement waits for a pending QUADS move.** When an assignment ends,
+  QUADS reports the host available at once but runs the move back to its
   default cloud minutes later, and that move powers the host off. Placement
   now reads `GET /api/v3/moves` on every pass and again at launch, and a host
-  with a pending move is skipped as "waiting for QUADS to finish releasing the
-  host": no probe, no attempt spent, claim and error untouched, reconsidered
-  on the next pass. Manual managed setup (`POST /admin/nodes/setup`) answers
-  `409` for such a host and `503` when the moves cannot be read. The gateway
-  needs read access to `/api/v3/moves` (served by QUADS 3.0.2); a pass whose
-  moves read fails places nothing and reports it in `error`.
+  with a pending move is skipped as "QUADS has a pending move for the host":
+  no attempt spent, claim and error untouched, reconsidered on the next pass.
+  A host already listed in the pass snapshot is skipped before any probe; one
+  that only starts moving after the pass planned is refused at the launch.
+  Manual managed setup (`POST /admin/nodes/setup`) answers `409` for such a
+  host and `503` when the moves cannot be read. The gateway needs read access
+  to `/api/v3/moves` (served by QUADS 3.0.2); a pass whose moves read fails
+  places nothing, also skips claim settling and teardown bookkeeping for that
+  pass (the schedule enforcer is unaffected) and reports it in `error`, and a
+  QUADS without the endpoint leaves placement idle until it is upgraded.
 - **New `quads.stale_after_seconds` (default 900).** A pass makes no decision
-  from a QUADS inventory snapshot older than this and reports the snapshot
-  age in `error`. The poller keeps its last good data through an outage, and
+  from a QUADS inventory snapshot older than this. A pass that is already
+  stale reports the snapshot age in `error`; a launch refused because the
+  snapshot aged during the pass reports the same age under that host in
+  `skipped_hosts`. The poller keeps its last good data through an outage, and
   the default leaves room for roughly two missed polls at the default
   interval; request time and failed polls age the snapshot too, so this is
-  headroom, not a fixed tolerance. Startup fails if the value is under twice
-  `quads.poll_interval`, since a bound that tight reads a healthy poller as
-  stale.
+  headroom, not a fixed tolerance. `quads.poll_interval`,
+  `quads.schedule_check_interval` and `quads.schedule_lookahead_hours` must
+  each be at least 1, and the bound must be at least 60 and at least twice
+  the interval, checked at startup where placement runs (QUADS configured and
+  `placement.enabled`); a deployment with placement off, or without QUADS, is
+  unaffected by the interlock. The 900 default is checked too, so a
+  deployment that already sets `quads.poll_interval` above 450 must raise
+  `stale_after_seconds` to twice the interval, or lower the interval, before
+  restarting.
 - **Before upgrading with placement enabled:** configure QUADS, download each profile's files
   with `POST /admin/models/download` at the revisions the catalog pins, check
   `GET /admin/placement` shows every profile's files as present, list any host
