@@ -73,6 +73,7 @@ case "$*" in
     done
     ;;
   *"--query-gpu=memory.total"*) echo "{gpu_vram_mb}" ;;
+  *"--query-gpu=memory.free"*) echo "${{AUTOVLLM_TEST_GPU_FREE_MB:-81920}}" ;;
   *"--query-gpu=compute_cap"*) echo "{gpu_compute_cap}" ;;
   *"--query-gpu=driver_version"*) echo "580.126.09" ;;
   *"--query-gpu=persistence_mode"*) echo "Enabled" ;;
@@ -1198,6 +1199,8 @@ def _run_preflight_command(
     gpu_model: str = "NVIDIA A100",
     gpu_compute_cap: str = "8.0",
     gpu_vram_mb: int = 81920,
+    fit_budget_mib: str | None = None,
+    gpu_free_mb: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = _script_environment(
         tmp_path,
@@ -1217,6 +1220,10 @@ def _run_preflight_command(
         env["AUTOVLLM_GPU_DEVICES"] = gpu_devices
     if tensor_parallel is not None:
         env["AUTOVLLM_TENSOR_PARALLEL"] = tensor_parallel
+    if fit_budget_mib is not None:
+        env["AUTOVLLM_FIT_BUDGET_MIB"] = fit_budget_mib
+    if gpu_free_mb is not None:
+        env["AUTOVLLM_TEST_GPU_FREE_MB"] = gpu_free_mb
     model_path = str(local_model_dir) if local_model_dir is not None else model
     return subprocess.run(
         [
@@ -1249,6 +1256,50 @@ def test_preflight_accepts_verified_complete_snapshot(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "verified complete" in result.stdout
+
+
+def test_preflight_skips_memory_plan_without_a_budget(tmp_path: Path) -> None:
+    result = _run_preflight_command(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "No gateway memory plan" in result.stdout
+
+
+def test_preflight_rejects_memory_below_the_gateway_plan(tmp_path: Path) -> None:
+    result = _run_preflight_command(
+        tmp_path, fit_budget_mib="60000", gpu_free_mb="1000"
+    )
+
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    assert "memory plan reserved 60000 MiB" in output
+    assert "another process is using the device" in output
+
+
+def test_preflight_accepts_memory_at_the_gateway_plan(tmp_path: Path) -> None:
+    result = _run_preflight_command(
+        tmp_path, fit_budget_mib="60000", gpu_free_mb="60000"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Memory plan fits" in result.stdout
+
+
+def test_preflight_fails_closed_on_unparseable_free_memory(tmp_path: Path) -> None:
+    result = _run_preflight_command(
+        tmp_path, fit_budget_mib="60000", gpu_free_mb="not-a-number"
+    )
+
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    assert "did not report a usable free-memory value" in output
+
+
+def test_preflight_rejects_a_non_integer_gateway_budget(tmp_path: Path) -> None:
+    result = _run_preflight_command(tmp_path, fit_budget_mib="lots")
+
+    assert result.returncode != 0
+    assert "is not an integer count of MiB" in result.stdout + result.stderr
 
 
 def test_prestage_skips_download_when_snapshot_verified(tmp_path: Path) -> None:

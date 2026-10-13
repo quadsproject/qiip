@@ -2869,11 +2869,17 @@ class NodeProvisioner:
                 f"also failed: {exc}",
             )
 
-    async def _stop_failed_vllm_start(self, hostname: str) -> None:
-        """Best-effort cleanup after a vLLM start or OOM retry fails."""
-        command = self._script_command(
-            "stop-vllm.sh",
-            scripts_dir=self._engine_scripts_dir(InferenceEngine.VLLM).name,
+    async def _stop_failed_vllm_start(self, hostname: str) -> bool:
+        """Best-effort cleanup after a vLLM start or OOM retry fails.
+
+        Returns ``False`` when the stop command failed, so an OOM retry can
+        refuse to re-plan against a host that still has an engine holding its
+        VRAM. The stop runs through the uploaded bundle/generation path so a
+        freshly provisioned host without the legacy script directory is still
+        stopped.
+        """
+        command = self._remote_script_command(
+            hostname, InferenceEngine.VLLM, "stop-vllm.sh"
         )
         try:
             await self._ssh_run_command(hostname, command)
@@ -2885,6 +2891,8 @@ class NodeProvisioner:
                 exc_info=True,
             )
             self._log(hostname, "warning", f"vLLM stop script failed: {exc}")
+            return False
+        return True
 
     async def _read_vllm_device_memory(
         self, hostname: str
@@ -3066,16 +3074,20 @@ class NodeProvisioner:
         plan: VllmFitPlan | None,
         attempt: int,
         max_attempts: int,
+        failure: BaseException | None = None,
     ) -> tuple[int, VllmFitPlan, tuple[VllmDeviceMemory, ...]] | None:
         """Decide, stop cleanly, and re-plan the next bounded adjustment.
 
         Returns ``None`` when the failure is not a recognized memory failure,
-        every adjustable field is explicit, or the retry budget is exhausted.
-        The caller must then stop the engine and re-raise.
+        every adjustable field is explicit, the retry budget is exhausted, or
+        the incumbent engine could not be stopped. The caller must then stop
+        the engine and re-raise.
         """
         if plan is None or not plan.retry_available or attempt + 1 >= max_attempts:
             return None
-        if not await self._vllm_oom_in_engine_log(hostname):
+        if not self._vllm_failure_is_memory(failure) and not (
+            await self._vllm_oom_in_engine_log(hostname)
+        ):
             return None
         self._log(
             hostname,
@@ -3083,7 +3095,17 @@ class NodeProvisioner:
             "vLLM ran out of memory during attempt "
             f"{attempt + 1}; stopping it cleanly before the bounded retry",
         )
-        await self._stop_failed_vllm_start(hostname)
+        stopped = await self._stop_failed_vllm_start(hostname)
+        if not stopped:
+            # Re-planning against a host whose retained VRAM the incumbent
+            # still owns would plan from a lie. Surface the original failure.
+            self._log(
+                hostname,
+                "warning",
+                "vLLM retry skipped because the previous engine could not be "
+                "stopped cleanly",
+            )
+            return None
         planned = await self._plan_vllm_launch(
             hostname, model=model, params=params, attempt=attempt + 1
         )
@@ -3103,6 +3125,18 @@ class NodeProvisioner:
             return None
         self._log(hostname, "info", next_plan.plan_line())
         return attempt + 1, next_plan, selected
+
+    @staticmethod
+    def _vllm_failure_is_memory(failure: BaseException | None) -> bool:
+        """Classify a start failure from the exception before any engine log.
+
+        The node-side preflight memory guard bails before vLLM writes its log,
+        so its refusal only exists in the command's stderr.
+        """
+        if failure is None:
+            return False
+        stderr = getattr(failure, "stderr", "")
+        return is_memory_failure(f"{failure}\n{stderr}")
 
     async def _verify_vllm_runtime(
         self,
@@ -3257,7 +3291,7 @@ class NodeProvisioner:
                     vllm_params=effective_params,
                     vllm_plan=plan,
                 )
-            except Exception:
+            except Exception as exc:
                 retry = await self._vllm_maybe_retry(
                     hostname,
                     model=model,
@@ -3265,6 +3299,7 @@ class NodeProvisioner:
                     plan=plan,
                     attempt=attempt,
                     max_attempts=max_attempts,
+                    failure=exc,
                 )
                 if retry is None:
                     await self._stop_failed_vllm_start(hostname)
@@ -3279,7 +3314,7 @@ class NodeProvisioner:
             self._log(hostname, "info", "Waiting for health endpoint")
             try:
                 await self._poll_health(hostname, engine=InferenceEngine.VLLM)
-            except Exception:
+            except Exception as exc:
                 retry = await self._vllm_maybe_retry(
                     hostname,
                     model=model,
@@ -3287,6 +3322,7 @@ class NodeProvisioner:
                     plan=plan,
                     attempt=attempt,
                     max_attempts=max_attempts,
+                    failure=exc,
                 )
                 if retry is None:
                     await self._stop_failed_vllm_start(hostname)

@@ -415,8 +415,14 @@ class VllmRuntimeRequest(BaseModel):
     ) -> dict[str, object]:
         values: dict[str, object] = handler(self)
         params = values.get("params")
-        if isinstance(params, dict) and not params:
-            values.pop("params", None)
+        if isinstance(params, dict):
+            # A nested model dumps its ``None`` keys, so drop the fields the
+            # operator left automatic instead of shipping eight nulls.
+            trimmed = {key: value for key, value in params.items() if value is not None}
+            if trimmed:
+                values["params"] = trimmed
+            else:
+                values.pop("params", None)
         if values.get("model") is None:
             values.pop("model", None)
         return values
