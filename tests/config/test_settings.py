@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import warnings
 from pathlib import Path
@@ -32,6 +33,19 @@ from inference_proxy.config.settings import (
     Settings,
     SSHSettings,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_quads_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop exported QUADS and placement settings before each test.
+
+    conftest pins ``INFERENCE_PROXY_CONF_DIR`` for the same reason: a shell
+    or runner with deployment values exported must not decide what these
+    tests construct. Every test that needs a value sets it itself.
+    """
+    for name in list(os.environ):
+        if name.startswith(("INFERENCE_PROXY_QUADS__", "INFERENCE_PROXY_PLACEMENT__")):
+            monkeypatch.delenv(name, raising=False)
 
 
 class TestServerSettings:
@@ -637,23 +651,117 @@ class TestEnvVarOverrideQUADSBaseUrl:
                 server_timezone="Mars/Olympus_Mons",
             )
 
-    def test_stale_bound_under_two_poll_intervals_is_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="at least twice quads.poll_interval"):
-            QUADSSettings(poll_interval=300, stale_after_seconds=599)
+    def test_stale_bound_under_two_poll_intervals_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com"
+        )
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SERVER_TIMEZONE", "America/New_York")
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "300")
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__STALE_AFTER_SECONDS", "599")
+        # Ambient deployment env must not decide whether the rule applies.
+        monkeypatch.setenv("INFERENCE_PROXY_PLACEMENT__ENABLED", "true")
 
-    def test_stale_bound_of_exactly_two_poll_intervals_is_accepted(self) -> None:
-        settings = QUADSSettings(poll_interval=300, stale_after_seconds=600)
-        assert settings.stale_after_seconds == 600
+        with pytest.raises(ValidationError, match="at least twice quads.poll_interval"):
+            Settings(_env_file=None)
+
+    def test_stale_bound_of_exactly_two_poll_intervals_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com"
+        )
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SERVER_TIMEZONE", "America/New_York")
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "300")
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__STALE_AFTER_SECONDS", "600")
+        monkeypatch.setenv("INFERENCE_PROXY_PLACEMENT__ENABLED", "true")
+
+        assert Settings(_env_file=None).quads.stale_after_seconds == 600
 
     def test_a_longer_poll_interval_needs_a_longer_stale_bound(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Raising the poll interval alone can invalidate the default bound."""
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com"
+        )
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SERVER_TIMEZONE", "America/New_York")
         monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "600")
+        monkeypatch.setenv("INFERENCE_PROXY_PLACEMENT__ENABLED", "true")
         with pytest.raises(ValidationError, match="1200s for a 600s poll interval"):
             Settings(_env_file=None)
         monkeypatch.setenv("INFERENCE_PROXY_QUADS__STALE_AFTER_SECONDS", "1200")
         assert Settings(_env_file=None).quads.stale_after_seconds == 1200
+
+    def test_a_longer_poll_interval_without_placement_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only placement reads the bound, so an opted-out deployment may tune."""
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com"
+        )
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SERVER_TIMEZONE", "America/New_York")
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "600")
+        monkeypatch.setenv("INFERENCE_PROXY_PLACEMENT__ENABLED", "false")
+
+        settings = Settings(_env_file=None)
+        assert settings.quads.base_url == "http://quads.example.com"
+        assert settings.placement.enabled is False
+        assert settings.quads.poll_interval == 600
+
+    def test_a_longer_poll_interval_without_quads_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No QUADS means no poller and no placement, so the bound is unused."""
+        monkeypatch.delenv("INFERENCE_PROXY_QUADS__BASE_URL", raising=False)
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "600")
+
+        settings = Settings(_env_file=None)
+        assert settings.quads.base_url is None
+        assert settings.quads.poll_interval == 600
+
+    def test_poll_interval_must_be_positive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "0")
+
+        with pytest.raises(ValidationError, match="poll_interval"):
+            Settings(_env_file=None)
+
+    def test_schedule_check_interval_must_be_positive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The enforcer sleeps this long between checks, like the poller."""
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SCHEDULE_CHECK_INTERVAL", "0")
+
+        with pytest.raises(ValidationError, match="schedule_check_interval"):
+            Settings(_env_file=None)
+
+    def test_schedule_lookahead_hours_must_be_positive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Whole hours only: zero is not a window anyone can be free for."""
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SCHEDULE_LOOKAHEAD_HOURS", "0")
+
+        with pytest.raises(ValidationError, match="schedule_lookahead_hours"):
+            Settings(_env_file=None)
+
+    def test_stale_bound_has_an_absolute_floor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Below a minute the bound is not a bound, whatever the poll cadence."""
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com"
+        )
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SERVER_TIMEZONE", "America/New_York")
+        # A short interval keeps the 2x interlock satisfied, so only the
+        # absolute floor can reject this.
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "10")
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__STALE_AFTER_SECONDS", "59")
+
+        with pytest.raises(ValidationError, match="greater than or equal to 60"):
+            Settings(_env_file=None)
 
 
 class TestEnvVarOverrideQUADSTimeout:

@@ -160,13 +160,18 @@ quads:
   base_url: null
   server_timezone: null
   timeout: 10.0
+  # Must be at least 1; the poller sleeps this long after each poll finishes.
   poll_interval: 300
   verify_ssl: true
+  # Must be at least 1; the schedule enforcer sleeps this long after each check.
   schedule_check_interval: 300
+  # Must be at least 1; placement, manual setup and the schedule enforcer
+  # need a host free for the whole window.
   schedule_lookahead_hours: 24
   # Automatic placement makes no decision from an inventory snapshot older
   # than this (the poller keeps its last good data through a QUADS outage).
-  # Must be at least twice poll_interval.
+  # Must be at least 60; where placement runs it must also be at least twice
+  # poll_interval, checked at startup.
   stale_after_seconds: 900
 
 placement:
