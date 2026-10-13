@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.8 (2026-10-13)
+
+### Bug Fixes
+
+- Enforce the stale bound only where placement runs
+  ([`982deb9`](https://github.com/quadsproject/qiip/commit/982deb996bb903e370d94962e51eb1ec6f7b755d))
+
+
 ## v0.2.0-dev.7 (2026-10-13)
 
 ### Bug Fixes
