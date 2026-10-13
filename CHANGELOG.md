@@ -2,6 +2,45 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.6 (2026-10-13)
+
+### Bug Fixes
+
+- Address local OIDC provider review findings
+  ([`cbded89`](https://github.com/quadsproject/qiip/commit/cbded892ac8e76a3d0fbcc546872f68cc9b7d992))
+
+- Harden the issuer migration crash recovery
+  ([`02a133d`](https://github.com/quadsproject/qiip/commit/02a133d6ba4c59d4d6f5a0efc76769b447bc09a0))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`6d1eff9`](https://github.com/quadsproject/qiip/commit/6d1eff9d299b8c1e05930037ddf556d2dd938219))
+
+### Code Style
+
+- **tests**: Ruff format for local OIDC provider change
+  ([`f41abf6`](https://github.com/quadsproject/qiip/commit/f41abf6b619bf9578ff65a8357485e77ae7614dc))
+
+### Documentation
+
+- Warn that a global SSL_CERT_FILE replaces the trust store
+  ([`6894d5b`](https://github.com/quadsproject/qiip/commit/6894d5b24e60f6118f1e3e359a140d7136934439))
+
+### Features
+
+- Local Login merges the admin and local oauth sign-in paths
+  ([`13b3906`](https://github.com/quadsproject/qiip/commit/13b39068715a0fc9048a0a0ea04c099cb0d53cae))
+
+- Opt-in local OIDC auth provider (RFE #230)
+  ([`435077a`](https://github.com/quadsproject/qiip/commit/435077a1e204a782b0e9ec9454b135056ad8d1a5))
+
+### Testing
+
+- Satisfy strict mypy for the new auth tests
+  ([`cee2e76`](https://github.com/quadsproject/qiip/commit/cee2e765a583acba0252fa3091c8a261bbbee9ea))
+
+
 ## v0.2.0-dev.5 (2026-10-09)
 
 ### Bug Fixes
