@@ -611,19 +611,22 @@ async def setup_node(
                         f"{lookahead_hours}-hour scheduling window"
                     ),
                 )
-            # A host with a pending move is about to be powered off by QUADS.
+            # Free by schedule, but QUADS has a move to run for this host
+            # first: a reclaim powers it off, and a move into an assignment
+            # that just started means it is not qiip's to provision.
             try:
-                releasing = await quads_client.get_pending_moves()
+                pending_moves = await quads_client.get_pending_moves()
             except QUADSConnectionError as exc:
                 raise HTTPException(
                     status_code=503, detail="QUADS unavailable"
                 ) from exc
-            if hostname in releasing:
+            if hostname in pending_moves:
                 raise HTTPException(
                     status_code=409,
                     detail=(
-                        f"QUADS is still releasing host '{hostname}' (a move is "
-                        "pending); retry once the move has completed"
+                        f"QUADS has a pending move for host '{hostname}'; retry "
+                        "once the move has completed, or check the move in "
+                        "QUADS if it stays pending"
                     ),
                 )
 

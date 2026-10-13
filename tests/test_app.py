@@ -569,6 +569,40 @@ class TestLifespanRegistryIntegration:
             server_timezone="America/New_York",
         )
 
+    def test_lifespan_passes_configured_stale_bound(
+        self,
+        test_settings: Settings,
+    ) -> None:
+        """A configured bound must reach the reconciler, not its own default."""
+        mock_etcd = MagicMock()
+        mock_etcd.get_snapshot.return_value = EtcdSnapshot((), 1)
+        mock_etcd.prefix = "/nodes/"
+        quads = QUADSSettings(
+            base_url="http://quads.example.com",
+            server_timezone="America/New_York",
+            stale_after_seconds=1200,
+        )
+        settings = test_settings.model_copy(update={"quads": quads})
+
+        from inference_proxy.main import create_app
+
+        with (
+            patch("inference_proxy.main.EtcdClient", return_value=mock_etcd),
+            patch("inference_proxy.main.EtcdWatcher"),
+            patch("inference_proxy.main.QUADSPoller") as quads_poller_cls,
+            patch("inference_proxy.main.ScheduleEnforcer") as enforcer_cls,
+            patch("inference_proxy.main.QUADSClient"),
+            patch("inference_proxy.main.PlacementReconciler") as reconciler_cls,
+        ):
+            quads_poller_cls.return_value.stop = AsyncMock()
+            enforcer_cls.return_value.stop = AsyncMock()
+            reconciler_cls.return_value.stop = AsyncMock()
+            app = create_app(settings=settings)
+            with TestClient(app):
+                pass
+
+        assert reconciler_cls.call_args.kwargs["quads_stale_after_seconds"] == 1200
+
 
 class TestGetRegistryDependency:
     """get_registry dependency returns the registry from app.state."""

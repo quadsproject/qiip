@@ -537,13 +537,18 @@ class QUADSSettings(BaseModel):
     base_url: str | None = None
     server_timezone: str | None = None
     timeout: float = 10.0
-    poll_interval: int = 300
+    poll_interval: int = Field(default=300, ge=1)
     verify_ssl: bool = True
-    schedule_check_interval: int = 300
-    schedule_lookahead_hours: int = 24
+    # The schedule enforcer sleeps this long between checks, like the poller.
+    schedule_check_interval: int = Field(default=300, ge=1)
+    # Placement, manual setup and the schedule enforcer all require a host to
+    # be free for this whole window, so a value below an hour narrows it to
+    # nothing.
+    schedule_lookahead_hours: int = Field(default=24, ge=1)
     # Placement makes no decision from an inventory snapshot older than this.
-    # At least twice poll_interval: headroom over the poll cadence, not a
-    # guarantee about missed polls, since request time also ages the snapshot.
+    # Settings requires at least twice poll_interval where placement runs: the
+    # bound is headroom over the poll cadence, not a guarantee about missed
+    # polls, since request time and failed polls also age the snapshot.
     stale_after_seconds: int = Field(default=900, ge=60)
 
     @model_validator(mode="after")
@@ -561,25 +566,6 @@ class QUADSSettings(BaseModel):
                     f"quads.server_timezone is not a known IANA timezone: "
                     f"{self.server_timezone!r}"
                 ) from exc
-        return self
-
-    @model_validator(mode="after")
-    def stale_bound_outlasts_the_poll_cadence(self) -> Self:
-        """Refuse a stale bound at or too close to the poll cadence.
-
-        The poller sleeps ``poll_interval`` after each poll finishes, and only a
-        successful poll refreshes ``last_sync``, so a bound at or below one
-        interval reads a healthy poller as stale whenever a pass lands late in
-        the cycle. Twice the interval is minimum headroom, not a promise about
-        how many failed polls are tolerated: request time ages the snapshot too.
-        """
-        if self.stale_after_seconds < 2 * self.poll_interval:
-            raise ValueError(
-                "quads.stale_after_seconds must be at least twice "
-                f"quads.poll_interval ({2 * self.poll_interval}s for a "
-                f"{self.poll_interval}s poll interval), got "
-                f"{self.stale_after_seconds}s"
-            )
         return self
 
 
@@ -1335,5 +1321,31 @@ class Settings(BaseSettings):
             raise ValueError(
                 "etcd.node_lease_ttl must be greater than three times "
                 "resilience.health_check_interval"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def stale_bound_outlasts_the_poll_cadence(self) -> Self:
+        """Refuse a stale bound at or too close to the poll cadence.
+
+        Only placement reads the bound, and only through the poller's
+        ``last_sync``, so the rule applies where placement can run: QUADS
+        configured and placement enabled. A deployment without QUADS, or with
+        placement opted out, may tune the poll interval on its own.
+
+        The poller sleeps ``poll_interval`` after each poll finishes and only a
+        successful poll refreshes ``last_sync``, so a bound at or below one
+        interval reads a healthy poller as stale whenever a pass lands late in
+        the cycle. Twice the interval is minimum headroom, not a promise about
+        how many failed polls are tolerated: request time ages the snapshot too.
+        """
+        if not self.placement.enabled or self.quads.base_url is None:
+            return self
+        if self.quads.stale_after_seconds < 2 * self.quads.poll_interval:
+            raise ValueError(
+                "quads.stale_after_seconds must be at least twice "
+                f"quads.poll_interval ({2 * self.quads.poll_interval}s for a "
+                f"{self.quads.poll_interval}s poll interval), got "
+                f"{self.quads.stale_after_seconds}s"
             )
         return self
