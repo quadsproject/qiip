@@ -639,10 +639,12 @@ check_persistence_mode() {
 
 # ── Gateway memory plan ─────────────────────────
 
-# The gateway plans vLLM from each selected device's free VRAM and passes the
-# resulting per-device budget. If another tenant took that memory between the
-# plan and the launch, vLLM would OOM while loading weights; fail closed here
-# so the gateway's bounded retry can re-plan instead of crashing mid-load.
+# The gateway plans vLLM from the free VRAM of the devices the launch actually
+# allocates and passes that per-device budget. If another tenant takes the
+# memory between the plan and the launch, vLLM would OOM while loading weights;
+# fail closed here so the gateway's bounded retry can re-plan instead of
+# crashing mid-load. This only catches post-plan degradation, not a device that
+# was already busy when the plan was made.
 check_vllm_memory() {
     local budget="${AUTOVLLM_FIT_BUDGET_MIB:-}"
     if [ -z "$budget" ]; then
@@ -667,10 +669,11 @@ check_vllm_memory() {
     IFS=',' read -r -a fit_devices <<< "$plan_device_list"
     local index free_mib
     for index in "${fit_devices[@]}"; do
-        free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$index" | xargs)
+        free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$index" | xargs) || free_mib=""
         # Fail closed: a blank or non-numeric answer proves nothing, so treat it
         # as a device that cannot satisfy the plan rather than skipping the
-        # check (``[ -lt ]`` on garbage is an error under set -e anyway).
+        # check (``[ -lt ]`` on garbage is an error that would otherwise kill
+        # the script under set -e without a [FAIL] line).
         if [[ ! "$free_mib" =~ ^[0-9]+$ ]]; then
             _bail "GPU ${index} did not report a usable free-memory value (${free_mib:-empty}); cannot verify the ${budget} MiB memory plan"
         fi

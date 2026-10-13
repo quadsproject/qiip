@@ -65,6 +65,10 @@ DEFAULT_RUNTIME_OVERHEAD_MIB = 4096
 # of the usable budget, whichever is larger.
 MIN_RESERVE_MIB = 256
 RESERVE_FRACTION = 0.02
+# A profile inferred from a model name clamps its layer count (see
+# estimate_model_profile), so its KV footprint can be understated by a wide
+# margin. Widen the reserve for those plans so uncertainty fails closed.
+APPROXIMATE_RESERVE_FRACTION = 0.10
 
 # Preferred context per measured profile before memory pressure shrinks it.
 PROFILE_DESIRED_CONTEXT: dict[str, int] = {
@@ -892,7 +896,10 @@ def plan_vllm_launch(
         weights_mib=weights_mib,
         kv_bytes_per_token=kv_bytes_per_token,
     )
-    reserve = max(MIN_RESERVE_MIB, round(budget * RESERVE_FRACTION))
+    reserve_fraction = (
+        APPROXIMATE_RESERVE_FRACTION if model.approximate else RESERVE_FRACTION
+    )
+    reserve = max(MIN_RESERVE_MIB, round(budget * reserve_fraction))
     kv_budget = remaining - overhead - reserve
 
     fitting, context, reason = _fit_context(
@@ -931,9 +938,14 @@ def plan_vllm_launch(
                     reason=step.reason,
                 )
             )
-    effective.max_num_batched_tokens = min(
-        effective.max_num_batched_tokens, effective.max_model_len
-    )
+    if request.max_num_batched_tokens is None:
+        effective.max_num_batched_tokens = min(
+            effective.max_num_batched_tokens, effective.max_model_len
+        )
+    else:
+        # An explicit batch size is authoritative: the scheduler's chunked
+        # prefill makes it independent of the context, so never rewrite it.
+        effective.max_num_batched_tokens = request.max_num_batched_tokens
     if not fitting:
         blocked_reason = blocked_reason or reason
     if blocked_reason is not None:
@@ -997,8 +1009,10 @@ def _resolve_model(
         )
     # Size by the effective allocation, mirroring configure_vllm_params in
     # start-vllm.sh: datacenter buckets spread across the allocated cards, while
-    # consumer and Turing buckets are sized by a single card.
-    per_card_gb = (devices[0].total_mib + 512) // 1024
+    # consumer and Turing buckets are sized by a single card. Use the smallest
+    # allocated card so a heterogeneous subset is never planned against a
+    # larger sibling's capacity; vLLM shards weights evenly across TP ranks.
+    per_card_gb = (min(device.total_mib for device in devices) + 512) // 1024
     sizing_gb = (
         tensor_parallel * per_card_gb
         if profile_bucket in DATACENTER_BUCKETS

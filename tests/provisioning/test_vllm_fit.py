@@ -33,6 +33,77 @@ def _device(
     )
 
 
+def test_heterogeneous_subset_sizes_from_the_smallest_card() -> None:
+    devices = (
+        _device(total_mib=81_920, index=0),
+        _device(total_mib=24_576, index=1),
+    )
+    plan = plan_vllm_launch(
+        profile_bucket="hopper", devices=devices, requested=VllmRequested()
+    )
+
+    # vLLM shards weights evenly across the TP ranks, so the 24 GiB card bounds
+    # the sharded plan even though the pool totals 104 GiB.
+    assert plan.effective.tensor_parallel_size == 2
+    assert plan.effective.model == "Qwen/Qwen2.5-14B-Instruct"
+    assert "with 48 GB" in plan.model_reason
+    assert plan.fitting is True
+
+
+def test_explicit_batching_is_preserved_above_the_fitted_context() -> None:
+    plan = plan_vllm_launch(
+        profile_bucket="hopper",
+        devices=[_device(free_mib=73_500)],
+        requested=VllmRequested(max_num_batched_tokens=32_768),
+    )
+
+    assert plan.fitting is True
+    assert plan.effective.max_model_len == 4_096
+    # Chunked prefill makes the batch independent of the context, so a pinned
+    # batch larger than the fitted context is never rewritten.
+    assert plan.effective.max_num_batched_tokens == 32_768
+    assert all(a.field != "max_num_batched_tokens" for a in plan.adjustments)
+
+
+def test_explicit_batching_is_preserved_below_the_fitted_context() -> None:
+    plan = plan_vllm_launch(
+        profile_bucket="hopper",
+        devices=[_device()],
+        requested=VllmRequested(max_num_batched_tokens=2_048),
+    )
+
+    assert plan.fitting is True
+    assert plan.effective.max_model_len == 8_192
+    assert plan.effective.max_num_batched_tokens == 2_048
+
+
+def test_explicit_batching_survives_an_oom_retry() -> None:
+    plan = plan_vllm_launch(
+        profile_bucket="hopper",
+        devices=[_device(free_mib=73_500)],
+        requested=VllmRequested(max_num_batched_tokens=32_768),
+        attempt=1,
+    )
+
+    # The retry's context step must not drag the pinned batch down with it.
+    assert plan.effective.max_model_len == 2_048
+    assert plan.effective.max_num_batched_tokens == 32_768
+    assert all(a.field != "max_num_batched_tokens" for a in plan.adjustments)
+    assert plan.retry_available is True
+
+
+def test_approximate_plans_reserve_more_for_estimation_error() -> None:
+    plan = plan_vllm_launch(
+        profile_bucket="hopper",
+        devices=[_device()],
+        requested=VllmRequested(model="acme/Secret-13B-AWQ"),
+    )
+
+    assert plan.approximate is True
+    assert plan.fitting is True
+    assert plan.estimate.reserve_mib == round(plan.estimate.usable_budget_mib * 0.10)
+
+
 def test_select_vllm_model_matches_profile_and_vram_thresholds() -> None:
     assert select_vllm_model("hopper", 240) == "Qwen/Qwen2.5-72B-Instruct"
     assert select_vllm_model("hopper", 80) == "Qwen/Qwen2.5-32B-Instruct"

@@ -492,7 +492,6 @@ function renderVllmRuntime(node) {
   values.hidden = false;
 
   var requested = runtime.requested || {};
-  var requestedParams = requested.params || {};
   var effective = runtime.effective || {};
   var estimate = runtime.estimate || {};
   var automatic = effective.model_selection === "automatic";
@@ -540,7 +539,7 @@ function renderVllmRuntime(node) {
   var entries = runtime.adjustments || [];
   if (entries.length === 0) {
     var none = document.createElement("li");
-    none.textContent = requestedParams && automatic
+    none.textContent = automatic
       ? "None: the initial plan fit without adjustment."
       : "None: no automatic field required adjustment.";
     adjustments.appendChild(none);

@@ -153,7 +153,8 @@ provisioning:
   llamacpp_build_jobs: 0
   llamacpp_setup_timeout: 7200.0
   llamacpp_fit_target_mib: 512
-  # Bounded total automatic vLLM launch attempts (1 uses no retries).
+  # Bounded number of automatic vLLM launches per setup, including the initial
+  # memory-aware plan (N allows N-1 recognized-OOM retries); 1-5.
   vllm_memory_retry_max_attempts: 4
 
 quads:

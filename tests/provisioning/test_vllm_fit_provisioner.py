@@ -137,6 +137,8 @@ async def test_fitting_plan_reaches_the_start_script_and_is_persisted() -> None:
     command = commands[0]
     assert "AUTOVLLM_MODEL=Qwen/Qwen2.5-32B-Instruct" in command
     assert "AUTOVLLM_MAX_MODEL_LEN=8192" in command
+    assert "AUTOVLLM_MAX_BATCHED_TOKENS=8192" in command
+    assert "AUTOVLLM_GPU_DEVICES=0" in command
     assert "AUTOVLLM_ATTENTION_BACKEND=FLASHINFER" in command
     assert "AUTOVLLM_FIT_BUDGET_MIB=73728" in command
     assert "AUTOVLLM_FIT_RESERVE_MIB=1475" in command
@@ -879,3 +881,153 @@ async def test_cached_snapshot_is_used_for_an_unknown_explicit_model(
     plan, _selected = planned
     assert plan.approximate is False
     assert plan.estimate.weights_mib > 0
+
+
+def test_vllm_failure_is_memory_classifies_a_preflight_refusal() -> None:
+    refusal = RemoteCommandError(
+        "host1",
+        "bash auto-vllm/start-vllm.sh",
+        1,
+        stderr=(
+            "[FAIL] GPU 0 has 1000 MiB free but the memory plan reserved "
+            "4096 MiB; another process is using the device"
+        ),
+    )
+
+    assert NodeProvisioner._vllm_failure_is_memory(refusal) is True
+    assert NodeProvisioner._vllm_failure_is_memory(None) is False
+    assert NodeProvisioner._vllm_failure_is_memory(RuntimeError("boom")) is False
+
+
+@pytest.mark.asyncio
+async def test_stop_failed_vllm_start_uses_the_uploaded_bundle() -> None:
+    provisioner, _ssh = _provisioner()
+    provisioner._remote_bundles[("host1", InferenceEngine.VLLM)] = (
+        ".qiip/bundles/abc123"
+    )
+    commands: list[str] = []
+
+    async def run_command(host: str, command: str) -> str:
+        commands.append(command)
+        return ""
+
+    with patch.object(provisioner, "_ssh_run_command", new=run_command):
+        assert await provisioner._stop_failed_vllm_start("host1") is True
+
+    assert len(commands) == 1
+    assert ".qiip/bundles/abc123/common/generations.py" in commands[0]
+    assert commands[0].endswith("stop-vllm.sh")
+    assert "auto-vllm/stop-vllm.sh" not in commands[0]
+
+
+@pytest.mark.asyncio
+async def test_stop_failed_vllm_start_reports_a_failed_stop() -> None:
+    provisioner, _ssh = _provisioner()
+
+    async def fail_command(host: str, command: str) -> str:
+        raise RemoteCommandError(host, command, 1)
+
+    with patch.object(provisioner, "_ssh_run_command", new=fail_command):
+        assert await provisioner._stop_failed_vllm_start("host1") is False
+
+
+@pytest.mark.asyncio
+async def test_preflight_memory_refusal_retries_without_an_engine_log() -> None:
+    commands: list[str] = []
+    starts = {"count": 0}
+
+    async def streaming(host: str, command: str) -> AsyncIterator[tuple[str, str]]:
+        if "nvidia-smi" in command:
+            yield "stdout", _MEMORY_ROW
+            return
+        starts["count"] += 1
+        commands.append(command)
+        if starts["count"] == 1:
+            raise RemoteCommandError(
+                host,
+                command,
+                1,
+                stderr=(
+                    "[FAIL] GPU 0 has 1000 MiB free but the memory plan "
+                    "reserved 4096 MiB; another process is using the device"
+                ),
+            )
+        yield "stdout", "# Model:              " + _AUTO_MODEL
+
+    provisioner, _ssh = _provisioner(streaming)
+
+    async def run_command(host: str, command: str) -> str:
+        if "nvidia-smi" in command:
+            return _MEMORY_ROW
+        if "vllm-serve.log" in command:
+            # The engine never started, so there is no OOM text to observe.
+            return "INFO starting engine"
+        return ""
+
+    with (
+        patch.object(
+            provisioner,
+            "_read_vllm_device_memory",
+            new_callable=AsyncMock,
+            return_value=(_hopper(73_500),),
+        ),
+        patch.object(provisioner, "_stop_failed_vllm_start", new_callable=AsyncMock),
+        patch.object(provisioner, "_ssh_run_command", new=run_command),
+        patch.object(provisioner, "_poll_health", new_callable=AsyncMock),
+    ):
+        model, runtime = await provisioner._start_vllm_with_retries(
+            "host1", model=None, vllm_params=None, started_at=datetime.now(UTC)
+        )
+
+    assert model == _AUTO_MODEL
+    assert runtime is not None
+    assert runtime.attempt == 1
+    assert len(commands) == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_is_skipped_when_the_engine_cannot_be_stopped() -> None:
+    commands: list[str] = []
+
+    async def streaming(host: str, command: str) -> AsyncIterator[tuple[str, str]]:
+        if "nvidia-smi" in command:
+            yield "stdout", _MEMORY_ROW
+            return
+        commands.append(command)
+        raise RemoteCommandError(
+            host,
+            command,
+            1,
+            stderr=(
+                "[FAIL] GPU 0 has 1000 MiB free but the memory plan reserved "
+                "4096 MiB; another process is using the device"
+            ),
+        )
+
+    provisioner, _ssh = _provisioner(streaming)
+
+    async def run_command(host: str, command: str) -> str:
+        return ""
+
+    with (
+        patch.object(
+            provisioner,
+            "_read_vllm_device_memory",
+            new_callable=AsyncMock,
+            return_value=(_hopper(73_500),),
+        ),
+        patch.object(
+            provisioner,
+            "_stop_failed_vllm_start",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+        patch.object(provisioner, "_ssh_run_command", new=run_command),
+        pytest.raises(RemoteCommandError),
+    ):
+        await provisioner._start_vllm_with_retries(
+            "host1", model=None, vllm_params=None, started_at=datetime.now(UTC)
+        )
+
+    # One start, no re-plan: the incumbent is still holding the VRAM.
+    assert len(commands) == 1
