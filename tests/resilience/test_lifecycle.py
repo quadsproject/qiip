@@ -54,7 +54,10 @@ def test_lifespan_cancels_provision_before_etcd_close(
         ],
         capture_output=True,
         text=True,
-        timeout=3,
+        # Importing the application dominates this probe's runtime, and a
+        # loaded CI runner can push that well past a few seconds; the
+        # assertion below verifies ordering, not startup latency.
+        timeout=30,
         check=False,
     )
 
