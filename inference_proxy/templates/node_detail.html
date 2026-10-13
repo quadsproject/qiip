@@ -183,6 +183,33 @@
                 </dl>
             </section>
 
+            <section class="card" id="vllm-runtime-panel" hidden>
+                <h2 class="card-title">vLLM Runtime Configuration</h2>
+                <p id="vllm-runtime-status" class="runtime-status" role="status" aria-live="polite"></p>
+                <dl id="vllm-runtime-values" class="runtime-grid" hidden>
+                    <div><dt>Model selection</dt><dd id="vllm-runtime-selection"></dd></div>
+                    <div><dt>Effective model</dt><dd id="vllm-runtime-model"></dd></div>
+                    <div><dt>Requested model</dt><dd id="vllm-runtime-requested-model"></dd></div>
+                    <div><dt>Tensor parallel</dt><dd id="vllm-runtime-tp"></dd></div>
+                    <div><dt>Max model length</dt><dd id="vllm-runtime-context"></dd></div>
+                    <div><dt>Max batched tokens</dt><dd id="vllm-runtime-batched"></dd></div>
+                    <div><dt>GPU memory utilization</dt><dd id="vllm-runtime-util"></dd></div>
+                    <div><dt>Dtype</dt><dd id="vllm-runtime-dtype"></dd></div>
+                    <div><dt>Attention backend</dt><dd id="vllm-runtime-backend"></dd></div>
+                    <div><dt>Weights per GPU</dt><dd id="vllm-runtime-weights"></dd></div>
+                    <div><dt>KV cache</dt><dd id="vllm-runtime-kv"></dd></div>
+                    <div><dt>Runtime overhead</dt><dd id="vllm-runtime-overhead"></dd></div>
+                    <div><dt>Reserve</dt><dd id="vllm-runtime-reserve"></dd></div>
+                    <div><dt>Usable budget</dt><dd id="vllm-runtime-budget"></dd></div>
+                    <div><dt>Free VRAM at plan</dt><dd id="vllm-runtime-free"></dd></div>
+                    <div><dt>Attempt</dt><dd id="vllm-runtime-attempt"></dd></div>
+                    <div class="runtime-grid-wide"><dt>Reason</dt><dd id="vllm-runtime-reason"></dd></div>
+                    <div class="runtime-grid-wide"><dt>Adjustments</dt><dd><ul id="vllm-runtime-adjustments" class="runtime-gpu-list"></ul></dd></div>
+                    <div class="runtime-grid-wide"><dt>Post-load GPU memory</dt><dd><ul id="vllm-runtime-gpus" class="runtime-gpu-list"></ul></dd></div>
+                    <div class="runtime-grid-wide"><dt>Observed</dt><dd id="vllm-runtime-observed"></dd></div>
+                </dl>
+            </section>
+
             <section class="card" id="recommendations-panel">
                 <h2 class="card-title">
                     Model Recommendations

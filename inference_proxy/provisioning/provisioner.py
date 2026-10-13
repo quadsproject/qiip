@@ -56,7 +56,14 @@ from inference_proxy.models.node import (
     NodeGPU,
     NodePlacement,
     NodeStatus,
+    VllmAdjustment,
+    VllmGPUState,
+    VllmMemoryEstimate,
+    VllmModelSelection,
     VllmParams,
+    VllmRuntimeEffective,
+    VllmRuntimeRequest,
+    VllmRuntimeState,
 )
 from inference_proxy.provisioning.bundles import (
     bundle_files,
@@ -85,6 +92,14 @@ from inference_proxy.provisioning.state import (
     ProvisioningResumeState,
     ProvisioningState,
     ProvisioningStep,
+)
+from inference_proxy.provisioning.vllm_fit import (
+    VllmDeviceMemory,
+    VllmFitPlan,
+    VllmRequested,
+    is_memory_failure,
+    plan_vllm_launch,
+    vllm_profile_bucket,
 )
 from inference_proxy.redfish.client import RedfishClient
 from inference_proxy.redfish.errors import RedfishError
@@ -802,6 +817,7 @@ class NodeProvisioner:
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
         vllm_params: VllmParams | None = None,
         draft_artifact: ResolvedGGUFArtifact | None = None,
+        vllm_plan: VllmFitPlan | None = None,
     ) -> dict[str, str]:
         """Return the exact environment accepted by the engine start script."""
         if engine == InferenceEngine.LLAMA_CPP:
@@ -874,6 +890,18 @@ class NodeProvisioner:
                     env["AUTOVLLM_GPU_DEVICES"] = ",".join(
                         str(device) for device in vllm_params.gpu_devices
                     )
+            if vllm_plan is not None:
+                if vllm_plan.effective.attention_backend is not None:
+                    env["AUTOVLLM_ATTENTION_BACKEND"] = (
+                        vllm_plan.effective.attention_backend
+                    )
+                env["AUTOVLLM_FIT_BUDGET_MIB"] = str(
+                    vllm_plan.estimate.usable_budget_mib
+                )
+                env["AUTOVLLM_FIT_RESERVE_MIB"] = str(vllm_plan.estimate.reserve_mib)
+                env["AUTOVLLM_FIT_OVERHEAD_MIB"] = str(
+                    vllm_plan.estimate.runtime_overhead_mib
+                )
         if self._hf_token:
             env["HF_TOKEN"] = self._hf_token
         return env
@@ -2479,23 +2507,26 @@ class NodeProvisioner:
                 started_at=provision_started_at,
             )
             self._log(hostname, "info", f"Starting {engine} inference engine")
-            model_name = await self._run_start_vllm(
-                hostname,
-                model=model,
-                engine=engine,
-                artifact=artifact,
-                llamacpp_request=llamacpp_request,
-                vllm_params=vllm_params,
-                draft_artifact=draft_artifact,
-            )
-            current_step = "health_poll"
-            await self._update_state(
-                hostname, ProvisioningStep.HEALTH_POLL, started_at=provision_started_at
-            )
-            self._log(hostname, "info", "Waiting for health endpoint")
-            await self._poll_health(hostname, engine=engine)
             llamacpp_runtime: LlamaCppRuntimeState | None = None
+            vllm_runtime: VllmRuntimeState | None = None
             if engine == InferenceEngine.LLAMA_CPP:
+                model_name = await self._run_start_vllm(
+                    hostname,
+                    model=model,
+                    engine=engine,
+                    artifact=artifact,
+                    llamacpp_request=llamacpp_request,
+                    vllm_params=vllm_params,
+                    draft_artifact=draft_artifact,
+                )
+                current_step = "health_poll"
+                await self._update_state(
+                    hostname,
+                    ProvisioningStep.HEALTH_POLL,
+                    started_at=provision_started_at,
+                )
+                self._log(hostname, "info", "Waiting for health endpoint")
+                await self._poll_health(hostname, engine=engine)
                 current_step = "llamacpp_runtime_verify"
                 llamacpp_runtime = await self._verify_llamacpp_runtime(
                     hostname,
@@ -2504,6 +2535,14 @@ class NodeProvisioner:
                     ),
                     draft_artifact=draft_artifact,
                     gpus=gpus,
+                )
+            else:
+                model_name, vllm_runtime = await self._start_vllm_with_retries(
+                    hostname,
+                    model=model,
+                    vllm_params=vllm_params,
+                    started_at=provision_started_at,
+                    on_step=set_current_step,
                 )
             current_step = "registering"
             await self._update_state(
@@ -2517,6 +2556,7 @@ class NodeProvisioner:
                 engine=engine,
                 artifact_id=artifact_id,
                 llamacpp_runtime=llamacpp_runtime,
+                vllm_runtime=vllm_runtime,
                 owner=owner,
                 gpus=gpus,
                 placement=placement,
@@ -2827,6 +2867,407 @@ class NodeProvisioner:
                 f"also failed: {exc}",
             )
 
+    async def _stop_failed_vllm_start(self, hostname: str) -> None:
+        """Best-effort cleanup after a vLLM start or OOM retry fails."""
+        command = self._script_command(
+            "stop-vllm.sh",
+            scripts_dir=self._engine_scripts_dir(InferenceEngine.VLLM).name,
+        )
+        try:
+            await self._ssh_run_command(hostname, command)
+        except Exception as exc:
+            logger.warning(
+                "vllm_cleanup_failed",
+                hostname=hostname,
+                error=str(exc),
+                exc_info=True,
+            )
+            self._log(hostname, "warning", f"vLLM stop script failed: {exc}")
+
+    async def _read_vllm_device_memory(
+        self, hostname: str
+    ) -> tuple[VllmDeviceMemory, ...]:
+        """Read selected-device total/free memory and compute capability.
+
+        Returns an empty tuple, never a partial reading, when the node cannot
+        answer. The caller then falls back to the node-side runtime heuristics
+        rather than inventing memory numbers.
+        """
+        try:
+            output = await self._ssh_run_command(
+                hostname,
+                "nvidia-smi --query-gpu=index,memory.total,memory.free,compute_cap "
+                "--format=csv,noheader,nounits",
+            )
+        except Exception as exc:
+            self._log(hostname, "warning", f"vLLM memory planning skipped: {exc}")
+            return ()
+        devices: list[VllmDeviceMemory] = []
+        try:
+            for line in output.splitlines():
+                if not line.strip():
+                    continue
+                index, total, free, capability = (
+                    part.strip() for part in line.split(",")
+                )
+                devices.append(
+                    VllmDeviceMemory(
+                        index=int(index),
+                        total_mib=int(total),
+                        free_mib=int(free),
+                        compute_capability=capability,
+                    )
+                )
+        except ValueError as exc:
+            self._log(
+                hostname,
+                "warning",
+                f"vLLM memory planning skipped: unreadable GPU memory ({exc})",
+            )
+            return ()
+        if not devices:
+            return ()
+        return tuple(sorted(devices, key=lambda device: device.index))
+
+    def _select_vllm_devices(
+        self, devices: tuple[VllmDeviceMemory, ...], vllm_params: VllmParams | None
+    ) -> tuple[VllmDeviceMemory, ...]:
+        """Honor an explicit device subset and fail on a stale index."""
+        requested = vllm_params.gpu_devices if vllm_params is not None else None
+        if not requested:
+            return devices
+        by_index = {device.index: device for device in devices}
+        missing = [index for index in requested if index not in by_index]
+        if missing:
+            raise ProvisioningError(
+                f"requested GPU devices {missing} are not present on the host"
+            )
+        return tuple(by_index[index] for index in requested)
+
+    @staticmethod
+    def _vllm_requested(model: str | None, params: VllmParams | None) -> VllmRequested:
+        if params is None:
+            return VllmRequested(model=model)
+        return VllmRequested(
+            model=model,
+            tensor_parallel_size=params.tensor_parallel_size,
+            max_model_len=params.max_model_len,
+            max_num_batched_tokens=params.max_num_batched_tokens,
+            gpu_memory_utilization=params.gpu_memory_utilization,
+            dtype=params.dtype,
+            gpu_devices=params.gpu_devices,
+        )
+
+    async def _plan_vllm_launch(
+        self,
+        hostname: str,
+        *,
+        model: str | None,
+        params: VllmParams | None,
+        attempt: int,
+    ) -> tuple[VllmFitPlan, tuple[VllmDeviceMemory, ...]] | None:
+        """Plan one attempt, or return None when the host cannot be measured."""
+        devices = await self._read_vllm_device_memory(hostname)
+        if not devices:
+            return None
+        selected = self._select_vllm_devices(devices, params)
+        first = selected[0]
+        if first.compute_capability is None:
+            self._log(
+                hostname,
+                "warning",
+                "vLLM memory planning skipped: the node reported no compute capability",
+            )
+            return None
+        try:
+            bucket = vllm_profile_bucket(first.compute_capability, first.total_mib)
+        except ValueError as exc:
+            self._log(hostname, "warning", f"vLLM memory planning skipped: {exc}")
+            return None
+        try:
+            plan = await asyncio.to_thread(
+                plan_vllm_launch,
+                profile_bucket=bucket,
+                devices=selected,
+                requested=self._vllm_requested(model, params),
+                attempt=attempt,
+            )
+        except ValueError as exc:
+            raise ProvisioningError(
+                f"could not plan the vLLM launch for {hostname}: {exc}"
+            ) from exc
+        return plan, selected
+
+    @staticmethod
+    def _require_fitting_plan(hostname: str, plan: VllmFitPlan) -> None:
+        if not plan.fitting:
+            raise ProvisioningError(
+                f"planned vLLM launch does not fit {hostname}: {plan.reason}"
+            )
+
+    @staticmethod
+    def _plan_vllm_effective(
+        vllm_params: VllmParams | None,
+        plan: VllmFitPlan,
+        selected: tuple[VllmDeviceMemory, ...],
+    ) -> VllmParams:
+        """Translate an authorized plan into the env the start script reads."""
+        params = vllm_params or VllmParams()
+        return VllmParams(
+            tensor_parallel_size=plan.effective.tensor_parallel_size,
+            max_model_len=plan.effective.max_model_len,
+            gpu_memory_utilization=plan.effective.gpu_memory_utilization,
+            max_num_batched_tokens=plan.effective.max_num_batched_tokens,
+            tool_call_parser=params.tool_call_parser,
+            reasoning_parser=params.reasoning_parser,
+            dtype=plan.effective.dtype,
+            gpu_devices=tuple(device.index for device in selected),
+        )
+
+    async def _vllm_oom_in_engine_log(self, hostname: str) -> bool:
+        """Return whether the retained engine log shows a recognized OOM."""
+        try:
+            log_text = await self._ssh_run_command(
+                hostname,
+                "cat -- "
+                + shlex.quote(self._engine_log_path(hostname, InferenceEngine.VLLM)),
+            )
+        except Exception as exc:
+            logger.warning(
+                "vllm_oom_probe_failed",
+                hostname=hostname,
+                error=str(exc),
+            )
+            return False
+        return is_memory_failure(log_text)
+
+    async def _vllm_maybe_retry(
+        self,
+        hostname: str,
+        *,
+        model: str | None,
+        params: VllmParams | None,
+        plan: VllmFitPlan | None,
+        attempt: int,
+        max_attempts: int,
+    ) -> tuple[int, VllmFitPlan, tuple[VllmDeviceMemory, ...]] | None:
+        """Decide, stop cleanly, and re-plan the next bounded adjustment.
+
+        Returns ``None`` when the failure is not a recognized memory failure,
+        every adjustable field is explicit, or the retry budget is exhausted.
+        The caller must then stop the engine and re-raise.
+        """
+        if plan is None or not plan.retry_available or attempt + 1 >= max_attempts:
+            return None
+        if not await self._vllm_oom_in_engine_log(hostname):
+            return None
+        self._log(
+            hostname,
+            "warning",
+            "vLLM ran out of memory during attempt "
+            f"{attempt + 1}; stopping it cleanly before the bounded retry",
+        )
+        await self._stop_failed_vllm_start(hostname)
+        planned = await self._plan_vllm_launch(
+            hostname, model=model, params=params, attempt=attempt + 1
+        )
+        if planned is None:
+            return None
+        next_plan, selected = planned
+        self._require_fitting_plan(hostname, next_plan)
+        self._log(hostname, "info", next_plan.plan_line())
+        return attempt + 1, next_plan, selected
+
+    async def _verify_vllm_runtime(
+        self,
+        hostname: str,
+        *,
+        plan: VllmFitPlan,
+        vllm_params: VllmParams | None,
+        selected: tuple[VllmDeviceMemory, ...],
+    ) -> VllmRuntimeState:
+        """Persist the authorized plan and observe post-load selected-device memory."""
+        memory_text = await self._ssh_run_command(
+            hostname,
+            "nvidia-smi --query-gpu=index,memory.total,memory.used,memory.free "
+            "--format=csv,noheader,nounits",
+        )
+        selected_indices = {device.index for device in selected}
+        rows: list[VllmGPUState] = []
+        try:
+            for line in memory_text.splitlines():
+                if not line.strip():
+                    continue
+                index_text, total_text, used_text, free_text = line.split(",")
+                index = int(index_text.strip())
+                if index not in selected_indices:
+                    continue
+                rows.append(
+                    VllmGPUState(
+                        index=index,
+                        total_mib=int(total_text.strip()),
+                        used_mib=int(used_text.strip()),
+                        free_mib=int(free_text.strip()),
+                    )
+                )
+        except ValueError as exc:
+            raise ProvisioningError(
+                "could not parse post-load NVIDIA memory telemetry"
+            ) from exc
+        if not rows:
+            raise ProvisioningError(
+                "post-load NVIDIA memory telemetry returned no selected GPUs"
+            )
+        params = vllm_params or VllmParams()
+        request = VllmRuntimeRequest(
+            model=plan.requested.model,
+            params=VllmParams(
+                tensor_parallel_size=plan.requested.tensor_parallel_size,
+                max_model_len=plan.requested.max_model_len,
+                max_num_batched_tokens=plan.requested.max_num_batched_tokens,
+                gpu_memory_utilization=plan.requested.gpu_memory_utilization,
+                tool_call_parser=params.tool_call_parser,
+                reasoning_parser=params.reasoning_parser,
+                dtype=plan.requested.dtype,
+                gpu_devices=plan.requested.gpu_devices,
+            ),
+        )
+        runtime = VllmRuntimeState(
+            requested=request,
+            effective=VllmRuntimeEffective(
+                model=plan.effective.model,
+                model_selection=VllmModelSelection(plan.model_selection),
+                tensor_parallel_size=plan.effective.tensor_parallel_size,
+                max_model_len=plan.effective.max_model_len,
+                max_num_batched_tokens=plan.effective.max_num_batched_tokens,
+                gpu_memory_utilization=plan.effective.gpu_memory_utilization,
+                dtype=plan.effective.dtype,
+                attention_backend=plan.effective.attention_backend,
+            ),
+            estimate=VllmMemoryEstimate(
+                weights_mib=plan.estimate.weights_mib,
+                weights_per_gpu_mib=plan.estimate.weights_per_gpu_mib,
+                kv_cache_mib=plan.estimate.kv_cache_mib,
+                runtime_overhead_mib=plan.estimate.runtime_overhead_mib,
+                reserve_mib=plan.estimate.reserve_mib,
+                usable_budget_mib=plan.estimate.usable_budget_mib,
+                free_per_gpu_mib=plan.estimate.free_per_gpu_mib,
+            ),
+            adjustments=tuple(
+                VllmAdjustment(
+                    field=item.field,
+                    previous=item.previous,
+                    value=item.value,
+                    reason=item.reason,
+                )
+                for item in plan.adjustments
+            ),
+            attempt=plan.attempt,
+            reason=plan.reason,
+            gpus=tuple(sorted(rows, key=lambda row: row.index)),
+            observed_at=datetime.now(UTC),
+        )
+        used = ",".join(str(row.used_mib) for row in runtime.gpus)
+        free = ",".join(str(row.free_mib) for row in runtime.gpus)
+        self._log(
+            hostname,
+            "info",
+            "vLLM fitted: "
+            f"model={runtime.effective.model} "
+            f"selection={runtime.effective.model_selection.value} "
+            f"tp={runtime.effective.tensor_parallel_size} "
+            f"max_model_len={runtime.effective.max_model_len} "
+            f"max_num_batched_tokens={runtime.effective.max_num_batched_tokens} "
+            f"gpu_memory_utilization={runtime.effective.gpu_memory_utilization:g} "
+            f"attempt={runtime.attempt} gpu_used_mib={used} gpu_free_mib={free}",
+        )
+        return runtime
+
+    async def _start_vllm_with_retries(
+        self,
+        hostname: str,
+        *,
+        model: str | None,
+        vllm_params: VllmParams | None,
+        started_at: datetime,
+        on_step: Callable[[str], None] | None = None,
+    ) -> tuple[str, VllmRuntimeState | None]:
+        """Start vLLM, poll health, and retry recognized OOMs within bounds.
+
+        Without a memory plan (a host that cannot be measured) the legacy
+        node-side behavior is preserved: start once, poll health once, and
+        record no runtime state.
+        """
+        plan: VllmFitPlan | None = None
+        selected: tuple[VllmDeviceMemory, ...] = ()
+        planned = await self._plan_vllm_launch(
+            hostname, model=model, params=vllm_params, attempt=0
+        )
+        if planned is not None:
+            plan, selected = planned
+            self._require_fitting_plan(hostname, plan)
+            self._log(hostname, "info", plan.plan_line())
+        max_attempts = self._settings.vllm_memory_retry_max_attempts
+        attempt = 0
+        while True:
+            if on_step is not None:
+                on_step("starting_engine")
+            start_model = plan.effective.model if plan is not None else model
+            effective_params = (
+                self._plan_vllm_effective(vllm_params, plan, selected)
+                if plan is not None
+                else vllm_params
+            )
+            try:
+                model_name = await self._run_start_vllm(
+                    hostname,
+                    model=start_model,
+                    vllm_params=effective_params,
+                    vllm_plan=plan,
+                )
+            except Exception:
+                retry = await self._vllm_maybe_retry(
+                    hostname,
+                    model=model,
+                    params=vllm_params,
+                    plan=plan,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                )
+                if retry is None:
+                    await self._stop_failed_vllm_start(hostname)
+                    raise
+                attempt, plan, selected = retry
+                continue
+            if on_step is not None:
+                on_step("health_poll")
+            await self._update_state(
+                hostname, ProvisioningStep.HEALTH_POLL, started_at=started_at
+            )
+            self._log(hostname, "info", "Waiting for health endpoint")
+            try:
+                await self._poll_health(hostname, engine=InferenceEngine.VLLM)
+            except Exception:
+                retry = await self._vllm_maybe_retry(
+                    hostname,
+                    model=model,
+                    params=vllm_params,
+                    plan=plan,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                )
+                if retry is None:
+                    await self._stop_failed_vllm_start(hostname)
+                    raise
+                attempt, plan, selected = retry
+                continue
+            if plan is None:
+                return model_name, None
+            runtime = await self._verify_vllm_runtime(
+                hostname, plan=plan, vllm_params=vllm_params, selected=selected
+            )
+            return model_name, runtime
+
     @staticmethod
     def _verify_profile_evidence(
         fit: LlamaCppRuntimeFit,
@@ -3066,6 +3507,7 @@ class NodeProvisioner:
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
         vllm_params: VllmParams | None = None,
         draft_artifact: ResolvedGGUFArtifact | None = None,
+        vllm_plan: VllmFitPlan | None = None,
     ) -> str:
         """Run the engine start script and extract model name from stdout."""
         if engine == InferenceEngine.LLAMA_CPP:
@@ -3083,6 +3525,7 @@ class NodeProvisioner:
                 llamacpp_request=llamacpp_request,
                 vllm_params=vllm_params,
                 draft_artifact=draft_artifact,
+                vllm_plan=vllm_plan,
             ),
         )
         output: AsyncIterator[tuple[str, str]]
@@ -3198,6 +3641,7 @@ class NodeProvisioner:
         engine: InferenceEngine = InferenceEngine.VLLM,
         artifact_id: str | None = None,
         llamacpp_runtime: LlamaCppRuntimeState | None = None,
+        vllm_runtime: VllmRuntimeState | None = None,
         self_setup: bool = False,
         owner: str = "",
         gpus: tuple[NodeGPU, ...] = (),
@@ -3212,6 +3656,7 @@ class NodeProvisioner:
             engine=engine,
             artifact_id=artifact_id,
             llamacpp_runtime=llamacpp_runtime,
+            vllm_runtime=vllm_runtime,
             last_heartbeat=datetime.now(UTC),
             managed=managed,
             self_setup=self_setup,

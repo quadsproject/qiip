@@ -153,6 +153,7 @@ class UnifiedNodeService:
             engine=node.engine,
             artifact_id=node.artifact_id,
             llamacpp_runtime=node.llamacpp_runtime,
+            vllm_runtime=node.vllm_runtime,
             state=state,
             actions=actions,
             gpu_vendor=host.gpu_vendor if host else None,

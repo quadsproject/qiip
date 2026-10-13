@@ -637,6 +637,44 @@ check_persistence_mode() {
     fi
 }
 
+# ── Gateway memory plan ─────────────────────────
+
+# The gateway plans vLLM from each selected device's free VRAM and passes the
+# resulting per-device budget. If another tenant took that memory between the
+# plan and the launch, vLLM would OOM while loading weights; fail closed here
+# so the gateway's bounded retry can re-plan instead of crashing mid-load.
+check_vllm_memory() {
+    local budget="${AUTOVLLM_FIT_BUDGET_MIB:-}"
+    if [ -z "$budget" ]; then
+        _mark PASS "No gateway memory plan; node-side sizing applies"
+        return 0
+    fi
+    if ! [[ "$budget" =~ ^[0-9]+$ ]]; then
+        _bail "AUTOVLLM_FIT_BUDGET_MIB '${budget}' is not an integer count of MiB"
+    fi
+
+    local plan_device_list=""
+    if [ -n "$GPU_DEVICES_OVERRIDE" ]; then
+        plan_device_list="$GPU_DEVICES_OVERRIDE"
+    else
+        local i
+        for (( i=0; i<GPU_COUNT; i++ )); do
+            plan_device_list+="${plan_device_list:+,}$i"
+        done
+    fi
+
+    local -a fit_devices=()
+    IFS=',' read -r -a fit_devices <<< "$plan_device_list"
+    local index free_mib
+    for index in "${fit_devices[@]}"; do
+        free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$index" | xargs)
+        if [ -z "$free_mib" ] || [ "$free_mib" -lt "$budget" ]; then
+            _bail "GPU ${index} has ${free_mib:-0} MiB free but the memory plan reserved ${budget} MiB; another process is using the device"
+        fi
+    done
+    _mark PASS "Memory plan fits: ${budget} MiB free on ${#fit_devices[@]} selected device(s)"
+}
+
 # ── Orchestrator ────────────────────────────────────────────────────────
 
 run_preflight() {
@@ -657,6 +695,7 @@ run_preflight() {
     check_fabric
     check_cuda_devices
     check_cuda_execution
+    check_vllm_memory
     check_model
     check_model_topology
     check_nfs_mounts

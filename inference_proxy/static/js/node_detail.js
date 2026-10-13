@@ -469,6 +469,101 @@ function renderLlamaCppRuntime(node, observation) {
   });
 }
 
+function renderVllmRuntime(node) {
+  var panel = document.getElementById("vllm-runtime-panel");
+  if (!panel) return;
+  if (!node || node.engine !== "vllm") {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  var status = document.getElementById("vllm-runtime-status");
+  var values = document.getElementById("vllm-runtime-values");
+  var runtime = node.vllm_runtime;
+  if (!runtime) {
+    status.hidden = false;
+    status.textContent = node.state === "healthy"
+      ? "No memory-aware launch record; this node was started without a gateway plan."
+      : "vLLM runtime configuration is unavailable until the next successful managed setup.";
+    values.hidden = true;
+    return;
+  }
+  status.hidden = true;
+  values.hidden = false;
+
+  var requested = runtime.requested || {};
+  var requestedParams = requested.params || {};
+  var effective = runtime.effective || {};
+  var estimate = runtime.estimate || {};
+  var automatic = effective.model_selection === "automatic";
+
+  document.getElementById("vllm-runtime-selection").textContent =
+    automatic ? "Automatic (policy sized from available memory)" : "Explicit (operator selection preserved)";
+  document.getElementById("vllm-runtime-model").textContent = effective.model || "—";
+  document.getElementById("vllm-runtime-requested-model").textContent =
+    requested.model || "auto";
+  document.getElementById("vllm-runtime-tp").textContent =
+    formatRuntimeCount(effective.tensor_parallel_size) + " GPU(s)";
+  document.getElementById("vllm-runtime-context").textContent =
+    formatRuntimeCount(effective.max_model_len) + " tokens";
+  document.getElementById("vllm-runtime-batched").textContent =
+    formatRuntimeCount(effective.max_num_batched_tokens) + " tokens";
+  document.getElementById("vllm-runtime-util").textContent =
+    (effective.gpu_memory_utilization * 100).toFixed(0) + "%";
+  document.getElementById("vllm-runtime-dtype").textContent =
+    effective.dtype || "auto";
+  document.getElementById("vllm-runtime-backend").textContent =
+    effective.attention_backend || "vLLM default";
+  document.getElementById("vllm-runtime-weights").textContent =
+    formatRuntimeCount(estimate.weights_per_gpu_mib) + " MiB";
+  document.getElementById("vllm-runtime-kv").textContent =
+    formatRuntimeCount(estimate.kv_cache_mib) + " MiB";
+  document.getElementById("vllm-runtime-overhead").textContent =
+    formatRuntimeCount(estimate.runtime_overhead_mib) + " MiB";
+  document.getElementById("vllm-runtime-reserve").textContent =
+    formatRuntimeCount(estimate.reserve_mib) + " MiB";
+  document.getElementById("vllm-runtime-budget").textContent =
+    formatRuntimeCount(estimate.usable_budget_mib) + " MiB per GPU";
+  document.getElementById("vllm-runtime-free").textContent =
+    formatRuntimeCount(estimate.free_per_gpu_mib) + " MiB per GPU";
+  document.getElementById("vllm-runtime-attempt").textContent =
+    String((runtime.attempt || 0) + 1);
+  document.getElementById("vllm-runtime-reason").textContent =
+    runtime.reason || "—";
+
+  var adjustments = document.getElementById("vllm-runtime-adjustments");
+  adjustments.textContent = "";
+  var entries = runtime.adjustments || [];
+  if (entries.length === 0) {
+    var none = document.createElement("li");
+    none.textContent = requestedParams && automatic
+      ? "None: the initial plan fit without adjustment."
+      : "None: no automatic field required adjustment.";
+    adjustments.appendChild(none);
+  } else {
+    entries.forEach(function (adjustment) {
+      var item = document.createElement("li");
+      item.textContent = adjustment.field + ": " +
+        (adjustment.previous || "auto") + " → " + adjustment.value +
+        " (" + adjustment.reason + ")";
+      adjustments.appendChild(item);
+    });
+  }
+
+  var gpuList = document.getElementById("vllm-runtime-gpus");
+  gpuList.textContent = "";
+  (runtime.gpus || []).forEach(function (gpu) {
+    var item = document.createElement("li");
+    item.textContent = "GPU " + gpu.index + ": " +
+      formatRuntimeCount(gpu.used_mib) + " MiB used, " +
+      formatRuntimeCount(gpu.free_mib) + " MiB free of " +
+      formatRuntimeCount(gpu.total_mib) + " MiB";
+    gpuList.appendChild(item);
+  });
+  document.getElementById("vllm-runtime-observed").textContent =
+    "Post-load snapshot at " + formatRuntimeTimestamp(runtime.observed_at);
+}
+
 async function submitLlamaCppRelaunch() {
   if (!llamaCppRelaunch || !currentDetailNode) return;
   if (llamaCppRelaunch.isBusy()) return;
@@ -595,6 +690,7 @@ async function refreshDetail() {
       missingTag.textContent = "";
       missingTag.hidden = true;
       renderLlamaCppRuntime(null, currentRelaunchObservation);
+      renderVllmRuntime(null);
     } else {
       stateEl.textContent = node.state;
       if (!READ_ONLY) {
@@ -602,6 +698,7 @@ async function refreshDetail() {
         renderLlamaCppRuntime(node, currentRelaunchObservation);
       }
       renderOriginTag(node);
+      renderVllmRuntime(node);
       document.getElementById("setup-config-panel").style.display =
         READ_ONLY || node.self_setup ? "none" : "";
 

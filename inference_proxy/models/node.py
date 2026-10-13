@@ -383,6 +383,126 @@ class LlamaCppRuntimeState(BaseModel):
         return value
 
 
+class VllmModelSelection(StrEnum):
+    """Where a vLLM model choice came from.
+
+    ``AUTO`` means the gateway applied its documented profile-and-VRAM policy;
+    ``EXPLICIT`` means the operator named the model and it was never
+    substituted.
+    """
+
+    AUTO = "automatic"
+    EXPLICIT = "explicit"
+
+
+class VllmRuntimeRequest(BaseModel):
+    """Operator choices retained so a retry or relaunch replays them exactly.
+
+    Every field defaulting to ``None`` is one the planner sizes automatically.
+    A value present here is authoritative and is never adjusted after an OOM.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    model: str | None = Field(default=None, min_length=1, max_length=512)
+    params: VllmParams = Field(default_factory=VllmParams)
+
+    @model_serializer(mode="wrap")
+    def serialize_request(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        values: dict[str, object] = handler(self)
+        params = values.get("params")
+        if isinstance(params, dict) and not params:
+            values.pop("params", None)
+        if values.get("model") is None:
+            values.pop("model", None)
+        return values
+
+
+class VllmRuntimeEffective(BaseModel):
+    """The launch settings the plan authorized and the node actually used."""
+
+    model_config = ConfigDict(frozen=True)
+
+    model: str = Field(min_length=1, max_length=512)
+    model_selection: VllmModelSelection
+    tensor_parallel_size: int = Field(ge=1)
+    max_model_len: int = Field(ge=1)
+    max_num_batched_tokens: int = Field(ge=1)
+    gpu_memory_utilization: float = Field(gt=0.0, le=1.0)
+    dtype: str | None = None
+    attention_backend: str | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_effective(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        values: dict[str, object] = handler(self)
+        for name in ("dtype", "attention_backend"):
+            if values.get(name) is None:
+                values.pop(name, None)
+        return values
+
+
+class VllmMemoryEstimate(BaseModel):
+    """Recorded per-device memory arithmetic behind an automatic plan."""
+
+    model_config = ConfigDict(frozen=True)
+
+    weights_mib: int = Field(ge=0)
+    weights_per_gpu_mib: int = Field(ge=0)
+    kv_cache_mib: int = Field(ge=0)
+    runtime_overhead_mib: int = Field(ge=0)
+    reserve_mib: int = Field(ge=0)
+    usable_budget_mib: int = Field(ge=0)
+    free_per_gpu_mib: int = Field(ge=0)
+
+
+class VllmAdjustment(BaseModel):
+    """One bounded change the retry policy applied to an automatic field."""
+
+    model_config = ConfigDict(frozen=True)
+
+    field: str = Field(min_length=1, max_length=64)
+    previous: str = Field(max_length=64)
+    value: str = Field(max_length=64)
+    reason: str = Field(min_length=1, max_length=64)
+
+
+class VllmGPUState(BaseModel):
+    """One selected GPU's post-load memory telemetry."""
+
+    model_config = ConfigDict(frozen=True)
+
+    index: int = Field(ge=0)
+    total_mib: int = Field(ge=1)
+    used_mib: int = Field(ge=0)
+    free_mib: int = Field(ge=0)
+
+
+class VllmRuntimeState(BaseModel):
+    """Verified vLLM plan, its adjustments, and the post-load observation."""
+
+    model_config = ConfigDict(frozen=True)
+
+    requested: VllmRuntimeRequest
+    effective: VllmRuntimeEffective
+    estimate: VllmMemoryEstimate
+    adjustments: tuple[VllmAdjustment, ...] = ()
+    attempt: int = Field(default=0, ge=0)
+    reason: str = Field(min_length=1, max_length=512)
+    gpus: tuple[VllmGPUState, ...] = Field(min_length=1)
+    observed_at: datetime
+
+    @field_validator("observed_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("observed_at must include a timezone")
+        return value
+
+
 class NodeGPU(BaseModel):
     """One physical GPU observed on the node with ``nvidia-smi``."""
 
@@ -455,6 +575,7 @@ class Node(BaseModel):
     engine: InferenceEngine = InferenceEngine.VLLM
     artifact_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     llamacpp_runtime: LlamaCppRuntimeState | None = None
+    vllm_runtime: VllmRuntimeState | None = None
     last_heartbeat: datetime | None = None
     capabilities: NodeCapabilities = Field(default_factory=NodeCapabilities)
     active_connections: int = 0
