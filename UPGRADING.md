@@ -712,8 +712,12 @@ using only the catalog models and their pinned configurations. Set
   moves read fails places nothing and reports it in `error`.
 - **New `quads.stale_after_seconds` (default 900).** A pass makes no decision
   from a QUADS inventory snapshot older than this and reports the snapshot
-  age in `error`. The poller keeps its last good data through an outage; the
-  default allows two missed polls at the default interval.
+  age in `error`. The poller keeps its last good data through an outage, and
+  the default leaves room for roughly two missed polls at the default
+  interval; request time and failed polls age the snapshot too, so this is
+  headroom, not a fixed tolerance. Startup fails if the value is under twice
+  `quads.poll_interval`, since a bound that tight reads a healthy poller as
+  stale.
 - **Before upgrading with placement enabled:** configure QUADS, download each profile's files
   with `POST /admin/models/download` at the revisions the catalog pins, check
   `GET /admin/placement` shows every profile's files as present, list any host

@@ -637,6 +637,24 @@ class TestEnvVarOverrideQUADSBaseUrl:
                 server_timezone="Mars/Olympus_Mons",
             )
 
+    def test_stale_bound_under_two_poll_intervals_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="at least twice quads.poll_interval"):
+            QUADSSettings(poll_interval=300, stale_after_seconds=599)
+
+    def test_stale_bound_of_exactly_two_poll_intervals_is_accepted(self) -> None:
+        settings = QUADSSettings(poll_interval=300, stale_after_seconds=600)
+        assert settings.stale_after_seconds == 600
+
+    def test_a_longer_poll_interval_needs_a_longer_stale_bound(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Raising the poll interval alone can invalidate the default bound."""
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "600")
+        with pytest.raises(ValidationError, match="1200s for a 600s poll interval"):
+            Settings(_env_file=None)
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__STALE_AFTER_SECONDS", "1200")
+        assert Settings(_env_file=None).quads.stale_after_seconds == 1200
+
 
 class TestEnvVarOverrideQUADSTimeout:
     def test_env_var_override_quads_timeout(
