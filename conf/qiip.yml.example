@@ -166,6 +166,7 @@ quads:
   schedule_lookahead_hours: 24
   # Automatic placement makes no decision from an inventory snapshot older
   # than this (the poller keeps its last good data through a QUADS outage).
+  # Must be at least twice poll_interval.
   stale_after_seconds: 900
 
 placement:

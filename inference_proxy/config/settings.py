@@ -542,6 +542,8 @@ class QUADSSettings(BaseModel):
     schedule_check_interval: int = 300
     schedule_lookahead_hours: int = 24
     # Placement makes no decision from an inventory snapshot older than this.
+    # At least twice poll_interval: headroom over the poll cadence, not a
+    # guarantee about missed polls, since request time also ages the snapshot.
     stale_after_seconds: int = Field(default=900, ge=60)
 
     @model_validator(mode="after")
@@ -559,6 +561,25 @@ class QUADSSettings(BaseModel):
                     f"quads.server_timezone is not a known IANA timezone: "
                     f"{self.server_timezone!r}"
                 ) from exc
+        return self
+
+    @model_validator(mode="after")
+    def stale_bound_outlasts_the_poll_cadence(self) -> Self:
+        """Refuse a stale bound at or too close to the poll cadence.
+
+        The poller sleeps ``poll_interval`` after each poll finishes, and only a
+        successful poll refreshes ``last_sync``, so a bound at or below one
+        interval reads a healthy poller as stale whenever a pass lands late in
+        the cycle. Twice the interval is minimum headroom, not a promise about
+        how many failed polls are tolerated: request time ages the snapshot too.
+        """
+        if self.stale_after_seconds < 2 * self.poll_interval:
+            raise ValueError(
+                "quads.stale_after_seconds must be at least twice "
+                f"quads.poll_interval ({2 * self.poll_interval}s for a "
+                f"{self.poll_interval}s poll interval), got "
+                f"{self.stale_after_seconds}s"
+            )
         return self
 
 
