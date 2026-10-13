@@ -783,6 +783,32 @@ Source/archive checksums and transactional activation
 remain mandatory. Check artifact hit/miss, fallback reason, resource and timing
 markers in attempt logs before fleet rollout.
 
+### 31. Size managed vLLM launches from available memory
+
+Managed vLLM setup now sizes the launch on the gateway from the selected
+devices' free VRAM, the model's weights and quantization, the KV cache, and a
+per-profile runtime overhead. The planner chooses context, batching, tensor
+parallelism, dtype, and attention backend consistently with the selected
+runtime profile, records its estimate and reserve, and emits a
+`qiip_vllm_plan` record. When the operator requests no model, the largest
+catalog model the budget supports is selected and the selection policy is
+recorded; an explicitly requested model is never replaced. A value the operator
+set explicitly — context, tensor-parallel size, utilization, or dtype — is never
+silently rewritten: if it does not fit, provisioning stops with a reason.
+
+Automatic utilization is capped to the measured free VRAM so the plan pre-empts
+vLLM's own free-memory refusal instead of tripping it. Recognized memory
+failures during an automatic launch are retried under a bounded, logged policy
+that stops the failed engine, recomputes the plan from current memory, and
+records each adjustment. The attempt budget is
+`INFERENCE_PROXY_PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS` (total attempts,
+default 4; 1 disables retries). A fully explicit configuration yields no
+adjustments and is never retried. The requested and effective settings, the
+adjustment reasons, and the memory estimate are persisted with the node as
+`vllm_runtime` and shown on the node-detail dashboard. Hosts whose GPU memory
+cannot be measured fall back to the previous single-attempt launch and record
+no runtime state.
+
 ## Artifact Sources and Mirror Policy
 
 There is no single global mirror switch. Each source has a different trust and configuration boundary.
@@ -861,6 +887,8 @@ until every gateway that may provision or display the node understands it.
 | **New surface** | `/admin/nodes[]` now includes nullable `artifact_id`. Managed llama.cpp nodes report the exact discovered GGUF generation selected at setup; vLLM, older, manual, and QUADS-only records can report `null`. | Preserve the field when correlating a node with the GGUF catalog, but continue to handle `null` during rolling upgrades and for non-artifact-backed nodes. |
 | **New surface** | `/admin/nodes[]` now includes nullable `llamacpp_runtime`. Successful managed llama.cpp setup records requested sizing, verified effective context/concurrency/cache/offload values, per-GPU post-load memory, and an ISO-8601 UTC observation time. The node-detail dashboard renders the same state as a read-only card. | Treat the GPU values as a timestamped post-load snapshot, not live telemetry. Handle `null` for older records, vLLM nodes, QUADS-only hosts, and llama.cpp nodes that have not completed setup on the new version. |
 | **New surface** | `llamacpp_runtime.requested` can represent either automatic sizing or a complete gateway-authorized custom policy with `context_per_slot`, `slots`, and `cache_type`. Identity-preserving llama.cpp retries inherit the persisted policy: automatic policy recomputes, while custom policy replays exact values and revalidates fit. Host-ambient sizing overrides remain rejected. | Continue to omit selection fields for an identity-preserving retry. Preserve the complete `requested` object in clients and do not treat gateway-authorized sizing as permission to set ambient `AUTOLLAMACPP_*` or `LLAMA_ARG_*` overrides. |
+| **New surface** | `/admin/nodes[]` now includes nullable `vllm_runtime`. Successful managed vLLM setup records the requested overrides, the effective context/batching/tensor-parallel/dtype/attention values, the memory estimate and reserve, per-adjustment reasons, the model-selection policy, and an ISO-8601 UTC observation time. The node-detail dashboard renders the same state as a read-only card. | Handle `null` for older records, llama.cpp nodes, QUADS-only hosts, and hosts whose GPU memory could not be measured. Treat `approximate: true` as a name-derived estimate rather than a measured checkpoint. |
+| **Behavioral break** | Managed vLLM setup now plans context, batching, tensor parallelism, dtype, attention backend, and utilization from measured free VRAM and a per-profile overhead, and retries recognized automatic-mode memory failures up to `PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS` total attempts (default 4). Automatic utilization is capped to available free memory. Explicit context, tensor-parallel size, utilization, or dtype are never silently changed; a non-fitting explicit configuration fails with a reason. | Review the persisted `vllm_runtime.effective` and its adjustment reasons before pinning workload limits. Lower the retry budget to 1 to disable automatic retries, and provide an explicit model or tensor-parallel size to keep the previous fixed-settings behavior. |
 | **New surface** | `POST /admin/nodes/{hostname}/llamacpp/relaunch` accepts a strict typed automatic or custom policy for a healthy managed llama.cpp node. It drains traffic, performs a verified background relaunch, and rolls back to the previous requested policy on failure. New lifecycle states are `relaunching` and teardown-only `relaunch_failed`; both are excluded from routing and model listing. | Require 202 handling and follow the existing provisioning task and log endpoints. Treat 409 as an ineligible or busy node, 422 as an invalid policy, 429 as lifecycle capacity exhaustion, and 503 as unavailable connection tracking. Never route to either relaunch lifecycle state. |
 | **New surface** | The node-detail llama.cpp runtime card supersedes its read-only form with a typed automatic/custom policy editor. It seeds the persisted requested reserve and custom tuple, validates fixed limits before submission, confirms downtime, and follows relaunch task and log progress. Dirty forms become stale rather than being overwritten when another session changes the verified runtime. | Use Reset to adopt the latest persisted policy before submitting stale edits. Treat the aggregate context preview as arithmetic, not a fit guarantee; server-side estimator and post-load verification remain authoritative. |
 | **New surface** | Custom llama.cpp sizing can persist `allow_estimator_overrun=true`, exposed as **Attempt launch if estimate exceeds target** in the node-detail editor. It bypasses only a valid estimator non-fit result; estimator failures, static limits, full GPU offload, and the actual post-load free-VRAM target remain fail-closed. Automatic sizing cannot enable it. | Use this only to calibrate a known-conservative estimator on an otherwise dedicated GPU. A failed attempt invokes transactional rollback. Preserve the field when replaying a previously verified custom policy, and use `effective.estimator_overrun_used` to distinguish permission from an overrun that was actually needed. |

@@ -501,6 +501,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 hf_token=hf_token.get_secret_value() if hf_token else None,
                 nfs_export=resolved_settings.huggingface.nfs_export,
                 artifact_index=artifact_index,
+                hf_cache_dir=resolved_settings.huggingface.cache_dir,
             )
             app.state.provisioner = provisioner
             resources.push_async_callback(

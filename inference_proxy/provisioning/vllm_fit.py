@@ -28,13 +28,16 @@ import json
 import math
 import re
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
 MIB = 1024 * 1024
 ModelSelection = Literal["explicit", "automatic"]
-AdjustmentReason = Literal["oom_retry"]
+# ``free_memory`` records a utilization the measured free VRAM required before
+# the first launch; ``topology`` records a tensor-parallel size the model's head
+# geometry forced; ``oom_retry`` records a bounded response to a recognized OOM.
+AdjustmentReason = Literal["oom_retry", "free_memory", "topology"]
 
 # Tested context lengths. The plan never invents an untested value.
 CONTEXT_LADDER: tuple[int, ...] = (2048, 4096, 8192, 16384, 32768, 65536, 131072)
@@ -322,27 +325,33 @@ _MODEL_CATALOG: dict[str, VllmModelProfile] = {
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".gguf", ".pt")
 _QUANTIZED_MARKERS = ("awq", "gptq", "4bit", "4-bit", "int4", "fp8", "w4a16")
 _PARAMETER_PATTERN = re.compile(r"(?<![0-9.])([0-9]+(?:\.[0-9]+)?)\s*[bB](?![a-zA-Z])")
-# Kept deliberately aligned with the retention signature in
-# provisioning/reliability.py so the same evidence classifies identically.
+# A superset of the retention signature in provisioning/reliability.py: it adds
+# the two refusals this feature itself produces -- vLLM's free-memory gate
+# ("less than desired GPU memory utilization") and the node-side preflight bail
+# ("the memory plan reserved") -- so both retry instead of failing outright.
 _OOM_PATTERN = re.compile(
     r"cuda out of memory|cuda error: out of memory|"
-    r"torch\.cuda\.OutOfMemoryError|out of memory on device",
+    r"torch\.cuda\.OutOfMemoryError|out of memory on device|"
+    r"less than desired gpu memory utilization|memory plan reserved",
     re.IGNORECASE,
 )
 
 
 def is_memory_failure(log_text: str) -> bool:
-    """Return whether an engine log shows a recognized CUDA OOM failure."""
+    """Return whether an engine log shows a recognized memory failure."""
     return _OOM_PATTERN.search(log_text) is not None
 
 
 def vllm_profile_bucket(compute_capability: str, total_mib: int) -> str:
-    """Map measured hardware to a tested profile bucket.
+    """Map measured hardware to a tested vLLM profile bucket.
 
-    This mirrors ``common/profiles.sh::select_runtime_profile`` exactly so the
-    gateway plans for the same bucket the node would select on its own. The
-    shell stays authoritative for OS/ABI and driver gating, which setup.sh has
-    already enforced by the time the gateway plans.
+    This mirrors the bucket selection in
+    ``common/profiles.sh::select_runtime_profile`` for the vLLM engine. Volta is
+    intentionally absent: that function rejects the volta bucket for vLLM
+    because the pinned CUDA 13.0 stack dropped SM70, so planning one would only
+    persist a launch the node always refuses. The shell stays authoritative for
+    OS/ABI and driver gating, which setup.sh has already enforced by the time
+    the gateway plans.
     """
     major_text, _, minor_text = compute_capability.strip().partition(".")
     if not major_text.isdigit() or not minor_text.isdigit():
@@ -366,8 +375,6 @@ def vllm_profile_bucket(compute_capability: str, total_mib: int) -> str:
         bucket = "turing"
     elif sm == 75:
         bucket = "consumer-turing"
-    elif sm == 70 and vram_gb >= 16:
-        bucket = "volta"
     if bucket is None:
         raise ValueError(f"no tested runtime profile for sm{sm} with {total_mib} MiB")
     return bucket
@@ -581,12 +588,102 @@ def _utilization_reduced(effective: _MutableEffective) -> None:
 
 
 # Ordered bounded policy. Each successful OOM retry applies the next step that
-# touches a field the operator left automatic.
+# touches a field the operator left automatic. Context and batch come first
+# because a genuine KV-cache OOM is relieved by shrinking the KV pool;
+# utilization is last because lowering it also lowers that pool, so it is only
+# the final lever (it does clear vLLM's own free-memory gate, which the plan
+# already pre-empts by capping automatic utilization to measured free VRAM).
 ADJUSTMENT_POLICY: tuple[_AdjustmentStep, ...] = (
     _AdjustmentStep("max_model_len", "oom_retry", _context_halved),
     _AdjustmentStep("max_num_batched_tokens", "oom_retry", _batch_reduced),
     _AdjustmentStep("gpu_memory_utilization", "oom_retry", _utilization_reduced),
 )
+
+
+def _reduction_key(effective: _MutableEffective) -> tuple[int, int, float]:
+    """The fields a bounded reduction step can change."""
+    return (
+        effective.max_model_len,
+        effective.max_num_batched_tokens,
+        effective.gpu_memory_utilization,
+    )
+
+
+# Files vLLM refuses to start without: it raises
+# "Free memory on device ... less than desired GPU memory utilization" when
+# ``free < ceil(total * gpu_memory_utilization)``. Plan to the measured free
+# memory instead of an abstract fraction of total.
+def _utilization_fits(devices: Sequence[VllmDeviceMemory], utilization: float) -> bool:
+    """Return whether vLLM's free-memory gate accepts *utilization*."""
+    if utilization <= 0:
+        return False
+    return all(
+        math.ceil(device.total_mib * utilization) <= device.free_mib
+        for device in devices
+    )
+
+
+def _max_fitting_utilization(devices: Sequence[VllmDeviceMemory]) -> float:
+    """The largest two-decimal utilization every device's free VRAM allows."""
+    if not devices:
+        return 0.0
+    ratio = 1.0
+    for device in devices:
+        if device.total_mib <= 0:
+            return 0.0
+        ratio = min(ratio, device.free_mib / device.total_mib)
+    candidate = math.floor(ratio * 100) / 100
+    while candidate > 0 and not _utilization_fits(devices, candidate):
+        candidate = round(candidate - 0.01, 2)
+    return max(0.0, candidate)
+
+
+def _effective_weights_mib(model: VllmModelProfile, dtype: str | None) -> int:
+    """Rescale a checkpoint's weight footprint to the dtype vLLM will load.
+
+    A quantized checkpoint keeps its measured size; an explicit wider dtype
+    (``float32`` for a bf16 checkpoint) doubles or quadruples the resident
+    weights, so the estimate must move with it.
+    """
+    if model.quantized:
+        return model.weights_mib
+    native = _dtype_bytes(model.kv_dtype)
+    chosen = _dtype_bytes(dtype)
+    if chosen == native:
+        return model.weights_mib
+    return math.ceil(model.weights_mib * chosen / native)
+
+
+def _kv_bytes_per_token_for(model: VllmModelProfile, dtype: str | None) -> int:
+    """KV bytes for one token at the dtype vLLM will actually use."""
+    return (
+        2
+        * model.num_hidden_layers
+        * model.num_key_value_heads
+        * model.head_dim
+        * _dtype_bytes(dtype)
+    )
+
+
+def _tensor_parallel_valid(model: VllmModelProfile, tensor_parallel: int) -> bool:
+    """Mirror the node's shardability rule for attention and KV heads."""
+    if tensor_parallel <= 1:
+        return True
+    heads = model.num_attention_heads
+    kv_heads = min(model.num_key_value_heads, heads)
+    if tensor_parallel > heads or heads % tensor_parallel:
+        return False
+    if tensor_parallel <= kv_heads:
+        return kv_heads % tensor_parallel == 0
+    return tensor_parallel % kv_heads == 0
+
+
+def _largest_valid_tensor_parallel(model: VllmModelProfile, device_count: int) -> int:
+    """The largest shardable TP size not exceeding the selected devices."""
+    for candidate in range(min(device_count, model.num_attention_heads), 0, -1):
+        if _tensor_parallel_valid(model, candidate):
+            return candidate
+    return 1
 
 
 def largest_ladder_value(limit: int, ladder: Sequence[int]) -> int:
@@ -648,26 +745,103 @@ def plan_vllm_launch(
     if attempt < 0:
         raise ValueError("attempt must not be negative")
     request = requested or VllmRequested()
+    adjustments: list[VllmAdjustment] = []
+    blocked_reason: str | None = None
 
-    model_name, selection, model_reason = _resolve_model(
-        profile_bucket, devices, request
-    )
-    model = model_profile_for(model_name, cache_dir=cache_dir)
-
+    # Tensor parallel is resolved before the model because an automatic model is
+    # sized by the effective allocation, not the physical inventory.
     device_count = len(devices)
+    explicit_tp = request.tensor_parallel_size is not None
     tensor_parallel = request.tensor_parallel_size or _default_tensor_parallel(
         profile_bucket, device_count
     )
-    tensor_parallel = max(1, min(tensor_parallel, device_count))
+    if tensor_parallel > device_count:
+        if explicit_tp:
+            blocked_reason = (
+                f"explicit tensor_parallel_size {tensor_parallel} exceeds the "
+                f"{device_count} selected device(s)"
+            )
+        tensor_parallel = device_count
     allocated = list(devices[:tensor_parallel])
 
-    utilization = (
+    model: VllmModelProfile | None = None
+    selection: ModelSelection = "automatic"
+    model_reason = ""
+    tp_adjustment: VllmAdjustment | None = None
+    for _ in range(3):
+        model_name, selection, model_reason = _resolve_model(
+            profile_bucket, allocated, request, tensor_parallel
+        )
+        model = model_profile_for(model_name, cache_dir=cache_dir)
+        if _tensor_parallel_valid(model, tensor_parallel):
+            break
+        if explicit_tp:
+            if blocked_reason is None:
+                blocked_reason = (
+                    f"explicit tensor_parallel_size {tensor_parallel} is not "
+                    f"shardable for {model_name} "
+                    f"({model.num_attention_heads} attention / "
+                    f"{model.num_key_value_heads} KV heads)"
+                )
+            break
+        reduced = _largest_valid_tensor_parallel(model, device_count)
+        if reduced == tensor_parallel:
+            break
+        if tp_adjustment is None:
+            tp_adjustment = VllmAdjustment(
+                field="tensor_parallel_size",
+                previous=_format_setting(tensor_parallel),
+                value=_format_setting(reduced),
+                reason="topology",
+            )
+        tensor_parallel = reduced
+        allocated = list(devices[:tensor_parallel])
+    if model is None:  # pragma: no cover - the loop always runs at least once
+        raise ValueError("could not resolve a model profile")
+    if tp_adjustment is not None:
+        adjustments.append(tp_adjustment)
+
+    # vLLM refuses to start unless free >= ceil(total * utilization), so an
+    # automatic utilization is capped by measured free memory. An explicit one
+    # is never changed: it either fits or the plan fails with the reason.
+    requested_utilization = (
         request.gpu_memory_utilization
         if request.gpu_memory_utilization is not None
         else DEFAULT_GPU_MEMORY_UTILIZATION
     )
+    utilization = requested_utilization
+    if request.gpu_memory_utilization is not None:
+        if not _utilization_fits(allocated, requested_utilization):
+            blocked_reason = blocked_reason or (
+                f"explicit gpu_memory_utilization {requested_utilization:g} needs "
+                f"{math.ceil(min(d.total_mib for d in allocated) * requested_utilization)} "
+                f"MiB free per device but only "
+                f"{min(d.free_mib for d in allocated)} MiB is available"
+            )
+    else:
+        util_cap = _max_fitting_utilization(allocated)
+        utilization = min(requested_utilization, util_cap)
+        if utilization < requested_utilization:
+            if utilization < MIN_GPU_MEMORY_UTILIZATION:
+                blocked_reason = blocked_reason or (
+                    "free memory cannot satisfy the minimum GPU memory "
+                    f"utilization {MIN_GPU_MEMORY_UTILIZATION:g} "
+                    f"(at most {util_cap:g} is available)"
+                )
+            else:
+                adjustments.append(
+                    VllmAdjustment(
+                        field="gpu_memory_utilization",
+                        previous=_format_setting(requested_utilization),
+                        value=_format_setting(utilization),
+                        reason="free_memory",
+                    )
+                )
+
     dtype = request.dtype or _choose_dtype(profile_bucket, model)
     backend = _choose_attention_backend(profile_bucket)
+    weights_mib = _effective_weights_mib(model, dtype)
+    kv_bytes_per_token = _kv_bytes_per_token_for(model, dtype)
 
     desired_context = min(
         PROFILE_DESIRED_CONTEXT.get(profile_bucket, DEFAULT_DESIRED_CONTEXT),
@@ -694,7 +868,6 @@ def plan_vllm_launch(
     )
     applicable = [step for step in ADJUSTMENT_POLICY if not step.is_explicit(request)]
     steps_to_apply = applicable[:attempt]
-    retry_available = len(applicable) > attempt
 
     overhead = (
         runtime_overhead_mib
@@ -716,6 +889,8 @@ def plan_vllm_launch(
         allocated,
         effective.tensor_parallel_size,
         effective.gpu_memory_utilization,
+        weights_mib=weights_mib,
+        kv_bytes_per_token=kv_bytes_per_token,
     )
     reserve = max(MIN_RESERVE_MIB, round(budget * RESERVE_FRACTION))
     kv_budget = remaining - overhead - reserve
@@ -732,7 +907,6 @@ def plan_vllm_launch(
     effective.max_model_len = context
     effective.max_num_batched_tokens = min(effective.max_num_batched_tokens, context)
 
-    adjustments: list[VllmAdjustment] = []
     for step in steps_to_apply:
         if step.field_name == "gpu_memory_utilization":
             if effective.gpu_memory_utilization != utilization_before:
@@ -761,11 +935,23 @@ def plan_vllm_launch(
         effective.max_num_batched_tokens, effective.max_model_len
     )
     if not fitting:
-        retry_available = False
+        blocked_reason = blocked_reason or reason
+    if blocked_reason is not None:
+        fitting = False
+        reason = blocked_reason
+
+    # A retry is only worth offering when the next bounded step actually moves a
+    # field; an at-floor plan must not relaunch a byte-identical configuration.
+    retry_available = False
+    if fitting and attempt < len(applicable):
+        trial = replace(effective)
+        before_key = _reduction_key(trial)
+        applicable[attempt].apply(trial)
+        retry_available = before_key != _reduction_key(trial)
 
     kv_cache_mib = math.ceil(kv_per_token * effective.max_model_len)
     estimate = VllmEstimate(
-        weights_mib=model.weights_mib,
+        weights_mib=weights_mib,
         weights_per_gpu_mib=weights_per_gpu,
         kv_cache_mib=kv_cache_mib,
         runtime_overhead_mib=overhead,
@@ -801,6 +987,7 @@ def _resolve_model(
     profile_bucket: str,
     devices: Sequence[VllmDeviceMemory],
     requested: VllmRequested,
+    tensor_parallel: int,
 ) -> tuple[str, ModelSelection, str]:
     if requested.model:
         return (
@@ -808,12 +995,21 @@ def _resolve_model(
             "explicit",
             f"explicit model {requested.model}",
         )
-    total_vram_gb = sum(device.total_mib for device in devices) // 1024
-    model = select_vllm_model(profile_bucket, total_vram_gb)
+    # Size by the effective allocation, mirroring configure_vllm_params in
+    # start-vllm.sh: datacenter buckets spread across the allocated cards, while
+    # consumer and Turing buckets are sized by a single card.
+    per_card_gb = (devices[0].total_mib + 512) // 1024
+    sizing_gb = (
+        tensor_parallel * per_card_gb
+        if profile_bucket in DATACENTER_BUCKETS
+        else per_card_gb
+    )
+    model = select_vllm_model(profile_bucket, sizing_gb)
     return (
         model,
         "automatic",
-        f"automatic policy: profile {profile_bucket} with {total_vram_gb} GB",
+        f"automatic policy: profile {profile_bucket} with {sizing_gb} GB "
+        f"(tp={tensor_parallel}, {per_card_gb} GB/device)",
     )
 
 
@@ -822,6 +1018,9 @@ def _memory_budget(
     devices: Sequence[VllmDeviceMemory],
     tensor_parallel: int,
     utilization: float,
+    *,
+    weights_mib: int,
+    kv_bytes_per_token: int,
 ) -> tuple[int, int, int, int, float]:
     """Return budget left after weights, usable budget, free floor, weights/GPU, KV/token."""
     usable = [
@@ -830,9 +1029,9 @@ def _memory_budget(
     ]
     budget = min(usable)
     free = min(device.free_mib for device in devices)
-    weights_per_gpu = math.ceil(model.weights_mib / tensor_parallel)
+    weights_per_gpu = math.ceil(weights_mib / tensor_parallel)
     kv_shards = max(1, min(tensor_parallel, model.num_key_value_heads))
-    kv_per_token_mib = model.kv_bytes_per_token / kv_shards / MIB
+    kv_per_token_mib = kv_bytes_per_token / kv_shards / MIB
     remaining = budget - weights_per_gpu
     return remaining, budget, free, weights_per_gpu, kv_per_token_mib
 

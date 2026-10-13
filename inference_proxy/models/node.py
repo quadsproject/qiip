@@ -396,10 +396,12 @@ class VllmModelSelection(StrEnum):
 
 
 class VllmRuntimeRequest(BaseModel):
-    """Operator choices retained so a retry or relaunch replays them exactly.
+    """Operator choices retained for the audit trail and dashboard.
 
     Every field defaulting to ``None`` is one the planner sizes automatically.
     A value present here is authoritative and is never adjusted after an OOM.
+    A retry re-plans from these same live arguments, so the recorded request is
+    what every attempt was derived from, not a replay buffer.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -427,6 +429,7 @@ class VllmRuntimeEffective(BaseModel):
 
     model: str = Field(min_length=1, max_length=512)
     model_selection: VllmModelSelection
+    model_reason: str = Field(min_length=1, max_length=512)
     tensor_parallel_size: int = Field(ge=1)
     max_model_len: int = Field(ge=1)
     max_num_batched_tokens: int = Field(ge=1)
@@ -492,6 +495,7 @@ class VllmRuntimeState(BaseModel):
     adjustments: tuple[VllmAdjustment, ...] = ()
     attempt: int = Field(default=0, ge=0)
     reason: str = Field(min_length=1, max_length=512)
+    approximate: bool = False
     gpus: tuple[VllmGPUState, ...] = Field(min_length=1)
     observed_at: datetime
 

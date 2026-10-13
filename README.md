@@ -606,6 +606,16 @@ telemetry. Automatic policy records contain `sizing` and `fit_target_mib`.
 Gateway-authorized custom records additionally contain exact
 `context_per_slot`, `slots`, and `cache_type` values.
 
+Successful managed vLLM setup reports `vllm_runtime`, containing the requested
+overrides, the effective context, batching, tensor parallelism, dtype, and
+attention backend, the device-indexed memory estimate and reserve, the list of
+automatic adjustments with the reason for each, which model was selected and
+why, and an ISO-8601 UTC observation time. `requested` records only the values
+the operator or gateway supplied, so the difference from `effective` is the
+automatic sizing. Other nodes and older records report `vllm_runtime: null`,
+and `approximate` marks a plan sized from the model name because no local
+checkpoint was available.
+
 A host present only in QUADS has not been provisioned and therefore reports
 both `engine: null` and `artifact_id: null`. Do not interpret a null engine as
 vLLM. It means QIIP has no registered serving identity for that host.
@@ -1375,6 +1385,7 @@ controlled source fallback for the attached NVIDIA GPUs. Gateway settings:
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_BUILD_JOBS` | `0` | Compiler-job ceiling; automatic sizing (`0`) and explicit ceilings both respect available CPU and RAM |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT` | `7200` | Total wall-clock deadline for the llama.cpp setup command, including the CUDA source build (seconds) |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB` | `512` | Free VRAM margin per GPU enforced by the llama.cpp capacity planner (MiB) |
+| `INFERENCE_PROXY_PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS` | `4` | Total automatic-mode vLLM launch attempts, including the first; `1` disables memory-failure retries |
 
 Changing `LLAMACPP_VERSION` requires an explicitly configured matching digest.
 Artifact production, compatibility rules, source resource budgets, and rollout
@@ -1417,6 +1428,25 @@ timestamped per-GPU memory snapshot, and exposes it on the node-detail
 dashboard. See
 [auto-llamacpp](auto-llamacpp/README.md) for the direct script contract and
 build details.
+
+Managed vLLM setup is sized the same way, but on the gateway. The planner reads
+per-device total and free VRAM, the model's weights and quantization, the KV
+cache, and a per-profile runtime overhead, records the estimate and reserve,
+and chooses context, batching, tensor parallelism, and a supported dtype and
+attention backend consistent with the selected profile. When the free VRAM
+cannot satisfy the estimated `gpu_memory_utilization`, the planner caps the
+utilization to what is actually available instead of sending vLLM past its own
+free-memory gate. It never rewrites a value the operator set explicitly: an
+explicit context, tensor-parallel size, or utilization that does not fit stops
+provisioning with a reason rather than being silently changed. When no model is
+requested, `select_vllm_model` picks the largest catalog model the budget
+supports and records the policy that chose it. Recognized memory failures during
+an automatic launch are retried under a bounded policy
+(`INFERENCE_PROXY_PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS`, total attempts,
+default 4): the failed engine is stopped, the plan is recomputed from live
+memory, and each adjustment is logged with its reason and persisted as the
+effective configuration. See [auto-vllm](auto-vllm/README.md) for the direct
+script contract and the plan record.
 
 LLMFit has one version setting: `INFERENCE_PROXY_LLMFIT__VERSION`.
 

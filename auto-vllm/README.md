@@ -165,6 +165,39 @@ settings and defaults. Setup clears the selected generation's saved settings,
 including when reactivating the same generation. Profiles assume a homogeneous GPU family: with a
 subset, model, VRAM, and compute-cap detection use the first selected card.
 
+## Memory planning and automatic retry
+
+Managed launches are planned before the engine starts. The gateway reads each
+selected device's total and free VRAM, estimates weights, KV cache, runtime
+overhead, and a reserve, and emits a `qiip_vllm_plan` record whose effective
+context, batching, tensor-parallel size, dtype, and attention backend stay
+consistent with the selected runtime profile. When no model is requested, the
+largest catalog model the budget supports is selected; an explicitly requested
+model is never replaced. Explicit context, tensor-parallel size, utilization,
+and dtype are never rewritten, and a non-fitting explicit value fails the plan
+with a reason instead of being silently clamped.
+
+When the gateway plans a launch it also passes the plan back as
+`AUTOVLLM_FIT_BUDGET_MIB` (per-device MiB the plan reserved),
+`AUTOVLLM_FIT_RESERVE_MIB`, and `AUTOVLLM_FIT_OVERHEAD_MIB`. Preflight then
+verifies that every selected device still has at least the planned budget free
+and fails closed when a device's free memory is missing or non-numeric, so a
+concurrent job cannot push the engine past its own free-memory gate.
+`AUTOVLLM_ATTENTION_BACKEND` pins the planned backend, and an unsupported
+combination (for example `FLASHINFER` below SM90) is rejected before launch.
+The budget and reserve are reported in the configuration banner.
+
+vLLM refuses to start when a device's free memory is below
+`ceil(total * gpu_memory_utilization)`. The gateway caps automatic utilization
+to the measured free VRAM so the plan pre-empts that refusal. If a recognized
+memory failure still occurs during an automatic launch, the gateway stops the
+failed engine cleanly, recomputes the plan from current memory under a bounded
+policy (`INFERENCE_PROXY_PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS`, total
+attempts, default 4), and retries. Each reduction is logged with its reason and
+persisted with the node as `vllm_runtime`, alongside the requested overrides,
+the memory estimate, and the model-selection policy. Standalone script runs
+select a model themselves but record no gateway plan.
+
 ## Health check
 
 ```bash

@@ -153,8 +153,8 @@ provisioning:
   llamacpp_build_jobs: 0
   llamacpp_setup_timeout: 7200.0
   llamacpp_fit_target_mib: 512
-  # Bounded number of automatic vLLM OOM retries (1 uses no retries).
-  vllm_memory_retry_max_attempts: 3
+  # Bounded total automatic vLLM launch attempts (1 uses no retries).
+  vllm_memory_retry_max_attempts: 4
 
 quads:
   # Set base_url to enable the QUADS integration; server_timezone is then

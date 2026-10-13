@@ -499,6 +499,8 @@ function renderVllmRuntime(node) {
 
   document.getElementById("vllm-runtime-selection").textContent =
     automatic ? "Automatic (policy sized from available memory)" : "Explicit (operator selection preserved)";
+  document.getElementById("vllm-runtime-model-reason").textContent =
+    effective.model_reason || "—";
   document.getElementById("vllm-runtime-model").textContent = effective.model || "—";
   document.getElementById("vllm-runtime-requested-model").textContent =
     requested.model || "auto";
@@ -516,6 +518,8 @@ function renderVllmRuntime(node) {
     effective.attention_backend || "vLLM default";
   document.getElementById("vllm-runtime-weights").textContent =
     formatRuntimeCount(estimate.weights_per_gpu_mib) + " MiB";
+  document.getElementById("vllm-runtime-approximate").textContent =
+    runtime.approximate ? "Approximate (no local checkpoint; sized from the model name)" : "Measured from the local checkpoint";
   document.getElementById("vllm-runtime-kv").textContent =
     formatRuntimeCount(estimate.kv_cache_mib) + " MiB";
   document.getElementById("vllm-runtime-overhead").textContent =

@@ -494,6 +494,7 @@ class NodeProvisioner:
         hf_token: str | None = None,
         nfs_export: str | None = None,
         artifact_index: GGUFArtifactIndex | None = None,
+        hf_cache_dir: str | None = None,
     ) -> None:
         self._ssh_client = ssh_client
         self._etcd_client = etcd_client
@@ -522,6 +523,7 @@ class NodeProvisioner:
         self._hf_token = hf_token
         self._nfs_export = nfs_export
         self._artifact_index = artifact_index
+        self._hf_cache_dir = hf_cache_dir
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._owner_updates: set[asyncio.Task[Node]] = set()
         self._provisioning_tasks: dict[str, ProvisioningTask] = {}
@@ -2990,9 +2992,10 @@ class NodeProvisioner:
                 profile_bucket=bucket,
                 devices=selected,
                 requested=self._vllm_requested(model, params),
+                cache_dir=self._hf_cache_dir,
                 attempt=attempt,
             )
-        except ValueError as exc:
+        except (ValueError, OverflowError) as exc:
             raise ProvisioningError(
                 f"could not plan the vLLM launch for {hostname}: {exc}"
             ) from exc
@@ -3021,11 +3024,19 @@ class NodeProvisioner:
             tool_call_parser=params.tool_call_parser,
             reasoning_parser=params.reasoning_parser,
             dtype=plan.effective.dtype,
-            gpu_devices=tuple(device.index for device in selected),
+            gpu_devices=tuple(
+                device.index
+                for device in selected[: plan.effective.tensor_parallel_size]
+            ),
         )
 
     async def _vllm_oom_in_engine_log(self, hostname: str) -> bool:
-        """Return whether the retained engine log shows a recognized OOM."""
+        """Return whether retained output shows a recognized memory failure.
+
+        The engine log holds vLLM's own refusal or CUDA OOM. The node-side
+        preflight bails before vLLM writes anything, so its lines only reach the
+        retained provisioning output, which is checked as a fallback.
+        """
         try:
             log_text = await self._ssh_run_command(
                 hostname,
@@ -3038,8 +3049,13 @@ class NodeProvisioner:
                 hostname=hostname,
                 error=str(exc),
             )
-            return False
-        return is_memory_failure(log_text)
+            log_text = ""
+        if log_text and is_memory_failure(log_text):
+            return True
+        return any(
+            is_memory_failure(entry["msg"])
+            for entry in self._log_buffer.get_entries(hostname)
+        )
 
     async def _vllm_maybe_retry(
         self,
@@ -3074,7 +3090,17 @@ class NodeProvisioner:
         if planned is None:
             return None
         next_plan, selected = planned
-        self._require_fitting_plan(hostname, next_plan)
+        if not next_plan.fitting:
+            # The adjustment cannot make the launch fit. Stop rather than
+            # replace the original failure with a misleading "does not fit"
+            # error; the caller re-raises the recognized OOM.
+            self._log(
+                hostname,
+                "warning",
+                "vLLM retry cannot fit the host and will not be attempted: "
+                f"{next_plan.reason}",
+            )
+            return None
         self._log(hostname, "info", next_plan.plan_line())
         return attempt + 1, next_plan, selected
 
@@ -3137,6 +3163,7 @@ class NodeProvisioner:
             effective=VllmRuntimeEffective(
                 model=plan.effective.model,
                 model_selection=VllmModelSelection(plan.model_selection),
+                model_reason=plan.model_reason,
                 tensor_parallel_size=plan.effective.tensor_parallel_size,
                 max_model_len=plan.effective.max_model_len,
                 max_num_batched_tokens=plan.effective.max_num_batched_tokens,
@@ -3164,6 +3191,7 @@ class NodeProvisioner:
             ),
             attempt=plan.attempt,
             reason=plan.reason,
+            approximate=plan.approximate,
             gpus=tuple(sorted(rows, key=lambda row: row.index)),
             observed_at=datetime.now(UTC),
         )
@@ -3200,6 +3228,10 @@ class NodeProvisioner:
         """
         plan: VllmFitPlan | None = None
         selected: tuple[VllmDeviceMemory, ...] = ()
+        # The incumbent server holds VRAM that would otherwise look allocated to
+        # a process the plan does not control, so it must be stopped before the
+        # first measurement. The retry path already stops before re-planning.
+        await self._stop_failed_vllm_start(hostname)
         planned = await self._plan_vllm_launch(
             hostname, model=model, params=vllm_params, attempt=0
         )
@@ -3263,9 +3295,15 @@ class NodeProvisioner:
                 continue
             if plan is None:
                 return model_name, None
-            runtime = await self._verify_vllm_runtime(
-                hostname, plan=plan, vllm_params=vllm_params, selected=selected
-            )
+            try:
+                runtime = await self._verify_vllm_runtime(
+                    hostname, plan=plan, vllm_params=vllm_params, selected=selected
+                )
+            except Exception:
+                # A runtime we cannot verify must not stay running and
+                # registered as healthy.
+                await self._stop_failed_vllm_start(hostname)
+                raise
             return model_name, runtime
 
     @staticmethod

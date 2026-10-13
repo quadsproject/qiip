@@ -121,11 +121,15 @@ def test_multi_gpu_plan_shards_weights_and_kv() -> None:
 
     assert plan.fitting is True
     assert plan.model_selection == "automatic"
-    assert plan.effective.model == "Qwen/Qwen2.5-72B-Instruct"
-    assert plan.effective.tensor_parallel_size == 3
-    # 145 GiB of weights split three ways leaves ample room for 32K.
+    # 72B has 64 attention heads, so TP=3 is not shardable. The plan drops to
+    # the largest valid size and re-sizes the model to that allocation (160 GB).
+    assert plan.effective.model == "Qwen/Qwen2.5-32B-Instruct"
+    assert plan.effective.tensor_parallel_size == 2
+    assert [(item.field, item.reason) for item in plan.adjustments] == [
+        ("tensor_parallel_size", "topology")
+    ]
+    assert plan.estimate.weights_per_gpu_mib == 32_000
     assert plan.effective.max_model_len == 32768
-    assert plan.estimate.weights_per_gpu_mib == 48_334
 
 
 def test_non_fitting_plan_reports_weights_over_budget() -> None:
@@ -152,8 +156,10 @@ def test_busy_gpu_free_memory_caps_the_budget() -> None:
 
     assert plan.fitting is False
     assert plan.estimate.free_per_gpu_mib == 5120
-    # The free cap, not 90% of total, decides the budget.
-    assert plan.estimate.usable_budget_mib == 5120
+    # The capped utilization, not 90% of total, decides the budget.
+    assert plan.estimate.usable_budget_mib == 4915
+    assert plan.effective.gpu_memory_utilization == 0.06
+    assert "minimum GPU memory utilization" in plan.reason
 
 
 def test_busy_gpu_that_still_fits_shrinks_context() -> None:
@@ -165,7 +171,13 @@ def test_busy_gpu_that_still_fits_shrinks_context() -> None:
 
     assert plan.fitting is True
     assert plan.estimate.free_per_gpu_mib == 73_500
-    assert plan.estimate.usable_budget_mib == 73_500
+    # Utilization is capped to what free VRAM satisfies (0.89), so vLLM's own
+    # free-memory gate cannot refuse the launch the plan authorized.
+    assert plan.estimate.usable_budget_mib == 72908
+    assert plan.effective.gpu_memory_utilization == 0.89
+    assert [(item.field, item.reason) for item in plan.adjustments] == [
+        ("gpu_memory_utilization", "free_memory")
+    ]
     assert plan.effective.max_model_len == 4096
     assert plan.effective.max_model_len < 8192
 
@@ -440,7 +452,7 @@ def test_load_model_profile_rejects_config_without_geometry(tmp_path: Path) -> N
 def test_a_budget_without_room_for_the_minimum_context_is_reported() -> None:
     plan = plan_vllm_launch(
         profile_bucket="hopper",
-        devices=[_device(free_mib=71_650)],
+        devices=[_device(free_mib=72_090)],
         requested=VllmRequested(),
     )
 
@@ -480,7 +492,10 @@ def test_vllm_profile_bucket_mirrors_the_node_profiles() -> None:
     assert vllm_profile_bucket("8.9", 24_576) == "consumer-ada"
     assert vllm_profile_bucket("7.5", 16_384) == "turing"
     assert vllm_profile_bucket("7.5", 8_192) == "consumer-turing"
-    assert vllm_profile_bucket("7.0", 16_384) == "volta"
+    # Volta is intentionally unsupported for vLLM: the pinned CUDA 13.0 stack
+    # dropped SM70, so the node rejects the bucket this function would name.
+    with pytest.raises(ValueError, match="no tested runtime profile"):
+        vllm_profile_bucket("7.0", 16_384)
 
 
 def test_vllm_profile_bucket_rejects_unparseable_or_unsupported_hardware() -> None:
@@ -498,6 +513,92 @@ def test_is_memory_failure_recognizes_only_cuda_oom_signatures() -> None:
         "RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB"
     )
     assert is_memory_failure("RuntimeError: out of memory on device 0")
+    # vLLM's own free-memory refusal and the node-side preflight bail must also
+    # classify as retryable, or the bounded policy can never fire.
+    assert is_memory_failure(
+        "Free memory on device (78.5/79.2 GiB) on your GPU is less than "
+        "desired GPU memory utilization"
+    )
+    assert is_memory_failure(
+        "GPU 0 has 1000 MiB free but the memory plan reserved 4096 MiB"
+    )
     assert not is_memory_failure("Connection refused")
     assert not is_memory_failure("")
     assert not is_memory_failure("the host is out of memory for disk")
+
+
+def test_explicit_tensor_parallel_above_the_device_count_is_refused() -> None:
+    plan = plan_vllm_launch(
+        profile_bucket="hopper",
+        devices=[_device()],
+        requested=VllmRequested(tensor_parallel_size=4),
+    )
+
+    assert plan.fitting is False
+    assert plan.effective.tensor_parallel_size == 1
+    assert "exceeds the 1 selected device" in plan.reason
+
+
+def test_explicit_unshardable_tensor_parallel_is_refused() -> None:
+    plan = plan_vllm_launch(
+        profile_bucket="hopper",
+        devices=[_device(index=index) for index in range(3)],
+        requested=VllmRequested(
+            model="Qwen/Qwen2.5-72B-Instruct", tensor_parallel_size=3
+        ),
+    )
+
+    # 64 attention heads cannot be split three ways; an explicit choice is
+    # reported, never silently rewritten.
+    assert plan.fitting is False
+    assert plan.effective.tensor_parallel_size == 3
+    assert "not shardable" in plan.reason
+
+
+def test_explicit_utilization_that_free_memory_cannot_satisfy_is_refused() -> None:
+    plan = plan_vllm_launch(
+        profile_bucket="hopper",
+        devices=[_device(total_mib=81_920, free_mib=73_500)],
+        requested=VllmRequested(gpu_memory_utilization=0.95),
+    )
+
+    assert plan.fitting is False
+    assert plan.effective.gpu_memory_utilization == 0.95
+    assert "explicit gpu_memory_utilization 0.95" in plan.reason
+
+
+def test_explicit_wide_dtype_inflates_the_weight_estimate() -> None:
+    request = VllmRequested(model="Qwen/Qwen2.5-7B-Instruct", dtype="float32")
+    plan = plan_vllm_launch(
+        profile_bucket="hopper", devices=[_device()], requested=request
+    )
+
+    # bf16 weights are doubled when the operator forces float32.
+    assert plan.estimate.weights_mib == 30_400
+    assert plan.estimate.weights_per_gpu_mib == 30_400
+
+
+def test_retry_is_unavailable_when_the_next_step_cannot_change_anything() -> None:
+    # Context and batch already sit at the floor under this overhead, so the
+    # first policy step is a no-op and a retry would relaunch a byte-identical
+    # configuration.
+    plan = plan_vllm_launch(
+        profile_bucket="hopper",
+        devices=[_device()],
+        requested=VllmRequested(),
+        runtime_overhead_mib=7_400,
+    )
+
+    assert plan.fitting is True
+    assert plan.effective.max_model_len == MIN_CONTEXT
+    assert plan.adjustments == ()
+    assert plan.retry_available is False
+
+
+def test_max_fitting_utilization_refuses_degenerate_devices() -> None:
+    # A utilization of zero can never satisfy vLLM's free-memory gate.
+    assert vllm_fit._utilization_fits((_device(),), 0.0) is False
+    # A device that reports no total memory cannot support a plan, and an empty
+    # inventory has nothing to plan against.
+    assert vllm_fit._max_fitting_utilization(()) == 0.0
+    assert vllm_fit._max_fitting_utilization((VllmDeviceMemory(0, 0, 0, "9.0"),)) == 0.0
