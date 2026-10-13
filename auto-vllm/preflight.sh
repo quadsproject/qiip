@@ -668,11 +668,17 @@ check_vllm_memory() {
     local index free_mib
     for index in "${fit_devices[@]}"; do
         free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$index" | xargs)
-        if [ -z "$free_mib" ] || [ "$free_mib" -lt "$budget" ]; then
-            _bail "GPU ${index} has ${free_mib:-0} MiB free but the memory plan reserved ${budget} MiB; another process is using the device"
+        # Fail closed: a blank or non-numeric answer proves nothing, so treat it
+        # as a device that cannot satisfy the plan rather than skipping the
+        # check (``[ -lt ]`` on garbage is an error under set -e anyway).
+        if [[ ! "$free_mib" =~ ^[0-9]+$ ]]; then
+            _bail "GPU ${index} did not report a usable free-memory value (${free_mib:-empty}); cannot verify the ${budget} MiB memory plan"
+        fi
+        if [ "$free_mib" -lt "$budget" ]; then
+            _bail "GPU ${index} has ${free_mib} MiB free but the memory plan reserved ${budget} MiB; another process is using the device"
         fi
     done
-    _mark PASS "Memory plan fits: ${budget} MiB free on ${#fit_devices[@]} selected device(s)"
+    _mark PASS "Memory plan fits: each of ${#fit_devices[@]} selected device(s) has at least the planned ${budget} MiB free"
 }
 
 # ── Orchestrator ────────────────────────────────────────────────────────

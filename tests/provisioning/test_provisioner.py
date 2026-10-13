@@ -244,6 +244,7 @@ def _make_provisioner(
     nfs_export: str | None = "nfs.example:/exports/huggingface",
     hf_token: str | None = None,
     artifact_index: GGUFArtifactIndex | None = None,
+    hf_cache_dir: str | None = None,
 ) -> NodeProvisioner:
     """Build a NodeProvisioner with mock dependencies."""
     ssh_client = ssh_client or MagicMock()
@@ -263,6 +264,7 @@ def _make_provisioner(
         hf_token=hf_token,
         nfs_export=nfs_export,
         artifact_index=artifact_index,
+        hf_cache_dir=hf_cache_dir,
     )
 
 

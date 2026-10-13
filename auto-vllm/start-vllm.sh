@@ -413,6 +413,12 @@ run_vllm() {
         # aborts this script under set -e rather than registering the wrong model.
         bash "${SCRIPT_DIR}/stop-vllm.sh"
     fi
+    # Capture the gateway memory plan before clearing the environment so the
+    # configuration banner can report the plan the launch actually used. These
+    # values must not leak into the long-lived vLLM process environment.
+    local plan_budget_mib="${AUTOVLLM_FIT_BUDGET_MIB:-}"
+    local plan_reserve_mib="${AUTOVLLM_FIT_RESERVE_MIB:-}"
+    local plan_overhead_mib="${AUTOVLLM_FIT_OVERHEAD_MIB:-}"
     clear_script_environment
 
     # Running the venv binary directly doesn't activate the venv, so tools
@@ -447,7 +453,7 @@ run_vllm() {
 # Memory Util:        ${GPU_MEM_UTIL}
 # Max Context:        $MAX_MODEL_LEN tokens
 # Max Batched Tokens: $MAX_BATCHED_TOKENS tokens
-# Memory Budget:      ${AUTOVLLM_FIT_BUDGET_MIB:-(none)} MiB/device (reserve ${AUTOVLLM_FIT_RESERVE_MIB:-(none)} MiB, overhead ${AUTOVLLM_FIT_OVERHEAD_MIB:-(none)} MiB)
+# Memory Budget:      ${plan_budget_mib:-(none)} MiB/device planned (reserve ${plan_reserve_mib:-(none)} MiB, overhead ${plan_overhead_mib:-(none)} MiB)
 # Tool Call Parser:   $tool_call_parser
 # Reasoning Parser:   ${REASONING_PARSER_OVERRIDE:-(none)}
 # Dtype:              ${EFFECTIVE_DTYPE:-(none)}
