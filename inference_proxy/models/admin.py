@@ -27,6 +27,7 @@ from inference_proxy.models.node import (
     LlamaCppRuntimeRequest,
     LlamaCppRuntimeState,
     VllmParams,
+    VllmRuntimeState,
 )
 from inference_proxy.provisioning.state import ProvisioningResumeState
 
@@ -72,6 +73,7 @@ class AdminNodeResponse(BaseModel):
     engine: InferenceEngine | None = None
     artifact_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     llamacpp_runtime: LlamaCppRuntimeState | None = None
+    vllm_runtime: VllmRuntimeState | None = None
     state: str = ""
     actions: list[str] = []
     gpu_vendor: str | None = None

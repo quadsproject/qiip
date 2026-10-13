@@ -228,6 +228,7 @@ clear_script_environment() {
     unset AUTOVLLM_NFS_EXPORT
     unset AUTOVLLM_GPU_DEVICES
     unset AUTOVLLM_ENV_FILE
+    unset AUTOVLLM_FIT_BUDGET_MIB AUTOVLLM_FIT_RESERVE_MIB AUTOVLLM_FIT_OVERHEAD_MIB
 }
 
 configure_attention_backend() {
@@ -446,6 +447,7 @@ run_vllm() {
 # Memory Util:        ${GPU_MEM_UTIL}
 # Max Context:        $MAX_MODEL_LEN tokens
 # Max Batched Tokens: $MAX_BATCHED_TOKENS tokens
+# Memory Budget:      ${AUTOVLLM_FIT_BUDGET_MIB:-(none)} MiB/device (reserve ${AUTOVLLM_FIT_RESERVE_MIB:-(none)} MiB, overhead ${AUTOVLLM_FIT_OVERHEAD_MIB:-(none)} MiB)
 # Tool Call Parser:   $tool_call_parser
 # Reasoning Parser:   ${REASONING_PARSER_OVERRIDE:-(none)}
 # Dtype:              ${EFFECTIVE_DTYPE:-(none)}

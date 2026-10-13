@@ -348,6 +348,9 @@ class ProvisioningSettings(BaseModel):
     llamacpp_build_jobs: int = Field(default=0, ge=0)
     llamacpp_setup_timeout: float = Field(default=7200.0, gt=0)
     llamacpp_fit_target_mib: int = Field(default=512, ge=1)
+    # Bounded automatic-mode OOM retries for a vLLM launch. Attempt zero is the
+    # initial memory-aware plan; each retry applies one logged adjustment.
+    vllm_memory_retry_max_attempts: int = Field(default=3, ge=1, le=5)
 
     @field_validator("generation_root")
     @classmethod
