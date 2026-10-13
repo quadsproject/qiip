@@ -2,6 +2,24 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.7 (2026-10-13)
+
+### Bug Fixes
+
+- Require quads.stale_after_seconds to be at least twice poll_interval
+  ([`34fe664`](https://github.com/quadsproject/qiip/commit/34fe6643dfa3fccf89a6f0137ed270d99ed5faba))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`6b04141`](https://github.com/quadsproject/qiip/commit/6b04141abecb6c4a3bca18fdd8c51020f2f2bbab))
+
+### Features
+
+- Wait for QUADS to finish releasing a host before placing on it
+  ([`08842a6`](https://github.com/quadsproject/qiip/commit/08842a65b0d6ebf19359b204c07f686ff6d606d0))
+
+
 ## v0.2.0-dev.6 (2026-10-13)
 
 ### Bug Fixes
