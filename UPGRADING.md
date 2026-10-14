@@ -830,7 +830,10 @@ The vLLM sync and the llama.cpp source build are now resumed rather than
 repeated: each verifier re-derives the sealed runtime from the same marker and
 republishes the runtime selection the way a fresh install would. The CUDA probe
 (`cuda_proof`) intentionally re-runs every attempt because it must reflect the
-current driver and device state before a reboot decision.
+current driver and device state before a reboot decision. For llama.cpp the
+proof is deferred to the installer, so the `llamacpp_install` verifier re-runs
+it before the stage can be skipped; a proof failure re-runs the stage and
+reaches the same reboot handling.
 
 Only recognized transient download, repository, and SSH transport failures are
 retried automatically, under bounded exponential backoff with jitter

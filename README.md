@@ -1512,9 +1512,12 @@ run; a run that exhausts its own deadline is terminal and is not retried.
 The attempt list shows the attempt number, retry count, current stage, percent
 of the ordered pipeline passed, and the next operator action. The CUDA
 probe (`cuda_proof`) deliberately re-runs every attempt because it must reflect
-the current driver and device state before a reboot decision; every other
-expensive stage (package installation, vLLM sync, the llama.cpp source build)
-is resumed when its checkpoint and verifier still hold.
+the current driver and device state before a reboot decision. For llama.cpp the
+proof is deferred to the installer, so the `llamacpp_install` verifier re-runs
+it (and re-derives the sealed runtime) before the stage can be skipped, and a
+proof failure re-runs the stage so status 10 still reaches the reboot handling.
+Every other expensive stage (package installation, vLLM sync, the llama.cpp
+source build) is resumed when its checkpoint and verifier still hold.
 
 ### HuggingFace model downloads
 
