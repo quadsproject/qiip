@@ -34,16 +34,18 @@
             <section class="card">
                 <h2 class="card-title">Usage leaderboard</h2>
                 <div class="table-wrap">
-                    <table>
-                        <thead>
+                    <table aria-label="Usage leaderboard">
+                        <thead id="leaderboard-head">
                             <tr>
-                                <th scope="col">#</th>
-                                <th scope="col">User</th>
-                                <th scope="col">Tokens</th>
-                                <th scope="col">Requests</th>
-                                <th scope="col">Prompt tokens</th>
-                                <th scope="col">Completion tokens</th>
-                                <th scope="col">Total tokens</th>
+                                <th scope="col">Rank</th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">User</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Tokens</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Requests</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Prompt tokens</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Completion tokens</button></th>
+                                {# The server sends the ranking by total tokens DESC (#}
+                                {# store.list_leaderboard), so the column carries its state. #}
+                                <th scope="col" data-sort="number" aria-sort="descending"><button type="button" class="th-sort">Total tokens</button></th>
                             </tr>
                         </thead>
                         <tbody id="leaderboard-body">
@@ -56,15 +58,15 @@
             <section class="card">
                 <h2 class="card-title">Your tokens</h2>
                 <div class="table-wrap">
-                    <table>
-                        <thead>
+                    <table aria-label="Your tokens">
+                        <thead id="tokens-head">
                             <tr>
-                                <th scope="col">Name</th>
-                                <th scope="col">Prefix</th>
-                                <th scope="col">Created</th>
-                                <th scope="col">Last used</th>
-                                <th scope="col">Status</th>
-                                <th scope="col">Models</th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Name</button></th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Prefix</button></th>
+                                <th scope="col" data-sort="date"><button type="button" class="th-sort">Created</button></th>
+                                <th scope="col" data-sort="date"><button type="button" class="th-sort">Last used</button></th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Status</button></th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Models</button></th>
                                 <th scope="col">Actions</th>
                             </tr>
                         </thead>
@@ -106,6 +108,7 @@
     </footer>
 
     <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/table_sort.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/leaderboard.js') }}"></script>
 </body>
 </html>

@@ -22,6 +22,27 @@
   const $ = (id) => document.getElementById(id);
   let pendingToken = "";
 
+  // ------------------------------------------------------------------
+  // Column sorting (shared js/table_sort.js)
+  // ------------------------------------------------------------------
+
+  const SORTABLE_TABLES = [
+    { head: "tokens-head", body: "tokens-table-body" },
+    { head: "usage-head", body: "usage-table-body" },
+  ];
+
+  function enableTableSort() {
+    SORTABLE_TABLES.forEach((table) => {
+      window.tableSort.enable($(table.head), $(table.body));
+    });
+  }
+
+  function reapplyTableSort() {
+    SORTABLE_TABLES.forEach((table) => {
+      window.tableSort.reapply($(table.head), $(table.body));
+    });
+  }
+
   function clearChildren(el) {
     while (el.firstChild) el.removeChild(el.firstChild);
   }
@@ -111,14 +132,22 @@
       td.className = "muted-status";
       row.appendChild(td);
       body.appendChild(row);
+      reapplyTableSort();
       return;
     }
     for (const token of tokens) {
       const row = document.createElement("tr");
       row.appendChild(tdCell(token.name));
       row.appendChild(tdCell(token.prefix));
-      row.appendChild(tdCell(token.revoked ? "-" : formatDate(token.created_at)));
-      row.appendChild(tdCell(token.last_used_at ? formatDate(token.last_used_at) : "never"));
+      row.appendChild(
+        tdCell(token.revoked ? "-" : formatDate(token.created_at), token.revoked ? "" : token.created_at)
+      );
+      row.appendChild(
+        tdCell(
+          token.last_used_at ? formatDate(token.last_used_at) : "never",
+          token.last_used_at || ""
+        )
+      );
       row.appendChild(tdCell(token.revoked ? "revoked" : "active"));
       row.appendChild(
         tdCell(
@@ -136,11 +165,13 @@
       row.appendChild(actions);
       body.appendChild(row);
     }
+    reapplyTableSort();
   }
 
-  function tdCell(text) {
+  function tdCell(text, sortValue) {
     const td = document.createElement("td");
     td.textContent = text;
+    if (sortValue !== undefined) td.dataset.sortValue = String(sortValue);
     return td;
   }
 
@@ -371,6 +402,7 @@
       td.className = "muted-status";
       row.appendChild(td);
       body.appendChild(row);
+      reapplyTableSort();
       return;
     }
     for (const row of data.rows) {
@@ -386,6 +418,7 @@
         ]),
       );
     }
+    reapplyTableSort();
   }
 
   // ------------------------------------------------------------------
@@ -402,6 +435,7 @@
 
   async function init() {
     parseErrorParam();
+    enableTableSort();
     wireTokenForm();
     wireEndpointPicker();
 

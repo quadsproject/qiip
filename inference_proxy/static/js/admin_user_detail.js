@@ -13,9 +13,10 @@
     while (el.firstChild) el.removeChild(el.firstChild);
   }
 
-  function tdCell(text) {
+  function tdCell(text, sortValue) {
     const td = document.createElement("td");
     td.textContent = text;
+    if (sortValue !== undefined) td.dataset.sortValue = String(sortValue);
     return td;
   }
 
@@ -28,6 +29,34 @@
     return "$" + Number(amount).toLocaleString(undefined, {
       minimumFractionDigits: 2,
       maximumFractionDigits: 2,
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Column sorting (shared js/table_sort.js)
+  // ------------------------------------------------------------------
+
+  const SORTABLE_TABLES = [
+    { head: "tokens-head", body: "tokens-table-body" },
+    { head: "usage-head", body: "usage-table-body" },
+    { head: "timeline-head", body: "timeline-table-body" },
+  ];
+
+  function enableTableSort() {
+    SORTABLE_TABLES.forEach((table) => {
+      window.tableSort.enable(
+        document.getElementById(table.head),
+        document.getElementById(table.body)
+      );
+    });
+  }
+
+  function reapplyTableSort() {
+    SORTABLE_TABLES.forEach((table) => {
+      window.tableSort.reapply(
+        document.getElementById(table.head),
+        document.getElementById(table.body)
+      );
     });
   }
 
@@ -94,14 +123,22 @@
       td.className = "muted-status";
       row.appendChild(td);
       body.appendChild(row);
+      reapplyTableSort();
       return;
     }
     for (const token of tokens) {
       const row = document.createElement("tr");
       row.appendChild(tdCell(token.name));
       row.appendChild(tdCell(token.prefix));
-      row.appendChild(tdCell(token.revoked ? "-" : formatDate(token.created_at)));
-      row.appendChild(tdCell(token.last_used_at ? formatDate(token.last_used_at) : "never"));
+      row.appendChild(
+        tdCell(token.revoked ? "-" : formatDate(token.created_at), token.revoked ? "" : token.created_at)
+      );
+      row.appendChild(
+        tdCell(
+          token.last_used_at ? formatDate(token.last_used_at) : "never",
+          token.last_used_at || ""
+        )
+      );
       const statusCell = document.createElement("td");
       const badge = document.createElement("span");
       badge.className = "badge " + (token.revoked ? "badge-unhealthy" : "badge-healthy");
@@ -122,6 +159,7 @@
       row.appendChild(actions);
       body.appendChild(row);
     }
+    reapplyTableSort();
   }
 
   function renderUsage(usage, totals, body) {
@@ -136,6 +174,7 @@
       td.className = "muted-status";
       row.appendChild(td);
       body.appendChild(row);
+      reapplyTableSort();
       return;
     }
     totalsEl.textContent =
@@ -154,6 +193,7 @@
       tr.appendChild(tdCell(String(row.total_tokens)));
       body.appendChild(tr);
     }
+    reapplyTableSort();
   }
 
   function renderTimeline(timeline, body) {
@@ -166,6 +206,7 @@
       td.className = "muted-status";
       row.appendChild(td);
       body.appendChild(row);
+      reapplyTableSort();
       return;
     }
     for (const entry of timeline) {
@@ -177,6 +218,7 @@
       tr.appendChild(tdCell(String(entry.total_tokens)));
       body.appendChild(tr);
     }
+    reapplyTableSort();
   }
 
   async function refresh() {
@@ -213,6 +255,7 @@
   }
 
   document.addEventListener("DOMContentLoaded", function () {
+    enableTableSort();
     refresh();
     setInterval(refresh, POLL_INTERVAL_MS);
   });
