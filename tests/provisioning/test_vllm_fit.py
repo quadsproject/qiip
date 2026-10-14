@@ -363,6 +363,22 @@ def test_plan_line_records_estimate_and_adjustment() -> None:
     assert "fitting=true" in line
 
 
+def test_retried_plan_reason_matches_the_effective_context() -> None:
+    plan = plan_vllm_launch(
+        profile_bucket="hopper",
+        devices=[_device()],
+        requested=VllmRequested(),
+        attempt=1,
+    )
+
+    # _fit_context picks 8192 from the KV budget, then the bounded retry halves
+    # it. The persisted reason must name the effective value, not the pre-retry
+    # fit, so the dashboard cannot report a stale context.
+    assert plan.effective.max_model_len == 4096
+    assert "8192 tokens" in plan.reason
+    assert "4096 tokens" in plan.reason
+
+
 def test_unsupported_profile_raises() -> None:
     with pytest.raises(ValueError):
         plan_vllm_launch(
