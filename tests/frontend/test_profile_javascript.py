@@ -19,11 +19,13 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[2]
 _PROFILE_JS = _ROOT / "inference_proxy/static/js/profile.js"
+_TABLE_SORT_JS = _ROOT / "inference_proxy/static/js/table_sort.js"
 
 _HARNESS = r"""
 const fs = require("fs");
 const vm = require("vm");
 const source = fs.readFileSync(process.argv[1], "utf8");
+const sortSource = fs.readFileSync(process.argv[2], "utf8");
 
 const calls = [];
 const elements = new Map();
@@ -35,13 +37,23 @@ function element() {
     _attrs: {},
     hidden: false, textContent: "", value: "", className: "", style: {},
     disabled: false, src: "", alt: "", colSpan: 0,
+    dataset: {},
     checked: false, selected: false, type: "",
     addEventListener(name, fn) { this._handlers[name] = fn; },
     focus() {}, select() {}, click() {},
     getAttribute(name) { return this._attrs[name] || null; },
     setAttribute(name, value) { this._attrs[name] = String(value); },
+    removeAttribute(name) { delete this._attrs[name]; },
     contains(target) { return this === target || this.children.indexOf(target) >= 0; },
-    appendChild(child) { this.children.push(child); child.parent = this; return child; },
+    appendChild(child) {
+      if (child.parent && child.parent.children) {
+        const index = child.parent.children.indexOf(child);
+        if (index !== -1) child.parent.children.splice(index, 1);
+      }
+      this.children.push(child);
+      child.parent = this;
+      return child;
+    },
     removeChild(child) {
       const i = this.children.indexOf(child);
       if (i >= 0) this.children.splice(i, 1);
@@ -87,7 +99,7 @@ const sandbox = {
       "/auth/me": USER,
       "/profile/tokens": TOKENS,
       "/profile/endpoints": ENDPOINTS,
-      "/profile/usage": { totals: { request_count: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }, rows: [] },
+      "/profile/usage": { totals: { request_count: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }, rows: USAGE_ROWS },
     }[url];
     return {
       ok: url !== "/auth/me" || USER !== null,
@@ -97,7 +109,22 @@ const sandbox = {
   },
 };
 
+function buildHead(id, kinds) {
+  const head = byId(id);
+  const row = element();
+  kinds.forEach(function (kind) {
+    const cell = element();
+    if (kind) cell.dataset.sort = kind;
+    row.appendChild(cell);
+  });
+  head.appendChild(row);
+}
+
+buildHead("tokens-head", ["text", "text", "date", "date", "text", "text", null]);
+buildHead("usage-head", ["text", "text", "text", "number", "number", "number", "number"]);
+
 vm.createContext(sandbox);
+vm.runInContext(sortSource, sandbox);
 vm.runInContext(source, sandbox);
 
 (async function () {
@@ -135,6 +162,17 @@ vm.runInContext(source, sandbox);
     await new Promise(function (r) { setTimeout(r, 20); });
   }
 
+  let usageAscending = null;
+  if (SORT_USAGE) {
+    const usageHead = byId("usage-head").children[0].children;
+    const header = usageHead[usageHead.length - 1];
+    header._handlers.click();
+    usageAscending = byId("usage-table-body").children.map(function (row) {
+      return row.children[0] ? row.children[0].textContent : "";
+    });
+    header._handlers.click();
+  }
+
   const body = byId("tokens-table-body");
   const list = byId("endpoint-list");
   const select = byId("token-endpoints");
@@ -146,6 +184,13 @@ vm.runInContext(source, sandbox);
     }),
     rowScopes: body.children.map(function (row) {
       return row.children[5] ? row.children[5].textContent : "";
+    }),
+    usageRows: byId("usage-table-body").children.map(function (row) {
+      return row.children[0] ? row.children[0].textContent : "";
+    }),
+    usageAscending: usageAscending,
+    usageAria: byId("usage-head").children[0].children.map(function (cell) {
+      return cell.getAttribute("aria-sort");
     }),
     listValues: list.children
       .filter(function (child) { return child !== byId("endpoint-empty"); })
@@ -173,6 +218,8 @@ def _run(
     endpoints: list[dict[str, Any]],
     check_index: int = -1,
     reopen: bool = False,
+    usage: list[dict[str, Any]] | None = None,
+    sort_usage: bool = False,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -182,6 +229,8 @@ def _run(
         .replace("ENDPOINTS", json.dumps(endpoints))
         .replace("CHECK_INDEX", str(check_index))
         .replace("REOPEN", "true" if reopen else "false")
+        .replace("USAGE_ROWS", json.dumps(usage or []))
+        .replace("SORT_USAGE", "true" if sort_usage else "false")
         .replace(
             "USER",
             json.dumps(
@@ -190,7 +239,7 @@ def _run(
         )
     )
     result = subprocess.run(
-        [node, "-e", script, str(_PROFILE_JS)],
+        [node, "-e", script, str(_PROFILE_JS), str(_TABLE_SORT_JS)],
         check=False,
         capture_output=True,
         text=True,
@@ -273,3 +322,61 @@ def test_picker_selection_updates_summary_and_select() -> None:
     assert result["summary"] == "1 Endpoints Selected"
     assert result["selectValues"][0] == {"value": "gpu01", "selected": True}
     assert result["selectValues"][1] == {"value": "gpu02", "selected": False}
+
+
+def test_usage_table_sorts_by_total_tokens() -> None:
+    usage = [
+        {
+            "token_name": "ci",
+            "model": "llama-3",
+            "endpoint": "/v1/chat/completions",
+            "request_count": 3,
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "total_tokens": 150,
+        },
+        {
+            "token_name": "laptop",
+            "model": "qwen3",
+            "endpoint": "/v1/messages",
+            "request_count": 1,
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+        },
+    ]
+
+    result = _run([_token(1, False)], [], usage=usage, sort_usage=True)
+
+    assert result["usageAscending"] == ["laptop", "ci"]
+    assert result["usageRows"] == ["ci", "laptop"]
+    assert result["usageAria"][-1] == "descending"
+    assert result["usageAria"][0] is None
+
+
+def test_unsorted_usage_table_keeps_server_order() -> None:
+    usage = [
+        {
+            "token_name": "laptop",
+            "model": "qwen3",
+            "endpoint": "/v1/messages",
+            "request_count": 1,
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+        },
+        {
+            "token_name": "ci",
+            "model": "llama-3",
+            "endpoint": "/v1/chat/completions",
+            "request_count": 3,
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "total_tokens": 150,
+        },
+    ]
+
+    result = _run([_token(1, False)], [], usage=usage)
+
+    assert result["usageRows"] == ["laptop", "ci"]
+    assert set(result["usageAria"]) == {None}

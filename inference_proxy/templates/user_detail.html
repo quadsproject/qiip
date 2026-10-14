@@ -47,15 +47,15 @@
             <section class="card">
                 <h2 class="card-title">Tokens</h2>
                 <div class="table-wrap">
-                    <table>
-                        <thead>
+                    <table aria-label="Tokens">
+                        <thead id="tokens-head">
                             <tr>
-                                <th scope="col">Name</th>
-                                <th scope="col">Prefix</th>
-                                <th scope="col">Created</th>
-                                <th scope="col">Last used</th>
-                                <th scope="col">Status</th>
-                                <th scope="col">Scope</th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Name</button></th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Prefix</button></th>
+                                <th scope="col" data-sort="date"><button type="button" class="th-sort">Created</button></th>
+                                <th scope="col" data-sort="date"><button type="button" class="th-sort">Last used</button></th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Status</button></th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Scope</button></th>
                                 <th scope="col">Actions</th>
                             </tr>
                         </thead>
@@ -70,16 +70,16 @@
                 <h2 class="card-title">Usage</h2>
                 <p class="muted-status" id="usage-totals"></p>
                 <div class="table-wrap">
-                    <table>
-                        <thead>
+                    <table aria-label="Usage">
+                        <thead id="usage-head">
                             <tr>
-                                <th scope="col">Token</th>
-                                <th scope="col">Model</th>
-                                <th scope="col">Endpoint</th>
-                                <th scope="col">Requests</th>
-                                <th scope="col">Prompt tokens</th>
-                                <th scope="col">Completion tokens</th>
-                                <th scope="col">Total tokens</th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Token</button></th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Model</button></th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Endpoint</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Requests</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Prompt tokens</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Completion tokens</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Total tokens</button></th>
                             </tr>
                         </thead>
                         <tbody id="usage-table-body">
@@ -92,14 +92,14 @@
             <section class="card">
                 <h2 class="card-title">Daily timeline</h2>
                 <div class="table-wrap">
-                    <table>
-                        <thead>
+                    <table aria-label="Daily timeline">
+                        <thead id="timeline-head">
                             <tr>
-                                <th scope="col">Day (UTC)</th>
-                                <th scope="col">Requests</th>
-                                <th scope="col">Prompt tokens</th>
-                                <th scope="col">Completion tokens</th>
-                                <th scope="col">Total tokens</th>
+                                <th scope="col" data-sort="date"><button type="button" class="th-sort">Day (UTC)</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Requests</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Prompt tokens</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Completion tokens</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Total tokens</button></th>
                             </tr>
                         </thead>
                         <tbody id="timeline-table-body">
@@ -120,6 +120,7 @@
     <script>const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};</script>
     <script>const USER_ID = {{ user_id }};</script>
     <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/table_sort.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/admin_user_detail.js') }}"></script>
 </body>
 </html>

@@ -61,7 +61,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
 - **Local OAuth (opt-in)** -- a vendored toy OpenID Connect provider (`oidc-provider/`, test-only) plus the `auth.internal_oidc` plugin let a small install maintain a local user list instead of Google. Off by default; enabling it turns the sign-in page's **Local Admin** option into **Local Login** (no separate provider button; the OIDC flow stays reachable by direct link). User rows are keyed by (provider issuer, subject) so Google and local accounts coexist. See [Local OIDC provider](#local-oidc-provider-opt-in)
 - **Self-service onboarding** -- signed-in normal users land on `/start`: one question per screen (name a token, pick a coding tool, pick models) ending in a short-lived `curl ... | bash` line that writes the tool's config; returning users see their single token and its models. See [Self-service onboarding](#self-service-onboarding-start)
-- **Usage leaderboard** -- signed-in users get a simple dashboard at `/leaderboard`: every non-admin user ranked by token usage (admin tokens and usage never appear), plus the viewer's own token manager (create replaces, delete revokes) and a per-harness config download with optional model and harness pickers (RFE #156)
+- **Usage leaderboard** -- signed-in users get a simple dashboard at `/leaderboard`: every non-admin user ranked by token usage (admin tokens and usage never appear), plus the viewer's own token manager (create replaces, delete revokes) and a per-harness config download with optional model and harness pickers (RFE #156); every table on the token pages sorts by column
 - **Per-token model scope** -- a token minted by the onboarding flow may only request the models chosen for it; other models are refused on `/v1` with `403 model_not_permitted`, and `/v1/models` lists only the token's models
 - **User API tokens** -- admin-role users can mint `qiip_...` bearer tokens on their profile page to call the `/v1` inference API; normal users own exactly one token, managed on `/start`. Tokens are stored as SHA-256 digests and can be revoked at any time
 - **Stable agent-config token** -- one derived per-user key (`agent-config`) is shared by every config download across servers and browsers; its raw value is derived from `auth.session_secret` + user + generation and never stored, so revoking it rotates the key embedded in already-downloaded configs (configuration downloads for admin-only servers require the Google session that can mint it)
@@ -1181,6 +1181,17 @@ Token management dashboards (admin and per-user):
   revocation, and adds the same premium-equivalent cost estimate next to the
   usage totals. The admin dashboard front page shows the grand total
   "token budget saved" for all token-attributed requests.
+- Every token and usage table on `/leaderboard`, `/profile`,
+  `/dashboard/tokens`, and `/dashboard/users/{id}` sorts by column: click a
+  header label (or reach it with Tab and press Enter) to sort ascending,
+  activate it again for descending. `aria-sort` marks the active column, the
+  chosen sort survives the page poll refresh, and rows carrying a formatted
+  value (dates, `$USD`, `active / total` counts) sort by the underlying
+  number. Columns without a sort header stay fixed: the Action columns, and
+  the leaderboard `Rank` column, which keeps each user's total-token standing
+  and travels with the user when another column drives the order. The server
+  ranking is the initial order until a header is activated (the leaderboard
+  `Total tokens` header carries it as `aria-sort`), and a reload restores it.
 - The estimate is `prompt_tokens/1M * input_rate + completion_tokens/1M *
   output_rate`: what the recorded mix would have cost at the configured
   premium frontier-model rate. It is an equivalence figure for self-hosted

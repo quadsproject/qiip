@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, TypedDict
 
 import pytest
@@ -201,3 +202,29 @@ class TestAdminTokenPages:
         assert response.status_code == 200
         assert "QIIP - User Tokens" in response.text
         assert "timeline-table-body" in response.text
+
+
+@pytest.mark.parametrize(
+    ("route", "labels"),
+    [
+        ("/profile", ("API Tokens", "Usage")),
+        ("/dashboard/tokens", ("Users", "All tokens")),
+        ("/dashboard/users/1", ("Tokens", "Usage", "Daily timeline")),
+    ],
+)
+def test_token_pages_declare_sortable_columns(
+    client: TestClient, route: str, labels: tuple[str, ...]
+) -> None:
+    """Each token page loads the shared sorter and labels its sortable columns."""
+    html = client.get(route).text
+
+    assert "js/table_sort.js" in html
+    kinds = re.findall(r'data-sort="([^"]*)"', html)
+    assert kinds
+    assert set(kinds) <= {"text", "number", "date"}
+    headers = re.findall(r'<th[^>]*data-sort="[^"]*"[^>]*>(.*?)</th>', html)
+    assert len(headers) == len(kinds)
+    for header in headers:
+        assert 'type="button"' in header
+    for label in labels:
+        assert f'aria-label="{label}"' in html

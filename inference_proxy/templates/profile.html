@@ -86,15 +86,15 @@
                         <p class="muted-status">Use it as <code>Authorization: Bearer &lt;token&gt;</code> on requests to the <code>/v1</code> inference API, including <code>/v1/messages</code> (Claude Code) and <code>/v1/responses</code> (Codex).</p>
                     </div>
                     <div class="table-wrap">
-                        <table>
-                            <thead>
+                        <table aria-label="API Tokens">
+                            <thead id="tokens-head">
                                 <tr>
-                                    <th scope="col">Name</th>
-                                    <th scope="col">Prefix</th>
-                                    <th scope="col">Created</th>
-                                    <th scope="col">Last used</th>
-                                    <th scope="col">Status</th>
-                                    <th scope="col">Scope</th>
+                                    <th scope="col" data-sort="text"><button type="button" class="th-sort">Name</button></th>
+                                    <th scope="col" data-sort="text"><button type="button" class="th-sort">Prefix</button></th>
+                                    <th scope="col" data-sort="date"><button type="button" class="th-sort">Created</button></th>
+                                    <th scope="col" data-sort="date"><button type="button" class="th-sort">Last used</button></th>
+                                    <th scope="col" data-sort="text"><button type="button" class="th-sort">Status</button></th>
+                                    <th scope="col" data-sort="text"><button type="button" class="th-sort">Scope</button></th>
                                     <th scope="col">Actions</th>
                                 </tr>
                             </thead>
@@ -110,16 +110,16 @@
                     <p class="muted-status" id="usage-totals">Loading usage...</p>
                     <p class="muted-status" id="usage-savings" hidden></p>
                     <div class="table-wrap">
-                        <table>
-                            <thead>
+                        <table aria-label="Usage">
+                            <thead id="usage-head">
                                 <tr>
-                                    <th scope="col">Token</th>
-                                    <th scope="col">Model</th>
-                                    <th scope="col">Endpoint</th>
-                                    <th scope="col">Requests</th>
-                                    <th scope="col">Prompt tokens</th>
-                                    <th scope="col">Completion tokens</th>
-                                    <th scope="col">Total tokens</th>
+                                    <th scope="col" data-sort="text"><button type="button" class="th-sort">Token</button></th>
+                                    <th scope="col" data-sort="text"><button type="button" class="th-sort">Model</button></th>
+                                    <th scope="col" data-sort="text"><button type="button" class="th-sort">Endpoint</button></th>
+                                    <th scope="col" data-sort="number"><button type="button" class="th-sort">Requests</button></th>
+                                    <th scope="col" data-sort="number"><button type="button" class="th-sort">Prompt tokens</button></th>
+                                    <th scope="col" data-sort="number"><button type="button" class="th-sort">Completion tokens</button></th>
+                                    <th scope="col" data-sort="number"><button type="button" class="th-sort">Total tokens</button></th>
                                 </tr>
                             </thead>
                             <tbody id="usage-table-body">
@@ -139,6 +139,7 @@
     </footer>
 
     <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/table_sort.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/profile.js') }}"></script>
 </body>
 </html>
