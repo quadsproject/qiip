@@ -16,6 +16,7 @@ from inference_proxy.provisioning.log_store import AttemptLogStore
 from inference_proxy.provisioning.provisioner import (
     NodeProvisioner,
     ProvisioningError,
+    SetupDeadlineError,
 )
 from inference_proxy.provisioning.ssh_client import SSHConnectionError
 
@@ -181,6 +182,43 @@ class TestRunSetupWithRetries:
         assert calls == 1
         reconcile.assert_awaited_once_with(_HOST)
 
+    @pytest.mark.asyncio
+    async def test_stage_deadline_is_terminal_and_not_retried(
+        self, store: AttemptLogStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        provisioner, _buffer = _make(
+            store,
+            settings=ProvisioningSettings(
+                vllm_setup_timeout=0.05,
+                stage_retry_max_attempts=3,
+                stage_retry_base_delay=0.01,
+                stage_retry_max_delay=0.02,
+                stage_retry_jitter=0,
+            ),
+        )
+        calls = 0
+
+        async def never_finishes(*_args: object, **_kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(5)
+
+        monkeypatch.setattr(provisioner, "_run_setup", never_finishes)
+
+        with pytest.raises(SetupDeadlineError, match="stage deadline"):
+            await provisioner._run_setup_with_retries(
+                _HOST,
+                started_at=datetime.now(UTC),
+                on_step=lambda _step: None,
+                engine=InferenceEngine.VLLM,
+                plan_id=_PLAN,
+            )
+
+        # Exhausting the run's own deadline must not trigger a retry loop.
+        assert calls == 1
+
 
 class TestResumeEnvironment:
     def test_emits_plan_and_verified_stages(self, store: AttemptLogStore) -> None:
@@ -256,6 +294,18 @@ class TestPlanInputs:
 
         assert first_inputs != second_inputs
         assert setup_plan_id(first_inputs) != setup_plan_id(second_inputs)
+
+    def test_plan_includes_bundle_identity_and_api_port(
+        self, store: AttemptLogStore
+    ) -> None:
+        provisioner, _buffer = _make(store)
+        inputs = provisioner._setup_plan_inputs(InferenceEngine.VLLM)
+        # A re-uploaded script and a changed port both invalidate completed
+        # stages even when no setting changed.
+        assert inputs["bundle_version"] == provisioner._bundle_version(
+            InferenceEngine.VLLM
+        )
+        assert inputs["api_port"] == provisioner._settings.vllm_port
 
     def test_llamacpp_plan_includes_catalog_inputs(
         self, store: AttemptLogStore

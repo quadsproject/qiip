@@ -30,7 +30,7 @@ let boot;
 const attempt = { attempt_id: "abc", status: "failed", operation: "provision", engine: "vllm",
   started_at: "2026-09-16T12:00:00Z", model: "org/model", stage: "driver", bundle_version: "sha256:abc",
   attempt_number: 2, transient_retries: 1,
-  progress: {completed_count: 3, total_stages: 14, percent: 21.4},
+  progress: {completed_count: 3, stages_passed: 6, total_stages: 13, percent: 46.2},
   failure_class: "transient", next_action: "Retry setup; verified stages resume automatically",
   sources: {"setup.stderr": "collected"}, issues: ["source unavailable"], dropped_records: 2,
   failure_summary: "driver rejected",
@@ -80,7 +80,7 @@ async function settle() { for (let n=0;n<15;n++) await Promise.resolve(); }
     assert output["initial"]["summary"].startswith("driver rejected\n")
     assert "attempt 2" in output["initial"]["summary"]
     assert "1 automatic retry" in output["initial"]["summary"]
-    assert "progress 3/14 (21.4%)" in output["initial"]["summary"]
+    assert "progress 46.2% · 3 stages verified" in output["initial"]["summary"]
     assert "class transient" in output["initial"]["summary"]
     assert "next: Retry setup" in output["initial"]["summary"]
     assert "exit 7" in output["initial"]["details"]

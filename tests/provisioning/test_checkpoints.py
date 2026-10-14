@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from inference_proxy.provisioning.log_store import AttemptLogStore
+from inference_proxy.provisioning.log_store import (
+    SETUP_ENGINE_STAGES,
+    SETUP_STAGE_ORDER,
+    AttemptLogStore,
+    setup_progress,
+)
 
 
 @pytest.fixture
@@ -114,6 +119,20 @@ class TestRecordCheckpoint:
         with pytest.raises(KeyError):
             store.record_checkpoint("missing", "nvidia_driver", "completed")
 
+    def test_unknown_stage_is_ignored(self, store: AttemptLogStore) -> None:
+        attempt = _create(store)
+        store.record_checkpoint(attempt, "vendor_marker", "completed")
+        assert store.get(attempt)["checkpoints"] == {}
+        assert store.get(attempt)["progress"] is None
+
+    def test_checkpoint_map_is_bounded(self, store: AttemptLogStore) -> None:
+        attempt = _create(store)
+        # Every known stage, but the store caps the map so a compromised or
+        # confused caller cannot grow the manifest without bound.
+        for stage in SETUP_STAGE_ORDER:
+            store.record_checkpoint(attempt, stage, "completed")
+        assert len(store.get(attempt)["checkpoints"]) <= 32
+
 
 class TestTransientRetries:
     def test_counts_each_increment(self, store: AttemptLogStore) -> None:
@@ -184,3 +203,42 @@ class TestResumableCheckpoints:
         attempt = _create(store)
         store.record_checkpoint(attempt, "firewall", "skipped")
         assert "firewall" in store.resumable_checkpoints("host1", "sha256:plan-a")
+
+    def test_generation_activate_is_never_resumed(self, store: AttemptLogStore) -> None:
+        # Activating the new upload must run on every attempt: it is cheap and
+        # is the step that makes the freshly separated generation live.
+        attempt = _create(store)
+        store.record_checkpoint(attempt, "generation_activate", "completed")
+        assert store.resumable_checkpoints("host1", "sha256:plan-a") == {}
+
+
+class TestSetupProgress:
+    def test_conditional_stages_do_not_cap_progress_below_100(self) -> None:
+        # A host whose driver is already compatible skips nvidia_driver and
+        # cuda_toolkit. Progress must still reach 100% when the terminal stage
+        # completes, using pipeline position rather than raw stage count.
+        completed = {stage: "skipped" for stage in SETUP_ENGINE_STAGES["vllm"]}
+        completed["nvidia_driver"] = "skipped"
+        completed["cuda_toolkit"] = "skipped"
+        progress = setup_progress(completed, engine="vllm")
+        assert progress["percent"] == 100.0
+        assert progress["stages_passed"] == len(SETUP_ENGINE_STAGES["vllm"])
+
+    def test_gapped_completion_reports_pipeline_position(self) -> None:
+        stages = SETUP_ENGINE_STAGES["vllm"]
+        completed = {stages[0]: "completed", stages[4]: "completed"}
+        progress = setup_progress(completed, engine="vllm")
+        assert progress["completed_count"] == 2
+        assert progress["stages_passed"] == 5
+        assert progress["total_stages"] == len(stages)
+
+    def test_midpoint_is_bounded(self) -> None:
+        stages = SETUP_ENGINE_STAGES["llama_cpp"]
+        completed = {stages[1]: "completed"}
+        progress = setup_progress(completed, engine="llama_cpp")
+        assert 0 < progress["percent"] < 100.0
+        assert progress["total_stages"] == len(stages)
+
+    def test_unknown_engine_falls_back_to_union(self) -> None:
+        progress = setup_progress({}, engine="vendor")
+        assert progress["total_stages"] == len(SETUP_STAGE_ORDER)

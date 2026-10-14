@@ -575,12 +575,31 @@ select_llamacpp_runtime() {
     fi
 }
 
+# Resume support: re-derive the installed runtime the same way
+# install_llamacpp does and republish the runtime selection, so skipping an
+# expensive source build does not leave generation_activate without a runtime.
+qiip_verify_llamacpp_install() {
+    local runtime
+    runtime=$(llamacpp_artifact_tool local "$LLAMACPP_INSTALL_ROOT" "$(llamacpp_host_identity)") \
+        || return 1
+    [ -n "$runtime" ] || return 1
+    verify_llamacpp_binaries "$runtime" >/dev/null 2>&1 || return 1
+    select_llamacpp_runtime "$runtime" >/dev/null 2>&1 || return 1
+    [ -n "$QIIP_RUNTIME_SELECTION" ] || return 1
+}
+
 install_llamacpp_driver_checked() {
-    echo "[STEP:llamacpp_install:START]"
+    local name="llamacpp_install"
+    checkpoint_plan_sync
+    if checkpoint_stage_verified "$name"; then
+        echo "[STEP:${name}:SKIP]"
+        return 0
+    fi
+    echo "[STEP:${name}:START]"
     run_with_errexit install_llamacpp
     local status="$STEP_STATUS"
     if [ "$status" -ne 0 ]; then
-        echo "[STEP:llamacpp_install:FAIL]"
+        echo "[STEP:${name}:FAIL]"
         if [ "$status" -eq 10 ]; then
             if [ "${QIIP_DRIVER_REPAIRED:-0}" -eq 1 ]; then
                 require_driver_reboot "CUDA execution failed after driver repair"
@@ -594,7 +613,8 @@ install_llamacpp_driver_checked() {
     if [ -f "${DRIVER_STATE_DIR}/driver-reboot" ]; then
         sudo rm -f "${DRIVER_STATE_DIR}/driver-reboot"
     fi
-    echo "[STEP:llamacpp_install:OK]"
+    record_checkpoint "$name"
+    echo "[STEP:${name}:OK]"
 }
 
 # --- Main ---

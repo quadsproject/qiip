@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -17,6 +18,10 @@ from inference_proxy.config.settings import (
     DEFAULT_LLMFIT_VERSION,
     DEFAULT_NVIDIA_DRIVER_SHA256,
     DEFAULT_NVIDIA_DRIVER_VERSION,
+)
+from inference_proxy.provisioning.log_store import (
+    SETUP_ENGINE_STAGES,
+    SETUP_STAGE_ORDER,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1463,6 +1468,24 @@ class TestStageCheckpoints:
         assert "[STEP:firewall:SKIP]" in result.stdout
         assert "[STEP:firewall:FAIL]" not in result.stdout
 
+    def test_unwritable_state_dir_degrades_to_rerun(self, tmp_path: Path) -> None:
+        # A non-root SSH user may not own the state directory. Checkpoints are
+        # an optimization, so setup must re-run rather than abort.
+        readonly = tmp_path / "readonly"
+        readonly.mkdir()
+        readonly.chmod(0o555)
+        checkpoint = readonly / "nested" / "checkpoints"
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=firewall\n"
+            "step firewall true\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:OK]" in result.stdout
+        assert not checkpoint.exists()
+
     def test_completed_stage_is_recorded_for_compatible_plan(
         self, tmp_path: Path
     ) -> None:
@@ -1572,3 +1595,75 @@ class TestStageCheckpoints:
         result = _run_shell(_source_and(cmd))
         assert result.returncode == 0, result.stderr
         assert "[STEP:firewall:SKIP]" in result.stdout
+
+
+class TestStageOrderMatchesScripts:
+    """The canonical stage order cannot drift from the scripts.
+
+    Progress, resume state, and operator messaging all key off
+    ``SETUP_STAGE_ORDER``. If a script renames or adds a ``[STEP:...]`` stage
+    without updating the tuple, percent and the resume set silently lie.
+    """
+
+    _STEP_CALL = re.compile(
+        r"^[ \t]*(?:soft_)?step[ \t]+([a-z][a-z0-9_]*)", re.MULTILINE
+    )
+    _LITERAL_MARKER = re.compile(r"\[STEP:([a-z][a-z0-9_]*):")
+    _NAME_ASSIGN = re.compile(r'local\s+name="([a-z][a-z0-9_]*)"')
+
+    def _emitted(self) -> set[str]:
+        emitted: set[str] = set()
+        for relative in (
+            "common/setup-base.sh",
+            "auto-vllm/setup.sh",
+            "auto-llamacpp/setup.sh",
+        ):
+            text = (REPO_ROOT / relative).read_text()
+            emitted.update(self._STEP_CALL.findall(text))
+            emitted.update(self._LITERAL_MARKER.findall(text))
+            emitted.update(self._NAME_ASSIGN.findall(text))
+        return emitted
+
+    def test_union_matches_emitted_markers(self) -> None:
+        assert self._emitted() == set(SETUP_STAGE_ORDER)
+
+    def test_union_is_the_two_engine_orders(self) -> None:
+        union = set(SETUP_ENGINE_STAGES["vllm"]) | set(SETUP_ENGINE_STAGES["llama_cpp"])
+        assert union == set(SETUP_STAGE_ORDER)
+
+    def test_engine_orders_are_known_stages(self) -> None:
+        for stages in SETUP_ENGINE_STAGES.values():
+            assert set(stages) <= set(SETUP_STAGE_ORDER)
+
+
+class TestVllmInstallVerifier:
+    """Resuming ``vllm_install`` must republish the runtime selection."""
+
+    def test_verifier_republishes_runtime_selection(self, tmp_path: Path) -> None:
+        runtime = tmp_path / "runtime"
+        (runtime / "bin").mkdir(parents=True)
+        (runtime / "RUNTIME.json").write_text("{}")
+        _write_executable(runtime / "bin" / "vllm", "#!/bin/bash\nexit 0\n")
+        selection = tmp_path / "selection"
+        cmd = (
+            f"export QIIP_RUNTIME_SELECTION={shlex.quote(str(selection))}\n"
+            f"vllm_runtime_path() {{ printf '%s\\n' {shlex.quote(str(runtime))}; }}\n"
+            "vllm_runtime_marker() { printf 'marker\\n'; }\n"
+            "qiip_generation_tool() { return 0; }\n"
+            "qiip_verify_vllm_install\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert selection.read_text().strip() == str(runtime)
+
+    def test_verifier_rejects_missing_runtime(self, tmp_path: Path) -> None:
+        selection = tmp_path / "selection"
+        cmd = (
+            f"export QIIP_RUNTIME_SELECTION={shlex.quote(str(selection))}\n"
+            f"vllm_runtime_path() {{ printf '%s\\n' {shlex.quote(str(tmp_path / 'absent'))}; }}\n"
+            "vllm_runtime_marker() { printf 'marker\\n'; }\n"
+            "qiip_verify_vllm_install\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode != 0
+        assert not selection.exists()

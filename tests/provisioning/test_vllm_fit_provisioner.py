@@ -82,7 +82,9 @@ def _streaming(
     """
     calls = {"count": 0}
 
-    async def streaming(host: str, command: str) -> AsyncIterator[tuple[str, str]]:
+    async def streaming(
+        host: str, command: str, *, total_timeout: float | None = None
+    ) -> AsyncIterator[tuple[str, str]]:
         if "nvidia-smi" in command:
             yield "stdout", _MEMORY_ROW
             return
@@ -936,7 +938,9 @@ async def test_preflight_memory_refusal_retries_without_an_engine_log() -> None:
     commands: list[str] = []
     starts = {"count": 0}
 
-    async def streaming(host: str, command: str) -> AsyncIterator[tuple[str, str]]:
+    async def streaming(
+        host: str, command: str, *, total_timeout: float | None = None
+    ) -> AsyncIterator[tuple[str, str]]:
         if "nvidia-smi" in command:
             yield "stdout", _MEMORY_ROW
             return
@@ -989,7 +993,9 @@ async def test_preflight_memory_refusal_retries_without_an_engine_log() -> None:
 async def test_retry_is_skipped_when_the_engine_cannot_be_stopped() -> None:
     commands: list[str] = []
 
-    async def streaming(host: str, command: str) -> AsyncIterator[tuple[str, str]]:
+    async def streaming(
+        host: str, command: str, *, total_timeout: float | None = None
+    ) -> AsyncIterator[tuple[str, str]]:
         if "nvidia-smi" in command:
             yield "stdout", _MEMORY_ROW
             return

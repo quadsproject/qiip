@@ -111,6 +111,52 @@ class TestFailureClassification:
         message = "failed to download metadata for repo; missing required mirror"
         assert classify_failure(RuntimeError(message)) == FailureClass.TRANSIENT
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "401 Unauthorized",
+            "403 Forbidden",
+            "error: 404 Not Found for https://example/artifact",
+            "SSL certificate problem: self-signed certificate",
+            "host key verification failed",
+            "curl: (60) SSL certificate problem: unable to get local issuer certificate",
+        ],
+    )
+    def test_permanent_network_failures_are_configuration(self, message: str) -> None:
+        assert classify_failure(RuntimeError(message)) == FailureClass.CONFIGURATION
+
+    def test_ssh_auth_failure_is_configuration_not_transient(self) -> None:
+        # SSHConnectionError is normally transient, but a public-key rejection
+        # cannot be fixed by retrying.
+        exc = SSHConnectionError("host1", "Permission denied (publickey).")
+        assert classify_failure(exc) == FailureClass.CONFIGURATION
+
+    @pytest.mark.parametrize("code", ["6", "7", "28", "35", "52", "56"])
+    def test_transient_curl_codes_retry(self, code: str) -> None:
+        assert (
+            classify_failure(RuntimeError(f"curl: ({code}) boom"))
+            == FailureClass.TRANSIENT
+        )
+
+    @pytest.mark.parametrize("code", ["1", "2", "3", "5", "60", "77", "90"])
+    def test_permanent_curl_codes_do_not_retry(self, code: str) -> None:
+        assert (
+            classify_failure(RuntimeError(f"curl: ({code}) boom"))
+            == FailureClass.CONFIGURATION
+        )
+
+    def test_setup_deadline_exceeded_is_terminal(self) -> None:
+        # ``SetupDeadlineError`` (exercised end-to-end in test_resume_retry)
+        # derives from ProvisioningError and carries no transient marker, so it
+        # must never be auto-retried.
+        class SetupDeadlineError(Exception):
+            pass
+
+        assert (
+            classify_failure(SetupDeadlineError("setup exceeded its 60s deadline"))
+            == FailureClass.TERMINAL
+        )
+
     def test_unknown_failure_is_terminal(self) -> None:
         assert (
             classify_failure(RuntimeError("segmentation fault"))

@@ -22,6 +22,8 @@ from enum import StrEnum
 from typing import Any
 
 from inference_proxy.provisioning.log_store import (
+    NON_RESUMABLE_STAGES,
+    SETUP_ENGINE_STAGES,
     SETUP_STAGE_ORDER,
     setup_progress,
 )
@@ -74,8 +76,10 @@ _UNSUPPORTED_PATTERNS = (
     r"no cuda-capable device",
 )
 
-# Network, mirror, and transport symptoms. Matched before configuration so a
-# package repository outage does not look like a broken setup selection.
+# Network, mirror, and transport symptoms. Matched after permanent network
+# failures (auth, missing artifact, TLS trust) so a 401 or a certificate error
+# is never retried, but before configuration so a repository outage does not
+# look like a broken setup selection.
 _TRANSIENT_PATTERNS = (
     r"could not resolve host",
     r"temporary failure in name resolution",
@@ -98,7 +102,11 @@ _TRANSIENT_PATTERNS = (
     r"cannot download",
     r"error: failed to download metadata",
     r"wget: .*(?:unable|failed|error|timed out)",
-    r"curl: \(\d+\)",
+    # Only these curl exit codes are transient: 6 resolve, 7 connect, 28
+    # timeout, 35 TLS handshake, 52 empty reply, 56 recv failure. Permanent
+    # codes (1 unsupported protocol, 2 bad option, 3 bad URL, 5 proxy, 60 peer
+    # certificate, 77 CA certificate, 90 pinned key) must not retry.
+    r"curl: \((?:6|7|28|35|52|56)\)",
     r"resource temporarily unavailable",
     r"temporarily unavailable",
     r"mirror .* (?:failed|unavailable)",
@@ -109,6 +117,35 @@ _TRANSIENT_PATTERNS = (
     r"input/output error",
     r"git (?:clone|fetch).*(?:failed|timed out|unable)",
     r"named pipe.*unavailable",
+)
+
+# Authentication, authorization, missing immutable inputs, and TLS trust
+# failures are permanent: retrying cannot change a credential, a tag, or a
+# trust policy. Checked before the generic transient patterns and before the
+# transport-exception shortcut (an ``SSHConnectionError`` caused by
+# ``Permission denied (publickey)`` is a configuration failure).
+_PERMANENT_NETWORK_PATTERNS = (
+    r"401 unauthorized",
+    r"403 forbidden",
+    r"\b404\b.*(?:not found|no such)",
+    r"(?:not found|no such).*\b404\b",
+    r"error: 404\b",
+    r"returned error: 404\b",
+    r"permission denied \(publickey",
+    r"authentication failed",
+    r"invalid user",
+    r"access denied",
+    r"no such user",
+    r"certificate (?:verify|verification) (?:failed|error)",
+    r"ssl certificate problem",
+    r"certificate has expired",
+    r"peer certificate cannot be authenticated",
+    r"unable to get local issuer certificate",
+    r"self.signed certificate",
+    r"ssl: certificate_verify_failed",
+    r"host key verification failed",
+    r"remote host identification has changed",
+    r"curl: \((?:1|2|3|5|60|77|90)\)",
 )
 
 _CONFIGURATION_PATTERNS = (
@@ -131,6 +168,7 @@ _CONFIGURATION_PATTERNS = (
 
 _UNSUPPORTED_RE = re.compile("|".join(_UNSUPPORTED_PATTERNS), re.IGNORECASE)
 _MAINTENANCE_RE = re.compile("|".join(_MAINTENANCE_PATTERNS), re.IGNORECASE)
+_PERMANENT_RE = re.compile("|".join(_PERMANENT_NETWORK_PATTERNS), re.IGNORECASE)
 _TRANSIENT_RE = re.compile("|".join(_TRANSIENT_PATTERNS), re.IGNORECASE)
 _CONFIGURATION_RE = re.compile("|".join(_CONFIGURATION_PATTERNS), re.IGNORECASE)
 
@@ -141,10 +179,11 @@ def classify_failure(error: BaseException, *, output: str = "") -> FailureClass:
     ``output`` is optional captured remote output (for example the failing
     setup tail) that may carry a symptom the exception text omits.
 
-    Explicit resume/maintenance exceptions win first, then the exception type,
-    then the message. Configuration is checked after transient so a repository
-    outage reported by a remote command is retried instead of treated as a
-    selection error.
+    Explicit resume/maintenance exceptions win first. Permanent network
+    failures (auth, missing immutable input, TLS trust) are checked next so an
+    SSH connection error whose message is an authentication failure is not
+    retried. Only then does the exception type decide, followed by the generic
+    transient and configuration messages.
     """
     # ``SetupResumeRequiredError`` (defined in the orchestrator) exposes the
     # boundary as ``resume_state``; duck-typing avoids an import cycle.
@@ -154,9 +193,12 @@ def classify_failure(error: BaseException, *, output: str = "") -> FailureClass:
     text = f"{error}\n{output}"
     if _MAINTENANCE_RE.search(text):
         return FailureClass.MAINTENANCE
+    if _PERMANENT_RE.search(text):
+        return FailureClass.CONFIGURATION
     if _UNSUPPORTED_RE.search(text):
         return FailureClass.UNSUPPORTED_HARDWARE
-    # Transport exceptions are always transient regardless of message.
+    # Transport exceptions are transient unless a permanent message above
+    # already classified them (for example SSH public-key authentication).
     cause: BaseException | None = error
     while cause is not None:
         if (
@@ -242,9 +284,11 @@ def setup_plan_id(inputs: Mapping[str, Any]) -> str:
 
 
 __all__ = [
+    "NON_RESUMABLE_STAGES",
     "FailureClass",
     "NEXT_ACTIONS",
     "RetryPolicy",
+    "SETUP_ENGINE_STAGES",
     "SETUP_STAGE_ORDER",
     "classify_failure",
     "is_retryable",

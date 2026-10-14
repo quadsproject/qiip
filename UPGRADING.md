@@ -16,6 +16,9 @@ The guide separates three kinds of change:
 - [Self-service onboarding](#27-self-service-onboarding-moves-normal-users-to-start)
 - [Catalog profiles and automatic placement](#28-catalog-profiles-and-automatic-model-placement)
 - [Node command transport and CUDA build identity](#29-node-command-transport-and-cuda-build-identity)
+- [Reuse verified llama.cpp artifacts](#30-reuse-verified-llamacpp-artifacts-and-bound-source-builds)
+- [Size managed vLLM launches from available memory](#31-size-managed-vllm-launches-from-available-memory)
+- [Setup resume and bounded transient retries](#32-setup-resume-and-bounded-transient-retries)
 - [Artifact sources and mirror policy](#artifact-sources-and-mirror-policy)
 - [Client-visible compatibility changes](#client-visible-compatibility-changes)
 - [RPM install migration](#rpm-install-migration)
@@ -808,6 +811,43 @@ adjustment reasons, and the memory estimate are persisted with the node as
 `vllm_runtime` and shown on the node-detail dashboard. Hosts whose GPU memory
 cannot be measured fall back to the previous single-attempt launch and record
 no runtime state.
+
+### 32. Setup resume and bounded transient retries
+
+Setup now persists its plan inputs, per-stage checkpoints, attempt
+relationships, and retry history in the durable attempt database instead of
+re-running every stage after an interruption. Each attempt derives a plan id
+from a canonical digest of the inputs that change what setup does: the engine,
+model and artifact, NFS export, the content digest of the uploaded script
+bundle, and the API port. A later attempt resumes only stages whose recorded
+checkpoint carries the same plan id and whose stage-specific verifier still
+passes on the node. Changing any input invalidates every checkpoint, so the
+affected stages run again. `generation_activate` is always re-run and never
+resumed because it is the cheap step that makes a freshly separated engine
+upload live.
+
+The vLLM sync and the llama.cpp source build are now resumed rather than
+repeated: each verifier re-derives the sealed runtime from the same marker and
+republishes the runtime selection the way a fresh install would. The CUDA probe
+(`cuda_proof`) intentionally re-runs every attempt because it must reflect the
+current driver and device state before a reboot decision.
+
+Only recognized transient download, repository, and SSH transport failures are
+retried automatically, under bounded exponential backoff with jitter
+(`STAGE_RETRY_MAX_ATTEMPTS`, `STAGE_RETRY_BASE_DELAY`, `STAGE_RETRY_MAX_DELAY`,
+`STAGE_RETRY_JITTER`). The gateway reconciles remote ownership and stops a
+failed engine before each retry. Invalid configuration (bad credentials,
+missing immutable artifacts, untrusted certificates), unsupported hardware,
+and explicit maintenance boundaries are never retried automatically. Setup now
+runs under an engine-specific total deadline — `LLAMACPP_SETUP_TIMEOUT` or the
+new `VLLM_SETUP_TIMEOUT` — and a run that exhausts its own deadline is terminal
+rather than being mistaken for a socket timeout and retried.
+
+Operators see the attempt number, retry count, current stage, the percent of
+ordered setup stages passed, and the next operator action on the provisioning
+history and node-detail views. The stage-progress percentage uses pipeline
+position per engine, so a host that legitimately skips an optional stage still
+reaches 100% when the terminal stage completes.
 
 ## Artifact Sources and Mirror Policy
 
