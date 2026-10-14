@@ -392,7 +392,7 @@ const sandbox = {
           completion_tokens: 50, total_tokens: 150,
         }],
         estimated_cost_usd: 1.75,
-        model_label: "claude-opus-4.8",
+        model_label: "claude-sonnet-5",
       }; } };
     }
     return { ok: false, json: async function () { return {}; } };
@@ -419,7 +419,7 @@ vm.runInContext(source, sandbox);
 
     assert result["title"] == "Alice"
     assert "1.75" in result["savings"]
-    assert "claude-opus-4.8" in result["savings"]
+    assert "claude-sonnet-5" in result["savings"]
     assert result["tokenRows"] == 1
     assert result["usageRows"] == 1
     assert result["timelineRows"] == 1

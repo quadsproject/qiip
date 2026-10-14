@@ -264,14 +264,14 @@ class PricingSettings(BaseModel):
 
     The estimates are equivalence figures: what the recorded prompt and
     completion token mix would cost at this per-million-token rate. The
-    defaults track Anthropic Claude Opus-class 1M-context pricing
-    (input $5/MTok, output $25/MTok); deployments can override when the
-    reference model changes.
+    defaults track the published Anthropic Claude Sonnet MSRP (Sonnet 5,
+    1M context at standard pricing: input $2/MTok, output $10/MTok);
+    deployments can override when the reference model changes.
     """
 
-    input_rate_per_mtok: float = Field(default=5.0, gt=0)
-    output_rate_per_mtok: float = Field(default=25.0, gt=0)
-    model_label: str = Field(default="claude-opus-4.8", min_length=1)
+    input_rate_per_mtok: float = Field(default=2.0, gt=0)
+    output_rate_per_mtok: float = Field(default=10.0, gt=0)
+    model_label: str = Field(default="claude-sonnet-5", min_length=1)
 
     @field_validator("model_label")
     @classmethod

@@ -1192,12 +1192,13 @@ Token management dashboards (admin and per-user):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INFERENCE_PROXY_PRICING__INPUT_RATE_PER_MTOK` | `5.0` | USD per million input (prompt) tokens |
-| `INFERENCE_PROXY_PRICING__OUTPUT_RATE_PER_MTOK` | `25.0` | USD per million output (completion) tokens |
-| `INFERENCE_PROXY_PRICING__MODEL_LABEL` | `claude-opus-4.8` | Reference model shown next to the estimate |
+| `INFERENCE_PROXY_PRICING__INPUT_RATE_PER_MTOK` | `2.0` | USD per million input (prompt) tokens |
+| `INFERENCE_PROXY_PRICING__OUTPUT_RATE_PER_MTOK` | `10.0` | USD per million output (completion) tokens |
+| `INFERENCE_PROXY_PRICING__MODEL_LABEL` | `claude-sonnet-5` | Reference model shown next to the estimate |
 
-The defaults track published Claude Opus-class 1M-context pricing; override
-them when the reference model or your accounting changes.
+The defaults track the published [Claude Sonnet MSRP](https://platform.claude.com/docs/en/about-claude/pricing)
+(Sonnet 5: $2/$10 per MTok, 1M context at standard pricing); override them
+when the reference model or your accounting changes.
 
 ### Self-service onboarding (`/start`)
 

@@ -1549,16 +1549,16 @@ class TestSSOWhitelistDefaultDomain:
 class TestPricingSettings:
     """Premium rate settings for token budget estimates (RFE #113)."""
 
-    def test_defaults_match_opus_class_rates(self) -> None:
+    def test_defaults_match_sonnet_class_rates(self) -> None:
         pricing = PricingSettings()
-        assert pricing.input_rate_per_mtok == 5.0
-        assert pricing.output_rate_per_mtok == 25.0
-        assert pricing.model_label == "claude-opus-4.8"
+        assert pricing.input_rate_per_mtok == 2.0
+        assert pricing.output_rate_per_mtok == 10.0
+        assert pricing.model_label == "claude-sonnet-5"
 
     def test_registered_on_root_settings(self) -> None:
         settings = Settings(_env_file=None)
-        assert settings.pricing.input_rate_per_mtok == 5.0
-        assert settings.pricing.output_rate_per_mtok == 25.0
+        assert settings.pricing.input_rate_per_mtok == 2.0
+        assert settings.pricing.output_rate_per_mtok == 10.0
 
     def test_env_var_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("INFERENCE_PROXY_PRICING__INPUT_RATE_PER_MTOK", "8.5")
