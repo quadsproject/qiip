@@ -946,6 +946,15 @@ def plan_vllm_launch(
         # An explicit batch size is authoritative: the scheduler's chunked
         # prefill makes it independent of the context, so never rewrite it.
         effective.max_num_batched_tokens = request.max_num_batched_tokens
+    if fitting and effective.max_model_len != context:
+        # _fit_context sized the KV budget before the bounded retry ran, so its
+        # reason can name a context the retry then lowered. Keep the headline
+        # reason consistent with the persisted effective value.
+        retry_noun = "retry" if attempt == 1 else "retries"
+        reason = (
+            f"{reason}; {attempt} bounded OOM {retry_noun} reduced the "
+            f"context to {effective.max_model_len} tokens"
+        )
     if not fitting:
         blocked_reason = blocked_reason or reason
     if blocked_reason is not None:
