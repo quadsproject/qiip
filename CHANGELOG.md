@@ -2,6 +2,35 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.9 (2026-10-14)
+
+### Bug Fixes
+
+- **vllm**: Address review on memory-aware sizing
+  ([`2f3e0e2`](https://github.com/quadsproject/qiip/commit/2f3e0e24d136f31e25704e5c0032d2bd40f3102d))
+
+- **vllm**: Address the second review round on memory-aware sizing
+  ([`66b65fe`](https://github.com/quadsproject/qiip/commit/66b65fecdd9811e59ac03658ab8f576cdec15f2d))
+
+- **vllm**: Keep the retried plan reason consistent with the effective context
+  ([`45faef2`](https://github.com/quadsproject/qiip/commit/45faef2eda304af6467880bce52c828d91b30cea))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`c5f43d2`](https://github.com/quadsproject/qiip/commit/c5f43d205c087b01fa53822ba9856f8805cb7e1c))
+
+### Features
+
+- Size automatic vLLM launches from available memory
+  ([`a56b1f1`](https://github.com/quadsproject/qiip/commit/a56b1f135d8652280b99b8969ecfb812c7c896cf))
+
+### Testing
+
+- Widen timing-sensitive liveness timeouts
+  ([`e0c53b0`](https://github.com/quadsproject/qiip/commit/e0c53b0fbb6219878274cdd27ae04917fb1bdcfd))
+
+
 ## v0.2.0-dev.8 (2026-10-13)
 
 ### Bug Fixes
