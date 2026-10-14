@@ -117,6 +117,12 @@ class TestFailureClassification:
             "401 Unauthorized",
             "403 Forbidden",
             "error: 404 Not Found for https://example/artifact",
+            # Bare status codes without the reason phrase, as emitted by dnf,
+            # git, and wget.
+            "Status code: 403 for https://mirror.example/repo",
+            "fatal: unable to access 'https://example/repo': The requested URL returned error: 403",
+            "ERROR 403: Forbidden.",
+            "Status code: 401 for https://mirror.example/repo",
             "SSL certificate problem: self-signed certificate",
             "host key verification failed",
             "curl: (60) SSL certificate problem: unable to get local issuer certificate",

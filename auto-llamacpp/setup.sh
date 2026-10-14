@@ -237,8 +237,11 @@ verify_llamacpp_binaries() {
             return 1
         fi
     done
-    verify_managed_server_cli "${runtime}/bin/llama-server"
-    verify_fit_params_cli "${runtime}/bin/llama-fit-params"
+    # These are explicit so a caller that suppresses errexit (for example the
+    # resume verifier's ``cmd >/dev/null 2>&1 || return 1``) still propagates a
+    # failure instead of silently continuing.
+    verify_managed_server_cli "${runtime}/bin/llama-server" || return 1
+    verify_fit_params_cli "${runtime}/bin/llama-fit-params" || return 1
     # The pinned quantizer has no --version and returns 1 for --help.
     quantize_help=$("${runtime}/bin/llama-quantize" --help 2>&1) || quantize_status=$?
     if [ "$quantize_status" -gt 1 ] || ! grep -q '^usage:' <<< "$quantize_help"; then
@@ -584,6 +587,10 @@ qiip_verify_llamacpp_install() {
         || return 1
     [ -n "$runtime" ] || return 1
     verify_llamacpp_binaries "$runtime" >/dev/null 2>&1 || return 1
+    # llama.cpp defers the common cuda_proof to this installer, so a resumed
+    # install must re-prove CUDA execution too. A failure reruns the stage,
+    # which reports status 10 and reaches the reboot handling.
+    verify_llamacpp_cuda "$runtime" >/dev/null 2>&1 || return 1
     select_llamacpp_runtime "$runtime" >/dev/null 2>&1 || return 1
     [ -n "$QIIP_RUNTIME_SELECTION" ] || return 1
 }

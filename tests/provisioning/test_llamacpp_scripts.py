@@ -1691,6 +1691,7 @@ class TestLlamacppInstallVerifier:
             "llamacpp_artifact_tool() { printf '%s\\n' \"$AUTOLLAMACPP_TEST_RUNTIME\"; }\n"
             "llamacpp_host_identity() { printf 'identity\\n'; }\n"
             "verify_llamacpp_binaries() { return 0; }\n"
+            "verify_llamacpp_cuda() { return 0; }\n"
             "qiip_verify_llamacpp_install\n"
         )
         env = {**os.environ, "AUTOLLAMACPP_TEST_RUNTIME": str(runtime)}
@@ -1705,8 +1706,49 @@ class TestLlamacppInstallVerifier:
             "llamacpp_artifact_tool() { printf '%s\\n' /opt/llama.cpp/build; }\n"
             "llamacpp_host_identity() { printf 'identity\\n'; }\n"
             "verify_llamacpp_binaries() { return 1; }\n"
+            "verify_llamacpp_cuda() { return 0; }\n"
             "qiip_verify_llamacpp_install\n"
         )
         result = _run_shell(_source_setup(cmd))
         assert result.returncode != 0
         assert not selection.exists()
+
+    def test_verifier_rejects_failed_cuda_proof(self, tmp_path: Path) -> None:
+        # llama.cpp defers cuda_proof to the installer, so a resumed install
+        # must re-prove CUDA execution before it can be skipped; a failure has
+        # to rerun the stage rather than adopt the stale runtime.
+        selection = tmp_path / "selection"
+        cmd = (
+            f"export QIIP_RUNTIME_SELECTION={shlex.quote(str(selection))}\n"
+            "llamacpp_artifact_tool() { printf '%s\\n' /opt/llama.cpp/build; }\n"
+            "llamacpp_host_identity() { printf 'identity\\n'; }\n"
+            "verify_llamacpp_binaries() { return 0; }\n"
+            "verify_llamacpp_cuda() { return 10; }\n"
+            "qiip_verify_llamacpp_install\n"
+        )
+        result = _run_shell(_source_setup(cmd))
+        assert result.returncode != 0
+        assert not selection.exists()
+
+    def test_binary_verification_propagates_cli_failures(self, tmp_path: Path) -> None:
+        # ``cmd || return 1`` disables errexit inside the function, so the CLI
+        # checks must be explicit or a bad binary passes verification.
+        runtime = tmp_path / "build"
+        (runtime / "bin").mkdir(parents=True)
+        _write_executable(
+            runtime / "bin" / "llama-quantize",
+            "#!/bin/bash\necho 'usage: llama-quantize'\nexit 0\n",
+        )
+        cmd = (
+            "installed_llamacpp_version() { printf '%s\\n' \"$LLAMACPP_VERSION\"; }\n"
+            "verify_managed_server_cli() { return 1; }\n"
+            "verify_fit_params_cli() { return 0; }\n"
+            f"if verify_llamacpp_binaries {shlex.quote(str(runtime))} >/dev/null 2>&1; then\n"
+            "    echo PROPAGATED_OK\n"
+            "else\n"
+            "    echo PROPAGATED_FAIL\n"
+            "fi\n"
+        )
+        env = {**os.environ, "LLAMACPP_VERSION": "b7000"}
+        result = _run_shell(_source_setup(cmd), env=env)
+        assert "PROPAGATED_FAIL" in result.stdout

@@ -127,10 +127,17 @@ _TRANSIENT_PATTERNS = (
 _PERMANENT_NETWORK_PATTERNS = (
     r"401 unauthorized",
     r"403 forbidden",
-    r"\b404\b.*(?:not found|no such)",
-    r"(?:not found|no such).*\b404\b",
-    r"error: 404\b",
-    r"returned error: 404\b",
+    # Bare status codes without the reason phrase: dnf emits
+    # ``Status code: 403 for https://...``, git emits ``returned error: 403``,
+    # and wget emits ``ERROR 403: Forbidden``. A 401/403 next to a URL is an
+    # authorization failure, not a mirror blip.
+    r"status code: 40[13]\b",
+    r"returned error: 40[13]\b",
+    r"\berror:? 40[13]\b",
+    r"\b40[13]\b.{0,40}https?://",
+    r"https?://\S*.*\b40[13]\b",
+    r"\b40[134]\b.*(?:not found|no such|unauthorized|forbidden)",
+    r"(?:not found|no such).*\b40[34]\b",
     r"permission denied \(publickey",
     r"authentication failed",
     r"invalid user",
