@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.10 (2026-10-14)
+
+### Bug Fixes
+
+- Price token estimates at Sonnet 5 rates
+  ([`9c16bde`](https://github.com/quadsproject/qiip/commit/9c16bdeba338acca564aad9b698c1bad7d3252c0))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`33ef768`](https://github.com/quadsproject/qiip/commit/33ef76848b68d09a77f54dd19d1e3737ad4f1080))
+
+
 ## v0.2.0-dev.9 (2026-10-14)
 
 ### Bug Fixes
