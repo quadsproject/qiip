@@ -74,8 +74,8 @@ class TestAdminUsers:
         assert user["active_token_count"] == 1
         assert user["request_count"] == 1
         assert user["total_tokens"] == 1_500_000
-        # 1M prompt * $5 + 500k completion * $25 = $17.50 (defaults).
-        assert user["estimated_cost_usd"] == pytest.approx(17.5)
+        # 1M prompt * $2 + 500k completion * $10 = $7.00 (defaults).
+        assert user["estimated_cost_usd"] == pytest.approx(7.0)
 
     def test_list_users_empty(self, client: TestClient) -> None:
         response = client.get("/admin/users")
@@ -139,8 +139,8 @@ class TestAdminUserDetail:
         assert detail["usage"][0]["endpoint"] == "/v1/chat/completions"
         assert detail["totals"]["total_tokens"] == 1_500_000
         assert detail["timeline"][0]["total_tokens"] == 1_500_000
-        assert detail["estimated_cost_usd"] == pytest.approx(17.5)
-        assert detail["model_label"] == "claude-opus-4.8"
+        assert detail["estimated_cost_usd"] == pytest.approx(7.0)
+        assert detail["model_label"] == "claude-sonnet-5"
 
     def test_user_detail_unknown_404(self, client: TestClient) -> None:
         response = client.get("/admin/users/999")
@@ -160,8 +160,8 @@ class TestAdminBilling:
         billing: dict[str, Any] = response.json()
         assert billing["totals"]["total_tokens"] == 1_500_000
         assert billing["totals"]["request_count"] == 1
-        assert billing["estimated_cost_usd"] == pytest.approx(17.5)
-        assert billing["model_label"] == "claude-opus-4.8"
+        assert billing["estimated_cost_usd"] == pytest.approx(7.0)
+        assert billing["model_label"] == "claude-sonnet-5"
 
     def test_billing_empty(self, client: TestClient) -> None:
         response = client.get("/admin/billing")
