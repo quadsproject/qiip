@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from ipaddress import ip_address
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import structlog
@@ -82,6 +82,13 @@ from inference_proxy.provisioning.llamacpp_profile import (
     split_profile_sections,
 )
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
+from inference_proxy.provisioning.recovery import (
+    FailureClass,
+    RetryPolicy,
+    classify_failure,
+    next_action,
+    setup_plan_id,
+)
 from inference_proxy.provisioning.remote_logs import RemoteLogCollector
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
@@ -117,7 +124,7 @@ _SELF_SETUP_PROBE_TIMEOUT = 5.0
 # unhealthy response (e.g. 503) is authoritative and refuses adoption.
 _OPTIONAL_HEALTH_STATUSES = frozenset({404, 405, 501})
 
-STEP_PATTERN = re.compile(r"\[STEP:(\w+):(START|OK|FAIL|WARN)\]")
+STEP_PATTERN = re.compile(r"\[STEP:(\w+):(START|OK|SKIP|FAIL|WARN)\]")
 RESUME_PATTERN = re.compile(
     r"\[RESUME:(maintenance_required|reboot_required):([^\]\r\n]+)\]"
 )
@@ -541,6 +548,8 @@ class NodeProvisioner:
         *,
         model: str | None = None,
         operation: str = "provision",
+        plan_id: str | None = None,
+        setup_inputs: dict[str, Any] | None = None,
     ) -> None:
         identity, _manifest = bundle_manifest(
             bundle_files(self._engine_scripts_dir(engine), self._common_scripts_dir())
@@ -551,6 +560,8 @@ class NodeProvisioner:
             model=model,
             operation=operation,
             bundle_version="sha256:" + identity,
+            plan_id=plan_id or "sha256:" + identity,
+            setup_inputs=setup_inputs,
         )
         if self._log_buffer.store is not None and self._remote_logs is not None:
             recorder = self._remote_logs.recorders.get(hostname)
@@ -588,6 +599,25 @@ class NodeProvisioner:
                 attempt_id, "Remote log retrieval deadline exceeded", source="remote"
             )
             raise
+
+    def _record_failure_classification(
+        self, hostname: str, error: BaseException
+    ) -> None:
+        """Persist the retry class and operator action on the attempt.
+
+        The original error stays in the retained failure/diagnostics records;
+        this only adds the recovery decision so the UI can show what to do next.
+        """
+        store = self._log_buffer.store
+        attempt_id = self._log_buffer.attempts.get(hostname)
+        if store is None or attempt_id is None:
+            return
+        with suppress(KeyError):
+            store.update(
+                attempt_id,
+                failure_class=str(classify_failure(error)),
+                next_action=next_action(error),
+            )
 
     async def _capture_failure(
         self, hostname: str, stage: str, error: BaseException
@@ -776,6 +806,62 @@ class NodeProvisioner:
                 + ", ".join(missing)
             )
         return engine_dir, common_dir
+
+    def _setup_plan_inputs(
+        self,
+        engine: InferenceEngine = InferenceEngine.VLLM,
+        *,
+        artifact: ResolvedGGUFArtifact | None = None,
+        llamacpp_request: LlamaCppRuntimeRequest | None = None,
+        vllm_params: VllmParams | None = None,
+    ) -> dict[str, Any]:
+        """Return the inputs whose change invalidates a completed stage.
+
+        The identity must cover everything a setup stage installs, builds, or
+        mounts. The caller passes the resulting mapping to ``_begin_log`` so a
+        retry with different inputs cannot resume stale checkpoints.
+        """
+        inputs: dict[str, Any] = {
+            "engine": engine.value,
+            "nfs_export": self._required_nfs_export(),
+            "nfs_mount_point": self._settings.nfs_mount_point,
+            "nvidia_driver_version": self._settings.nvidia_driver_version,
+            "nvidia_driver_sha256": self._settings.nvidia_driver_sha256,
+            "llmfit_version": self._llmfit_version,
+            "llmfit_sha256": self._llmfit_sha256,
+            "min_disk_gb": self._settings.min_disk_gb,
+            "generation_root": str(self._settings.generation_root / engine.value),
+        }
+        if engine == InferenceEngine.LLAMA_CPP:
+            inputs.update(
+                llamacpp_version=self._settings.llamacpp_version,
+                llamacpp_sha256=self._settings.llamacpp_sha256,
+                llamacpp_source_url=self._settings.llamacpp_source_download_url(),
+                llamacpp_artifact_catalog_url=(
+                    self._settings.llamacpp_artifact_catalog_url
+                ),
+                llamacpp_artifact_catalog_sha256=(
+                    self._settings.llamacpp_artifact_catalog_sha256
+                ),
+                llamacpp_allow_source_build=self._settings.llamacpp_allow_source_build,
+                llamacpp_build_jobs=self._settings.llamacpp_build_jobs,
+                artifact_id=artifact.artifact_id if artifact is not None else None,
+                runtime_request=(
+                    llamacpp_request.model_dump(mode="json")
+                    if llamacpp_request is not None
+                    else None
+                ),
+            )
+        else:
+            inputs.update(
+                model=artifact.model_alias if artifact is not None else None,
+                vllm_params=(
+                    vllm_params.model_dump(mode="json")
+                    if vllm_params is not None
+                    else None
+                ),
+            )
+        return inputs
 
     def _setup_script_env(
         self, engine: InferenceEngine = InferenceEngine.VLLM
@@ -1100,6 +1186,19 @@ class NodeProvisioner:
                     ),
                 )
             store.update(attempt_id, **fields)
+        attempt_number: int | None = None
+        retry_count = 0
+        progress: dict[str, object] | None = None
+        failure_class: str | None = None
+        required_action: str | None = None
+        if store is not None and attempt_id is not None:
+            with suppress(KeyError):
+                manifest = store.get(attempt_id)
+                attempt_number = manifest.get("attempt_number")
+                retry_count = int(manifest.get("transient_retries") or 0)
+                progress = manifest.get("progress")
+                failure_class = manifest.get("failure_class")
+                required_action = manifest.get("next_action")
         state = ProvisioningState(
             hostname=hostname,
             attempt_id=attempt_id,
@@ -1109,6 +1208,11 @@ class NodeProvisioner:
             failed_step=failed_step,
             error=error,
             resume_state=resume_state,
+            attempt_number=attempt_number,
+            retry_count=retry_count,
+            progress=progress,
+            failure_class=failure_class,
+            next_action=required_action,
         )
         key = f"/provisioning/{hostname}"
         value = json.dumps(state.model_dump(mode="json")).encode("utf-8")
@@ -2417,8 +2521,19 @@ class NodeProvisioner:
                 "A prior provisioning operation is still active on the node; "
                 "wait for it to finish or tear the host down before retrying"
             )
+        plan_inputs = self._setup_plan_inputs(
+            engine,
+            artifact=artifact,
+            llamacpp_request=llamacpp_request,
+            vllm_params=vllm_params,
+        )
+        plan_id = setup_plan_id(plan_inputs)
         self._begin_log(
-            hostname, engine, model=artifact.model_alias if artifact else model
+            hostname,
+            engine,
+            model=artifact.model_alias if artifact else model,
+            plan_id=plan_id,
+            setup_inputs=plan_inputs,
         )
         record = self._provisioning_tasks.get(hostname)
         if record is not None:
@@ -2484,11 +2599,12 @@ class NodeProvisioner:
                 current_step = step
 
             current_step = "setup"
-            await self._run_setup(
+            await self._run_setup_with_retries(
                 hostname,
                 started_at=provision_started_at,
                 on_step=set_current_step,
                 engine=engine,
+                plan_id=plan_id,
             )
             current_step = "gpu_verify"
             await self._verify_gpu(hostname)
@@ -2569,6 +2685,7 @@ class NodeProvisioner:
             self._log(hostname, "info", "Provisioning complete")
         except Exception as exc:
             self._log(hostname, "error", f"Failed at step '{current_step}': {exc}")
+            self._record_failure_classification(hostname, exc)
             await self._update_state(
                 hostname,
                 ProvisioningStep.FAILED,
@@ -2679,6 +2796,142 @@ class NodeProvisioner:
                 recorder_path=f"{bundle}/common/provision-logs.py",
             )
 
+    def _setup_resume_env(self, hostname: str, plan_id: str | None) -> dict[str, str]:
+        """Return plan identity and verified stages for setup.sh.
+
+        A compatible plan reuses only stages the gateway has evidence for; a
+        changed plan id yields no resume stages, so setup.sh re-verifies and
+        every stale checkpoint is invalidated on the node.
+        """
+        env: dict[str, str] = {}
+        if plan_id:
+            env["QIIP_PLAN_ID"] = plan_id
+        store = self._log_buffer.store
+        if store is not None and plan_id:
+            with suppress(Exception):
+                verified = store.resumable_checkpoints(hostname, plan_id)
+                env["QIIP_RESUME_STAGES"] = ",".join(sorted(verified))
+        return env
+
+    def _record_step_checkpoint(
+        self, hostname: str, step_name: str, status: str, line: str
+    ) -> None:
+        store = self._log_buffer.store
+        attempt_id = self._log_buffer.attempts.get(hostname)
+        if store is None or attempt_id is None:
+            return
+        status_value = {
+            "START": "running",
+            "OK": "completed",
+            "SKIP": "skipped",
+            "FAIL": "failed",
+        }.get(status)
+        if status_value is None:
+            return
+        with suppress(KeyError):
+            store.record_checkpoint(
+                attempt_id, step_name, status_value, evidence=line[:512]
+            )
+
+    async def _run_setup_with_retries(
+        self,
+        hostname: str,
+        *,
+        started_at: datetime,
+        on_step: Callable[[str], None],
+        engine: InferenceEngine = InferenceEngine.VLLM,
+        plan_id: str | None = None,
+    ) -> None:
+        """Run setup.sh, retrying only recognized transient failures.
+
+        Bounded exponential backoff with jitter. Reconcile runs before each
+        retry so a still-live remote phase is never duplicated. Completed
+        stages are checkpointed by :meth:`_run_setup`, so a retry resumes
+        instead of repeating verified package/compile work.
+        """
+        policy = RetryPolicy(
+            max_attempts=self._settings.stage_retry_max_attempts,
+            base_delay_seconds=self._settings.stage_retry_base_delay,
+            max_delay_seconds=self._settings.stage_retry_max_delay,
+            jitter=self._settings.stage_retry_jitter,
+        )
+        store = self._log_buffer.store
+        attempt_id = self._log_buffer.attempts.get(hostname)
+        step_name = "setup"
+        captured_failure = False
+
+        def track_step(step: str) -> None:
+            nonlocal step_name
+            step_name = step
+            on_step(step)
+
+        for attempt in range(1, policy.max_attempts + 1):
+            try:
+                async with asyncio.timeout(self._setup_engine_timeout(engine)):
+                    await self._run_setup(
+                        hostname,
+                        started_at=started_at,
+                        on_step=track_step,
+                        engine=engine,
+                        plan_id=plan_id,
+                    )
+                # A recovered transient failure is not a failure: drop the
+                # provisional record while keeping the retry history.
+                if captured_failure and store is not None and attempt_id is not None:
+                    with suppress(KeyError):
+                        store.update(
+                            attempt_id,
+                            failure=None,
+                            failure_summary=None,
+                            diagnostics={"sources": {}},
+                            failure_class=None,
+                            next_action=None,
+                        )
+                return
+            except Exception as exc:
+                failure_class = classify_failure(exc)
+                if (
+                    failure_class != FailureClass.TRANSIENT
+                    or attempt >= policy.max_attempts
+                ):
+                    raise
+                delay = policy.delay(attempt)
+                # Reconcile before retry: never duplicate a live remote phase.
+                if await self._reconcile_host(hostname):
+                    raise
+                if not captured_failure:
+                    # Capture the original error before the retry re-launches
+                    # the recorder and replaces the active phase; otherwise the
+                    # failure points at a phase that never ran and loses its
+                    # command evidence.
+                    await self._capture_failure(hostname, step_name, exc)
+                    captured_failure = True
+                self._record_failure_classification(hostname, exc)
+                if store is not None and attempt_id is not None:
+                    with suppress(KeyError):
+                        retries = store.increment_transient_retry(attempt_id)
+                        store.issue(
+                            attempt_id,
+                            f"Transient setup failure ({failure_class}); "
+                            f"automatic retry {retries} in {delay:.0f}s: {exc}",
+                            source="gateway",
+                        )
+                self._log(
+                    hostname,
+                    "warning",
+                    f"Transient setup failure; retry {attempt}/"
+                    f"{policy.max_retries} in {delay:.0f}s",
+                )
+                await asyncio.sleep(delay)
+
+    def _setup_engine_timeout(self, engine: InferenceEngine) -> float:
+        """Return the stage-specific total deadline for one setup run."""
+        return (
+            self._settings.llamacpp_setup_timeout
+            if engine == InferenceEngine.LLAMA_CPP
+            else self._settings.vllm_setup_timeout
+        )
+
     async def _run_setup(
         self,
         hostname: str,
@@ -2686,13 +2939,16 @@ class NodeProvisioner:
         started_at: datetime,
         on_step: Callable[[str], None],
         engine: InferenceEngine = InferenceEngine.VLLM,
+        plan_id: str | None = None,
     ) -> None:
         """Run setup.sh and parse step markers from stdout (D-05, D-06)."""
+        env = self._setup_script_env(engine)
+        env.update(self._setup_resume_env(hostname, plan_id))
         command = self._remote_script_command(
             hostname,
             engine,
             "setup.sh",
-            env=self._setup_script_env(engine),
+            env=env,
         )
         output: AsyncIterator[tuple[str, str]]
         if self._remote_logs is not None:
@@ -2727,6 +2983,7 @@ class NodeProvisioner:
                     if match:
                         step_name, status = match.group(1), match.group(2)
                         on_step(step_name)
+                        self._record_step_checkpoint(hostname, step_name, status, line)
                         if status in {"START", "WARN"}:
                             with suppress(ValueError):
                                 await self._update_state(

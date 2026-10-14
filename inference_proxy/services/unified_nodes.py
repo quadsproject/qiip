@@ -166,6 +166,11 @@ class UnifiedNodeService:
             failed_step=task.failed_step if task else None,
             error=task.error if task else None,
             resume_state=task.resume_state if task else None,
+            attempt_number=task.attempt_number if task else None,
+            retry_count=task.retry_count if task else 0,
+            progress=task.progress if task else None,
+            failure_class=task.failure_class if task else None,
+            next_action=task.next_action if task else None,
         )
 
     @staticmethod

@@ -800,11 +800,27 @@ async function refreshDetail() {
           rb.textContent = formatSetupResumeState(task.resume_state);
           tdStatus.appendChild(rb);
         }
+        if (task.attempt_number && task.attempt_number > 1) {
+          var ab = document.createElement("span"); ab.className = "badge badge-in-progress";
+          ab.textContent = "attempt " + task.attempt_number; tdStatus.appendChild(ab);
+        }
+        if (task.retry_count) {
+          var rtb = document.createElement("span"); rtb.className = "badge badge-in-progress";
+          rtb.textContent = task.retry_count + (task.retry_count === 1 ? " retry" : " retries");
+          tdStatus.appendChild(rtb);
+        }
+        if (task.next_action) {
+          var nb = document.createElement("span"); nb.className = "badge badge-failed";
+          nb.textContent = task.next_action; tdStatus.appendChild(nb);
+        }
         ttr.appendChild(tdStatus);
 
         var tdErr = document.createElement("td");
-        if (task.error) { tdErr.className = "error-text"; tdErr.textContent = task.error; }
-        else { tdErr.textContent = "—"; }
+        var progressNote = task.progress && task.progress.total_stages
+          ? "progress " + task.progress.completed_count + "/" + task.progress.total_stages
+          : "";
+        if (task.error) { tdErr.className = "error-text"; tdErr.textContent = task.error + (progressNote ? " · " + progressNote : ""); }
+        else { tdErr.textContent = progressNote || "—"; }
         ttr.appendChild(tdErr);
 
         var tdStart = document.createElement("td"); tdStart.textContent = new Date(task.started_at).toLocaleString(); ttr.appendChild(tdStart);

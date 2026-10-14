@@ -29,6 +29,9 @@ function element(id) {
 let boot;
 const attempt = { attempt_id: "abc", status: "failed", operation: "provision", engine: "vllm",
   started_at: "2026-09-16T12:00:00Z", model: "org/model", stage: "driver", bundle_version: "sha256:abc",
+  attempt_number: 2, transient_retries: 1,
+  progress: {completed_count: 3, total_stages: 14, percent: 21.4},
+  failure_class: "transient", next_action: "Retry setup; verified stages resume automatically",
   sources: {"setup.stderr": "collected"}, issues: ["source unavailable"], dropped_records: 2,
   failure_summary: "driver rejected",
   failure: {failed_at: "2026-09-16T12:01:00Z", duration_seconds: 60, exit_code: 7,
@@ -75,6 +78,11 @@ async function settle() { for (let n=0;n<15;n++) await Promise.resolve(); }
     )
     output = json.loads(result.stdout)
     assert output["initial"]["summary"].startswith("driver rejected\n")
+    assert "attempt 2" in output["initial"]["summary"]
+    assert "1 automatic retry" in output["initial"]["summary"]
+    assert "progress 3/14 (21.4%)" in output["initial"]["summary"]
+    assert "class transient" in output["initial"]["summary"]
+    assert "next: Retry setup" in output["initial"]["summary"]
     assert "exit 7" in output["initial"]["details"]
     assert "phase-1" in output["initial"]["details"]
     assert (
