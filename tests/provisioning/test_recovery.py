@@ -89,6 +89,9 @@ class TestFailureClassification:
             "fatal: unable to access 'https://example/repo': Failed to connect",
             "TLS handshake timeout",
             "The requested URL returned error: 503",
+            "Status code: 503 for https://mirror.example/repo",
+            "ERROR 503: Service Unavailable.",
+            "fatal: unable to access 'https://example/repo': The requested URL returned error: 502",
         ],
     )
     def test_transient_download_and_network_markers(self, message: str) -> None:

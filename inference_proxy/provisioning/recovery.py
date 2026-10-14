@@ -111,7 +111,14 @@ _TRANSIENT_PATTERNS = (
     r"temporarily unavailable",
     r"mirror .* (?:failed|unavailable)",
     r"dnf.*(?:timeout|connection|mirror|repodata|metadata)",
-    r"the requested url returned error: 5\d\d",
+    # 5xx means the server failed, not the request, so it is retryable whether
+    # it arrives as git/wget "returned error: 5xx", wget "ERROR 5xx", or dnf
+    # "Status code: 5xx for https://...".
+    r"status code: 5\d\d\b",
+    r"returned error: 5\d\d\b",
+    r"\berror:? 5\d\d\b",
+    r"\b5\d\d\b.{0,40}https?://",
+    r"\b5\d\d\b.*(?:service unavailable|bad gateway|gateway time|internal server error)",
     r"tls handshake timeout",
     r"i/o error",
     r"input/output error",
