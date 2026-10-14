@@ -156,6 +156,15 @@ provisioning:
   # Bounded number of automatic vLLM launches per setup, including the initial
   # memory-aware plan (N allows N-1 recognized-OOM retries); 1-5.
   vllm_memory_retry_max_attempts: 4
+  # Total deadline for one vLLM setup run (dependency resolution and venv sync).
+  vllm_setup_timeout: 3600.0
+  # Bounded automatic retry of transient download/repository/SSH failures. Only
+  # recognized transient failures retry; configuration, unsupported-hardware,
+  # and maintenance failures stop immediately.
+  stage_retry_max_attempts: 3
+  stage_retry_base_delay: 5.0
+  stage_retry_max_delay: 120.0
+  stage_retry_jitter: 0.25
 
 quads:
   # Set base_url to enable the QUADS integration; server_timezone is then

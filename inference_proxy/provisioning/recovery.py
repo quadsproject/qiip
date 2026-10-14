@@ -220,7 +220,7 @@ class RetryPolicy:
             raise ValueError("retry_number is 1-based")
         ceiling = min(
             self.max_delay_seconds,
-            self.base_delay_seconds * (2 ** (retry_number - 1)),
+            self.base_delay_seconds * (2.0 ** (retry_number - 1)),
         )
         if self.jitter == 0:
             return ceiling

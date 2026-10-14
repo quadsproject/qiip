@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -189,7 +190,7 @@ class TestRetryPolicy:
             {"jitter": -0.1},
         ],
     )
-    def test_invalid_settings_are_rejected(self, kwargs: dict[str, float]) -> None:
+    def test_invalid_settings_are_rejected(self, kwargs: dict[str, Any]) -> None:
         with pytest.raises(ValueError):
             RetryPolicy(**kwargs)
 

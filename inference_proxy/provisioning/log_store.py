@@ -15,7 +15,7 @@ import re
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -465,7 +465,9 @@ class AttemptLogStore:
             ).fetchall()
             return [row["hostname"] for row in rows]
 
-    def _mutate_metadata(self, attempt_id: str, mutate: Any) -> dict[str, Any]:
+    def _mutate_metadata(
+        self, attempt_id: str, mutate: Callable[[dict[str, Any]], None]
+    ) -> dict[str, Any]:
         """Atomically read-modify-write one attempt manifest."""
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -474,7 +476,7 @@ class AttemptLogStore:
             ).fetchone()
             if row is None:
                 raise KeyError(attempt_id)
-            metadata = json.loads(row[0])
+            metadata: dict[str, Any] = json.loads(row[0])
             mutate(metadata)
             self._update(db, attempt_id, metadata)
             return metadata
