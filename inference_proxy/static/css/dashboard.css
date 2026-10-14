@@ -820,6 +820,34 @@ tbody tr:last-child td { border-bottom: none; }
   font-variant-numeric: tabular-nums;
 }
 
+/* --- Sortable table headers (js/table_sort.js) --- */
+th[data-sort] .th-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+th[data-sort] { cursor: pointer; }
+
+th[data-sort] .th-sort:hover { color: var(--text); }
+
+.th-sort-arrow {
+  margin-left: 0.25rem;
+  font-size: 0.625rem;
+  color: var(--text-light);
+}
+
+th[aria-sort="ascending"] .th-sort-arrow::after { content: "\2191"; }
+th[aria-sort="descending"] .th-sort-arrow::after { content: "\2193"; }
+
 /* --- Skeleton loaders --- */
 @keyframes skeleton-sweep {
   0% { background-position: -200% 0; }

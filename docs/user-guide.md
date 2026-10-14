@@ -72,7 +72,8 @@ dashboard for signed-in users:
 
 - **Usage leaderboard**: every non-admin user ranked by total tokens.
   Admin users and their usage are never shown. Your own row is marked
-  `(you)`.
+  `(you)`. The `Rank` column is that standing, so it stays with each user
+  when you sort by another column.
 - **Your tokens**: your token with its status and models, plus a Delete
   button. Deleting revokes the token; tools configured with it stop
   working.
@@ -86,6 +87,10 @@ dashboard for signed-in users:
 config path from the table above. Unlike the setup script, it does not back
 up or merge into an existing config file, and single-model tools take
 exactly one model.
+
+Both tables sort by column: select a header label to sort ascending, select
+it again for descending. The arrow next to the label shows the direction,
+and the chosen sort stays in place when the page refreshes.
 
 ## Usage and limits
 

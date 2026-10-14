@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from datetime import timedelta
 from pathlib import Path
@@ -1105,6 +1106,29 @@ class TestLeaderboard:
         html = user_client.get("/leaderboard").text
         assert "leaderboard.js" in html
         assert "Usage leaderboard" in html
+
+    def test_page_declares_sortable_columns(self, user_client: TestClient) -> None:
+        html = user_client.get("/leaderboard").text
+
+        assert "js/table_sort.js" in html
+        for asset in ("js/table_sort.js", "js/leaderboard.js", "js/confirm_dialog.js"):
+            assert re.search(rf"/static/{re.escape(asset)}\?v=[0-9a-f]{{12}}", html)
+        kinds = re.findall(r'data-sort="([^"]*)"', html)
+        assert kinds
+        assert set(kinds) <= {"text", "number", "date"}
+        headers = re.findall(r'<th[^>]*data-sort="[^"]*"[^>]*>(.*?)</th>', html)
+        assert len(headers) == len(kinds)
+        for header in headers:
+            assert 'type="button"' in header
+        # The rank is a fixed standing, not a row position: no sort control.
+        assert re.search(r"<th[^>]*>Rank</th>", html)
+        for label in ("Usage leaderboard", "Your tokens"):
+            assert f'aria-label="{label}"' in html
+        # The server sends the ranking by total tokens DESC; the header says so.
+        assert html.count('aria-sort="descending"') == 1
+        assert re.search(
+            r'aria-sort="descending"[^>]*>\s*<button[^>]*>Total tokens', html
+        )
 
     def test_anonymous_gets_signin(self, app: FastAPI) -> None:
         response = TestClient(app).get("/leaderboard")

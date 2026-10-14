@@ -13,6 +13,7 @@ Regression coverage for:
 from __future__ import annotations
 
 import json
+import re
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -583,7 +584,8 @@ class TestDashboardRoles:
         # (restored: role management lives here AND on the token dashboard).
         assert 'id="admin-user-body"' in admin_page.text
         assert '<th scope="col">Admin</th>' in admin_page.text
-        assert '<th scope="col">Admin</th>' in tokens.text
+        # Headers now carry a sort button; the Admin column must still be there.
+        assert re.search(r"<th[^>]*>(?:<button[^>]*>)?Admin", tokens.text)
 
     def test_logout_visible_for_local_admin_session(
         self,

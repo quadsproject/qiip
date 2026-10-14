@@ -14,9 +14,10 @@
     while (el.firstChild) el.removeChild(el.firstChild);
   }
 
-  function tdCell(text) {
+  function tdCell(text, sortValue) {
     const td = document.createElement("td");
     td.textContent = text;
+    if (sortValue !== undefined) td.dataset.sortValue = String(sortValue);
     return td;
   }
 
@@ -47,6 +48,27 @@
   }
 
   // ------------------------------------------------------------------
+  // Column sorting (shared js/table_sort.js)
+  // ------------------------------------------------------------------
+
+  const SORTABLE_TABLES = [
+    { head: "leaderboard-head", body: "leaderboard-body" },
+    { head: "tokens-head", body: "tokens-table-body" },
+  ];
+
+  function enableTableSort() {
+    SORTABLE_TABLES.forEach((table) => {
+      window.tableSort.enable($(table.head), $(table.body));
+    });
+  }
+
+  function reapplyTableSort() {
+    SORTABLE_TABLES.forEach((table) => {
+      window.tableSort.reapply($(table.head), $(table.body));
+    });
+  }
+
+  // ------------------------------------------------------------------
   // Leaderboard
   // ------------------------------------------------------------------
 
@@ -61,6 +83,7 @@
       td.className = "muted-status";
       tr.appendChild(td);
       body.appendChild(tr);
+      reapplyTableSort();
       return;
     }
     rows.forEach((row, index) => {
@@ -68,6 +91,8 @@
       tr.appendChild(tdCell(String(index + 1)));
       const user = document.createElement("td");
       user.append(row.name || row.email);
+      // The " (you)" marker is decoration; the sort key is the name.
+      user.dataset.sortValue = row.name || row.email;
       if (me && row.id === me.id) {
         const you = document.createElement("span");
         you.className = "muted-status";
@@ -75,13 +100,14 @@
         user.appendChild(you);
       }
       tr.appendChild(user);
-      tr.appendChild(tdCell(row.active_token_count + " / " + row.token_count));
+      tr.appendChild(tdCell(row.active_token_count + " / " + row.token_count, row.token_count));
       tr.appendChild(tdCell(String(row.request_count)));
       tr.appendChild(tdCell(String(row.prompt_tokens)));
       tr.appendChild(tdCell(String(row.completion_tokens)));
       tr.appendChild(tdCell(String(row.total_tokens)));
       body.appendChild(tr);
     });
+    reapplyTableSort();
     $("board-note").textContent =
       rows.length + " users ranked by total tokens (admins excluded)";
   }
@@ -130,13 +156,19 @@
       td.className = "muted-status";
       tr.appendChild(td);
       body.appendChild(tr);
+      reapplyTableSort();
       return;
     }
     const tr = document.createElement("tr");
     tr.appendChild(tdCell(token.name));
     tr.appendChild(tdCell(token.prefix));
-    tr.appendChild(tdCell(formatDate(token.created_at)));
-    tr.appendChild(tdCell(token.last_used_at ? formatDate(token.last_used_at) : "never"));
+    tr.appendChild(tdCell(formatDate(token.created_at), token.created_at));
+    tr.appendChild(
+      tdCell(
+        token.last_used_at ? formatDate(token.last_used_at) : "never",
+        token.last_used_at || ""
+      )
+    );
     const status = document.createElement("td");
     const badge = document.createElement("span");
     badge.className = "badge badge-healthy";
@@ -150,6 +182,7 @@
     actions.appendChild(revokeButton(token));
     tr.appendChild(actions);
     body.appendChild(tr);
+    reapplyTableSort();
   }
 
   // ------------------------------------------------------------------
@@ -291,6 +324,7 @@
   }
 
   async function init() {
+    enableTableSort();
     wireTokenForm();
     try {
       me = await api("GET", "/auth/me");
