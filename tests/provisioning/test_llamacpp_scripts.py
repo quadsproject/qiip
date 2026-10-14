@@ -1677,3 +1677,36 @@ def test_storage_preflight_verifies_match_or_fails_on_wrong_export(
     bad = _run_shell(_source_start("run_storage_preflight"), env=env)
     assert bad.returncode != 0
     assert "not the expected export" in bad.stderr
+
+
+class TestLlamacppInstallVerifier:
+    """Resuming ``llamacpp_install`` must republish the runtime selection."""
+
+    def test_verifier_republishes_runtime_selection(self, tmp_path: Path) -> None:
+        runtime = tmp_path / "build"
+        runtime.mkdir()
+        selection = tmp_path / "selection"
+        cmd = (
+            f"export QIIP_RUNTIME_SELECTION={shlex.quote(str(selection))}\n"
+            "llamacpp_artifact_tool() { printf '%s\\n' \"$AUTOLLAMACPP_TEST_RUNTIME\"; }\n"
+            "llamacpp_host_identity() { printf 'identity\\n'; }\n"
+            "verify_llamacpp_binaries() { return 0; }\n"
+            "qiip_verify_llamacpp_install\n"
+        )
+        env = {**os.environ, "AUTOLLAMACPP_TEST_RUNTIME": str(runtime)}
+        result = _run_shell(_source_setup(cmd), env=env)
+        assert result.returncode == 0, result.stderr
+        assert selection.read_text().strip() == str(runtime)
+
+    def test_verifier_rejects_unverifiable_binaries(self, tmp_path: Path) -> None:
+        selection = tmp_path / "selection"
+        cmd = (
+            f"export QIIP_RUNTIME_SELECTION={shlex.quote(str(selection))}\n"
+            "llamacpp_artifact_tool() { printf '%s\\n' /opt/llama.cpp/build; }\n"
+            "llamacpp_host_identity() { printf 'identity\\n'; }\n"
+            "verify_llamacpp_binaries() { return 1; }\n"
+            "qiip_verify_llamacpp_install\n"
+        )
+        result = _run_shell(_source_setup(cmd))
+        assert result.returncode != 0
+        assert not selection.exists()

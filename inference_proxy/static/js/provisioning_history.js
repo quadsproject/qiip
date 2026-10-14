@@ -36,8 +36,10 @@ document.addEventListener("DOMContentLoaded", function () {
     if (retries) parts.push(retries + (retries === 1 ? " automatic retry" : " automatic retries"));
     var progress = attempt.progress;
     if (progress && progress.total_stages) {
-      var pct = progress.percent != null ? " (" + progress.percent + "%)" : "";
-      parts.push("progress " + progress.completed_count + "/" + progress.total_stages + pct);
+      var verified = Number(progress.completed_count || 0);
+      var pct = progress.percent != null ? progress.percent + "%" : "";
+      parts.push("progress " + (pct ? pct + " · " : "") + verified +
+        (verified === 1 ? " stage verified" : " stages verified"));
     }
     if (attempt.failure_class) parts.push("class " + String(attempt.failure_class).replace(/_/g, " "));
     if (attempt.next_action) parts.push("next: " + attempt.next_action);

@@ -109,18 +109,42 @@ install_uv() {
     return "$status"
 }
 
+vllm_runtime_marker() {
+    local python_version
+    python_version=$("$VLLM_BOOTSTRAP_PYTHON" --version)
+    printf 'schema=2\nprofile=%s\ncuda=%s\npython=%s\nuv=%s\n' \
+        "${PROFILE_NAME:-unselected}" "${PROFILE_CUDA_TOOLKIT_VERSION:-unknown}" \
+        "$python_version" "$UV_VERSION"
+    sha256sum "${UV_PROJECT}/pyproject.toml" "${UV_PROJECT}/uv.lock" | awk '{print $1}'
+}
+
+vllm_runtime_path() {
+    local identity
+    identity=$(vllm_runtime_marker | sha256sum | cut -d ' ' -f 1)
+    printf '%s/%s\n' "${VLLM_RUNTIME_ROOT%/}" "$identity"
+}
+
+# Resume support: re-derive the sealed runtime from the same marker and
+# republish the selection file that install_vllm normally writes. Without this
+# a resumed vLLM install would leave QIIP_RUNTIME_SELECTION empty and
+# generation_activate would fail with "no verified engine runtime".
+qiip_verify_vllm_install() {
+    local runtime marker
+    runtime=$(vllm_runtime_path) || return 1
+    [ -f "${runtime}/RUNTIME.json" ] || return 1
+    marker=$(vllm_runtime_marker) || return 1
+    qiip_generation_tool verify-runtime "$runtime" "$marker" >/dev/null 2>&1 || return 1
+    "${runtime}/bin/vllm" --version >/dev/null 2>&1 || return 1
+    printf '%s\n' "$runtime" > "$QIIP_RUNTIME_SELECTION"
+}
+
 install_vllm() {
     reject_retired_flashinfer_index
     install_uv
 
-    local identity runtime marker cli option python_version
-    python_version=$("$VLLM_BOOTSTRAP_PYTHON" --version)
-    marker=$(printf 'schema=2\nprofile=%s\ncuda=%s\npython=%s\nuv=%s\n' \
-        "${PROFILE_NAME:-unselected}" "${PROFILE_CUDA_TOOLKIT_VERSION:-unknown}" \
-        "$python_version" "$UV_VERSION"; \
-        sha256sum "${UV_PROJECT}/pyproject.toml" "${UV_PROJECT}/uv.lock" | awk '{print $1}')
-    identity=$(printf '%s' "$marker" | sha256sum | cut -d ' ' -f 1)
-    runtime="${VLLM_RUNTIME_ROOT%/}/${identity}"
+    local runtime marker cli option
+    marker=$(vllm_runtime_marker)
+    runtime=$(vllm_runtime_path)
     if [ -f "${runtime}/RUNTIME.json" ]; then
         qiip_generation_tool verify-runtime "$runtime" "$marker"
     else

@@ -26,13 +26,18 @@ _SOURCE_RECORD_BUDGET = 201
 # Ordered setup stages whose completion is checkpointed by ``[STEP:...]``.
 # This module is uploaded to nodes and must stay stdlib-only, so the canonical
 # order lives here and ``recovery`` imports it for its bounded progress view.
+# ``tests/provisioning/test_setup_script.py`` asserts this tuple matches the
+# ``[STEP:...]`` markers the engine scripts actually emit, so the list cannot
+# silently drift from the scripts again.
 SETUP_STAGE_ORDER: tuple[str, ...] = (
     "check_install_capacity",
     "system_prerequisites",
+    "runtime_prerequisites",
     "nvidia_driver",
     "cuda_toolkit",
     "fabric_manager",
     "cuda_proof",
+    "llamacpp_toolchain",
     "vllm_install",
     "llamacpp_install",
     "nfs_mount",
@@ -40,33 +45,93 @@ SETUP_STAGE_ORDER: tuple[str, ...] = (
     "llmfit_install",
     "generation_activate",
     "vllm_unit",
-    "llamacpp_unit",
 )
+
+# The stages each engine can emit, in pipeline order. A single union order
+# cannot distinguish an optional stage from a required one, so progress is
+# computed per engine and reaches 100% when the terminal stage completes.
+SETUP_ENGINE_STAGES: dict[str, tuple[str, ...]] = {
+    "vllm": (
+        "check_install_capacity",
+        "system_prerequisites",
+        "runtime_prerequisites",
+        "nvidia_driver",
+        "cuda_toolkit",
+        "fabric_manager",
+        "cuda_proof",
+        "vllm_install",
+        "nfs_mount",
+        "firewall",
+        "llmfit_install",
+        "generation_activate",
+        "vllm_unit",
+    ),
+    "llama_cpp": (
+        "check_install_capacity",
+        "system_prerequisites",
+        "runtime_prerequisites",
+        "nvidia_driver",
+        "fabric_manager",
+        "llamacpp_toolchain",
+        "cuda_toolkit",
+        "cuda_proof",
+        "llamacpp_install",
+        "nfs_mount",
+        "firewall",
+        "llmfit_install",
+        "generation_activate",
+    ),
+}
+
+# Only these stage names may be checkpointed. ``generation_activate`` is
+# deliberately absent from the resumable set: it is the cheap step that makes
+# a freshly separated upload live and must run on every attempt.
+NON_RESUMABLE_STAGES = frozenset({"generation_activate"})
+_ALLOWED_CHECKPOINT_STAGES = frozenset(SETUP_STAGE_ORDER)
+_MAX_CHECKPOINTS = 32
 
 
 def timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()  # noqa: UP017 - node Python 3.9
 
 
-def setup_progress(completed: dict[str, Any]) -> dict[str, Any]:
+def _stage_order(engine: str | None) -> tuple[str, ...]:
+    if engine:
+        return SETUP_ENGINE_STAGES.get(engine, SETUP_STAGE_ORDER)
+    return SETUP_STAGE_ORDER
+
+
+def setup_progress(
+    completed: dict[str, Any], *, engine: str | None = None
+) -> dict[str, Any]:
     """Summarize checkpoint state for operators.
 
-    Progress counts only stages in :data:`SETUP_STAGE_ORDER` so an unknown
-    vendor marker cannot report 100% before the real sequence finishes.
+    Only known stages count, so an unknown vendor marker cannot report 100%
+    early. ``percent`` measures pipeline position, not the fraction of every
+    possible stage: a stage a host legitimately does not need (an already
+    compatible driver, a skipped source build) must not cap the bar below 100%
+    once the terminal stage completes.
     """
-    done = {
+    stages = _stage_order(engine)
+    indexes = {stage: index for index, stage in enumerate(stages)}
+    done = [
         stage
-        for stage in SETUP_STAGE_ORDER
+        for stage in stages
         if str(completed.get(stage, "")).lower() in {"completed", "skipped"}
-    }
+    ]
+    passed = max((indexes[stage] + 1 for stage in done), default=0)
     failed = sorted(
-        stage for stage, status in completed.items() if str(status).lower() == "failed"
+        stage
+        for stage, status in completed.items()
+        if str(status).lower() == "failed" and stage in indexes
     )
+    total = len(stages)
     return {
-        "completed_stages": [stage for stage in SETUP_STAGE_ORDER if stage in done],
-        "total_stages": len(SETUP_STAGE_ORDER),
+        "completed_stages": done,
         "completed_count": len(done),
-        "percent": round(100 * len(done) / len(SETUP_STAGE_ORDER), 1),
+        "stages_passed": passed,
+        "total_stages": total,
+        "percent": round(100 * passed / total, 1) if total else 0.0,
         "failed_stages": failed,
     }
 
@@ -495,10 +560,14 @@ class AttemptLogStore:
         checkpoint map. ``completed_at`` is set once for terminal statuses so a
         resumed attempt keeps the original evidence timestamp.
         """
+        if stage not in _ALLOWED_CHECKPOINT_STAGES:
+            return
         terminal = status in {"completed", "skipped", "failed"}
 
         def mutate(metadata: dict[str, Any]) -> None:
             checkpoints = metadata.setdefault("checkpoints", {})
+            if stage not in checkpoints and len(checkpoints) >= _MAX_CHECKPOINTS:
+                return
             current = checkpoints.get(stage) or {}
             now = timestamp()
             checkpoint = {
@@ -519,7 +588,8 @@ class AttemptLogStore:
             metadata["checkpoints"] = checkpoints
             metadata["current_stage"] = stage
             metadata["progress"] = setup_progress(
-                {name: cp.get("status") for name, cp in checkpoints.items()}
+                {name: cp.get("status") for name, cp in checkpoints.items()},
+                engine=metadata.get("engine"),
             )
             if status == "running":
                 # A fresh stage means the previous failure is superseded.
@@ -562,7 +632,7 @@ class AttemptLogStore:
             if metadata.get("plan_id") != plan_id:
                 continue
             for stage, checkpoint in (metadata.get("checkpoints") or {}).items():
-                if stage in decided:
+                if stage in NON_RESUMABLE_STAGES or stage in decided:
                     continue
                 decided.add(stage)
                 if checkpoint.get("status") in {"completed", "skipped"}:

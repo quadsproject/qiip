@@ -1194,8 +1194,9 @@ class TestTasksEndpoint:
             "retry_count": 1,
             "progress": {
                 "completed_count": 3,
-                "total_stages": 14,
-                "percent": 21.4,
+                "stages_passed": 6,
+                "total_stages": 13,
+                "percent": 46.2,
             },
             "failure_class": "transient",
             "next_action": "Retry setup; verified stages resume automatically",
@@ -1211,6 +1212,7 @@ class TestTasksEndpoint:
         assert body["failure_class"] == "transient"
         assert body["next_action"].startswith("Retry setup")
         assert body["progress"]["completed_count"] == 3
+        assert body["progress"]["percent"] == 46.2
 
     def test_returns_tasks_from_etcd(
         self,

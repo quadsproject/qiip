@@ -208,6 +208,15 @@ class SetupResumeRequiredError(ProvisioningError):
         self.resume_state = state
 
 
+class SetupDeadlineError(ProvisioningError):
+    """One setup attempt exceeded its stage-specific total deadline.
+
+    Deliberately not a ``TimeoutError``: a download socket timeout is
+    transient, but the run's own deadline expiring is terminal. Retrying it
+    automatically would only repeat the exhausted wait.
+    """
+
+
 class SelfSetupError(Exception):
     """Raised when an already-running OpenAI-compatible server cannot be adopted."""
 
@@ -541,6 +550,18 @@ class NodeProvisioner:
     def log_buffer(self) -> ProvisioningLogBuffer:
         return self._log_buffer
 
+    def _bundle_version(self, engine: InferenceEngine) -> str:
+        """Return the content digest of the scripts uploaded for *engine*.
+
+        The bundle identity is part of the setup plan: a re-uploaded script
+        that changes an install or build must invalidate completed stages even
+        when every configured setting is unchanged.
+        """
+        identity, _manifest = bundle_manifest(
+            bundle_files(self._engine_scripts_dir(engine), self._common_scripts_dir())
+        )
+        return "sha256:" + identity
+
     def _begin_log(
         self,
         hostname: str,
@@ -551,16 +572,14 @@ class NodeProvisioner:
         plan_id: str | None = None,
         setup_inputs: dict[str, Any] | None = None,
     ) -> None:
-        identity, _manifest = bundle_manifest(
-            bundle_files(self._engine_scripts_dir(engine), self._common_scripts_dir())
-        )
+        bundle_version = self._bundle_version(engine)
         self._log_buffer.create(
             hostname,
             engine=engine.value,
             model=model,
             operation=operation,
-            bundle_version="sha256:" + identity,
-            plan_id=plan_id or "sha256:" + identity,
+            bundle_version=bundle_version,
+            plan_id=plan_id or bundle_version,
             setup_inputs=setup_inputs,
         )
         if self._log_buffer.store is not None and self._remote_logs is not None:
@@ -823,6 +842,11 @@ class NodeProvisioner:
         """
         inputs: dict[str, Any] = {
             "engine": engine.value,
+            "bundle_version": self._bundle_version(engine),
+            # AUTOVLLM_API_PORT / AUTOLLAMACPP_PORT feed configure_firewall,
+            # the systemd unit, and the generation config, so a port change
+            # must invalidate those completed stages too.
+            "api_port": self._settings.vllm_port,
             "nfs_export": self._required_nfs_export(),
             "nfs_mount_point": self._settings.nfs_mount_point,
             "nvidia_driver_version": self._settings.nvidia_driver_version,
@@ -2685,7 +2709,6 @@ class NodeProvisioner:
             self._log(hostname, "info", "Provisioning complete")
         except Exception as exc:
             self._log(hostname, "error", f"Failed at step '{current_step}': {exc}")
-            self._record_failure_classification(hostname, exc)
             await self._update_state(
                 hostname,
                 ProvisioningStep.FAILED,
@@ -2859,6 +2882,7 @@ class NodeProvisioner:
         attempt_id = self._log_buffer.attempts.get(hostname)
         step_name = "setup"
         captured_failure = False
+        timeout = self._setup_engine_timeout(engine)
 
         def track_step(step: str) -> None:
             nonlocal step_name
@@ -2867,14 +2891,14 @@ class NodeProvisioner:
 
         for attempt in range(1, policy.max_attempts + 1):
             try:
-                async with asyncio.timeout(self._setup_engine_timeout(engine)):
-                    await self._run_setup(
-                        hostname,
-                        started_at=started_at,
-                        on_step=track_step,
-                        engine=engine,
-                        plan_id=plan_id,
-                    )
+                await self._run_setup_once(
+                    hostname,
+                    started_at=started_at,
+                    on_step=track_step,
+                    engine=engine,
+                    plan_id=plan_id,
+                    timeout=timeout,
+                )
                 # A recovered transient failure is not a failure: drop the
                 # provisional record while keeping the retry history.
                 if captured_failure and store is not None and attempt_id is not None:
@@ -2894,6 +2918,10 @@ class NodeProvisioner:
                     failure_class != FailureClass.TRANSIENT
                     or attempt >= policy.max_attempts
                 ):
+                    # Terminal for this attempt chain. Record the classification
+                    # and the operator action the *setup* failure implies; a
+                    # later launch/health failure is classified elsewhere.
+                    self._record_failure_classification(hostname, exc)
                     raise
                 delay = policy.delay(attempt)
                 # Reconcile before retry: never duplicate a live remote phase.
@@ -2924,6 +2952,40 @@ class NodeProvisioner:
                 )
                 await asyncio.sleep(delay)
 
+    async def _run_setup_once(
+        self,
+        hostname: str,
+        *,
+        started_at: datetime,
+        on_step: Callable[[str], None],
+        engine: InferenceEngine,
+        plan_id: str | None,
+        timeout: float,
+    ) -> None:
+        """Run one setup attempt under its stage-specific total deadline.
+
+        ``asyncio.timeout`` raises ``TimeoutError`` on expiry, which is also
+        the type of an ordinary socket timeout. ``Timeout.expired()``
+        distinguishes the two: the run's own deadline is a terminal
+        :class:`SetupDeadlineError`, while a socket timeout stays
+        transient and eligible for the bounded retry.
+        """
+        try:
+            async with asyncio.timeout(timeout) as deadline:
+                await self._run_setup(
+                    hostname,
+                    started_at=started_at,
+                    on_step=on_step,
+                    engine=engine,
+                    plan_id=plan_id,
+                )
+        except TimeoutError:
+            if deadline.expired():
+                raise SetupDeadlineError(
+                    f"setup exceeded its {timeout:.0f}s stage deadline"
+                ) from None
+            raise
+
     def _setup_engine_timeout(self, engine: InferenceEngine) -> float:
         """Return the stage-specific total deadline for one setup run."""
         return (
@@ -2950,24 +3012,24 @@ class NodeProvisioner:
             "setup.sh",
             env=env,
         )
+        # The node must bound the same run the gateway bounds: pass the
+        # engine's stage deadline on both the durable-recorder and direct-SSH
+        # paths so a stuck command cannot outlive the gateway's wait.
+        timeout = self._setup_engine_timeout(engine)
         output: AsyncIterator[tuple[str, str]]
         if self._remote_logs is not None:
             output = self._remote_logs.run(
                 hostname,
                 command,
                 stage="setup",
-                timeout=self._settings.llamacpp_setup_timeout
-                if engine == InferenceEngine.LLAMA_CPP
-                else None,
+                timeout=timeout,
             )
-        elif engine == InferenceEngine.LLAMA_CPP:
+        else:
             output = self._ssh_client.run_streaming(
                 hostname,
                 command,
-                total_timeout=self._settings.llamacpp_setup_timeout,
+                total_timeout=timeout,
             )
-        else:
-            output = self._ssh_client.run_streaming(hostname, command)
         resume: SetupResumeRequiredError | None = None
         try:
             async for stream, line in output:

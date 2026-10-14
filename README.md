@@ -1386,6 +1386,11 @@ controlled source fallback for the attached NVIDIA GPUs. Gateway settings:
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_BUILD_JOBS` | `0` | Compiler-job ceiling; automatic sizing (`0`) and explicit ceilings both respect available CPU and RAM |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT` | `7200` | Total wall-clock deadline for the llama.cpp setup command, including the CUDA source build (seconds) |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB` | `512` | Free VRAM margin per GPU enforced by the llama.cpp capacity planner (MiB) |
+| `INFERENCE_PROXY_PROVISIONING__VLLM_SETUP_TIMEOUT` | `3600` | Total wall-clock deadline for the vLLM setup command, including the wheel/project sync (seconds) |
+| `INFERENCE_PROXY_PROVISIONING__STAGE_RETRY_MAX_ATTEMPTS` | `3` | Total setup attempts for a recognized transient failure, including the first |
+| `INFERENCE_PROXY_PROVISIONING__STAGE_RETRY_BASE_DELAY` | `5.0` | Base delay before the first jittered retry delay (seconds) |
+| `INFERENCE_PROXY_PROVISIONING__STAGE_RETRY_MAX_DELAY` | `120.0` | Upper bound on a single retry delay (seconds) |
+| `INFERENCE_PROXY_PROVISIONING__STAGE_RETRY_JITTER` | `0.25` | Fractional jitter applied to each retry delay (`0`-.`1`) |
 | `INFERENCE_PROXY_PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS` | `4` | Total automatic-mode vLLM launch attempts, including the first; `1` disables memory-failure retries |
 
 Changing `LLAMACPP_VERSION` requires an explicitly configured matching digest.
@@ -1481,6 +1486,35 @@ Node-side launch tuning uses the `AUTOVLLM_*` namespace. The retired
 `start-vllm.sh`. All seven reserved legacy inputs, including `VLLM_MODEL` and
 `VLLM_PORT`, are removed from the child environment so script inputs cannot
 leak into the namespace reserved by vLLM itself.
+
+### Setup resume and transient retries
+
+Setup persists the plan inputs, per-stage checkpoints, attempt relationships,
+and retry history in the durable attempt database. Each attempt derives a plan
+id from a canonical digest of the inputs that change what setup does: the
+engine, model and artifact, NFS export, the content digest of the uploaded
+script bundle, and the API port. A later attempt only resumes stages whose
+recorded checkpoint has the same plan id and whose stage-specific verifier
+still passes on the node; any input change invalidates every checkpoint so the
+stage runs again. `generation_activate`, the cheap step that makes a freshly
+separated engine upload live, is always re-run and never resumed.
+
+Only recognized transient download, repository, and SSH transport failures are
+retried automatically. Retries use bounded exponential backoff with jitter
+(`STAGE_RETRY_MAX_ATTEMPTS`, `STAGE_RETRY_BASE_DELAY`, `STAGE_RETRY_MAX_DELAY`,
+`STAGE_RETRY_JITTER`), and the gateway reconciles remote ownership and stops a
+failed engine before re-running. Invalid configuration (a bad credential,
+missing artifact, or untrusted certificate), unsupported hardware, and
+explicit maintenance boundaries are never retried automatically. The
+`LLAMACPP_SETUP_TIMEOUT` and `VLLM_SETUP_TIMEOUT` deadlines bound each engine's
+run; a run that exhausts its own deadline is terminal and is not retried.
+
+The attempt list shows the attempt number, retry count, current stage, percent
+of the ordered pipeline passed, and the next operator action. The CUDA
+probe (`cuda_proof`) deliberately re-runs every attempt because it must reflect
+the current driver and device state before a reboot decision; every other
+expensive stage (package installation, vLLM sync, the llama.cpp source build)
+is resumed when its checkpoint and verifier still hold.
 
 ### HuggingFace model downloads
 

@@ -746,6 +746,8 @@ async def test_llamacpp_setup_uses_its_extended_total_timeout() -> None:
 
 async def _async_iter(
     items: list[tuple[str, str]],
+    *,
+    total_timeout: float | None = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Helper: async generator yielding items."""
     for item in items:
@@ -803,6 +805,8 @@ class TestProvisionSequence:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             if "setup.sh" in command:
                 call_order.append("setup")
@@ -1038,6 +1042,8 @@ class TestScriptUpload:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             if "setup.sh" in command:
                 call_order.append("setup")
@@ -1110,6 +1116,8 @@ class TestStepMarkerParsing:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             for item in [
                 ("stdout", "[STEP:system_update:START]"),
@@ -1143,6 +1151,8 @@ class TestModelExtraction:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             for item in [
                 ("stdout", "Starting container..."),
@@ -1164,6 +1174,8 @@ class TestModelExtraction:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             for item in [("stdout", "no model line here")]:
                 yield item
@@ -1181,6 +1193,8 @@ class TestModelExtraction:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("stdout", "# Model:              wrong/model")
 
@@ -1203,6 +1217,8 @@ class TestModelExtraction:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             captured_commands.append(command)
             for item in [("stdout", "# Model:              org/model")]:
@@ -1226,6 +1242,8 @@ class TestModelExtraction:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             captured_commands.append(command)
             for item in [("stdout", "# Model:              auto-detected")]:
@@ -1246,6 +1264,8 @@ class TestModelExtraction:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             captured_commands.append(command)
             for item in [("stdout", "# Model:              safe")]:
@@ -1719,6 +1739,8 @@ class TestSetupFailure:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("stdout", "[STEP:system_update:START]")
             raise RemoteCommandError("host1", "bash setup.sh", 1)
@@ -1746,6 +1768,8 @@ class TestSetupFailure:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             raise SSHConnectionError("host1", "connection refused")
             # Make it an async generator
@@ -1793,7 +1817,10 @@ class TestProvisioningFailureAccuracy:
         ssh.upload = AsyncMock()
 
         async def setup_output(
-            host: str, command: str
+            host: str,
+            command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             assert "setup.sh" in command
             for line in result.stdout.splitlines():
@@ -1846,7 +1873,10 @@ class TestProvisioningFailureAccuracy:
         ssh.upload = AsyncMock()
 
         async def setup_resume(
-            host: str, command: str
+            host: str,
+            command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             assert "setup.sh" in command
             yield "stdout", "[STEP:nvidia_driver:START]"
@@ -1969,6 +1999,8 @@ class TestProvisioningFailureAccuracy:
         async def setup_failure(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             assert host == "host1"
             assert "setup.sh" in command
@@ -1993,6 +2025,8 @@ class TestProvisioningFailureAccuracy:
         async def setup_failure(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("stdout", "[STEP:system_update:START]")
             raise RuntimeError("setup interrupted")
@@ -2019,6 +2053,8 @@ class TestProvisioningFailureAccuracy:
         async def setup_warning(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("stdout", "[STEP:llmfit_install:WARN]")
             raise RuntimeError("later setup failure")
@@ -2062,6 +2098,8 @@ class TestProvisioningFailureAccuracy:
         async def stopped(
             _host: str,
             _command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             if False:  # pragma: no cover - defines an empty async generator
                 yield ("stdout", "")
@@ -2104,6 +2142,8 @@ class TestProvisioningFailureAccuracy:
         async def stopped(
             _host: str,
             _command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             if False:  # pragma: no cover - defines an empty async generator
                 yield ("stdout", "")
@@ -2859,6 +2899,8 @@ def _make_full_provisioner(etcd: MagicMock) -> tuple[NodeProvisioner, MagicMock]
     async def mock_streaming(
         host: str,
         command: str,
+        *,
+        total_timeout: float | None = None,
     ) -> AsyncIterator[tuple[str, str]]:
         if "setup.sh" in command:
             for item in [
@@ -2942,6 +2984,8 @@ class TestStateTracking:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             if "setup.sh" in command:
                 raise RemoteCommandError("host1", "bash setup.sh", 1)
@@ -3188,6 +3232,8 @@ def _make_teardown_provisioner(
     async def mock_streaming(
         host: str,
         command: str,
+        *,
+        total_timeout: float | None = None,
     ) -> AsyncIterator[tuple[str, str]]:
         for item in [("stdout", "ok")]:
             yield item
@@ -3338,6 +3384,8 @@ class TestTeardownGraceful:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             commands.append(command)
             operation_order.append("stop")
@@ -3375,6 +3423,8 @@ class TestTeardownGraceful:
         async def capture_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             assert host == "host1"
             commands.append(command)
@@ -3443,6 +3493,8 @@ class TestTeardownGraceful:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             assert host == "host1"
             commands.append(command)
@@ -3504,6 +3556,8 @@ class TestTeardownForce:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             commands.append(command)
             for item in [("stdout", "ok")]:
@@ -3619,6 +3673,8 @@ class TestTeardownSSHFailure:
         async def failing_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             raise SSHConnectionError("host1", "connection refused")
             yield  # pragma: no cover
@@ -3651,6 +3707,8 @@ class TestTeardownSSHFailure:
         async def failing_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             assert shlex.split(command)[-2:] == ["stop-vllm.sh", "--force"]
             raise RemoteCommandError(host, command, 1, "process survived")

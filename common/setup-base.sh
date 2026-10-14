@@ -143,7 +143,9 @@ checkpoint_plan_sync() {
         echo "Setup plan changed; invalidating completed stage checkpoints"
     fi
     if [ ! -f "$file" ] || ! grep -qx "plan:${plan}" "$file" 2>/dev/null; then
-        printf 'plan:%s\n' "$plan" > "$file"
+        # A non-root SSH user may not own the state directory. Checkpoints are
+        # an optimization: degrade to a full re-run rather than aborting setup.
+        printf 'plan:%s\n' "$plan" > "$file" 2>/dev/null || return 0
     fi
 }
 
@@ -153,7 +155,7 @@ record_checkpoint() {
     file="$(checkpoint_file)"
     mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
     if ! grep -qx "stage:${name}" "$file" 2>/dev/null; then
-        printf 'stage:%s\n' "$name" >> "$file"
+        printf 'stage:%s\n' "$name" >> "$file" 2>/dev/null || return 0
     fi
 }
 
@@ -194,6 +196,10 @@ qiip_verify_cuda_toolkit() {
 
 qiip_verify_llmfit_install() {
     command -v llmfit >/dev/null 2>&1
+}
+
+qiip_verify_runtime_prerequisites() {
+    command -v wget >/dev/null 2>&1 && rpm -q nfs-utils >/dev/null 2>&1
 }
 
 # Install only absent packages: an ordinary retry must not upgrade the OS.
@@ -485,9 +491,9 @@ prepare_runtime() {
     RECOVERY_DRIVER_MIN="$PROFILE_DRIVER_MIN"
     RECOVERY_DRIVER_MAX_BRANCH="$PROFILE_DRIVER_MAX_BRANCH"
     if [ "$engine" = "llamacpp" ] && [ "$deferred_cuda" = "1" ]; then
-        step system_prerequisites install_missing_packages wget nfs-utils python3
+        step runtime_prerequisites install_missing_packages wget nfs-utils python3
     else
-        step system_prerequisites install_runtime_prerequisites "$engine"
+        step runtime_prerequisites install_runtime_prerequisites "$engine"
     fi
     if installed_driver_compatible; then compatibility_status=0; else compatibility_status=$?; fi
     if [ "$compatibility_status" -ne 0 ]; then

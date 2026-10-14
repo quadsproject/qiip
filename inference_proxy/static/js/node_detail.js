@@ -817,7 +817,8 @@ async function refreshDetail() {
 
         var tdErr = document.createElement("td");
         var progressNote = task.progress && task.progress.total_stages
-          ? "progress " + task.progress.completed_count + "/" + task.progress.total_stages
+          ? (task.progress.percent != null ? task.progress.percent + "% · " : "") +
+            Number(task.progress.completed_count || 0) + " stages verified"
           : "";
         if (task.error) { tdErr.className = "error-text"; tdErr.textContent = task.error + (progressNote ? " · " + progressNote : ""); }
         else { tdErr.textContent = progressNote || "—"; }
