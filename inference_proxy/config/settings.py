@@ -352,6 +352,17 @@ class ProvisioningSettings(BaseModel):
     # retries). Attempt zero is the initial memory-aware plan; each retry
     # applies one logged adjustment from the ordered policy.
     vllm_memory_retry_max_attempts: int = Field(default=4, ge=1, le=5)
+    # Issue #133: stage-specific total deadline for the vLLM setup phase
+    # (package download, dependency resolution, and virtualenv sync). llama.cpp
+    # keeps its longer build deadline in ``llamacpp_setup_timeout``.
+    vllm_setup_timeout: float = Field(default=3600.0, gt=0)
+    # Bounded automatic retry of recognized transient setup failures
+    # (download/repository/SSH). Configuration, unsupported-hardware, and
+    # maintenance failures are never retried automatically.
+    stage_retry_max_attempts: int = Field(default=3, ge=1, le=6)
+    stage_retry_base_delay: float = Field(default=5.0, gt=0, le=600)
+    stage_retry_max_delay: float = Field(default=120.0, gt=0, le=3600)
+    stage_retry_jitter: float = Field(default=0.25, ge=0, lt=1)
 
     @field_validator("generation_root")
     @classmethod

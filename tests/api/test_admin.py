@@ -219,6 +219,11 @@ class TestAdminNodesPopulated:
             "resume_state",
             "placement_blocker",
             "owner",
+            "attempt_number",
+            "retry_count",
+            "progress",
+            "failure_class",
+            "next_action",
         }
         assert set(node.keys()) == expected
         assert "last_heartbeat" not in node
@@ -341,6 +346,11 @@ class TestAdminNodesPopulated:
                 "error": None,
                 "resume_state": None,
                 "placement_blocker": None,
+                "attempt_number": None,
+                "retry_count": 0,
+                "progress": None,
+                "failure_class": None,
+                "next_action": None,
             }
         ]
         assert any(
@@ -1171,6 +1181,36 @@ class TestTasksEndpoint:
         response = client.get("/admin/provisioning/tasks")
         assert response.status_code == 200
         assert response.json()[0]["resume_state"] == resume_state
+
+    def test_recovery_visibility_survives_task_response(
+        self, client: TestClient, mock_provisioner: MagicMock
+    ) -> None:
+        task_data = {
+            "hostname": "gpu01",
+            "current_step": "setup",
+            "started_at": "2026-07-07T12:00:00Z",
+            "updated_at": "2026-07-07T12:05:00Z",
+            "attempt_number": 2,
+            "retry_count": 1,
+            "progress": {
+                "completed_count": 3,
+                "total_stages": 14,
+                "percent": 21.4,
+            },
+            "failure_class": "transient",
+            "next_action": "Retry setup; verified stages resume automatically",
+        }
+        mock_provisioner.list_tasks_raw.return_value = [
+            (json.dumps(task_data).encode(), {"key": b"/provisioning/gpu01"}),
+        ]
+        response = client.get("/admin/provisioning/tasks")
+        assert response.status_code == 200
+        body = response.json()[0]
+        assert body["attempt_number"] == 2
+        assert body["retry_count"] == 1
+        assert body["failure_class"] == "transient"
+        assert body["next_action"].startswith("Retry setup")
+        assert body["progress"]["completed_count"] == 3
 
     def test_returns_tasks_from_etcd(
         self,

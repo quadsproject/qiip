@@ -1437,3 +1437,138 @@ exit 1
     result = _run_shell(_source_and("nfs_server_reachable"), env=env)
     assert result.returncode == 0, result.stderr
     assert "reachable at [2001:db8::1]:2049" in result.stdout
+
+
+class TestStageCheckpoints:
+    """Stage checkpoints persist, resume, and invalidate (issue #133)."""
+
+    def _checkpoint_file(self, tmp_path: Path) -> Path:
+        return tmp_path / "checkpoints"
+
+    def test_compatible_stage_is_skipped_without_rerunning(
+        self, tmp_path: Path
+    ) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=firewall\n"
+            "checkpoint_plan_sync\n"
+            "record_checkpoint firewall\n"
+            # A non-zero command proves the stage body is not executed on resume.
+            "step firewall false\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:SKIP]" in result.stdout
+        assert "[STEP:firewall:FAIL]" not in result.stdout
+
+    def test_completed_stage_is_recorded_for_compatible_plan(
+        self, tmp_path: Path
+    ) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "step firewall true\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:START]" in result.stdout
+        assert "[STEP:firewall:OK]" in result.stdout
+        assert "plan:sha256:plan-a" in checkpoint.read_text()
+        assert "stage:firewall" in checkpoint.read_text()
+
+    def test_soft_step_resumes_as_skip(self, tmp_path: Path) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=fabric_manager\n"
+            "checkpoint_plan_sync\n"
+            "record_checkpoint fabric_manager\n"
+            "soft_step fabric_manager false\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:fabric_manager:SKIP]" in result.stdout
+        assert "[STEP:fabric_manager:WARN]" not in result.stdout
+
+    def test_changed_plan_invalidates_previous_checkpoints(
+        self, tmp_path: Path
+    ) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        checkpoint.write_text("plan:sha256:old\nstage:firewall\n")
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:new\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=firewall\n"
+            # The gateway still lists the stage, but the plan id changed, so the
+            # node must invalidate and re-run it.
+            "step firewall true\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "Setup plan changed" in result.stdout
+        assert "[STEP:firewall:SKIP]" not in result.stdout
+        assert "[STEP:firewall:OK]" in result.stdout
+        text = checkpoint.read_text()
+        assert "plan:sha256:new" in text
+        assert "plan:sha256:old" not in text
+
+    def test_stage_not_listed_by_gateway_is_rerun(self, tmp_path: Path) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        checkpoint.write_text("plan:sha256:plan-a\nstage:firewall\n")
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=nvidia_driver\n"
+            "step firewall true\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:SKIP]" not in result.stdout
+        assert "[STEP:firewall:OK]" in result.stdout
+
+    def test_without_plan_id_no_checkpoint_side_effects(self, tmp_path: Path) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        cmd = (
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "step firewall true\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:OK]" in result.stdout
+        assert not checkpoint.exists()
+
+    def test_verifier_failure_reruns_the_stage(self, tmp_path: Path) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=firewall\n"
+            "checkpoint_plan_sync\n"
+            "record_checkpoint firewall\n"
+            # The stage-specific verifier rejects the recorded evidence.
+            "qiip_verify_firewall() { return 1; }\n"
+            "step firewall true\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:SKIP]" not in result.stdout
+        assert "[STEP:firewall:OK]" in result.stdout
+
+    def test_passing_verifier_allows_skip(self, tmp_path: Path) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=firewall\n"
+            "checkpoint_plan_sync\n"
+            "record_checkpoint firewall\n"
+            "qiip_verify_firewall() { return 0; }\n"
+            "step firewall false\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:SKIP]" in result.stdout

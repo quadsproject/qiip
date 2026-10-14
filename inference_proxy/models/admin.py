@@ -87,6 +87,11 @@ class AdminNodeResponse(BaseModel):
     resume_state: ProvisioningResumeState | None = None
     placement_blocker: str | None = None
     owner: str = ""
+    attempt_number: int | None = None
+    retry_count: int = 0
+    progress: dict[str, object] | None = None
+    failure_class: str | None = None
+    next_action: str | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -242,6 +247,11 @@ class TaskStatusResponse(BaseModel):
     failed_step: str | None = None
     error: str | None = None
     resume_state: ProvisioningResumeState | None = None
+    attempt_number: int | None = None
+    retry_count: int = 0
+    progress: dict[str, object] | None = None
+    failure_class: str | None = None
+    next_action: str | None = None
 
 
 class QUADSStatusResponse(BaseModel):

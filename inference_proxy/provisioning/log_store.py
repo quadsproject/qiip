@@ -23,9 +23,52 @@ from typing import Any
 
 _SOURCE_RECORD_BUDGET = 201
 
+# Ordered setup stages whose completion is checkpointed by ``[STEP:...]``.
+# This module is uploaded to nodes and must stay stdlib-only, so the canonical
+# order lives here and ``recovery`` imports it for its bounded progress view.
+SETUP_STAGE_ORDER: tuple[str, ...] = (
+    "check_install_capacity",
+    "system_prerequisites",
+    "nvidia_driver",
+    "cuda_toolkit",
+    "fabric_manager",
+    "cuda_proof",
+    "vllm_install",
+    "llamacpp_install",
+    "nfs_mount",
+    "firewall",
+    "llmfit_install",
+    "generation_activate",
+    "vllm_unit",
+    "llamacpp_unit",
+)
+
 
 def timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()  # noqa: UP017 - node Python 3.9
+
+
+def setup_progress(completed: dict[str, Any]) -> dict[str, Any]:
+    """Summarize checkpoint state for operators.
+
+    Progress counts only stages in :data:`SETUP_STAGE_ORDER` so an unknown
+    vendor marker cannot report 100% before the real sequence finishes.
+    """
+    done = {
+        stage
+        for stage in SETUP_STAGE_ORDER
+        if str(completed.get(stage, "")).lower() in {"completed", "skipped"}
+    }
+    failed = sorted(
+        stage for stage, status in completed.items() if str(status).lower() == "failed"
+    )
+    return {
+        "completed_stages": [stage for stage in SETUP_STAGE_ORDER if stage in done],
+        "total_stages": len(SETUP_STAGE_ORDER),
+        "completed_count": len(done),
+        "percent": round(100 * len(done) / len(SETUP_STAGE_ORDER), 1),
+        "failed_stages": failed,
+    }
 
 
 class AttemptLogStore:
@@ -129,6 +172,8 @@ class AttemptLogStore:
         bundle_version: str = "unknown",
         operation: str = "provision",
         attempt_id: str | None = None,
+        plan_id: str | None = None,
+        setup_inputs: dict[str, Any] | None = None,
     ) -> str:
         attempt_id = attempt_id or uuid.uuid4().hex
         metadata: dict[str, Any] = dict(
@@ -145,6 +190,16 @@ class AttemptLogStore:
             sources={},
             issues=[],
             finished_at=None,
+            # Issue #133: stage checkpoints are bound to the setup plan so a
+            # compatible retry can resume verified work and a changed plan
+            # invalidates it. Extra keys are additive to the manifest.
+            plan_id=plan_id,
+            setup_inputs=dict(setup_inputs or {}),
+            checkpoints={},
+            progress=None,
+            failure_class=None,
+            next_action=None,
+            transient_retries=0,
         )
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -409,6 +464,108 @@ class AttemptLogStore:
                 "ORDER BY MAX(created) DESC"
             ).fetchall()
             return [row["hostname"] for row in rows]
+
+    def _mutate_metadata(self, attempt_id: str, mutate: Any) -> dict[str, Any]:
+        """Atomically read-modify-write one attempt manifest."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT metadata FROM attempts WHERE id=?", (attempt_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(attempt_id)
+            metadata = json.loads(row[0])
+            mutate(metadata)
+            self._update(db, attempt_id, metadata)
+            return metadata
+
+    def record_checkpoint(
+        self,
+        attempt_id: str,
+        stage: str,
+        status: str,
+        *,
+        evidence: str | None = None,
+    ) -> None:
+        """Persist completion evidence for one setup stage.
+
+        Idempotent and atomic: concurrent retries cannot interleave a partial
+        checkpoint map. ``completed_at`` is set once for terminal statuses so a
+        resumed attempt keeps the original evidence timestamp.
+        """
+        terminal = status in {"completed", "skipped", "failed"}
+
+        def mutate(metadata: dict[str, Any]) -> None:
+            checkpoints = metadata.setdefault("checkpoints", {})
+            current = checkpoints.get(stage) or {}
+            now = timestamp()
+            checkpoint = {
+                "stage": stage,
+                "status": status,
+                "plan_id": metadata.get("plan_id"),
+                "attempt_id": attempt_id,
+                "attempt_number": metadata.get("attempt_number"),
+                "started_at": current.get("started_at") or now,
+                "completed_at": current.get("completed_at")
+                or (now if terminal else None),
+                "evidence": (evidence or current.get("evidence") or "")[:1024] or None,
+            }
+            if status in {"running", "failed"}:
+                # Re-running invalidates the previous terminal evidence.
+                checkpoint["completed_at"] = None if status == "running" else now
+            checkpoints[stage] = checkpoint
+            metadata["checkpoints"] = checkpoints
+            metadata["current_stage"] = stage
+            metadata["progress"] = setup_progress(
+                {name: cp.get("status") for name, cp in checkpoints.items()}
+            )
+            if status == "running":
+                # A fresh stage means the previous failure is superseded.
+                metadata["failure_class"] = None
+                metadata["next_action"] = None
+
+        self._mutate_metadata(attempt_id, mutate)
+
+    def increment_transient_retry(self, attempt_id: str) -> int:
+        """Count one automatic transient retry and return the new total."""
+
+        def mutate(metadata: dict[str, Any]) -> None:
+            metadata["transient_retries"] = (
+                int(metadata.get("transient_retries") or 0) + 1
+            )
+            metadata["last_transient_retry_at"] = timestamp()
+
+        metadata = self._mutate_metadata(attempt_id, mutate)
+        return int(metadata["transient_retries"])
+
+    def resumable_checkpoints(
+        self, hostname: str, plan_id: str
+    ) -> dict[str, dict[str, Any]]:
+        """Return verified stages for the newest compatible retry chain.
+
+        Newest attempt first, so a stage re-run and failed in a later attempt
+        blocks an older completion. A changed ``plan_id`` invalidates every
+        checkpoint, which is exactly the plan-identity contract.
+        """
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT metadata FROM attempts WHERE hostname=? "
+                "ORDER BY created DESC, id DESC",
+                (hostname,),
+            ).fetchall()
+        merged: dict[str, dict[str, Any]] = {}
+        decided: set[str] = set()
+        for row in rows:
+            metadata = json.loads(row[0])
+            if metadata.get("plan_id") != plan_id:
+                continue
+            for stage, checkpoint in (metadata.get("checkpoints") or {}).items():
+                if stage in decided:
+                    continue
+                decided.add(stage)
+                if checkpoint.get("status") in {"completed", "skipped"}:
+                    merged[stage] = checkpoint
+        return merged
 
     def update_phase(self, attempt_id: str, phase: str, **changes: Any) -> None:
         """Atomically merge a node worker's phase state with current metadata."""

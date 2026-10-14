@@ -29,11 +29,26 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   function attemptUrl() { return base + "/" + encodeURIComponent(select.value); }
+  function recoveryLine(attempt) {
+    var parts = [];
+    if (attempt.attempt_number) parts.push("attempt " + attempt.attempt_number);
+    var retries = Number(attempt.transient_retries || 0);
+    if (retries) parts.push(retries + (retries === 1 ? " automatic retry" : " automatic retries"));
+    var progress = attempt.progress;
+    if (progress && progress.total_stages) {
+      var pct = progress.percent != null ? " (" + progress.percent + "%)" : "";
+      parts.push("progress " + progress.completed_count + "/" + progress.total_stages + pct);
+    }
+    if (attempt.failure_class) parts.push("class " + String(attempt.failure_class).replace(/_/g, " "));
+    if (attempt.next_action) parts.push("next: " + attempt.next_action);
+    return parts.join(" · ");
+  }
   function showManifest(attempt) {
     summary.textContent = (attempt.failure_summary ? attempt.failure_summary + "\n" : "") +
       attempt.status + " · " + attempt.engine + " · " +
       (attempt.model || "model not selected") + " · " + attempt.stage + " · " +
-      attempt.bundle_version;
+      attempt.bundle_version +
+      (recoveryLine(attempt) ? "\n" + recoveryLine(attempt) : "");
     var failure = attempt.failure;
     failureDetails.textContent = failure ? "Failed at " + failure.failed_at + " after " +
       Number(failure.duration_seconds).toFixed(1) + "s" +
@@ -102,7 +117,9 @@ document.addEventListener("DOMContentLoaded", function () {
         var option = document.createElement("option");
         option.value = attempt.attempt_id;
         option.textContent = new Date(attempt.started_at).toLocaleString() + " · " +
-          attempt.operation + " · " + attempt.status + " · " + attempt.attempt_id.slice(0, 8);
+          attempt.operation + " · " + attempt.status +
+          (attempt.attempt_number ? " · attempt " + attempt.attempt_number : "") +
+          " · " + attempt.attempt_id.slice(0, 8);
         select.appendChild(option);
       });
       historyOffset += data.attempts.length;

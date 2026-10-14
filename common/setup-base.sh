@@ -92,9 +92,15 @@ run_with_errexit() {
 
 step() {
     local name="$1"; shift
+    checkpoint_plan_sync
+    if checkpoint_stage_verified "$name"; then
+        echo "[STEP:${name}:SKIP]"
+        return 0
+    fi
     echo "[STEP:${name}:START]"
     run_with_errexit "$@"
     if [ "$STEP_STATUS" -eq 0 ]; then
+        record_checkpoint "$name"
         echo "[STEP:${name}:OK]"
     else
         echo "[STEP:${name}:FAIL]"
@@ -104,13 +110,90 @@ step() {
 
 soft_step() {
     local name="$1"; shift
+    checkpoint_plan_sync
+    if checkpoint_stage_verified "$name"; then
+        echo "[STEP:${name}:SKIP]"
+        return 0
+    fi
     echo "[STEP:${name}:START]"
     run_with_errexit "$@"
     if [ "$STEP_STATUS" -eq 0 ]; then
+        record_checkpoint "$name"
         echo "[STEP:${name}:OK]"
     else
         echo "[STEP:${name}:WARN] (non-fatal, continuing)"
     fi
+}
+
+# --- Stage checkpoints (issue #133) ---
+# A compatible retry passes QIIP_PLAN_ID and the stages the gateway verified
+# complete. The node independently re-verifies a stage before skipping it and
+# invalidates every checkpoint when the plan identity changes, so a changed
+# setup input never reuses stale evidence.
+checkpoint_file() {
+    printf '%s' "${QIIP_CHECKPOINT_FILE:-${DRIVER_STATE_DIR:-/var/lib/qiip/setup}/checkpoints}"
+}
+
+checkpoint_plan_sync() {
+    local plan="${QIIP_PLAN_ID:-}" file
+    [ -n "$plan" ] || return 0
+    file="$(checkpoint_file)"
+    mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+    if [ -f "$file" ] && ! grep -qx "plan:${plan}" "$file" 2>/dev/null; then
+        echo "Setup plan changed; invalidating completed stage checkpoints"
+    fi
+    if [ ! -f "$file" ] || ! grep -qx "plan:${plan}" "$file" 2>/dev/null; then
+        printf 'plan:%s\n' "$plan" > "$file"
+    fi
+}
+
+record_checkpoint() {
+    local name="$1" file
+    [ -n "${QIIP_PLAN_ID:-}" ] || return 0
+    file="$(checkpoint_file)"
+    mkdir -p "$(dirname "$file")" 2>/dev/null || return 0
+    if ! grep -qx "stage:${name}" "$file" 2>/dev/null; then
+        printf 'stage:%s\n' "$name" >> "$file"
+    fi
+}
+
+checkpoint_stage_verified() {
+    local name="$1" file verifier
+    [ -n "${QIIP_PLAN_ID:-}" ] || return 1
+    case ",${QIIP_RESUME_STAGES:-}," in
+        *",${name},"*) ;;
+        *) return 1 ;;
+    esac
+    file="$(checkpoint_file)"
+    grep -qx "plan:${QIIP_PLAN_ID}" "$file" 2>/dev/null || return 1
+    grep -qx "stage:${name}" "$file" 2>/dev/null || return 1
+    verifier="qiip_verify_${name}"
+    if declare -F "$verifier" >/dev/null 2>&1; then
+        "$verifier" >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
+# Independent re-validation hooks. A stage without a hook still resumes only
+# when the gateway and the node checkpoint agree on the same plan identity.
+qiip_verify_nfs_mount() {
+    verify_nfs_storage >/dev/null 2>&1
+}
+
+qiip_verify_nvidia_driver() {
+    installed_driver_compatible >/dev/null 2>&1
+}
+
+qiip_verify_cuda_toolkit() {
+    local installed
+    installed="$(nvcc_toolkit_version 2>/dev/null)" || return 1
+    [ -n "$installed" ] || return 1
+    [ -z "${PROFILE_CUDA_TOOLKIT_VERSION:-}" ] \
+        || [ "$installed" = "$PROFILE_CUDA_TOOLKIT_VERSION" ]
+}
+
+qiip_verify_llmfit_install() {
+    command -v llmfit >/dev/null 2>&1
 }
 
 # Install only absent packages: an ordinary retry must not upgrade the OS.
