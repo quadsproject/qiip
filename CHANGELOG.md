@@ -2,6 +2,33 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.11 (2026-10-14)
+
+### Bug Fixes
+
+- Document new setup settings and satisfy strict typing
+  ([`87d41b3`](https://github.com/quadsproject/qiip/commit/87d41b3f4463eeb60553fe384fa41eaeee7ccbb9))
+
+- **provisioning**: Address second review round
+  ([`dc93cd4`](https://github.com/quadsproject/qiip/commit/dc93cd4214fab5452d403b736410b2b1aab3ed46))
+
+- **provisioning**: Address setup resume review feedback
+  ([`337837e`](https://github.com/quadsproject/qiip/commit/337837e6801e72960500f0744338d7203802eadd))
+
+- **provisioning**: Retry bare 5xx download failures
+  ([`196add1`](https://github.com/quadsproject/qiip/commit/196add1e00feec34ac1626860dea81b642ee1ae3))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`bf62aa7`](https://github.com/quadsproject/qiip/commit/bf62aa75e4d8c959eb76c50c45d2e0c30204a891))
+
+### Features
+
+- **provisioning**: Resume verified stages and retry transient failures
+  ([`e14cc11`](https://github.com/quadsproject/qiip/commit/e14cc11d576aeef6fe2e06b8ff49900db05563bc))
+
+
 ## v0.2.0-dev.10 (2026-10-14)
 
 ### Bug Fixes
