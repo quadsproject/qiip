@@ -304,26 +304,52 @@ jobs:
       - name: Check dependency RPMs are published
         run: |
           script="$GITHUB_WORKSPACE/.github/scripts/copr_nvr_state.py"
-          chroots="$(python3 "$script" chroots)"
+          status=0
+          chroots="$(python3 "$script" chroots)" || status=$?
+          if [[ "$status" != 0 ]]; then
+            echo "could not read quadsdev/qiip from the Copr API (exit $status)." >&2
+            echo "::error title=Copr API unreadable::could not read quadsdev/qiip from the Copr API (exit $status), re-run the failed jobs when it answers"
+            exit 1
+          fi
           if [[ -z "$chroots" ]]; then
             echo "no chroots reported for quadsdev/qiip" >&2
             exit 1
           fi
           failed=0
+          missing_deps=0
           for chroot in $chroots; do
             if missing="$(python3 "$script" names "$chroot" \
                 python3-click python3-etcd3gw python3-fastapi \
                 python3-huggingface-hub python3-structlog python3-uvicorn)"; then
               echo "dependency RPMs present in $chroot"
               continue
+            else
+              status=$?
             fi
-            echo "COPR dependency RPMs missing from $chroot: $missing" >&2
-            echo "::error title=COPR dependency RPMs missing::$chroot: $missing"
+            if [[ "$status" == 1 && -n "$missing" ]]; then
+              echo "COPR dependency RPMs missing from $chroot: $missing" >&2
+              echo "::error title=COPR dependency RPMs missing::$chroot: $missing"
+              missing_deps=1
+              failed=1
+              continue
+            fi
+            if [[ "$status" == 2 ]]; then
+              echo "could not read $chroot from the repository (exit 2)." >&2
+              echo "That is an upstream Copr or packages.redhat.com problem, not a missing" >&2
+              echo "build: Copr's builders read the same endpoint, so a build would fail too." >&2
+              echo "::error title=Copr repository unreadable::could not read $chroot from quadsdev/qiip (exit 2), retry later"
+              failed=1
+              continue
+            fi
+            echo "the dependency lookup for $chroot failed (exit $status)." >&2
+            echo "::error title=Dependency preflight lookup failed::the dependency lookup for $chroot failed (exit $status), inspect the step log"
             failed=1
           done
           if [[ "$failed" == 1 ]]; then
-            echo "Publish copr-deps once (COPR dependencies workflow or " >&2
-            echo "copr-deps/README.md) before the first qiip/qiip-dev build." >&2
+            if [[ "$missing_deps" == 1 ]]; then
+              echo "Publish copr-deps once (COPR dependencies workflow or " >&2
+              echo "copr-deps/README.md) before the first qiip/qiip-dev build." >&2
+            fi
             exit 1
           fi
 
