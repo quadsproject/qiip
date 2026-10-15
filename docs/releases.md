@@ -89,6 +89,16 @@ sudo dnf install qiip-dev
 unit, `/etc/qiip`), so `qiip-dev` conflicts with `qiip`; use one train per
 host.
 
+The project stores its results in Copr's Pulp backend, so the per-build
+directories under `download.copr.fedorainfracloud.org` hold logs and build
+metadata only: RPMs and SRPMs are served from `<chroot>/Packages/<letter>/`,
+which is what `dnf repoquery --location` prints and what the "Go to Pulp
+results for this project" link in the Copr footer lists. `wget` follows the
+redirects to that storage by default, `curl` needs `-L`. Deleting a build in
+Copr deletes the RPM and SRPM files for its NVR as well, so only failed
+builds, or builds whose files the repository no longer serves, are safe to
+remove.
+
 ## Badges
 
 The README badges are live: GitHub release badges come from the `Release`

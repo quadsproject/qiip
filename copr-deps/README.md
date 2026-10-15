@@ -69,6 +69,23 @@ done
 The sdist sources are downloaded from PyPI and embedded in the SRPMs; no
 sources are kept in git.
 
+## Republishing
+
+The workflow publishes each pinned NVR once. It skips an NVR that is already
+in the repository, and refuses one that has a Copr build without its RPM.
+Copr keeps a single build per package version and every build of an NVR shares
+one NVRA-named file, so removing any build of that NVR, including one of two
+builds of the same version, deletes the RPM and SRPM and takes the package out
+of the repository.
+
+To republish, bump `Release:` in the spec, run the workflow again, and leave
+the previous build alone. Deleting a build in Copr also deletes the RPM and
+SRPM files for its NVR, so only delete builds whose files are already gone,
+for example a failed build or one whose RPM the repository no longer serves.
+
+`workflow_dispatch` accepts `dry_run: true`, which reports the state of every
+pinned NVR, submits nothing, and still fails when an NVR needs attention.
+
 ## COPR project configuration
 
 `quadsdev/qiip` is the only project. Keep its Fedora 43/44 chroots and

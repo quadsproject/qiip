@@ -270,6 +270,7 @@ jobs:
       needs.semantic.outputs.finalized == 'true' &&
       github.repository == 'quadsproject/qiip'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     container: fedora:43
     permissions:
       contents: read
@@ -293,28 +294,49 @@ jobs:
           mkdir -p "$HOME/.config"
           echo "$API_TOKEN_CONTENT" > "$HOME/.config/copr"
 
+      # A package stays listed in the project while its RPMs can be missing
+      # from the repository, which is how a dependency publish that Copr
+      # pruned left every qiip-dev build failing on an unsatisfiable floor.
+      # Check every chroot the project builds, since each serves its own
+      # metadata.
       - name: Check dependency RPMs are published
         run: |
-          python3 - <<'EOF'
-          import json, sys, urllib.request
-          url = ("https://copr.fedorainfracloud.org/api_3/package/list"
-                 "?ownername=quadsdev&projectname=qiip")
-          names = {p["name"] for p in json.load(urllib.request.urlopen(url))["items"]}
-          need = {"python3-click", "python3-etcd3gw", "python3-fastapi",
-                  "python3-huggingface-hub", "python3-structlog", "python3-uvicorn"}
-          missing = sorted(need - names)
-          if missing:
-              print("COPR dependency RPMs not published yet:", ", ".join(missing))
-              print("Publish copr-deps once (COPR dependencies workflow or "
-                    "copr-deps/README.md) before the first qiip/qiip-dev build.")
-              sys.exit(1)
-          print("dependency RPMs present in quadsdev/qiip")
-          EOF
+          script="$GITHUB_WORKSPACE/.github/scripts/copr_nvr_state.py"
+          chroots="$(python3 "$script" chroots)"
+          if [[ -z "$chroots" ]]; then
+            echo "no chroots reported for quadsdev/qiip" >&2
+            exit 1
+          fi
+          failed=0
+          for chroot in $chroots; do
+            if missing="$(python3 "$script" names "$chroot" \
+                python3-click python3-etcd3gw python3-fastapi \
+                python3-huggingface-hub python3-structlog python3-uvicorn)"; then
+              echo "dependency RPMs present in $chroot"
+              continue
+            fi
+            echo "COPR dependency RPMs missing from $chroot: $missing" >&2
+            echo "::error title=COPR dependency RPMs missing::$chroot: $missing"
+            failed=1
+          done
+          if [[ "$failed" == 1 ]]; then
+            echo "Publish copr-deps once (COPR dependencies workflow or " >&2
+            echo "copr-deps/README.md) before the first qiip/qiip-dev build." >&2
+            exit 1
+          fi
 
+      # Copr keeps one build per package version and every build of an NVR
+      # shares one NVRA-named file, so removing any build of that NVR,
+      # including one of two builds of the same version, deletes the RPM and
+      # SRPM and takes the package out of the repository. Submit only when
+      # nothing is published for the NVR, and verify that it landed.
       - name: Build SRPM and submit to COPR
         env:
           PROJECT: ${{ github.ref_name == 'main' && 'qiip' || 'qiip-dev' }}
         run: |
+          set -euo pipefail
+          script="$GITHUB_WORKSPACE/.github/scripts/copr_nvr_state.py"
+          python3 "$script" --self-test
           cd rpm
           make srpm NAME="$PROJECT"
           srpm_file="$(find . -name '*.src.rpm' -type f | head -n 1)"
@@ -322,5 +344,39 @@ jobs:
             echo "No .src.rpm found after 'make srpm'" >&2
             exit 1
           fi
+          nvr="$(basename "${srpm_file%.src.rpm}")"
+          status="$(python3 "$script" state "$PROJECT" "$nvr")"
+          if [[ "$status" == published ]]; then
+            echo "$nvr is already published in quadsdev/qiip, not resubmitting"
+            echo "Resubmitting an NVR that already has a build makes Copr delete"
+            echo "one of the two builds and the RPM file they share."
+            exit 0
+          fi
+          if [[ "$status" == stale ]]; then
+            echo "$nvr has a Copr build but no RPM in the repository." >&2
+            echo "::error title=$nvr is not installable::$nvr has a Copr build but no RPM in the repository"
+            echo "Delete that build in Copr (quadsdev/qiip, Builds tab, the ids above)," >&2
+            echo "then re-run this job with 'Re-run failed jobs'. A new push on the" >&2
+            echo "same commit releases nothing." >&2
+            exit 1
+          fi
           echo "Submitting $srpm_file to quadsdev/qiip"
           copr build quadsdev/qiip "$srpm_file"
+          status=""
+          for _ in 1 2 3 4 5 6; do
+            if ! status="$(python3 "$script" state "$PROJECT" "$nvr")"; then
+              echo "::error title=Copr repository state unreadable::could not read the state of $nvr"
+              exit 1
+            fi
+            if [[ "$status" == published ]]; then
+              break
+            fi
+            sleep 30
+          done
+          if [[ "$status" != published ]]; then
+            echo "$nvr is not in the repository although the build succeeded." >&2
+            echo "::error title=$nvr is not visible yet::$nvr is not in the repository although the build succeeded"
+            echo "Re-run this job; do not resubmit the SRPM." >&2
+            exit 1
+          fi
+          echo "$nvr published in quadsdev/qiip"
