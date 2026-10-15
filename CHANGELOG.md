@@ -2,6 +2,22 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.12 (2026-10-15)
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`abcf1f4`](https://github.com/quadsproject/qiip/commit/abcf1f4923abd887236e5bc6cf9ce9c29441fd0e))
+
+- Stop diagnostics tests flaking under load
+  ([`3b7fcc4`](https://github.com/quadsproject/qiip/commit/3b7fcc450ba40a1316b40ac8682b33023a14ad34))
+
+### Features
+
+- Sort the token and usage tables by column
+  ([`1473fdf`](https://github.com/quadsproject/qiip/commit/1473fdfbc752dadd68979ba9b575fce62e859f5d))
+
+
 ## v0.2.0-dev.11 (2026-10-14)
 
 ### Bug Fixes
