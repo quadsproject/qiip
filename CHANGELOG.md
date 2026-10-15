@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.14 (2026-10-15)
+
+### Bug Fixes
+
+- Unify the account cluster across the top bars
+  ([`120ec7c`](https://github.com/quadsproject/qiip/commit/120ec7c5a2f9bbafa0e37be27c769a0a31f434bc))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`a1328e8`](https://github.com/quadsproject/qiip/commit/a1328e8f29beb8a0a44ba8e988af831c8bc93ea2))
+
+
 ## v0.2.0-dev.13 (2026-10-15)
 
 ### Chores
