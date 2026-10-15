@@ -53,6 +53,7 @@ def _versioned_path(path: str) -> str:
             (
                 "css/dashboard.css",
                 "js/table_sort.js",
+                "js/clipboard.js",
                 "js/profile.js",
             ),
         ),

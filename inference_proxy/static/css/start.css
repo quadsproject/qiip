@@ -232,7 +232,8 @@
 
 .ob-btn:focus-visible,
 .ob-chip:focus-visible,
-.ob-model:focus-visible { outline-offset: 3px; border-radius: 999px; }
+.ob-model:focus-visible,
+.ob-token-copy:focus-visible { outline-offset: 3px; border-radius: 999px; }
 .ob-choice:focus-visible { border-radius: 1rem; }
 .ob-copy:focus-visible { outline-offset: -4px; border-radius: 0.6rem; }
 
@@ -433,6 +434,25 @@
 .ob-token-row { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0.4rem 1rem; }
 .ob-token-name { font-family: var(--font-display); font-size: 1.35rem; font-weight: 600; overflow-wrap: anywhere; }
 .ob-token-key { font-family: var(--font-mono); font-size: 0.9rem; color: var(--text-light); }
+.ob-token-copy {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  margin-left: 0.45rem;
+  padding: 0.28rem;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-light);
+  box-shadow: inset 0 0 0 1.5px var(--border);
+  cursor: pointer;
+  transition: color 160ms ease, box-shadow 200ms ease;
+}
+.ob-token-copy:hover:not(:disabled) { color: var(--text); box-shadow: inset 0 0 0 1.5px var(--text); }
+.ob-token-copy:disabled { opacity: 0.4; cursor: not-allowed; }
+.ob-token-copy svg { width: 0.95rem; height: 0.95rem; }
 .ob-label { font-size: 0.75rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-light); }
 .ob-models { display: flex; flex-wrap: wrap; gap: 0.5rem; }
 .ob-model {
@@ -557,5 +577,5 @@
   .ob-step > * { animation-duration: 1ms; animation-delay: 0ms; transform: none; }
   .ob-step.is-leaving { animation-duration: 1ms; }
   .ob-check circle, .ob-check path { animation-duration: 1ms; animation-delay: 0ms; }
-  .ob-btn, .ob-choice, .ob-chip, .ob-model, .ob-progress-bar, .ob-toast { transition-duration: 1ms; }
+  .ob-btn, .ob-choice, .ob-chip, .ob-model, .ob-token-copy, .ob-progress-bar, .ob-toast { transition-duration: 1ms; }
 }

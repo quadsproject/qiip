@@ -20,14 +20,18 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[2]
 _PROFILE_JS = _ROOT / "inference_proxy/static/js/profile.js"
 _TABLE_SORT_JS = _ROOT / "inference_proxy/static/js/table_sort.js"
+_CLIPBOARD_JS = _ROOT / "inference_proxy/static/js/clipboard.js"
 
 _HARNESS = r"""
 const fs = require("fs");
 const vm = require("vm");
 const source = fs.readFileSync(process.argv[1], "utf8");
 const sortSource = fs.readFileSync(process.argv[2], "utf8");
+const clipboardSource = fs.readFileSync(process.argv[3], "utf8");
 
 const calls = [];
+const toasts = [];
+const clipboardWrites = [];
 const elements = new Map();
 
 function element() {
@@ -38,7 +42,7 @@ function element() {
     hidden: false, textContent: "", value: "", className: "", style: {},
     disabled: false, src: "", alt: "", colSpan: 0,
     dataset: {},
-    checked: false, selected: false, type: "",
+    checked: false, selected: false, type: "", selectedOptions: [],
     addEventListener(name, fn) { this._handlers[name] = fn; },
     focus() {}, select() {}, click() {},
     getAttribute(name) { return this._attrs[name] || null; },
@@ -72,11 +76,11 @@ function byId(id) {
 }
 
 const sandbox = {
-  showToast: function () {},
+  showToast: function (message, type) { toasts.push([message, type]); },
   console,
   URL: URL,
   URLSearchParams: URLSearchParams,
-  navigator: { clipboard: { writeText: async function () {} } },
+  navigator: { clipboard: { writeText: async function (text) { clipboardWrites.push(text); } } },
   document: {
     readyState: "complete",
     getElementById: byId,
@@ -88,13 +92,18 @@ const sandbox = {
     execCommand() { return true; },
     body: element(),
   },
-  window: { location: { search: "", reload() {} }, confirm() { return true; } },
+  location: { search: "", reload() {} },
+  confirm() { return true },
   history: { replaceState() {} },
   requestAnimationFrame() {},
   setTimeout() {},
   clearTimeout() {},
   fetch: async function (url, options) {
     calls.push({ url, options });
+    const method = (options && options.method) || "GET";
+    if (url === "/profile/tokens" && method === "POST") {
+      return { ok: true, status: 200, json: async function () { return CREATED_TOKEN; } };
+    }
     const body = {
       "/auth/me": USER,
       "/profile/tokens": TOKENS,
@@ -123,8 +132,13 @@ function buildHead(id, kinds) {
 buildHead("tokens-head", ["text", "text", "date", "date", "text", "text", null]);
 buildHead("usage-head", ["text", "text", "text", "number", "number", "number", "number"]);
 
+// In a browser `window` IS the global object; mirror that so helpers assigned
+// to `window` are reachable by their bare names, exactly like in the pages.
+sandbox.window = sandbox;
+
 vm.createContext(sandbox);
 vm.runInContext(sortSource, sandbox);
+vm.runInContext(clipboardSource, sandbox);
 vm.runInContext(source, sandbox);
 
 (async function () {
@@ -162,6 +176,15 @@ vm.runInContext(source, sandbox);
     await new Promise(function (r) { setTimeout(r, 20); });
   }
 
+  if (SHOULD_CREATE) {
+    // Mint a token, then use the Copy button beside the one-time reveal.
+    byId("token-name").value = "laptop";
+    byId("token-form")._handlers.submit({ preventDefault() {} });
+    await new Promise(function (r) { setTimeout(r, 20); });
+    byId("token-copy-btn")._handlers.click();
+    await new Promise(function (r) { setTimeout(r, 20); });
+  }
+
   let usageAscending = null;
   if (SORT_USAGE) {
     const usageHead = byId("usage-head").children[0].children;
@@ -179,6 +202,15 @@ vm.runInContext(source, sandbox);
   process.stdout.write(JSON.stringify({
     summary: byId("endpoint-summary").textContent,
     emptyHidden: byId("endpoint-empty").hidden,
+    secret: {
+      hidden: byId("token-secret").hidden,
+      value: byId("token-secret-value").textContent,
+    },
+    clipboardWrites: clipboardWrites,
+    toasts: toasts,
+    posted: calls
+      .filter(function (call) { return call.options && call.options.method === "POST"; })
+      .map(function (call) { return call.url; }),
     rowNames: body.children.map(function (row) {
       return row.children[0] ? row.children[0].textContent : row.textContent;
     }),
@@ -220,6 +252,7 @@ def _run(
     reopen: bool = False,
     usage: list[dict[str, Any]] | None = None,
     sort_usage: bool = False,
+    created_token: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -227,6 +260,8 @@ def _run(
     script = (
         _HARNESS.replace("TOKENS", json.dumps(tokens))
         .replace("ENDPOINTS", json.dumps(endpoints))
+        .replace("CREATED_TOKEN", json.dumps(created_token or {}))
+        .replace("SHOULD_CREATE", "true" if created_token is not None else "false")
         .replace("CHECK_INDEX", str(check_index))
         .replace("REOPEN", "true" if reopen else "false")
         .replace("USAGE_ROWS", json.dumps(usage or []))
@@ -239,7 +274,7 @@ def _run(
         )
     )
     result = subprocess.run(
-        [node, "-e", script, str(_PROFILE_JS), str(_TABLE_SORT_JS)],
+        [node, "-e", script, str(_PROFILE_JS), str(_TABLE_SORT_JS), str(_CLIPBOARD_JS)],
         check=False,
         capture_output=True,
         text=True,
@@ -380,3 +415,25 @@ def test_unsorted_usage_table_keeps_server_order() -> None:
 
     assert result["usageRows"] == ["laptop", "ci"]
     assert set(result["usageAria"]) == {None}
+
+
+def test_created_token_is_copied_from_the_reveal_box() -> None:
+    """The one-time reveal's Copy button uses the shared clipboard helper."""
+    created = {
+        "token": "qiip_fresh_secret",
+        "id": 9,
+        "name": "laptop",
+        "prefix": "qiip_fresh",
+        "created_at": "2026-10-01T10:00:00Z",
+        "last_used_at": None,
+        "revoked": False,
+        "endpoint_scope": None,
+    }
+    result = _run([_token(1, False)], [], created_token=created)
+    assert result["posted"] == ["/profile/tokens"]
+    assert result["secret"] == {"hidden": False, "value": "qiip_fresh_secret"}
+    assert result["clipboardWrites"] == ["qiip_fresh_secret"]
+    assert result["toasts"] == [
+        ["Token created.", "success"],
+        ["Token copied to clipboard.", "success"],
+    ]

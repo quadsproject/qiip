@@ -605,8 +605,10 @@ authentication tier for the inference API:
   mints `qiip_...` bearer tokens for use against
   `/v1/chat/completions` and `/v1/completions`. Tokens are generated with
   `secrets.token_urlsafe(32)`, shown once at creation, and stored only as a
-  SHA-256 digest; listing returns just the public `qiip_######` prefix. Tokens
-  are revocable individually.
+  SHA-256 digest; listing returns just the public `qiip_######` prefix. The
+  one derived exception is the onboarding user's single `personal` token,
+  which is re-derived on demand (`/onboarding/token/reveal`, the setup script
+  and the config download). Tokens are revocable individually.
 - **Gateway enforcement (AUTH-03)**: A valid bearer token is always
   accepted. Enforcement is config-gated (`auth.enforce_api_tokens`, off by
   default): when off, an absent or invalid token simply means an anonymous

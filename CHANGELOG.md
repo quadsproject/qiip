@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## Unreleased
+
+### Features
+
+- Copy the user's own token from the leaderboard token row and the `/start`
+  token home: a clipboard icon next to the abbreviated prefix reveals the raw
+  value through `POST /onboarding/token/reveal` and confirms the copy
+  ([#247](https://github.com/quadsproject/qiip/issues/247))
+
 ## v0.2.0-dev.12 (2026-10-15)
 
 ### Chores
@@ -16,7 +25,6 @@
 
 - Sort the token and usage tables by column
   ([`1473fdf`](https://github.com/quadsproject/qiip/commit/1473fdfbc752dadd68979ba9b575fce62e859f5d))
-
 
 ## v0.2.0-dev.11 (2026-10-14)
 
@@ -209,19 +217,6 @@
 - Add user leaderboard and token dashboard
   ([`b41d846`](https://github.com/quadsproject/qiip/commit/b41d846818f061810a2480e943611d16618d2a7b))
 
-
-## Unreleased
-
-### Features
-
-- Leaderboard and token dashboard for normal users: usage ranking of
-  non-admin users, own-token create/delete, and per-harness config download
-  ([#156](https://github.com/quadsproject/qiip/issues/156))
-
-### Documentation
-
-- Add a user guide (`docs/user-guide.md`) covering sign-in, onboarding,
-  tokens, and the leaderboard
 
 ## v0.2.0-dev.2 (2026-10-08)
 

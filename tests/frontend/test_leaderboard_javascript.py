@@ -2,7 +2,10 @@
 
 The usage leaderboard and the signed-in user's token table sort by column
 through the shared table_sort.js module; the ranking the server sends stays
-the initial order until a header is activated.
+the initial order until a header is activated. The token row shows only the
+prefix, so the raw value is fetched on click by the clipboard icon next to it
+(`Copy token`), and a token from before the onboarding flow (not exportable)
+shows the note explaining why it cannot be copied or downloaded.
 """
 
 from __future__ import annotations
@@ -18,15 +21,19 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[2]
 _LEADERBOARD_JS = _ROOT / "inference_proxy/static/js/leaderboard.js"
 _TABLE_SORT_JS = _ROOT / "inference_proxy/static/js/table_sort.js"
+_CLIPBOARD_JS = _ROOT / "inference_proxy/static/js/clipboard.js"
 
 _HARNESS = r"""
 const fs = require("fs");
 const vm = require("vm");
 const sortSource = fs.readFileSync(process.argv[1], "utf8");
-const source = fs.readFileSync(process.argv[2], "utf8");
+const clipboardSource = fs.readFileSync(process.argv[2], "utf8");
+const source = fs.readFileSync(process.argv[3], "utf8");
 
 const elements = new Map();
 const calls = [];
+const toasts = [];
+const clipboardWrites = [];
 
 class Element {
   constructor(tag) {
@@ -113,22 +120,30 @@ const payloads = {
   },
   "/onboarding/leaderboard": LEADERBOARD_ROWS,
   "/onboarding/token": { name: "default" },
+  "/onboarding/token/reveal": { token: "qiip_revealed_value" },
 };
 
 const sandbox = {
   console,
-  showToast: function () {},
+  showToast: function (message, type) { toasts.push([message, type]); },
   confirmDialog: async function () { return true; },
+  navigator: {
+    clipboard: {
+      writeText: async function (text) { clipboardWrites.push(text); },
+    },
+  },
   document: {
     readyState: "complete",
     getElementById: byId,
     addEventListener() {},
     createElement(tag) { return new Element(tag); },
+    createElementNS(ns, tag) { return new Element(tag); },
     body: new Element("body"),
   },
-  window: { location: { href: "", search: "" }, confirm: function () { return true; } },
-  fetch: async function (url) {
-    calls.push(url);
+  location: { href: "", search: "" },
+  confirm: function () { return true; },
+  fetch: async function (url, options) {
+    calls.push({ url: url, method: (options && options.method) || "GET" });
     const body = payloads[url];
     return {
       ok: body !== undefined,
@@ -143,13 +158,53 @@ const sandbox = {
   URLSearchParams,
 };
 
+// In a browser `window` IS the global object; mirror that so helpers assigned
+// to `window` are reachable by their bare names, exactly like in the pages.
+sandbox.window = sandbox;
+
 vm.createContext(sandbox);
 vm.runInContext(sortSource, sandbox);
+vm.runInContext(clipboardSource, sandbox);
 vm.runInContext(source, sandbox);
 
 (async function () {
   // init() runs on load; wait for its fetches to settle.
   await new Promise(function (resolve) { setTimeout(resolve, 20); });
+
+  // The token row's prefix cell carries the clipboard icon. Click it and
+  // record the reveal call, the clipboard write and the toast; then check the
+  // legacy-token note and the Download config gating below.
+  const prefixCell = byId("tokens-table-body").children[0]
+    ? byId("tokens-table-body").children[0].children[1]
+    : null;
+  const copyButton = prefixCell && prefixCell.children[0] ? prefixCell.children[0] : null;
+  const revealBeforeClick = calls.filter(function (call) {
+    return call.url === "/onboarding/token/reveal";
+  }).length;
+  byId("token-harness").value = "pi";
+  if (byId("token-harness").listeners.change) byId("token-harness").listeners.change({});
+  const downloadDisabled = byId("config-download-btn").disabled;
+  if (copyButton) {
+    await copyButton.listeners.click({});
+    await new Promise(function (resolve) { setTimeout(resolve, 20); });
+  }
+  const copy = {
+    title: copyButton ? copyButton.title : null,
+    ariaLabel: copyButton ? copyButton.getAttribute("aria-label") : null,
+    className: copyButton ? copyButton.className : null,
+    iconShapes: copyButton && copyButton.children[0]
+      ? copyButton.children[0].children.map(function (child) { return child.tagName; })
+      : [],
+    prefixText: prefixCell ? prefixCell.textContent : null,
+    revealBeforeClick: revealBeforeClick,
+    revealAfterClick: calls.filter(function (call) {
+      return call.url === "/onboarding/token/reveal";
+    }).length,
+    legacyNoteHidden: byId("token-legacy-note").hidden,
+    downloadDisabled: downloadDisabled,
+    clipboardWrites: clipboardWrites.slice(),
+    toasts: toasts.slice(),
+  };
 
   const headers = byId("leaderboard-head").children[0].children;
   if (SORT_INDEX >= 0) {
@@ -197,9 +252,10 @@ vm.runInContext(source, sandbox);
       return cell.getAttribute("aria-sort");
     }),
     rowsAfterRerender: byId("leaderboard-body").children.length,
-    leaderboardFetches: calls.filter(function (url) {
-      return url === "/onboarding/leaderboard";
+    leaderboardFetches: calls.filter(function (call) {
+      return call.url === "/onboarding/leaderboard";
     }).length,
+    copy: copy,
     tokenRows: byId("tokens-table-body").children.map(function (row) {
       return row.children[0] ? row.children[0].textContent : "";
     }),
@@ -229,7 +285,14 @@ def _run(
         .replace("TOKEN", json.dumps(token))
     )
     result = subprocess.run(
-        [node, "-e", script, str(_TABLE_SORT_JS), str(_LEADERBOARD_JS)],
+        [
+            node,
+            "-e",
+            script,
+            str(_TABLE_SORT_JS),
+            str(_CLIPBOARD_JS),
+            str(_LEADERBOARD_JS),
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -358,3 +421,66 @@ def test_your_tokens_table_sorts_by_last_used() -> None:
     assert result["tokenRows"] == ["default"]
     assert "No token yet" not in result["tokenRows"][0]
     assert result["tokensAria"][3] == "ascending"
+
+
+def _copy_token(exportable: bool = True) -> dict[str, Any]:
+    return {
+        "id": 7,
+        "name": "default",
+        "prefix": "qiip_abc123",
+        "created_at": "2026-10-01T10:00:00Z",
+        "last_used_at": None,
+        "models": ["llama-3"],
+        "exportable": exportable,
+    }
+
+
+def test_prefix_cell_offers_the_copy_icon() -> None:
+    result = _run([_user(1, "Bo", 10)], token=_copy_token())
+
+    copy = result["copy"]
+    assert copy["prefixText"] == "qiip_abc123"
+    assert copy["title"] == "Copy token"
+    assert copy["ariaLabel"] == "Copy token"
+    assert copy["className"] == "token-copy"
+    assert copy["iconShapes"] == ["path", "rect"]
+    assert copy["legacyNoteHidden"] is True
+    assert copy["downloadDisabled"] is False
+
+
+def test_copy_icon_reveals_the_token_and_toasts() -> None:
+    result = _run([_user(1, "Bo", 10)], token=_copy_token())
+
+    copy = result["copy"]
+    assert copy["revealBeforeClick"] == 0
+    assert copy["revealAfterClick"] == 1
+    assert copy["clipboardWrites"] == ["qiip_revealed_value"]
+    assert copy["toasts"] == [["Token copied to clipboard.", "success"]]
+
+
+def test_legacy_token_has_no_copy_icon_and_explains_itself() -> None:
+    result = _run([_user(1, "Bo", 10)], token=_copy_token(exportable=False))
+
+    copy = result["copy"]
+    assert copy["title"] is None
+    assert copy["prefixText"] == "qiip_abc123"
+    assert copy["legacyNoteHidden"] is False
+    assert copy["downloadDisabled"] is True
+    assert copy["toasts"] == []
+
+
+def test_no_token_hides_the_note_and_offers_no_copy_icon() -> None:
+    result = _run([_user(1, "Bo", 10)])
+
+    copy = result["copy"]
+    assert copy["title"] is None
+    assert copy["legacyNoteHidden"] is True
+    assert result["tokenRows"] == ["No token yet. Create one below."]
+
+
+def test_delete_still_sits_in_the_actions_cell() -> None:
+    result = _run([_user(1, "Bo", 10)], token=_copy_token())
+
+    # The actions cell holds Delete alone; the copy icon belongs to the prefix.
+    assert result["copy"]["prefixText"] == "qiip_abc123"
+    assert result["tokenRows"] == ["default"]
