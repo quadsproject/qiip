@@ -749,20 +749,9 @@
   };
 
   // ---- boot ---------------------------------------------------------------------
-  document.getElementById("ob-theme").addEventListener("click", function () {
-    var theme = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-    document.documentElement.dataset.theme = theme;
-    try {
-      localStorage.setItem("theme", theme);
-    } catch (err) {
-      /* private mode */
-    }
-  });
-
   api("GET", "/onboarding/state")
     .then(function (payload) {
       data = payload;
-      document.getElementById("ob-who").textContent = data.user.email;
       goHome(1);
     })
     .catch(function (err) {

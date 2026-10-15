@@ -66,20 +66,18 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 1rem;
+  row-gap: 0.25rem;
+  min-width: 0;
   padding: 1.25rem clamp(1rem, 4vw, 2.5rem);
 }
+/* Let the account group shrink so a long identity ellipsizes instead of
+   widening the header past a narrow viewport. The theme toggle keeps its
+   size: flex would otherwise squeeze its 2rem hit target instead. */
+.ob-top .nav-actions { min-width: 0; max-width: 100%; }
+.ob-top .theme-toggle { flex: none; }
 .ob-logo { display: block; }
-.ob-top-actions { display: flex; align-items: center; gap: 0.85rem; min-width: 0; }
-.ob-who {
-  color: var(--text-light);
-  font-size: 0.85rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 40vw;
-}
-.ob-logout { margin: 0; }
 .ob-link {
   background: none;
   border: 0;
@@ -558,7 +556,6 @@
 }
 
 @media (max-width: 34rem) {
-  .ob-who { display: none; }
   .ob-stage { place-items: start center; padding-top: 1.5rem; }
   .ob-choices { grid-template-columns: 1fr; max-height: 56dvh; }
   .ob-btn { width: 100%; justify-content: center; }
