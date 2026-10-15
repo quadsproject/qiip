@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.17 (2026-10-15)
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`42d7896`](https://github.com/quadsproject/qiip/commit/42d7896147918d11732130f96eeff09bb3fc0dce))
+
+### Features
+
+- Link the release RPM packages in the release notes
+  ([`814ac1d`](https://github.com/quadsproject/qiip/commit/814ac1d418c7b5639f7ab6ef348e2e1caed62a1d))
+
+
 ## v0.2.0-dev.16 (2026-10-15)
 
 ### Bug Fixes
