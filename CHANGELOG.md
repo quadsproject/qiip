@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.13 (2026-10-15)
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`564ff60`](https://github.com/quadsproject/qiip/commit/564ff60254c0fdbc001909bce59e5c30c0ec91c0))
+
+### Features
+
+- Copy the user's own token from the pages
+  ([`d1bcb53`](https://github.com/quadsproject/qiip/commit/d1bcb535d833228262fad8230f8df7d6b6cb7c15))
+
+
 ## Unreleased
 
 ### Features
