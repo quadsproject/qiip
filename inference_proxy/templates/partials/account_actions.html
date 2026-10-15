@@ -1,0 +1,18 @@
+{# Canonical signed-in account cluster: identity, sign out, theme toggle.
+
+   Every top bar includes this partial so the controls cannot drift apart.
+   Keep the order identity -> sign out -> theme toggle everywhere, and keep
+   the theme toggle outside the signed-in guard so anonymous viewers can
+   still switch themes. #}
+<div class="nav-actions">
+    {% if viewer_signed_in(request) %}
+    <span class="nav-identity" title="Signed in as {{ viewer_identity(request) }}">{{ viewer_identity(request) }}</span>
+    <form method="post" action="/auth/logout" class="nav-logout-form">
+        <button type="submit" class="nav-link nav-logout-btn">Logout</button>
+    </form>
+    {% endif %}
+    <button class="theme-toggle" type="button" aria-label="Toggle color theme" onclick="let t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;try{localStorage.setItem('theme',t)}catch(e){}">
+        <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+    </button>
+</div>

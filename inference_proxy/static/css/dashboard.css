@@ -230,7 +230,7 @@ main { padding: 0; }
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 0.8125rem;
-  color: var(--text-muted);
+  color: var(--text-light);
 }
 
 .nav-logout-form {
