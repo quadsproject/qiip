@@ -99,6 +99,13 @@ Copr deletes the RPM and SRPM files for its NVR as well, so only failed
 builds, or builds whose files the repository no longer serves, are safe to
 remove.
 
+Each release also gets a `Packages` section appended to its notes, by the
+`Link packages in release notes` job, but only after the COPR build verified
+that the artifacts are published: it lists the `dnf copr enable` and
+`dnf install` lines and the absolute URL of every RPM and SRPM in every
+chroot the project builds. Re-running the release job leaves the section
+unchanged.
+
 ## Badges
 
 The README badges are live: GitHub release badges come from the `Release`
