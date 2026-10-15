@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.16 (2026-10-15)
+
+### Bug Fixes
+
+- Guard Copr publishes against duplicate NVRs
+  ([`a15b4c7`](https://github.com/quadsproject/qiip/commit/a15b4c702d1b2e39f95a176659fef90700ac78ba))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`2c9e354`](https://github.com/quadsproject/qiip/commit/2c9e35442cc7802ce3be47818548d2e8292a885a))
+
+
 ## v0.2.0-dev.15 (2026-10-15)
 
 ### Bug Fixes
