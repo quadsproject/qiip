@@ -60,6 +60,9 @@ jobs:
       - name: Check formatting
         run: uv run --frozen ruff format --check .
 
+      - name: Check COPR publish helper
+        run: python3 .github/scripts/copr_nvr_state.py --self-test
+
       - name: Check node dependency lock
         env:
           UV_PROJECT_ENVIRONMENT: /tmp/auto-vllm-lock-check

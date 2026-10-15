@@ -6,6 +6,11 @@ name: COPR dependencies
 # dependency RPMs, published in the same COPR project.
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report what would be published without submitting to COPR
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,6 +23,7 @@ jobs:
   build_deps:
     name: Build and submit dependency RPMs
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     container: fedora:43
     if: github.repository == 'quadsproject/qiip'
     steps:
@@ -47,13 +53,75 @@ jobs:
             pip download --quiet --no-deps --no-binary=:all: "${pkg}==${version}" -d .
           done
 
-      - name: Build SRPMs and submit to COPR
+      - name: Build SRPMs
         run: |
           cd copr-deps
           for spec in *.spec; do
             rpmbuild -bs --define "_sourcedir $PWD" --define "_srcrpmdir $PWD" "$spec"
           done
+
+      # Copr keeps one build per package version and every build of an NVR
+      # shares one NVRA-named file, so removing any build of that NVR,
+      # including one of two builds of the same version, deletes the RPM and
+      # SRPM and takes the package out of the repository. Publish each NVR
+      # once and verify that it landed. The name and the NVR come from the
+      # built SRPM: structlog.spec spells its Name: with %{project}, so the
+      # spec text is not authoritative.
+      - name: Submit SRPMs to COPR
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          script="$GITHUB_WORKSPACE/.github/scripts/copr_nvr_state.py"
+          python3 "$script" --self-test
+          cd copr-deps
+          stale=0
           for srpm in *.src.rpm; do
+            name="$(rpm -qp --qf '%{NAME}' "$srpm")"
+            nvr="${srpm%.src.rpm}"
+            spec="${name#python3-}.spec"
+            status="$(python3 "$script" state "$name" "$nvr")"
+            if [[ "$status" == published ]]; then
+              echo "$nvr is already published in quadsdev/qiip, nothing to do"
+              continue
+            fi
+            if [[ "$status" == stale ]]; then
+              echo "$nvr has a Copr build but no RPM in the repository." >&2
+              echo "::error title=$nvr is not installable::$nvr has a Copr build but no RPM in the repository"
+              echo "Wait for that build to finish, then delete it only if it ended" >&2
+              echo "without publishing, or bump Release: in copr-deps/$spec." >&2
+              stale=1
+              if [[ "$DRY_RUN" != "true" ]]; then
+                exit 1
+              fi
+              continue
+            fi
+            if [[ "$DRY_RUN" == "true" ]]; then
+              echo "dry run: would submit $srpm to quadsdev/qiip"
+              continue
+            fi
             echo "Submitting $srpm to quadsdev/qiip"
             copr build quadsdev/qiip "$srpm"
+            status=""
+            for _ in 1 2 3 4 5 6; do
+              if ! status="$(python3 "$script" state "$name" "$nvr")"; then
+                echo "::error title=Copr repository state unreadable::could not read the state of $nvr"
+                exit 1
+              fi
+              if [[ "$status" == published ]]; then
+                break
+              fi
+              sleep 30
+            done
+            if [[ "$status" != published ]]; then
+              echo "$nvr is not in the repository although the build succeeded." >&2
+              echo "::error title=$nvr is not visible yet::$nvr is not in the repository although the build succeeded"
+              echo "Re-run this workflow; do not resubmit the SRPM." >&2
+              exit 1
+            fi
+            echo "$nvr published in quadsdev/qiip"
           done
+          if [[ "$stale" == 1 ]]; then
+            echo "some pinned NVRs need attention before they can be published" >&2
+            exit 1
+          fi
