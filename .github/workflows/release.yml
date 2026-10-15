@@ -269,6 +269,8 @@ jobs:
       needs.semantic.outputs.released == 'true' &&
       needs.semantic.outputs.finalized == 'true' &&
       github.repository == 'quadsproject/qiip'
+    outputs:
+      nvr: ${{ steps.submit.outputs.nvr }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     container: fedora:43
@@ -331,6 +333,7 @@ jobs:
       # SRPM and takes the package out of the repository. Submit only when
       # nothing is published for the NVR, and verify that it landed.
       - name: Build SRPM and submit to COPR
+        id: submit
         env:
           PROJECT: ${{ github.ref_name == 'main' && 'qiip' || 'qiip-dev' }}
         run: |
@@ -345,6 +348,7 @@ jobs:
             exit 1
           fi
           nvr="$(basename "${srpm_file%.src.rpm}")"
+          echo "nvr=$nvr" >> "$GITHUB_OUTPUT"
           status="$(python3 "$script" state "$PROJECT" "$nvr")"
           if [[ "$status" == published ]]; then
             echo "$nvr is already published in quadsdev/qiip, not resubmitting"
@@ -380,3 +384,97 @@ jobs:
             exit 1
           fi
           echo "$nvr published in quadsdev/qiip"
+
+  release_packages:
+    name: Link packages in release notes
+    needs:
+      - semantic
+      - copr_build
+    if: >-
+      needs.semantic.outputs.released == 'true' &&
+      needs.semantic.outputs.finalized == 'true' &&
+      needs.copr_build.outputs.nvr != '' &&
+      github.repository == 'quadsproject/qiip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.semantic.outputs.tag }}
+
+      # The URLs come from the repository metadata of every chroot, and they
+      # are checked against the project prefix before they are written into
+      # the notes: the notes render as markdown, so a location of an
+      # unexpected shape is refused rather than echoed. The step runs only
+      # after the publish guard verified the artifacts, so a link implies a
+      # file that exists.
+      - name: Append package links to the release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.semantic.outputs.tag }}
+          PROJECT: ${{ github.ref_name == 'main' && 'qiip' || 'qiip-dev' }}
+          NVR: ${{ needs.copr_build.outputs.nvr }}
+        run: |
+          set -euo pipefail
+          script=".github/scripts/copr_nvr_state.py"
+          if [[ ! -f "$script" ]]; then
+            echo "release tag $TAG predates the publish guard; no package links"
+            exit 0
+          fi
+          python3 "$script" --self-test
+          gh release view "$TAG" --json body -q .body > body.md
+          if grep -q '^## Packages$' body.md; then
+            echo "$TAG already lists its packages"
+            exit 0
+          fi
+          artifacts_out=""
+          error_out=""
+          for attempt in 1 2 3; do
+            if artifacts_out="$(python3 "$script" urls "$PROJECT" "$NVR" 2>&1)"; then
+              break
+            fi
+            error_out="${artifacts_out%%$'\n'*}"
+            artifacts_out=""
+            echo "attempt $attempt for $NVR: $error_out" >&2
+            sleep 30
+          done
+          if [[ -z "$artifacts_out" ]]; then
+            echo "$NVR has no verified artifact, last error: $error_out" >&2
+            echo "::error title=$NVR is not published::$error_out"
+            echo "Re-run this job once the repository answers; do not resubmit the SRPM." >&2
+            exit 1
+          fi
+          mapfile -t artifacts <<< "$artifacts_out"
+          prefix="https://download.copr.fedorainfracloud.org/results/quadsdev/qiip/"
+          for artifact in "${artifacts[@]}"; do
+            if [[ "$artifact" != "$prefix"* ]]; then
+              echo "unexpected artifact URL for $NVR: $artifact" >&2
+              exit 1
+            fi
+          done
+          {
+            echo
+            echo "## Packages"
+            echo
+            echo "Enable the repository and install:"
+            echo
+            echo '```'
+            echo "sudo dnf copr enable quadsdev/qiip"
+            echo "sudo dnf install $PROJECT"
+            echo '```'
+            echo
+            echo "Artifacts:"
+            echo
+            for artifact in "${artifacts[@]}"; do
+              echo "- \`$artifact\`"
+            done
+          } >> body.md
+          prerelease=(--prerelease=false)
+          if [[ "$TAG" == *-dev.* ]]; then
+            prerelease=(--prerelease)
+          fi
+          gh release edit "$TAG" --notes-file body.md "${prerelease[@]}"
+          echo "linked ${#artifacts[@]} artifacts in $TAG"

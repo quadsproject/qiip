@@ -15,6 +15,9 @@ Modes:
                            the existing build ids and states on stderr
   names <chroot> <name>... print the names without a fetchable binary RPM in
                            the chroot, exit 1 when any name is missing
+  urls <name> <nvr>        print the absolute URL of every published artifact
+                           of an NVR, one per line, across every chroot, exit 1
+                           when nothing is published
   chroots                  print the Fedora chroots the project builds
   --self-test              run the offline metadata parsing checks
 
@@ -75,16 +78,17 @@ def primary_href(repomd: bytes) -> str:
     return match.group(1).decode()
 
 
-def binary_packages(primary: bytes) -> list[tuple[str, str, str]]:
-    """Return (NVR, name, location) for every binary RPM in primary metadata.
+def packages(primary: bytes, include_src: bool = False) -> list[tuple[str, str, str]]:
+    """Return (NVR, name, location) for the RPMs in primary metadata.
 
-    Source RPMs are skipped: they share the NVR of the package they were built
-    from, and only a binary RPM makes an NVR installable.
+    Source RPMs are skipped unless requested: they share the NVR of the
+    package they were built from, and only a binary RPM makes an NVR
+    installable.
     """
     packages: list[tuple[str, str, str]] = []
     for package in re.findall(rb'<package type="rpm">(.*?)</package>', primary, re.S):
         arch = re.search(rb"<arch>([^<]+)</arch>", package)
-        if arch and arch.group(1) == b"src":
+        if not include_src and arch and arch.group(1) == b"src":
             continue
         name = re.search(rb"<name>([^<]+)</name>", package)
         version = re.search(
@@ -162,7 +166,7 @@ def file_exists(url: str) -> bool:
 def chroot_serves(name: str, version_release: str, chroot: str) -> bool:
     """Return whether this chroot serves the binary RPM of one version-release."""
     nvr = f"{name}-{version_release}.{dist_of(chroot)}"
-    for entry_nvr, _entry_name, location in binary_packages(fetch_primary(chroot)):
+    for entry_nvr, _entry_name, location in packages(fetch_primary(chroot)):
         if entry_nvr == nvr:
             return file_exists(f"{PROJECT}/{chroot}/{location}")
     return False
@@ -179,7 +183,7 @@ def state(name: str, nvr: str) -> str:
 
 def missing_names(chroot: str, names: list[str]) -> list[str]:
     """Return the names without a fetchable binary RPM in this chroot."""
-    grouped = candidates_by_name(binary_packages(fetch_primary(chroot)))
+    grouped = candidates_by_name(packages(fetch_primary(chroot)))
     return [
         name
         for name in names
@@ -188,6 +192,37 @@ def missing_names(chroot: str, names: list[str]) -> list[str]:
             for location in grouped.get(name, [])
         )
     ]
+
+
+def artifact_urls(
+    chroot: str, name: str, version_release: str, primary: bytes
+) -> list[str]:
+    """Return the project URLs of one version-release in one chroot's metadata."""
+    wanted = f"{name}-{version_release}.{dist_of(chroot)}"
+    return [
+        f"{PROJECT}/{chroot}/{location}"
+        for nvr, _entry_name, location in packages(primary, include_src=True)
+        if nvr == wanted
+    ]
+
+
+def urls(name: str, nvr: str) -> list[str]:
+    """Return the fetchable artifacts of one NVR in every project chroot."""
+    version_release = version_release_of(name, nvr)
+    found: list[str] = []
+    for chroot in chroots():
+        chroot_urls = [
+            url
+            for url in artifact_urls(
+                chroot, name, version_release, fetch_primary(chroot)
+            )
+            if file_exists(url)
+        ]
+        if not chroot_urls:
+            print(f"no published artifact for {nvr} in {chroot}", file=sys.stderr)
+            return []
+        found.extend(chroot_urls)
+    return sorted(found)
 
 
 def chroots() -> list[str]:
@@ -202,16 +237,25 @@ def chroots() -> list[str]:
 def self_test() -> int:
     """Check the metadata parsing and NVR arithmetic without network access."""
     assert primary_href(REPOMD) == "repodata/abc-primary.xml.gz"
-    assert binary_packages(PRIMARY) == [
+    assert packages(PRIMARY) == [
         (
             "python3-click-8.5.0-1.fc43",
             "python3-click",
             "Packages/p/python3-click-8.5.0-1.fc43.noarch.rpm",
         )
     ]
-    assert candidates_by_name(binary_packages(PRIMARY)) == {
+    assert candidates_by_name(packages(PRIMARY)) == {
         "python3-click": ["Packages/p/python3-click-8.5.0-1.fc43.noarch.rpm"]
     }
+    assert [nvr for nvr, _name, _location in packages(PRIMARY, include_src=True)] == [
+        "python3-click-8.5.0-1.fc43",
+        "python3-click-8.5.0-1.fc43",
+    ]
+    click = "Packages/p/python3-click-8.5.0-1.fc43."
+    assert artifact_urls("fedora-43-x86_64", "python3-click", "8.5.0-1", PRIMARY) == [
+        f"{PROJECT}/fedora-43-x86_64/{click}noarch.rpm",
+        f"{PROJECT}/fedora-43-x86_64/{click}src.rpm",
+    ]
     assert dist_of("fedora-43-x86_64") == "fc43"
     assert dist_of("fedora-44-x86_64") == "fc44"
     assert version_release_of("qiip-dev", "qiip-dev-0.2.0~dev.15-1.fc43") == (
@@ -230,8 +274,8 @@ def self_test() -> int:
     return 0
 
 
-def main(argv: list[str]) -> int:
-    """Dispatch the requested mode."""
+def dispatch(argv: list[str]) -> int:
+    """Run the requested mode."""
     if argv[1:2] == ["--self-test"]:
         return self_test()
     if argv[1:2] == ["chroots"] and len(argv) == 2:
@@ -245,6 +289,13 @@ def main(argv: list[str]) -> int:
             builds = build_states(name, version_release_of(name, nvr))
             print(f"copr builds for {nvr}: {', '.join(builds)}", file=sys.stderr)
         return 0
+    if argv[1:2] == ["urls"] and len(argv) == 4:
+        found = urls(argv[2], argv[3])
+        if not found:
+            print(f"no published artifact for {argv[3]}", file=sys.stderr)
+            return 1
+        print("\n".join(found))
+        return 0
     if argv[1:2] == ["names"] and len(argv) >= 4:
         missing = missing_names(argv[2], argv[3:])
         if missing:
@@ -253,6 +304,15 @@ def main(argv: list[str]) -> int:
         return 0
     print(__doc__, file=sys.stderr)
     return 2
+
+
+def main(argv: list[str]) -> int:
+    """Dispatch the requested mode, reporting a failed lookup on one line."""
+    try:
+        return dispatch(argv)
+    except (urllib.error.HTTPError, urllib.error.URLError) as error:
+        print(f"copr_nvr_state: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
