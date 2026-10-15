@@ -2,6 +2,23 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.18 (2026-10-15)
+
+### Bug Fixes
+
+- Tell a Copr outage apart from missing dependency RPMs
+  ([`0df4381`](https://github.com/quadsproject/qiip/commit/0df43816825912ab4e666b80dee922df1d9f3a2b))
+
+### Chores
+
+- Absorb transient Chrome hangs in browser tests (#215)
+  ([#216](https://github.com/quadsproject/qiip/pull/216),
+  [`25c3f7d`](https://github.com/quadsproject/qiip/commit/25c3f7d911100343880240d8cdd641d6153f5467))
+
+- Refresh uv.lock after version bump
+  ([`5c5a405`](https://github.com/quadsproject/qiip/commit/5c5a405c71b23b3d5f44f0e47907e6f9b85511f8))
+
+
 ## v0.2.0-dev.17 (2026-10-15)
 
 ### Chores
