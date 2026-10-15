@@ -35,7 +35,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **OpenAI-compatible API** -- drop-in replacement for `/v1/chat/completions`, `/v1/completions`, and `/v1/models`
 - **Claude Code and Codex** -- the Anthropic Messages API (`/v1/messages`) and the OpenAI Responses API (`/v1/responses`) are forwarded to vLLM and llama.cpp nodes, which implement them natively, with the same token auth, routing, failover, and usage tracking as chat completions
 - **Streaming support** -- Server-Sent Events (SSE) for real-time token generation
-- **Chat playground** -- browser-based chat UI at `/chat` with markdown rendering and model selection
+- **Chat playground** -- browser-based chat UI at `/chat` for signed-in users, with markdown rendering, model selection, and usage recorded against a normal user's own token
 - **Service discovery** -- watches etcd for node registration/deregistration in real time
 - **Least-connections load balancing** -- routes to the node with the fewest in-flight requests
 - **Automatic failover** -- retries transport, timeout, and 5xx failures on alternate healthy nodes before a response begins (configurable, default 3 attempts)
@@ -269,7 +269,23 @@ the quick-start port with the shipped unit behind nginx gets 502s.
 
 ### Chat playground
 
-The `/chat` playground saves its optional System Prompt in browser local
+The `/chat` playground is for signed-in viewers; an anonymous visitor gets the
+sign-in page. Admins (admin role, the full-access trust list, or the local
+admin) have no personal token to reveal, so the page does not ask for one and
+they chat anonymously like any other API client. Every other signed-in user
+chats with their own token: the page reveals it through
+`POST /onboarding/token/reveal` (the endpoint the token Copy action uses)
+before every turn, so a token replaced in another `/start` tab is followed,
+and sends it on every `/v1` call with `X-Qiip-Require-Token: 1`, so a
+credential that no longer resolves is refused instead of billed as an
+anonymous request. Turns ask for streamed usage
+(`stream_options.include_usage`), and each one is recorded against the
+revealed token (AUTH-04) and limited to the models that token may use. A
+reveal that fails (no token yet, a pre-onboarding token, or an error)
+disables the playground with the server's message and a pointer to `/start`,
+instead of falling back to unattributed anonymous calls.
+
+The playground saves its optional System Prompt in browser local
 storage and sends it to the backend as an OpenAI `system` message. Some model
 chat templates enforce strict user/assistant alternation and reject that role.
 If such a model reports that conversation roles must alternate, clear the
@@ -390,7 +406,7 @@ Public endpoints:
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting |
 | `POST` | `/v1/responses` | OpenAI Responses API (Codex) |
 | `GET` | `/v1/models` | List models available across healthy nodes |
-| `GET` | `/chat` | Browser chat playground |
+| `GET` | `/chat` | Browser chat playground (signed-in viewers; anonymous visitors get the sign-in page, a signed-in normal user chats with their own token) |
 | `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage (signed-in normal users are redirected to `/start`) |
 | `GET` | `/start` | Onboarding wizard and token home for signed-in normal users (clipboard icon next to the token prefix copies the token); anonymous visitors get the sign-in page, admins are redirected to `/dashboard` |
 | `GET` | `/leaderboard` | Leaderboard and token dashboard for signed-in normal users (admins are redirected to `/dashboard`): non-admin usage ranking, the viewer's own token (copy/create/delete), and a per-harness config download |
@@ -529,9 +545,10 @@ env_key = "QIIP_API_KEY"
 All `/admin/*` API endpoints and `/dashboard` admin pages accept either the
 shared HTTP Basic credentials configured below or a signed-in Google user
 carrying the **admin role** (granted by the HTTP Basic admin user on the
-token dashboard at `/dashboard/tokens`). The inference API, chat page, profile page,
+token dashboard at `/dashboard/tokens`). The inference API, profile page,
 and health endpoint are public; the inference API may additionally require a
-user API token (see [User authentication (Google OAuth)](#user-authentication-google-oauth)).
+user API token, and the chat playground requires a signed-in viewer (see
+[User authentication (Google OAuth)](#user-authentication-google-oauth)).
 For example:
 
 ```bash
@@ -988,9 +1005,21 @@ Enablement and guardrails:
   preserve fully public `/v1` deployments; set
   `INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS=true` once you want to require a
   token.
-- `/v1/models`, `/health`, and the chat playground stay public in both modes;
-  `/v1/models` lists only models served by unowned nodes (owner-private models
-  are never enumerated).
+- A request may require strict authentication for itself with
+  `X-Qiip-Require-Token: 1`, independent of `auth.enforce_api_tokens`: an
+  absent or unresolvable credential is then refused with `401` instead of
+  being served as an anonymous request, in the route's own error shape
+  (`invalid_api_key`). It applies to the token-authenticated inference routes
+  (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`,
+  `/v1/messages/count_tokens`, `/v1/responses`), never to the public
+  `/v1/models` or `/health`. The chat playground sends it with every attributed
+  call, so a token revoked in another `/start` tab cannot silently turn a turn
+  into an anonymous, unrecorded request.
+- `/v1/models` and `/health` stay public in both modes; the chat playground
+  requires a signed-in viewer, and a signed-in normal user's playground calls
+  carry that user's token, so they follow enforcement like any other client.
+  `/v1/models` lists only models served by unowned, non-admin-only nodes
+  (owner-private and admin-only models are never enumerated).
 - Anonymously reached `/v1` requests are proxied but not attributed; only
   token-authenticated calls record per-token usage (AUTH-04).
 
@@ -1219,8 +1248,10 @@ users; this section is the operator-facing description of the same flow.
 
 Normal (non-admin) users get one page. After Google sign-in they land on
 `/start`, and every operations page (`/dashboard`, node detail, `/models`,
-`/chat`, `/profile`, the token and admin pages) redirects them back to it.
-Admins are unaffected and are redirected away from `/start`.
+`/profile`, the token and admin pages) redirects them back to it. The `/chat`
+playground stays open to them, and it runs on the token they set up here, so
+playground usage is recorded with the rest of their usage. Admins are
+unaffected and are redirected away from `/start`.
 
 A user without a token walks through one question per screen:
 

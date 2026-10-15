@@ -39,6 +39,11 @@ from inference_proxy.plugins.interfaces.auth import AuthPlugin
 # /auth/callback (the callback URL itself carries no provider hint).
 AUTH_PROVIDER_SESSION_KEY = "auth_provider"
 
+# Request header asking for strict authentication: a caller that means to be
+# attributed (the chat playground) must not silently degrade to anonymous when
+# its credential no longer resolves.
+_REQUIRE_TOKEN_HEADER = "x-qiip-require-token"
+
 
 def get_auth_store(request: Request) -> AuthStore:
     """Return the lifespan-created auth store from application state."""
@@ -146,6 +151,11 @@ async def get_api_auth(
       permit anonymous traffic, so an invalid presented token is treated as
       anonymous rather than rejected. With enforcement on, absent or
       invalid tokens are rejected with 401.
+    * ``X-Qiip-Require-Token: 1`` asks for strict authentication per request,
+      independent of ``auth.enforce_api_tokens``: a caller that means to be
+      attributed (the chat playground) must not silently degrade to
+      anonymous when its credential no longer resolves, for example after
+      the token was replaced elsewhere.
     * A whitelist that cannot be fetched/parsed is treated as unavailable
       and the token is rejected (never served stale data).
 
@@ -153,7 +163,13 @@ async def get_api_auth(
     OpenAI-compatible ``invalid_api_key`` body.
     """
     presented = _presented_tokens(request, accept_x_api_key=False)
-    return await _authenticate(presented, settings, store, allowlist)
+    return await _authenticate(
+        presented,
+        settings,
+        store,
+        allowlist,
+        required=_requires_token(request),
+    )
 
 
 async def get_messages_api_auth(
@@ -171,7 +187,13 @@ async def get_messages_api_auth(
     the bearer token does not resolve.
     """
     presented = _presented_tokens(request, accept_x_api_key=True)
-    return await _authenticate(presented, settings, store, allowlist)
+    return await _authenticate(
+        presented,
+        settings,
+        store,
+        allowlist,
+        required=_requires_token(request),
+    )
 
 
 def _presented_tokens(request: Request, *, accept_x_api_key: bool) -> list[str]:
@@ -193,19 +215,32 @@ async def _authenticate(
     settings: Settings,
     store: AuthStore,
     allowlist: AllowlistProtocol | None,
+    *,
+    required: bool = False,
 ) -> TokenAuth | None:
-    """Resolve the first presented token that is valid, under enforcement."""
+    """Resolve the first presented token that is valid, under enforcement.
+
+    ``required`` (``X-Qiip-Require-Token``) refuses an unresolvable request
+    even with ``auth.enforce_api_tokens`` off: a caller that presents a
+    credential to be attributed must not fall back to anonymous.
+    """
     for token in presented:
         auth = await asyncio.to_thread(store.resolve_token, token)
         if auth is not None:
             await _enforce_sso_whitelist(settings, allowlist, auth)
             return auth
 
-    if settings.auth.enforce_api_tokens:
+    if required or settings.auth.enforce_api_tokens:
         if presented:
             raise ApiAuthError("Invalid API token")
         raise ApiAuthError("Authentication required for inference requests")
     return None
+
+
+def _requires_token(request: Request) -> bool:
+    """Return True when the caller asked for strict authentication."""
+    value = request.headers.get(_REQUIRE_TOKEN_HEADER, "").strip().lower()
+    return value in {"1", "true"}
 
 
 async def _enforce_sso_whitelist(

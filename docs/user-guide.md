@@ -12,8 +12,16 @@ if your domain is restricted, it has to be on the gateway allowlist), or a
 local account on small installs that run the opt-in local OIDC provider
 (the Local Login form; the operator hands out the username/password). Once
 signed in you land on `/start`, your home page. Every operations page
-(`/dashboard`, `/models`, `/chat`, `/profile`, the admin pages) sends a
-normal user back there.
+(`/dashboard`, `/models`, `/profile`, the admin pages) sends a normal user
+back there.
+
+## Chat playground
+
+`/chat` is a browser playground for trying out a model. It runs on your own
+token, so the models it offers are the models your token may use (never
+admin-only servers) and its usage is recorded with your other usage, which
+`/leaderboard` shows for your tokens. If you have no token yet, the playground
+stays disabled and links you to `/start`, where you create one.
 
 ## Connect your tool the first time
 
