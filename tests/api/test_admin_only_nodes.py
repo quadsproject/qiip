@@ -171,6 +171,27 @@ class TestAdminOnlyRoutingScope:
         assert response.status_code != 200
         assert len(httpx_mock.get_requests()) == 0
 
+    def test_anonymous_request_never_selects_admin_only_node(
+        self,
+        app: FastAPI,
+        test_registry: NodeRegistry,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        """End-to-end: a request carrying no token (the admin playground, or
+        any anonymous API client) resolves to anonymous scope, so naming an
+        admin-only node's model by id is still refused."""
+        test_registry.add(_make_node("admin_only1", admin_only=True, model="secret"))
+        test_registry.add(_make_node("pub1", model="public"))
+
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            json={"model": "secret", "messages": [{"role": "user", "content": "Hi"}]},
+        )
+
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "model_not_found"
+        assert len(httpx_mock.get_requests()) == 0
+
     def test_admin_role_token_selects_admin_only_node(
         self,
         client: TestClient,
@@ -548,11 +569,10 @@ class TestDashboardRoles:
             "/dashboard/admin",
             "/dashboard/users/1",
             "/models",
-            "/chat",
             "/profile",
         ],
     )
-    def test_normal_user_is_sent_to_start_from_every_page(
+    def test_normal_user_is_sent_to_start_from_operations_pages(
         self,
         app: FastAPI,
         auth_store: AuthStore,

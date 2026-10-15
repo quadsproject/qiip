@@ -45,7 +45,9 @@ def _node() -> str:
 
 
 def test_chat_uses_pinned_local_frontend_dependencies() -> None:
-    rendered = templates.get_template("chat.html").render(request=_TemplateRequest())
+    rendered = templates.get_template("chat.html").render(
+        request=_TemplateRequest(), anonymous_playground=False
+    )
 
     assert not re.search(r'<script[^>]+src=["\']https?://', rendered)
     for relative_path, expected_digest in _VENDORED_ASSETS.items():
@@ -101,6 +103,7 @@ const sandbox = {
   TextDecoder: class {
     decode(value) { return value ? value.toString() : ""; }
   },
+  ANONYMOUS_PLAYGROUND: true,
   document: {
     addEventListener() {},
     createElement() { return new Element(); },

@@ -208,7 +208,9 @@ class TestNavbarLogout:
         )
 
     def test_logout_hidden_for_anonymous(self, app: FastAPI) -> None:
-        response = TestClient(app).get("/chat")
+        # /profile renders the shared navbar for anonymous visitors; the chat
+        # page sends them to the sign-in shell instead.
+        response = TestClient(app).get("/profile")
 
         assert response.status_code == 200
         assert ">Logout</button>" not in response.text
