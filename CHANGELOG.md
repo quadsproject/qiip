@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.15 (2026-10-15)
+
+### Bug Fixes
+
+- Run the chat playground on the user's token
+  ([`56b8c40`](https://github.com/quadsproject/qiip/commit/56b8c406f588299b54f635715419ac7807e7d53b))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`554942c`](https://github.com/quadsproject/qiip/commit/554942cb1e46f2a87d75f4a5376c70cd52412607))
+
+
 ## v0.2.0-dev.14 (2026-10-15)
 
 ### Bug Fixes
