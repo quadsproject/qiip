@@ -511,23 +511,13 @@
       copy.type = "button";
       box.append(code, copy);
       copy.addEventListener("click", async function () {
-        var copied = false;
-        try {
-          await navigator.clipboard.writeText(choice.link.command);
-          copied = true;
-        } catch (err) {
+        var copied = await qiipCopyToClipboard(choice.link.command);
+        if (!copied) {
           var range = document.createRange();
           range.selectNodeContents(code);
           var selection = window.getSelection();
           selection.removeAllRanges();
           selection.addRange(range);
-          try {
-            copied = document.execCommand("copy");
-          } catch (ignored) {
-            copied = false;
-          }
-        }
-        if (!copied) {
           toast("Couldn't copy for you. The line is selected: press Ctrl+C.");
           return;
         }
@@ -624,10 +614,19 @@
 
       var card = el("div", "ob-card");
       var row = el("div", "ob-token-row");
-      row.append(
-        el("span", "ob-token-name", token.name),
-        el("span", "ob-token-key", token.prefix + "…")
-      );
+      var key = el("span", "ob-token-key", token.prefix + "…");
+      if (token.exportable) {
+        key.appendChild(
+          qiipTokenCopyButton({
+            className: "ob-token-copy",
+            reveal: function () {
+              return api("POST", "/onboarding/token/reveal");
+            },
+            notify: toast,
+          })
+        );
+      }
+      row.append(el("span", "ob-token-name", token.name), key);
       var made = new Date(token.created_at);
       var facts = el("div", "ob-meta");
       facts.appendChild(
@@ -741,7 +740,7 @@
           el(
             "p",
             "ob-sub",
-            "This token was made before the new setup flow. Create a new token to set up a tool in one step."
+            "This token was made before the new setup flow. Create a new token to copy it or set up a tool in one step."
           )
         );
       }

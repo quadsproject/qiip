@@ -144,10 +144,19 @@
     return button;
   }
 
+  function tokenCopyButton() {
+    return qiipTokenCopyButton({
+      className: "token-copy",
+      reveal: () => api("POST", "/onboarding/token/reveal"),
+      notify: showToast,
+    });
+  }
+
   function renderTokens() {
     const body = $("tokens-table-body");
     clearChildren(body);
     const token = state.token;
+    $("token-legacy-note").hidden = !token || Boolean(token.exportable);
     if (!token) {
       const tr = document.createElement("tr");
       const td = document.createElement("td");
@@ -161,7 +170,9 @@
     }
     const tr = document.createElement("tr");
     tr.appendChild(tdCell(token.name));
-    tr.appendChild(tdCell(token.prefix));
+    const prefix = tdCell(token.prefix);
+    if (token.exportable) prefix.appendChild(tokenCopyButton());
+    tr.appendChild(prefix);
     tr.appendChild(tdCell(formatDate(token.created_at), token.created_at));
     tr.appendChild(
       tdCell(
@@ -213,7 +224,8 @@
 
   function updateDownloadButton() {
     const harness = $("token-harness").value;
-    $("config-download-btn").disabled = !harness || !state.token;
+    $("config-download-btn").disabled =
+      !harness || !state.token || !state.token.exportable;
   }
 
   function wireTokenForm() {

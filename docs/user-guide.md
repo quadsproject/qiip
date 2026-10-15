@@ -53,17 +53,24 @@ models can be picked later.
 
 ## Your token
 
-A normal user owns exactly one token. The home screen shows it: name,
-prefix, when it was last used, and the models it may use (tap a chip to
-change the list). Two actions exist:
+A normal user owns exactly one token. The home screen shows it: name, the
+first characters of its value, when it was last used, and the models it may
+use (tap a chip to change the list). Three actions exist:
 
+- **The clipboard icon** next to the prefix copies the full token to your
+  clipboard, for a client or a script the setup flow does not cover (the
+  pages themselves only ever show the prefix). A notification tells you the
+  token is on the clipboard.
 - **Set up a tool** reuses the current token and just fetches a new setup
   link for another harness.
 - **Create a new token** revokes the old one. Tools configured with the old
   token stop working and need to be set up again.
 
-The raw token value is shown once at creation and never again; the pages
-only ever show its prefix. If you lose it, create a new token.
+Copying works for tokens created by the current setup flow. A token made
+before it shows a note instead of the icon. If a token can no longer be
+re-derived after the operator rotates the session secret, the icon stays and
+the copy reports that a new token is needed; creating one replaces the old
+token.
 
 ## Leaderboard
 
@@ -74,7 +81,8 @@ dashboard for signed-in users:
   Admin users and their usage are never shown. Your own row is marked
   `(you)`. The `Rank` column is that standing, so it stays with each user
   when you sort by another column.
-- **Your tokens**: your token with its status and models, plus a Delete
+- **Your tokens**: your token with its status and models, the clipboard icon
+  next to its prefix (the same copy action as the home screen) and a Delete
   button. Deleting revokes the token; tools configured with it stop
   working.
 - **Create a token**: a simplified flow. Pick an optional model, or leave

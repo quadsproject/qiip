@@ -254,6 +254,25 @@ def _require_available(models: list[str], available: list[str]) -> list[str]:
     return chosen
 
 
+async def _require_personal_token(store: AuthStore, user: User) -> ApiToken:
+    """Return the caller's active personal token.
+
+    Every path that narrows, exports or re-derives the user's own token needs
+    the same two refusals: no active token (404), and a token from before the
+    onboarding flow that cannot be narrowed or re-derived (409). Keeping them
+    here stops those credential paths from drifting apart.
+    """
+    token = await asyncio.to_thread(store.get_active_token, user.id)
+    if token is None:
+        raise HTTPException(status_code=404, detail="You don't have a token yet")
+    if token.purpose != "personal":
+        raise HTTPException(
+            status_code=409,
+            detail="This token was created the old way. Create a new token first.",
+        )
+    return token
+
+
 async def _widen_token_scope(
     store: AuthStore, user_id: int, token: ApiToken, models: list[str]
 ) -> None:
@@ -329,8 +348,9 @@ async def create_personal_token(
 ) -> dict[str, object]:
     """Mint the user's token, replacing (revoking) any previous one.
 
-    The raw secret is not returned: the user never needs to handle it, the
-    setup script delivers it straight into the harness config.
+    The raw secret is not returned here: the setup script and config
+    download deliver it into the harness config, and ``/onboarding/token/
+    reveal`` re-derives it on demand for the page's Copy action.
     """
     await enforce_mint_allowlist(user, settings, allowlist)
     name = body.name if body.name is not None else "default"
@@ -347,6 +367,32 @@ async def create_personal_token(
     return {"token": _token_view(created)}
 
 
+@onboarding_router.post("/onboarding/token/reveal")
+async def reveal_token(
+    user: Annotated[User, Depends(require_normal_user)],
+    store: Annotated[AuthStore, Depends(get_auth_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, str]:
+    """Return the caller's own raw token so the page can copy it.
+
+    The pages hold only the prefix, so the Copy action asks for the value
+    here. It is re-derived server-side exactly like the setup script and the
+    config download do, and the value travels in a POST response body only,
+    so the secret never lands in a URL, a page payload or a log; every
+    non-static response is ``Cache-Control: no-store`` (api/middleware.py).
+    """
+    token = await _require_personal_token(store, user)
+    raw = await asyncio.to_thread(
+        store.reveal_personal_token, token.id, _session_secret(settings)
+    )
+    if raw is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This token can no longer be exported. Create a new token first.",
+        )
+    return {"token": raw}
+
+
 @onboarding_router.put("/onboarding/token/models")
 async def update_token_models(
     body: ModelsRequest,
@@ -360,24 +406,17 @@ async def update_token_models(
     Models already on the token stay selectable even when no node serves
     them at the moment, so an edit never silently drops one.
     """
-    token = await asyncio.to_thread(store.get_active_token, user.id)
-    if token is None:
-        raise HTTPException(status_code=404, detail="You don't have a token yet")
-    if token.purpose != "personal":
-        # Narrowing an unrestricted legacy or agent-config key cannot be undone
-        # here (a scope needs at least one model), so never do it implicitly.
-        raise HTTPException(
-            status_code=409,
-            detail="This token was created the old way. Create a new token first.",
-        )
+    # Narrowing an unrestricted legacy or agent-config key cannot be undone
+    # here (a scope needs at least one model), so never do it implicitly.
+    token = await _require_personal_token(store, user)
     allowed = _available_models(user, settings, registry) + (token.model_scope or [])
     models = _require_available(body.models, allowed)
     if not await asyncio.to_thread(store.set_token_models, user.id, token.id, models):
         raise HTTPException(
             status_code=409, detail="Your token changed. Reload and try again."
         )
-    token = await asyncio.to_thread(store.get_active_token, user.id)
-    return {"token": _token_view(token)}
+    refreshed = await asyncio.to_thread(store.get_active_token, user.id)
+    return {"token": _token_view(refreshed)}
 
 
 @onboarding_router.post("/onboarding/setup-link", status_code=201)
@@ -396,14 +435,7 @@ async def create_setup_link(
     harness = get_harness(body.harness)
     if harness is None or harness.requires_route not in _served_routes():
         raise HTTPException(status_code=400, detail="That tool isn't supported yet")
-    token = await asyncio.to_thread(store.get_active_token, user.id)
-    if token is None:
-        raise HTTPException(status_code=404, detail="You don't have a token yet")
-    if token.purpose != "personal":
-        raise HTTPException(
-            status_code=409,
-            detail="This token was created the old way. Create a new token first.",
-        )
+    token = await _require_personal_token(store, user)
     models = _require_available(
         body.models, _available_models(user, settings, registry)
     )
@@ -472,14 +504,7 @@ async def download_config(
     harness = get_harness(body.harness)
     if harness is None or harness.requires_route not in _served_routes():
         raise HTTPException(status_code=400, detail="That tool isn't supported yet")
-    token = await asyncio.to_thread(store.get_active_token, user.id)
-    if token is None:
-        raise HTTPException(status_code=404, detail="You don't have a token yet")
-    if token.purpose != "personal":
-        raise HTTPException(
-            status_code=409,
-            detail="This token was created the old way. Create a new token first.",
-        )
+    token = await _require_personal_token(store, user)
     models = _require_available(
         body.models, _available_models(user, settings, registry)
     )

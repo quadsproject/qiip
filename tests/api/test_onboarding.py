@@ -224,6 +224,7 @@ class TestStartPage:
             "css/start.css",
             "js/start.js",
             "js/model_info.js",
+            "js/clipboard.js",
             "img/qiip.svg",
         ],
     )
@@ -1104,8 +1105,10 @@ class TestLeaderboard:
 
     def test_page_renders_for_signed_in_user(self, user_client: TestClient) -> None:
         html = user_client.get("/leaderboard").text
+        assert "clipboard.js" in html
         assert "leaderboard.js" in html
         assert "Usage leaderboard" in html
+        assert 'id="token-legacy-note"' in html
 
     def test_page_declares_sortable_columns(self, user_client: TestClient) -> None:
         html = user_client.get("/leaderboard").text
@@ -1203,3 +1206,119 @@ class TestConfigDownload:
             ).status_code
             == 400
         )
+
+
+class TestTokenReveal:
+    """The page Copy action: the raw token is re-derived on click only."""
+
+    def test_state_marks_a_minted_token_exportable(
+        self, user_client: TestClient
+    ) -> None:
+        _mint(user_client, [MODEL_A])
+        state = user_client.get("/onboarding/state").json()
+        assert state["token"]["exportable"] is True
+
+    def test_reveal_returns_the_token_the_setup_script_embeds(
+        self, user_client: TestClient
+    ) -> None:
+        _mint(user_client, [MODEL_A])
+        url = _link(user_client, "pi", [MODEL_A])["url"].replace(
+            "http://testserver", ""
+        )
+        from_script = _script_token(user_client.get(url).text)
+
+        response = user_client.post("/onboarding/token/reveal")
+
+        assert response.status_code == 200
+        assert response.json() == {"token": from_script}
+        assert response.headers["cache-control"] == "no-store"
+
+    def test_revealed_token_matches_the_config_download(
+        self, user_client: TestClient
+    ) -> None:
+        _mint(user_client, [MODEL_A])
+        download = user_client.post(
+            "/onboarding/config", json={"harness": "opencode", "models": [MODEL_A]}
+        )
+        api_key = json.loads(download.text)["provider"]["qiip"]["options"]["apiKey"]
+        assert user_client.post("/onboarding/token/reveal").json()["token"] == api_key
+
+    def test_revealed_token_authenticates_v1(self, user_client: TestClient) -> None:
+        _mint(user_client, [MODEL_A])
+        raw = user_client.post("/onboarding/token/reveal").json()["token"]
+        listed = TestClient(user_client.app).get(
+            "/v1/models", headers={"Authorization": f"Bearer {raw}"}
+        )
+        assert listed.status_code == 200
+        assert [m["id"] for m in listed.json()["data"]] == [MODEL_A]
+
+    def test_reveal_without_a_token_is_404(self, user_client: TestClient) -> None:
+        assert user_client.post("/onboarding/token/reveal").status_code == 404
+
+    def test_revoked_token_is_404(self, user_client: TestClient) -> None:
+        token = _mint(user_client, [MODEL_A])
+        assert user_client.post("/onboarding/token/reveal").status_code == 200
+        revoked = user_client.delete(f"/profile/tokens/{token['id']}")
+        assert revoked.status_code == 200
+        assert user_client.post("/onboarding/token/reveal").status_code == 404
+
+    def test_legacy_token_cannot_be_revealed(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        _legacy_token(auth_store)
+        response = user_client.post("/onboarding/token/reveal")
+        assert response.status_code == 409
+        assert "old way" in response.json()["detail"]
+
+    def test_rotated_session_secret_cannot_be_revealed(
+        self, user_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _mint(user_client, [MODEL_A])
+        monkeypatch.setattr(
+            "inference_proxy.api.onboarding._session_secret",
+            lambda settings: "rotated-secret",
+        )
+        response = user_client.post("/onboarding/token/reveal")
+        assert response.status_code == 409
+        assert "no longer be exported" in response.json()["detail"]
+
+    def test_reveal_requires_a_session(self, app: FastAPI) -> None:
+        assert TestClient(app).post("/onboarding/token/reveal").status_code == 401
+
+    def test_reveal_needs_no_configured_origin(
+        self, user_client: TestClient, test_settings: Settings
+    ) -> None:
+        """Copy keeps working where setup links cannot be built."""
+        _mint(user_client, [MODEL_A])
+        test_settings.oauth = OAuthSettings()
+        assert user_client.post("/onboarding/token/reveal").status_code == 200
+        blocked = user_client.post(
+            "/onboarding/config", json={"harness": "opencode", "models": [MODEL_A]}
+        )
+        assert blocked.status_code == 503
+        assert "oauth.redirect_uri" in blocked.json()["detail"]
+
+    def test_reveal_is_post_only(self, user_client: TestClient) -> None:
+        """A GET would put the request in a URL and a cache; only POST exists."""
+        assert user_client.get("/onboarding/token/reveal").status_code == 405
+
+    def test_reveal_returns_only_the_callers_own_token(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        other = auth_store.upsert_google_user(
+            google_sub="sub-other", email="other@example.com", name="Other", picture=""
+        )
+        theirs = auth_store.create_personal_token(other.id, "theirs", [MODEL_A], SECRET)
+        _mint(user_client, [MODEL_A])
+        mine = user_client.post("/onboarding/token/reveal").json()["token"]
+        assert mine != theirs.token
+        assert user_client.post("/onboarding/token/reveal").json()["token"] == mine
+
+    def test_admin_is_refused(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        admin = auth_store.list_users_with_stats()[0]
+        auth_store.set_user_admin(admin.id, True)
+        response = user_client.post("/onboarding/token/reveal")
+        assert response.status_code == 403
+        assert "profile page" in response.json()["detail"]
