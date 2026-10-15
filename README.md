@@ -60,8 +60,8 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Admin-only inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). At `/v1` they are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with an `admin_only` badge in the admin fleet view. Token usage from admin-only servers is tracked on the token summary pages exactly like any other node
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
 - **Local OAuth (opt-in)** -- a vendored toy OpenID Connect provider (`oidc-provider/`, test-only) plus the `auth.internal_oidc` plugin let a small install maintain a local user list instead of Google. Off by default; enabling it turns the sign-in page's **Local Admin** option into **Local Login** (no separate provider button; the OIDC flow stays reachable by direct link). User rows are keyed by (provider issuer, subject) so Google and local accounts coexist. See [Local OIDC provider](#local-oidc-provider-opt-in)
-- **Self-service onboarding** -- signed-in normal users land on `/start`: one question per screen (name a token, pick a coding tool, pick models) ending in a short-lived `curl ... | bash` line that writes the tool's config; returning users see their single token and its models. See [Self-service onboarding](#self-service-onboarding-start)
-- **Usage leaderboard** -- signed-in users get a simple dashboard at `/leaderboard`: every non-admin user ranked by token usage (admin tokens and usage never appear), plus the viewer's own token manager (create replaces, delete revokes) and a per-harness config download with optional model and harness pickers (RFE #156); every table on the token pages sorts by column
+- **Self-service onboarding** -- signed-in normal users land on `/start`: one question per screen (name a token, pick a coding tool, pick models) ending in a short-lived `curl ... | bash` line that writes the tool's config; returning users see their single token, its models, and a clipboard icon that copies the token. See [Self-service onboarding](#self-service-onboarding-start)
+- **Usage leaderboard** -- signed-in users get a simple dashboard at `/leaderboard`: every non-admin user ranked by token usage (admin tokens and usage never appear), plus the viewer's own token manager (copy the token with the clipboard icon next to its prefix, create replaces, delete revokes) and a per-harness config download with optional model and harness pickers (RFE #156, #247); every table on the token pages sorts by column
 - **Per-token model scope** -- a token minted by the onboarding flow may only request the models chosen for it; other models are refused on `/v1` with `403 model_not_permitted`, and `/v1/models` lists only the token's models
 - **User API tokens** -- admin-role users can mint `qiip_...` bearer tokens on their profile page to call the `/v1` inference API; normal users own exactly one token, managed on `/start`. Tokens are stored as SHA-256 digests and can be revoked at any time
 - **Stable agent-config token** -- one derived per-user key (`agent-config`) is shared by every config download across servers and browsers; its raw value is derived from `auth.session_secret` + user + generation and never stored, so revoking it rotates the key embedded in already-downloaded configs (configuration downloads for admin-only servers require the Google session that can mint it)
@@ -392,8 +392,8 @@ Public endpoints:
 | `GET` | `/v1/models` | List models available across healthy nodes |
 | `GET` | `/chat` | Browser chat playground |
 | `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage (signed-in normal users are redirected to `/start`) |
-| `GET` | `/start` | Onboarding wizard and token home for signed-in normal users; anonymous visitors get the sign-in page, admins are redirected to `/dashboard` |
-| `GET` | `/leaderboard` | Leaderboard and token dashboard for signed-in normal users (admins are redirected to `/dashboard`): non-admin usage ranking, the viewer's own tokens (create/delete), and a per-harness config download |
+| `GET` | `/start` | Onboarding wizard and token home for signed-in normal users (clipboard icon next to the token prefix copies the token); anonymous visitors get the sign-in page, admins are redirected to `/dashboard` |
+| `GET` | `/leaderboard` | Leaderboard and token dashboard for signed-in normal users (admins are redirected to `/dashboard`): non-admin usage ranking, the viewer's own token (copy/create/delete), and a per-harness config download |
 | `GET` | `/s/{id}` | Setup script for a live onboarding link. The id is the credential: 15 minute life, not logged. A dead link returns a script that explains and exits 1 |
 | `GET` | `/auth/login` | Start provider OAuth sign-in (302 to the provider; `?provider=google` or `?provider=internal_oidc` selects it, default is the first configured provider) |
 | `GET` | `/auth/callback` | Provider redirect target; signs the session cookie |
@@ -426,6 +426,7 @@ Onboarding endpoints (signed-in normal users only; admin-role sessions get 403):
 |--------|------|-------------|
 | `GET` | `/onboarding/state` | Identity, the user's current token (never the raw secret), models online right now, and the supported coding tools |
 | `POST` | `/onboarding/token` | Mint the user's single token; name and model list are optional (no name defaults to `default`, no models means every model online right now). Revokes every other token the user has |
+| `POST` | `/onboarding/token/reveal` | Return the caller's own raw token, re-derived server-side, for the Copy action (404 without a token, 409 for a token minted before this flow or one that can no longer be derived; `no-store`) |
 | `PUT` | `/onboarding/token/models` | Replace the token's model list (409 for tokens minted before this flow) |
 | `POST` | `/onboarding/setup-link` | Create a `/s/{id}` link for one coding tool; returns the ready-to-paste command and its expiry |
 | `POST` | `/onboarding/config` | Download the config file for one coding tool with the user's own token embedded; models outside the token's scope are added to it first |
@@ -1240,14 +1241,15 @@ instead of replacing them, and leaves the file readable only by the user. It
 needs `bash`; `python3` is used for JSON merges when present.
 
 A user who already has a token sees only that token, the models it may use
-(tap to change), and buttons to set up another tool or replace the token.
+(tap to change), a clipboard icon next to the prefix that copies the token,
+and buttons to set up another tool or replace the token.
 
 The header also links to the usage leaderboard (`/leaderboard`): every
 non-admin user ranked by token usage (admin users and their usage are never
 shown), plus the viewer's own token manager. From there a normal user can
-delete the token, create a new one by picking an optional model (nothing
-picked means every model online right now), and optionally pick an agent
-harness to download that harness's config file with the token embedded.
+copy the token, delete it, create a new one by picking an optional model
+(nothing picked means every model online right now), and optionally pick an
+agent harness to download that harness's config file with the token embedded.
 
 | Coding tool | Config written | Models | Needs |
 |-------------|----------------|--------|-------|

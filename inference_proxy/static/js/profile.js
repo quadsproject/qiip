@@ -328,32 +328,11 @@
     });
     $("token-copy-btn").addEventListener("click", () => {
       if (!pendingToken) return;
-      const done = () => {
-        showToast("Token copied to clipboard.", "success");
-      };
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(pendingToken).then(done, () => fallbackCopy(done));
-      } else {
-        fallbackCopy(done);
-      }
+      qiipCopyToClipboard(pendingToken).then((copied) => {
+        if (copied) showToast("Token copied to clipboard.", "success");
+        else showToast("Couldn't copy. Select the token and press Ctrl+C.", "warning");
+      });
     });
-  }
-
-  function fallbackCopy(done) {
-    const area = document.createElement("textarea");
-    area.value = pendingToken;
-    area.setAttribute("readonly", "");
-    area.style.position = "absolute";
-    area.style.left = "-9999px";
-    document.body.appendChild(area);
-    area.select();
-    try {
-      document.execCommand("copy");
-    } catch (_err) {
-      /* clipboard unavailable */
-    }
-    area.remove();
-    done();
   }
 
   // ------------------------------------------------------------------

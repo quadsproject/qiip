@@ -57,6 +57,10 @@
 
             <section class="card">
                 <h2 class="card-title">Your tokens</h2>
+                <p class="muted-status" id="token-legacy-note" hidden>
+                    This token was made before the new setup flow, so it can't be
+                    copied or exported. Create a new token below.
+                </p>
                 <div class="table-wrap">
                     <table aria-label="Your tokens">
                         <thead id="tokens-head">
@@ -101,7 +105,7 @@
         </main>
     </div>
 
-    <div id="toast-container"></div>
+    <div id="toast-container" role="status"></div>
 
     <footer>
         <p>QIIP Inference Proxy</p>
@@ -109,6 +113,7 @@
 
     <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/table_sort.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/clipboard.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/leaderboard.js') }}"></script>
 </body>
 </html>

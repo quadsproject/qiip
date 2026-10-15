@@ -82,7 +82,10 @@ class CreatedToken(ApiToken):
 
     The full ``token`` value is returned exactly once, at creation -- except
     for the derived ``agent-config`` key, which is returned by every
-    ``get_or_create_config_token`` call (see :mod:`inference_proxy.auth.store`).
+    ``get_or_create_config_token`` call, and for a ``personal`` onboarding
+    token, whose value is re-derived on demand by the setup script, the
+    config download and ``/onboarding/token/reveal`` (see
+    :mod:`inference_proxy.auth.store`).
     """
 
     token: str

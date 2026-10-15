@@ -6,11 +6,12 @@ signed in (the client decides from ``/auth/me``). The JSON endpoints under
 ``/profile/*`` are guarded by ``require_profile_user`` (AUTH-03).
 
 Per AUTH-02 a minted token's raw secret is returned exactly once, at
-creation; the list endpoints return only the token prefix for display. The
-one exception is ``name: agent-config``: that request returns the user's
-reusable derived config key (same value on every download, see
-``AuthStore.get_or_create_config_token``), which is intentionally not
-one-time.
+creation; the list endpoints return only the token prefix for display. Two
+tokens are intentionally not one-time: ``name: agent-config`` returns the
+user's reusable derived config key (same value on every download, see
+``AuthStore.get_or_create_config_token``), and a normal user's ``personal``
+onboarding token is re-derived on demand by the onboarding surface
+(``/onboarding/token/reveal``, the setup script and the config download).
 """
 
 from __future__ import annotations

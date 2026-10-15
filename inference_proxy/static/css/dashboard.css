@@ -1094,6 +1094,31 @@ th[aria-sort="descending"] .th-sort-arrow::after { content: "\2193"; }
 .btn-neutral { background: transparent; color: var(--text-light); border-color: var(--border-strong); }
 .btn-neutral:hover:not(:disabled) { border-color: var(--text); color: var(--text); background: var(--bg); }
 
+/* Clipboard icon shown beside an abbreviated token (leaderboard token row). */
+.token-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 0.4rem;
+  padding: 0.25rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-light);
+  cursor: pointer;
+  vertical-align: middle;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.token-copy:hover:not(:disabled) {
+  border-color: var(--text);
+  color: var(--text);
+  background: var(--bg);
+}
+
+.token-copy:disabled { opacity: 0.4; cursor: not-allowed; }
+.token-copy svg { width: 0.85rem; height: 0.85rem; }
+
 .btn-trigger { gap: 0.5rem; }
 .btn-trigger::after {
   content: "";
@@ -1311,6 +1336,7 @@ footer p { margin: 0; }
   html { scroll-behavior: auto; }
   .toast { transition: none; }
   .btn { transition: none; }
+  .token-copy { transition: none; }
   .nav-link { transition: none; }
   .theme-toggle { transition: none; }
   .setup-form input[type="text"] { transition: none; }
