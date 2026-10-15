@@ -52,6 +52,31 @@ def _forwarded_body(httpx_mock: HTTPXMock) -> dict[str, object]:
     return body
 
 
+def test_stream_options_reach_the_backend_unchanged(
+    client: TestClient,
+    test_registry: NodeRegistry,
+    httpx_mock: HTTPXMock,
+) -> None:
+    """The chat playground asks for streamed usage; the gateway must forward
+    the field, because without it the backend reports no usage and the turn is
+    recorded as zeros."""
+    _register_node(test_registry)
+    _mock_backend(httpx_mock, "/v1/chat/completions", stream=True)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": _MODEL,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+    )
+
+    assert response.status_code == 200
+    assert _forwarded_body(httpx_mock)["stream_options"] == {"include_usage": True}
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_tool_call_history_reaches_backend_unchanged(
     client: TestClient,

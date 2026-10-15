@@ -10,8 +10,23 @@ var sendBtn;
 var modelSelect;
 var streaming = false;
 var modelsAvailable = false;
+var authToken = null;
+var chatDisabled = false;
 var systemPromptTextarea;
 var systemPromptToggle;
+
+// Every /v1 call carries the playground credential when the viewer has one: a
+// signed-in normal user's own token, so their usage is recorded against it and
+// the model list is limited to what that token may use. The request also asks
+// for strict authentication, so a token that no longer resolves is refused
+// instead of silently becoming an anonymous call.
+function authHeaders(headers) {
+  if (authToken) {
+    headers["Authorization"] = "Bearer " + authToken;
+    headers["X-Qiip-Require-Token"] = "1";
+  }
+  return headers;
+}
 
 // Assistant Markdown is intentionally limited to inert formatting. Links render
 // as plain text and images/media/forms are removed, so model output cannot
@@ -59,8 +74,8 @@ function addMessage(role, content) {
 }
 
 function setInputEnabled(enabled) {
-  sendBtn.disabled = !enabled || !modelsAvailable;
-  chatInput.disabled = !enabled;
+  sendBtn.disabled = !enabled || !modelsAvailable || chatDisabled;
+  chatInput.disabled = !enabled || chatDisabled;
 }
 
 function commitTurn(userMessage, assistantContent) {
@@ -92,17 +107,38 @@ async function streamResponse(bubble, pendingUser) {
   cursor.className = "streaming-cursor";
   bubble.appendChild(cursor);
 
+  // Reveal per turn instead of reusing the token loaded with the page: a token
+  // replaced in another /start tab is followed, and a revoked one is refused
+  // before anything is sent.
+  var fresh = await revealCredential();
+  if (fresh === null) {
+    // The conversation stays visible, so the way out has to travel with it.
+    bubble.textContent = credentialError + " ";
+    bubble.classList.add("bubble-error");
+    appendStartLink(bubble);
+    failClosed();
+    return;
+  }
+  if (fresh) authToken = fresh;
+
   try {
     var resp = await fetch("/v1/chat/completions", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(function () {
         var payloadMessages = messages.concat([pendingUser]);
         var sp = systemPromptTextarea ? systemPromptTextarea.value.trim() : "";
         if (sp) {
           payloadMessages.unshift({ role: "system", content: sp });
         }
-        return { model: modelSelect.value, messages: payloadMessages, stream: true };
+        return {
+          model: modelSelect.value,
+          messages: payloadMessages,
+          stream: true,
+          // vLLM omits usage from a stream unless it is requested; without it
+          // the gateway can only record zeros for this turn.
+          stream_options: { include_usage: true },
+        };
       }()),
     });
 
@@ -181,7 +217,7 @@ async function streamResponse(bubble, pendingUser) {
 
 function sendMessage() {
   var text = chatInput.value.trim();
-  if (!text || streaming || !modelSelect.value) return;
+  if (!text || streaming || chatDisabled || !modelSelect.value) return;
   streaming = true;
 
   var pendingUser = { role: "user", content: text };
@@ -196,7 +232,7 @@ function sendMessage() {
 
 async function loadModels() {
   try {
-    var resp = await fetch("/v1/models");
+    var resp = await fetch("/v1/models", { headers: authHeaders({}) });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     var data = await resp.json();
     var models = data.data || [];
@@ -234,6 +270,96 @@ async function loadModels() {
   }
 }
 
+// A notice means this viewer has no token to chat with: the playground stays
+// disabled instead of making unattributed anonymous requests.
+function showChatNotice(message) {
+  failClosed();
+
+  var placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "Chat unavailable";
+  placeholder.disabled = true;
+  placeholder.selected = true;
+  modelSelect.textContent = "";
+  modelSelect.appendChild(placeholder);
+
+  var paragraph = document.getElementById("empty-state-text");
+  if (paragraph) {
+    paragraph.textContent = message + " ";
+    appendStartLink(paragraph);
+  }
+}
+
+// The way out of a disabled playground is always the same page.
+function appendStartLink(target) {
+  var link = document.createElement("a");
+  link.href = "/start";
+  link.textContent = "Open /start";
+  target.appendChild(link);
+}
+
+var CREDENTIAL_FAILURE =
+  "Could not load your chat credential. Reload the page and try again.";
+
+var credentialError = null;
+
+function credentialNotice(detail) {
+  return typeof detail === "string" && detail ? detail : CREDENTIAL_FAILURE;
+}
+
+function credentialRequired() {
+  return !(
+    typeof ANONYMOUS_PLAYGROUND !== "undefined" &&
+    ANONYMOUS_PLAYGROUND === true
+  );
+}
+
+// The page shell says whether this viewer chats anonymously (admin role, the
+// full-access trust list, or the local admin): none of them has a personal
+// token to reveal. Every other viewer runs the playground on their own token.
+//
+// Returns the revealed token, "" for the anonymous playground, or null when
+// the reveal failed (the reason is in credentialError).
+async function revealCredential() {
+  credentialError = null;
+  if (!credentialRequired()) return "";
+  var resp = null;
+  var body = {};
+  try {
+    resp = await fetch("/onboarding/token/reveal", { method: "POST" });
+    body = await resp.json();
+  } catch (e) {
+    credentialError = CREDENTIAL_FAILURE;
+    return null;
+  }
+  if (!resp.ok) {
+    credentialError = credentialNotice(body.detail);
+    return null;
+  }
+  if (!body.token) {
+    credentialError = CREDENTIAL_FAILURE;
+    return null;
+  }
+  return body.token;
+}
+
+// A viewer who must be attributed never falls back to anonymous calls.
+function failClosed() {
+  chatDisabled = true;
+  modelsAvailable = false;
+  setInputEnabled(false);
+}
+
+async function loadCredential() {
+  var token = await revealCredential();
+  if (token === null) {
+    showChatNotice(credentialError);
+    return;
+  }
+  if (token) authToken = token;
+  loadModels();
+}
+
 document.addEventListener("DOMContentLoaded", function () {
   messageArea = document.getElementById("message-area");
   messageAreaInner = messageArea.querySelector(".message-area-inner");
@@ -268,7 +394,7 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   }
 
-  loadModels();
+  loadCredential();
 
   sendBtn.addEventListener("click", sendMessage);
 

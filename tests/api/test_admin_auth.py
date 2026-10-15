@@ -363,7 +363,7 @@ class TestAdminBasicAuthentication:
         assert '<details class="signin-admin">' in response.text
         assert 'class="signin-admin" open' not in response.text
 
-    @pytest.mark.parametrize("path", ["/health", "/v1/models", "/chat"])
+    @pytest.mark.parametrize("path", ["/health", "/v1/models"])
     async def test_non_admin_routes_remain_public(
         self,
         app: FastAPI,

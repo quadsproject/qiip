@@ -6,11 +6,84 @@ Tests cover:
 - Chat page elements: model selector, message area, textarea, send button (CHAT-01, CHAT-03)
 - Accessibility: role="log", aria-live="polite"
 - Navigation: Chat link on dashboard, Dashboard link on chat (D-03)
+- Viewer access: only signed-in viewers get the playground, and a signed-in
+  normal user chats with their own token so usage is attributed (CHAT-04)
 """
 
 from __future__ import annotations
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pytest_httpx import HTTPXMock
+
+from inference_proxy.auth.dependencies import get_auth_plugin
+from inference_proxy.auth.store import AuthStore
+from inference_proxy.config.dependencies import get_settings
+from inference_proxy.config.settings import Settings
+from inference_proxy.discovery.registry import NodeRegistry
+from inference_proxy.models.node import Node, NodeStatus
+from tests.auth.conftest import FakeAuthPlugin
+
+_MODEL = "org/model-a"
+
+
+def _node(node_id: str, model: str, *, admin_only: bool = False) -> Node:
+    return Node(
+        node_id=node_id,
+        endpoint="10.0.1.100:8000",
+        status=NodeStatus.HEALTHY,
+        model=model,
+        managed=False,
+        self_setup=True,
+        admin_only=admin_only,
+    )
+
+
+def _signed_in_user_client(app: FastAPI) -> TestClient:
+    """Return a client signed in through the real callback as a normal user."""
+    app.dependency_overrides[get_auth_plugin] = lambda: FakeAuthPlugin()
+    client = TestClient(app)
+    response = client.get(
+        "/auth/callback?code=code&state=state", follow_redirects=False
+    )
+    assert response.headers["location"] == "/start"
+    return client
+
+
+def _session_secret(settings: Settings) -> str:
+    """Return the session secret the test fixtures configured."""
+    secret = settings.auth.session_secret
+    assert secret is not None
+    return secret.get_secret_value()
+
+
+def _completion(total_tokens: int) -> dict[str, object]:
+    return {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 0,
+        "model": _MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": total_tokens - 5,
+            "completion_tokens": 5,
+            "total_tokens": total_tokens,
+        },
+    }
+
+
+def _playground_headers(token: str) -> dict[str, str]:
+    """Exactly what the page sends: the token plus the strict-auth request."""
+    return {
+        "Authorization": f"Bearer {token}",
+        "X-Qiip-Require-Token": "1",
+    }
 
 
 class TestChatRoute:
@@ -146,3 +219,217 @@ class TestChatNavigation:
         """Chat nav bar contains href='/dashboard'."""
         response = client.get("/chat")
         assert 'href="/dashboard"' in response.text
+
+
+class TestChatViewerAccess:
+    """The playground is for signed-in viewers only (CHAT-04)."""
+
+    def test_anonymous_gets_the_signin_page(self, app: FastAPI) -> None:
+        response = TestClient(app).get("/chat")
+
+        assert response.status_code == 200
+        assert "Local Admin" in response.text
+        assert 'id="model-select"' not in response.text
+
+    def test_signed_in_user_gets_the_playground(
+        self,
+        app: FastAPI,
+        auth_store: AuthStore,
+    ) -> None:
+        client = _signed_in_user_client(app)
+
+        response = client.get("/chat")
+
+        assert response.status_code == 200
+        assert 'id="model-select"' in response.text
+        # The page must ask this viewer for their own token.
+        assert "const ANONYMOUS_PLAYGROUND = false;" in response.text
+
+    def test_admin_role_gets_the_anonymous_playground(
+        self,
+        client: TestClient,
+    ) -> None:
+        response = client.get("/chat")
+
+        assert response.status_code == 200
+        assert "const ANONYMOUS_PLAYGROUND = true;" in response.text
+
+    def test_full_access_user_gets_the_anonymous_playground(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        auth_store: AuthStore,
+    ) -> None:
+        """The trust list keeps a portfolio of tokens, so it is never asked to
+        reveal a personal one either."""
+        enabled = test_settings.model_copy(
+            deep=True,
+            update={
+                "auth": test_settings.auth.model_copy(
+                    update={"admin_only_tokens_full_access": ["alice@example.com"]}
+                )
+            },
+        )
+        app.dependency_overrides[get_settings] = lambda: enabled
+        client = _signed_in_user_client(app)
+
+        response = client.get("/chat")
+
+        assert response.status_code == 200
+        assert "const ANONYMOUS_PLAYGROUND = true;" in response.text
+
+
+class TestPlaygroundToken:
+    """A normal user's playground runs on their own token (CHAT-04).
+
+    The credential is ``POST /onboarding/token/reveal``: its contract, the
+    refusals the page turns into its notice, and the admin ``403`` that keeps
+    admins anonymous are covered in test_onboarding.py. These tests pin what
+    the playground does with the revealed token.
+    """
+
+    def test_revealed_token_attributes_usage_and_narrows_models(
+        self,
+        app: FastAPI,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+        test_settings: Settings,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        client = _signed_in_user_client(app)
+        user = auth_store.get_user(auth_store.list_users_with_stats()[0].id)
+        assert user is not None
+        created = auth_store.create_personal_token(
+            user.id,
+            "chat tool",
+            [_MODEL],
+            _session_secret(test_settings),
+        )
+        test_registry.add(_node("gpu01", _MODEL))
+        httpx_mock.add_response(
+            url="http://10.0.1.100:8000/v1/chat/completions",
+            json=_completion(10),
+        )
+
+        credential = client.post("/onboarding/token/reveal").json()
+
+        assert credential["token"] == created.token
+        headers = _playground_headers(credential["token"])
+        assert [
+            m["id"] for m in client.get("/v1/models", headers=headers).json()["data"]
+        ] == [_MODEL]
+
+        turn = client.post(
+            "/v1/chat/completions",
+            json={"model": _MODEL, "messages": [{"role": "user", "content": "hi"}]},
+            headers=headers,
+        )
+
+        assert turn.status_code == 200
+        usage = auth_store.get_usage_summary(created.id)
+        assert [(row.model, row.total_tokens) for row in usage] == [(_MODEL, 10)]
+
+    def test_admin_only_model_is_not_reachable(
+        self,
+        app: FastAPI,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+        test_settings: Settings,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        """A user's playground token cannot reach an admin-only server, even
+        when the token was scoped to that model name."""
+        client = _signed_in_user_client(app)
+        user = auth_store.get_user(auth_store.list_users_with_stats()[0].id)
+        assert user is not None
+        created = auth_store.create_personal_token(
+            user.id,
+            "chat tool",
+            ["secret"],
+            _session_secret(test_settings),
+        )
+        test_registry.add(_node("admin-only1", "secret", admin_only=True))
+        test_registry.add(_node("pub1", _MODEL))
+
+        raw = client.post("/onboarding/token/reveal").json()["token"]
+        assert [m["id"] for m in client.get("/v1/models").json()["data"]] == [_MODEL]
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={"model": "secret", "messages": [{"role": "user", "content": "hi"}]},
+            headers=_playground_headers(raw),
+        )
+
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "model_not_found"
+        assert len(httpx_mock.get_requests()) == 0
+        assert raw == created.token
+
+    def test_replacing_the_token_between_turns_is_followed(
+        self,
+        app: FastAPI,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+        test_settings: Settings,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        """The page reveals before every turn, so a token replaced in another
+        /start tab is followed. The revoked value is refused instead of being
+        served as an anonymous request (enforcement is off by default), which
+        would silently lose the turn's usage."""
+        client = _signed_in_user_client(app)
+        user = auth_store.get_user(auth_store.list_users_with_stats()[0].id)
+        assert user is not None
+        first = auth_store.create_personal_token(
+            user.id,
+            "first",
+            [_MODEL],
+            _session_secret(test_settings),
+        )
+        test_registry.add(_node("gpu01", _MODEL))
+        for total in (10, 20):
+            httpx_mock.add_response(
+                url="http://10.0.1.100:8000/v1/chat/completions",
+                json=_completion(total),
+            )
+
+        turned = client.post(
+            "/v1/chat/completions",
+            json={"model": _MODEL, "messages": [{"role": "user", "content": "one"}]},
+            headers=_playground_headers(
+                client.post("/onboarding/token/reveal").json()["token"]
+            ),
+        )
+        replacement = auth_store.create_personal_token(
+            user.id,
+            "second",
+            [_MODEL],
+            _session_secret(test_settings),
+        )
+        revealed = client.post("/onboarding/token/reveal").json()["token"]
+        again = client.post(
+            "/v1/chat/completions",
+            json={"model": _MODEL, "messages": [{"role": "user", "content": "two"}]},
+            headers=_playground_headers(revealed),
+        )
+        stale = client.post(
+            "/v1/chat/completions",
+            json={"model": _MODEL, "messages": [{"role": "user", "content": "three"}]},
+            headers=_playground_headers(first.token),
+        )
+
+        assert revealed == replacement.token
+        assert replacement.token != first.token
+        assert (turned.status_code, again.status_code) == (200, 200)
+        assert stale.status_code == 401
+        assert [
+            row.total_tokens
+            for row in auth_store.get_usage_summary(user.id)
+            if row.token_id == first.id
+        ] == [10]
+        assert [
+            row.total_tokens
+            for row in auth_store.get_usage_summary(user.id)
+            if row.token_id == replacement.id
+        ] == [20]
+        assert len(httpx_mock.get_requests()) == 2

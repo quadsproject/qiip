@@ -19,6 +19,7 @@ The guide separates three kinds of change:
 - [Reuse verified llama.cpp artifacts](#30-reuse-verified-llamacpp-artifacts-and-bound-source-builds)
 - [Size managed vLLM launches from available memory](#31-size-managed-vllm-launches-from-available-memory)
 - [Setup resume and bounded transient retries](#32-setup-resume-and-bounded-transient-retries)
+- [The chat playground requires a signed-in viewer](#33-the-chat-playground-requires-a-signed-in-viewer)
 - [Artifact sources and mirror policy](#artifact-sources-and-mirror-policy)
 - [Client-visible compatibility changes](#client-visible-compatibility-changes)
 - [RPM install migration](#rpm-install-migration)
@@ -78,7 +79,7 @@ INFERENCE_PROXY_ADMIN__USERNAME=operator
 INFERENCE_PROXY_ADMIN__PASSWORD=replace-me
 ```
 
-HTTP Basic authentication protects `/admin/*` and `/dashboard*`. The inference endpoints, chat page, and `/health` remain public. HTTP Basic sends a reusable base64-encoded credential on every request. Plain HTTP is an accepted deployment choice on a trusted work LAN; use a TLS terminator whenever the network path is not trusted.
+HTTP Basic authentication protects `/admin/*` and `/dashboard*`. The inference endpoints and `/health` remain public; the chat playground requires a signed-in viewer (section 33). HTTP Basic sends a reusable base64-encoded credential on every request. Plain HTTP is an accepted deployment choice on a trusted work LAN; use a TLS terminator whenever the network path is not trusted.
 
 State-changing admin endpoints accept JSON only. Cross-origin JSON and DELETE requests require a browser preflight, which is part of the current CSRF boundary. Do not add form-encoded, multipart, or plain-text state-changing admin endpoints without adding explicit CSRF protection.
 
@@ -564,7 +565,7 @@ configuration is required; read it before upgrading a gateway that already has
 Google users.
 
 - **One page for normal users.** After sign-in they land on `/start`, and
-  `/dashboard`, node detail pages, `/models`, `/chat`, `/profile`, and the
+  `/dashboard`, node detail pages, `/models`, `/profile`, and the
   token and admin pages all redirect them there. The read-only fleet and node
   views they had before are gone. Admin-role users and the local admin keep
   every page and are redirected away from `/start`. Users on the
@@ -851,6 +852,44 @@ ordered setup stages passed, and the next operator action on the provisioning
 history and node-detail views. The stage-progress percentage uses pipeline
 position per engine, so a host that legitimately skips an optional stage still
 reaches 100% when the terminal stage completes.
+
+### 33. The chat playground requires a signed-in viewer
+
+This changes who can use the browser playground at `/chat` and how its requests
+are authenticated. No configuration is required.
+
+- **The playground is no longer public.** An anonymous visitor gets the
+  sign-in page instead of the chat shell.
+- **A signed-in normal user chats with their own token.** The page reveals it
+  through `POST /onboarding/token/reveal` (the endpoint the token Copy action
+  already uses) before every turn, so a token replaced in another `/start` tab
+  is followed, and sends it as a bearer token plus `X-Qiip-Require-Token: 1` on
+  every `/v1` call. Each turn is recorded against that token (AUTH-04) with the
+  usage the backend reports for the stream (`stream_options.include_usage`),
+  the model selector lists only the models that token may use, and node
+  selection resolves to the user's non-admin scope. Under
+  `auth.enforce_api_tokens=true` the playground authenticates like any other
+  client instead of failing with `401`.
+- **A credential that no longer resolves is refused, never anonymized.** The
+  strict-auth request header asks the gateway to reject an absent or
+  unresolvable token with `401 invalid_api_key` even while anonymous access is
+  enabled, so a token revoked between the reveal and the turn can never be
+  served as an anonymous, unrecorded request. Ordinary clients keep the
+  documented enforcement-off fallback exactly as before.
+- **Admins keep the anonymous playground.** The page shell tells the script
+  that an admin viewer (admin role, the full-access trust list, or the local
+  admin) chats anonymously, so it never asks for a token: their calls carry no
+  credential and are not attributed, exactly as before. The reveal endpoint
+  refuses those viewers anyway (`403` for an admin role or a full-access user,
+  `401` for the local admin, which has no user row).
+- **A failed reveal disables the playground instead of falling back to
+  anonymous calls.** Without a personal token, or with a pre-onboarding token
+  whose value cannot be re-derived, the model selector stays disabled and shows
+  the reveal endpoint's message with a link to `/start`.
+- **Admin-only servers stay out of the playground.** Anonymous calls (the admin
+  playground included) and a signed-in normal user's token both resolve to a
+  non-admin node scope, so a model served only by an admin-only node is neither
+  listed nor routed to.
 
 ## Artifact Sources and Mirror Policy
 
