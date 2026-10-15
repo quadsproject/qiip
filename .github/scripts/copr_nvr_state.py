@@ -25,6 +25,10 @@ published  every project chroot serves the binary RPM of the NVR and its file
            is fetchable
 stale      a Copr build exists for the NVR but a chroot does not serve it
 absent     neither a Copr build nor a file exists for the NVR
+
+Exit status: 0 on success, 1 only when a name, NVR or artifact is not
+published, 2 when the repository or the Copr API cannot be read and when a
+lookup fails for any other reason.
 """
 
 from __future__ import annotations
@@ -40,6 +44,13 @@ PROJECT = "https://download.copr.fedorainfracloud.org/results/quadsdev/qiip"
 API = "https://copr.fedorainfracloud.org/api_3"
 TIMEOUT = 60
 BUILD_LIMIT = 200
+EXIT_MISSING = 1
+EXIT_UNREADABLE = 2
+
+
+class UndeterminedError(RuntimeError):
+    """Raised when the answer cannot be determined."""
+
 
 REPOMD = (
     b'<repomd><data type="primary">'
@@ -74,7 +85,7 @@ def primary_href(repomd: bytes) -> str:
     """Return the relative path of the primary metadata file in repomd.xml."""
     match = re.search(rb'<location href="(repodata/[^"]*primary\.xml\.gz)"', repomd)
     if match is None:
-        raise SystemExit("no primary metadata declared in repomd.xml")
+        raise UndeterminedError("no primary metadata declared in repomd.xml")
     return match.group(1).decode()
 
 
@@ -96,7 +107,9 @@ def packages(primary: bytes, include_src: bool = False) -> list[tuple[str, str, 
         )
         location = re.search(rb'<location href="([^"]+)"/>', package)
         if not (name and version and location):
-            raise SystemExit("unexpected package entry in the repository metadata")
+            raise UndeterminedError(
+                "unexpected package entry in the repository metadata"
+            )
         nvr = b"-".join((name.group(1), version.group(1), version.group(2)))
         packages.append(
             (nvr.decode(), name.group(1).decode(), location.group(1).decode())
@@ -123,7 +136,7 @@ def dist_of(chroot: str) -> str:
     """Return the dist tag of a Fedora chroot, for example fc43."""
     dist = "fc" + chroot.removeprefix("fedora-").removesuffix("-x86_64")
     if not re.fullmatch(r"fc\d+", dist):
-        raise SystemExit(f"unexpected chroot name: {chroot!r}")
+        raise UndeterminedError(f"unexpected chroot name: {chroot!r}")
     return dist
 
 
@@ -132,7 +145,7 @@ def version_release_of(name: str, nvr: str) -> str:
     stem = nvr.removeprefix(f"{name}-")
     version_release, _, dist = stem.rpartition(".")
     if stem == nvr or not re.fullmatch(r"fc\d+", dist):
-        raise SystemExit(f"not a {name} NVR with a fedora dist tag: {nvr!r}")
+        raise UndeterminedError(f"not a {name} NVR with a fedora dist tag: {nvr!r}")
     return version_release
 
 
@@ -144,7 +157,7 @@ def build_states(name: str, version_release: str) -> list[str]:
     )
     items = json.loads(fetch(url))["items"]
     if len(items) >= BUILD_LIMIT:
-        raise SystemExit(f"the build list for {name} is truncated")
+        raise UndeterminedError(f"the build list for {name} is truncated")
     return [
         f"{build['id']} {build['state']}"
         for build in items
@@ -267,7 +280,7 @@ def self_test() -> int:
     for bad in ("qiip-dev-1.0.0", "qiip-dev-1.0.0-1", "python3-click-1.0.0-1.fc43"):
         try:
             version_release_of("qiip-dev", bad)
-        except SystemExit:
+        except UndeterminedError:
             continue
         raise AssertionError(f"a foreign NVR must be rejected: {bad}")
     print("copr_nvr_state self-test ok")
@@ -293,26 +306,32 @@ def dispatch(argv: list[str]) -> int:
         found = urls(argv[2], argv[3])
         if not found:
             print(f"no published artifact for {argv[3]}", file=sys.stderr)
-            return 1
+            return EXIT_MISSING
         print("\n".join(found))
         return 0
     if argv[1:2] == ["names"] and len(argv) >= 4:
         missing = missing_names(argv[2], argv[3:])
         if missing:
             print(" ".join(missing))
-            return 1
+            return EXIT_MISSING
         return 0
     print(__doc__, file=sys.stderr)
-    return 2
+    return EXIT_UNREADABLE
 
 
 def main(argv: list[str]) -> int:
-    """Dispatch the requested mode, reporting a failed lookup on one line."""
+    """Dispatch the mode, reporting any failed lookup on one line.
+
+    Anything that stops the answer from being determined maps to
+    EXIT_UNREADABLE: a request failure, metadata that does not parse, a
+    truncated build list, or an unexpected error. EXIT_MISSING is reserved
+    for an answer that was determined.
+    """
     try:
         return dispatch(argv)
-    except (urllib.error.HTTPError, urllib.error.URLError) as error:
-        print(f"copr_nvr_state: {error}", file=sys.stderr)
-        return 2
+    except Exception as error:  # noqa: BLE001 - every failure is "undetermined"
+        print(f"copr_nvr_state: {type(error).__name__}: {error}", file=sys.stderr)
+        return EXIT_UNREADABLE
 
 
 if __name__ == "__main__":
