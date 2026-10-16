@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.19 (2026-10-16)
+
+### Bug Fixes
+
+- Address 0.2.0 roll-up review findings
+  ([`8cea3e1`](https://github.com/quadsproject/qiip/commit/8cea3e1e9d2723fc8a6218f1e2f06eee6d8bceab))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`14c1f87`](https://github.com/quadsproject/qiip/commit/14c1f875e389c9c801e7395301a56c6d305b1db3))
+
+
 ## v0.2.0-dev.18 (2026-10-15)
 
 ### Bug Fixes
