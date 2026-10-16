@@ -61,7 +61,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
 - **Local OAuth (opt-in)** -- a vendored toy OpenID Connect provider (`oidc-provider/`, test-only) plus the `auth.internal_oidc` plugin let a small install maintain a local user list instead of Google. Off by default; enabling it turns the sign-in page's **Local Admin** option into **Local Login** (no separate provider button; the OIDC flow stays reachable by direct link). User rows are keyed by (provider issuer, subject) so Google and local accounts coexist. See [Local OIDC provider](#local-oidc-provider-opt-in)
 - **Self-service onboarding** -- signed-in normal users land on `/start`: one question per screen (name a token, pick a coding tool, pick models) ending in a short-lived `curl ... | bash` line that writes the tool's config; returning users see their single token, its models, and a clipboard icon that copies the token. See [Self-service onboarding](#self-service-onboarding-start)
-- **Usage leaderboard** -- signed-in users get a simple dashboard at `/leaderboard`: every non-admin user ranked by token usage (admin tokens and usage never appear), plus the viewer's own token manager (copy the token with the clipboard icon next to its prefix, create replaces, delete revokes) and a per-harness config download with optional model and harness pickers (RFE #156, #247); every table on the token pages sorts by column
+- **Usage leaderboard** -- signed-in users get a simple dashboard at `/leaderboard`: every non-admin user ranked by token usage (admin tokens and usage never appear). Normal users also get their own token manager there (copy the token with the clipboard icon next to its prefix, create replaces, delete revokes) and a per-harness config download with optional model and harness pickers; admins see the same ranking and manage their tokens on `/profile` (RFE #156, #247); every table on the token pages sorts by column
 - **Per-token model scope** -- a token minted by the onboarding flow may only request the models chosen for it; other models are refused on `/v1` with `403 model_not_permitted`, and `/v1/models` lists only the token's models
 - **User API tokens** -- admin-role users can mint `qiip_...` bearer tokens on their profile page to call the `/v1` inference API; normal users own exactly one token, managed on `/start`. Tokens are stored as SHA-256 digests and can be revoked at any time
 - **Stable agent-config token** -- one derived per-user key (`agent-config`) is shared by every config download across servers and browsers; its raw value is derived from `auth.session_secret` + user + generation and never stored, so revoking it rotates the key embedded in already-downloaded configs (configuration downloads for admin-only servers require the Google session that can mint it)
@@ -409,7 +409,7 @@ Public endpoints:
 | `GET` | `/chat` | Browser chat playground (signed-in viewers; anonymous visitors get the sign-in page, a signed-in normal user chats with their own token) |
 | `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage (signed-in normal users are redirected to `/start`) |
 | `GET` | `/start` | Onboarding wizard and token home for signed-in normal users (clipboard icon next to the token prefix copies the token); anonymous visitors get the sign-in page, admins are redirected to `/dashboard` |
-| `GET` | `/leaderboard` | Leaderboard and token dashboard for signed-in normal users (admins are redirected to `/dashboard`): non-admin usage ranking, the viewer's own token (copy/create/delete), and a per-harness config download |
+| `GET` | `/leaderboard` | Leaderboard and token dashboard for signed-in viewers (the HTTP Basic admin is redirected to `/dashboard`): the non-admin usage ranking for everyone; the viewer's own token (copy/create/delete) and a per-harness config download for normal users, since admins manage tokens on `/profile` |
 | `GET` | `/s/{id}` | Setup script for a live onboarding link. The id is the credential: 15 minute life, not logged. A dead link returns a script that explains and exits 1 |
 | `GET` | `/auth/login` | Start provider OAuth sign-in (302 to the provider; `?provider=google` or `?provider=internal_oidc` selects it, default is the first configured provider) |
 | `GET` | `/auth/callback` | Provider redirect target; signs the session cookie |
@@ -436,7 +436,7 @@ signed-in session):
 | `GET` | `/profile/usage` | Aggregated usage per token/model plus headline totals |
 | `GET` | `/profile/endpoints` | Registered nodes the user may pin (unowned nodes plus nodes they own) |
 
-Onboarding endpoints (signed-in normal users only; admin-role sessions get 403):
+Onboarding endpoints (signed-in normal users only; admin-role sessions get 403, except the shared usage ranking below):
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -446,7 +446,7 @@ Onboarding endpoints (signed-in normal users only; admin-role sessions get 403):
 | `PUT` | `/onboarding/token/models` | Replace the token's model list (409 for tokens minted before this flow) |
 | `POST` | `/onboarding/setup-link` | Create a `/s/{id}` link for one coding tool; returns the ready-to-paste command and its expiry |
 | `POST` | `/onboarding/config` | Download the config file for one coding tool with the user's own token embedded; models outside the token's scope are added to it first |
-| `GET` | `/onboarding/leaderboard` | Non-admin users ranked by usage; admin users are never listed |
+| `GET` | `/onboarding/leaderboard` | Non-admin users ranked by usage; admin users are never listed. Every authenticated viewer may read it, admin-role sessions, the local-admin session and HTTP Basic included |
 
 Admin-authenticated endpoints (HTTP Basic or admin-role session):
 

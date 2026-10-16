@@ -640,6 +640,27 @@ h1 {
   margin-bottom: 1rem;
 }
 
+/* One label + select pair in the leaderboard token form. The pair wraps
+   as a unit so the select drops below its label in a narrow card. */
+.token-field {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  white-space: nowrap;
+  flex-wrap: wrap;
+}
+
+.token-field .setup-select {
+  min-width: 0;
+}
+
+/* The Create + Download config buttons, spaced like every other action row. */
+.token-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .token-pin-group {
   display: flex;
   align-items: center;
