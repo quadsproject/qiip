@@ -16,7 +16,7 @@
     allowlist_unavailable:
       "The whitelist service is unavailable. Please try again later.",
     account_conflict:
-      "This email is already linked to another sign-in provider.",
+      "This email is already linked to another account.",
   };
 
   const $ = (id) => document.getElementById(id);

@@ -42,3 +42,6 @@ plugins:
       # provider from OIDC_DOMAIN) so the form and the OIDC flow agree;
       # there is no per-plugin domain setting. Providers that advertise no
       # such claim map bare usernames to the default localdomain.
+      # The ID token must name this client in its audience (aud contains
+      # INFERENCE_PROXY_OAUTH__CLIENT_ID); a provider that publishes a
+      # resource-style audience needs an audience mapper for this client.

@@ -45,6 +45,7 @@ def _fake_discovery(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
 
 _VALID_USERINFO: dict[str, object] = {
     "iss": _LOCAL_ISSUER,
+    "aud": "my-qiip-client",
     "sub": "subject-123",
     "email": "alice@localdomain",
     "email_verified": True,
@@ -94,9 +95,10 @@ def _configured_settings(
     test_settings: Settings,
     *,
     metadata_url: str = _LOCAL_ISSUER + "/.well-known/openid-configuration",
+    client_id: str = "my-qiip-client",
 ) -> Settings:
     oauth = OAuthSettings(
-        client_id="my-qiip-client",
+        client_id=client_id,
         client_secret=SecretStr("s3cret"),
         redirect_uri="https://proxy.example.com/auth/callback",
     )
@@ -229,6 +231,63 @@ class TestInternalOidcPluginFlow:
             await plugin.complete_login(_request())
 
         assert exc_info.value.code == "no_profile"
+
+    async def test_complete_login_accepts_audience_list(
+        self, test_settings: Settings
+    ) -> None:
+        plugin = _plugin(_configured_settings(test_settings))
+        userinfo = dict(_VALID_USERINFO)
+        userinfo["aud"] = ["my-qiip-client", "other-client"]
+        _inject_fake(plugin, _FakeOAuth(_FakeOidc(token={"userinfo": userinfo})))
+
+        identity = await plugin.complete_login(_request())
+
+        assert identity.email == "alice@localdomain"
+
+    async def test_complete_login_foreign_audience_is_login_failed(
+        self, test_settings: Settings
+    ) -> None:
+        """A token minted for another client of the same provider (azp names
+        ours) is refused; authlib's azp check alone accepts it."""
+        plugin = _plugin(_configured_settings(test_settings))
+        userinfo = dict(_VALID_USERINFO)
+        userinfo["aud"] = "other-client"
+        userinfo["azp"] = "my-qiip-client"
+        _inject_fake(plugin, _FakeOAuth(_FakeOidc(token={"userinfo": userinfo})))
+
+        with pytest.raises(AuthCallbackError) as exc_info:
+            await plugin.complete_login(_request())
+
+        assert exc_info.value.code == "login_failed"
+
+    async def test_complete_login_missing_audience_is_login_failed(
+        self, test_settings: Settings
+    ) -> None:
+        plugin = _plugin(_configured_settings(test_settings))
+        userinfo = dict(_VALID_USERINFO)
+        del userinfo["aud"]
+        _inject_fake(plugin, _FakeOAuth(_FakeOidc(token={"userinfo": userinfo})))
+
+        with pytest.raises(AuthCallbackError) as exc_info:
+            await plugin.complete_login(_request())
+
+        assert exc_info.value.code == "login_failed"
+
+    async def test_complete_login_audience_uses_configured_client(
+        self, test_settings: Settings
+    ) -> None:
+        """The audience is compared against the configured client id, not a
+        literal: the default test audience is refused when the deployment
+        registers a different client."""
+        plugin = _plugin(
+            _configured_settings(test_settings, client_id="other-proxy-client")
+        )
+        _inject_fake(plugin, _FakeOAuth())
+
+        with pytest.raises(AuthCallbackError) as exc_info:
+            await plugin.complete_login(_request())
+
+        assert exc_info.value.code == "login_failed"
 
 
 class TestLocalUserList:

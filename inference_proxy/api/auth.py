@@ -201,13 +201,13 @@ async def local_admin_login(
                 picture="",
             )
         except AccountConflictError as exc:
-            # The username is valid but its email is already taken by an
-            # account from another provider; refuse rather than migrating
-            # the account (admin role and tokens) across providers.
+            # The username is valid but its email is already linked to
+            # another account; refuse rather than migrating the account
+            # (admin role and tokens).
             logger.warning("local login provider conflict", email=exc.email)
             raise HTTPException(
                 status_code=409,
-                detail="This email is already linked to another sign-in provider",
+                detail="This email is already linked to another account",
             ) from None
         set_session_user(request, user.id, settings.auth.session_ttl_seconds)
         logger.info("local oauth user signed in", user_id=user.id, email=identity[0])

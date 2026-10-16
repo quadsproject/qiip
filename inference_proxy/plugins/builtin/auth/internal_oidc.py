@@ -72,6 +72,8 @@ class InternalOidcPlugin(AuthPlugin):
         # Issuer advertised by the discovery document; authoritative over the
         # metadata-URL derivation when present.
         self._discovery_issuer: str | None = None
+        # Client id the ID token must be addressed to (``aud``).
+        self._client_id: str = ""
 
     def initialize(self, plugin_manager: PluginManager | None = None) -> bool:
         """Build the OIDC client when opted in with credentials + provider URL.
@@ -113,6 +115,7 @@ class InternalOidcPlugin(AuthPlugin):
         )
         self._client = oauth
         self._server_metadata_url = metadata_url
+        self._client_id = oauth_settings.client_id or ""
         self._fetch_email_domain()
         return True
 
@@ -176,7 +179,12 @@ class InternalOidcPlugin(AuthPlugin):
         )
 
     async def complete_login(self, request: Request) -> AuthIdentity:
-        """Exchange the callback code for claims and return a normalized identity."""
+        """Exchange the callback code for claims and return a normalized identity.
+
+        The ID token must be addressed to this client: ``aud`` has to contain
+        the configured client id, so a provider that publishes a resource-style
+        audience needs an audience mapper.
+        """
         try:
             token = await self._require_client().oidc.authorize_access_token(request)
         except OAuthError as exc:
@@ -200,6 +208,13 @@ class InternalOidcPlugin(AuthPlugin):
         if not isinstance(issuer, str) or not issuer:
             logger.warning("internal oidc callback missing issuer", userinfo=userinfo)
             raise AuthCallbackError("no_profile")
+        # authlib only checks azp when aud mismatches, so a token minted for
+        # a sibling client would pass; require the audience to name us.
+        aud = userinfo.get("aud")
+        audiences = aud if isinstance(aud, list) else [aud]
+        if self._client_id not in [str(item) for item in audiences]:
+            logger.warning("internal oidc callback audience mismatch", aud=aud)
+            raise AuthCallbackError("login_failed")
         name = userinfo.get("name")
         picture = userinfo.get("picture")
         return AuthIdentity(
