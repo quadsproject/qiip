@@ -1207,6 +1207,43 @@ class TestIssuerScopedUsers:
         assert refreshed.name == "Alice Smith"
         assert auth_store._conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
 
+    def test_same_issuer_email_refresh_conflict_refused(
+        self, auth_store: AuthStore
+    ) -> None:
+        """A refresh onto an email held by another row is refused like the
+        insert path, instead of escaping as a raw IntegrityError."""
+        first = auth_store.upsert_google_user(
+            google_sub="sub-123",
+            issuer=self._LOCAL_ISSUER,
+            email="alice@localdomain",
+            name="Alice",
+            picture="",
+        )
+        auth_store.upsert_google_user(
+            google_sub="sub-456",
+            issuer=self._LOCAL_ISSUER,
+            email="bob@localdomain",
+            name="Bob",
+            picture="",
+        )
+
+        with pytest.raises(AccountConflictError) as exc:
+            auth_store.upsert_google_user(
+                google_sub="sub-123",
+                issuer=self._LOCAL_ISSUER,
+                email="bob@localdomain",
+                name="Alice Renamed",
+                picture="",
+            )
+
+        assert exc.value.email == "bob@localdomain"
+        kept = auth_store.get_user(first.id)
+        assert kept is not None
+        assert kept.email == "alice@localdomain"
+        # A leaked transaction would hold the SQLite writer lock until the
+        # next commit, blocking sibling workers.
+        assert auth_store._conn.in_transaction is False
+
     def test_email_conflict_across_issuers_refused(
         self,
         auth_store: AuthStore,

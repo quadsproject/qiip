@@ -47,16 +47,17 @@ logger = structlog.get_logger()
 
 
 class AccountConflictError(Exception):
-    """A user row with the same email exists under another issuer.
+    """The requested email is already held by another account row.
 
-    Raised when the email-unique fallback cannot rebind because the row
-    belongs to a different provider; the login is refused rather than
-    silently moving an account (and its admin role and tokens) between
-    issuers.
+    Raised when the email-unique fallback cannot rebind (a different
+    provider owns the address) or when a same-issuer refresh would move a
+    mutable email onto a row another subject holds; the login is refused
+    rather than silently merging accounts (and their admin roles and
+    tokens).
     """
 
     def __init__(self, email: str) -> None:
-        super().__init__(f"email {email!r} is claimed by another issuer")
+        super().__init__(f"email {email!r} is already held by another account")
         self.email = email
 
 
@@ -482,14 +483,20 @@ class AuthStore:
                         self._conn.rollback()
                         raise AccountConflictError(email) from None
             else:
-                self._conn.execute(
-                    """
-                    UPDATE users
-                       SET email = ?, name = ?, picture = ?, updated_at = ?
-                     WHERE issuer = ? AND google_sub = ?
-                    """,
-                    (email, name, picture, now, issuer, google_sub),
-                )
+                try:
+                    self._conn.execute(
+                        """
+                        UPDATE users
+                           SET email = ?, name = ?, picture = ?, updated_at = ?
+                         WHERE issuer = ? AND google_sub = ?
+                        """,
+                        (email, name, picture, now, issuer, google_sub),
+                    )
+                except sqlite3.IntegrityError:
+                    # The refreshed email is held by another row; refuse like
+                    # the insert path instead of escaping as a 500.
+                    self._conn.rollback()
+                    raise AccountConflictError(email) from None
             self._conn.commit()
             row = self._conn.execute(
                 "SELECT * FROM users WHERE issuer = ? AND google_sub = ?",
