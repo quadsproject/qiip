@@ -572,6 +572,13 @@ Google users.
   `auth.admin_only_tokens_full_access` trust list are sent to `/profile`
   instead, where they keep minting pinned and unscoped tokens; the `/start`
   flow refuses them because its mint would revoke those tokens.
+- **Admins keep the leaderboard.** `/leaderboard` renders the non-admin
+  ranking for admin-role users and the local-admin session; admin rows are
+  never listed, and the token manager half of the page stays with normal
+  users (admins manage tokens on `/profile`). The HTTP Basic admin has no
+  session for the page's own requests and is redirected to `/dashboard`. The
+  ranking endpoint (`GET /onboarding/leaderboard`) answers every
+  authenticated viewer.
 - **`POST /profile/tokens` is admin-only** (admin role or the full-access
   trust list). Other normal users get `403`, including
   for `name: agent-config`. Scripts that minted tokens as a normal user must

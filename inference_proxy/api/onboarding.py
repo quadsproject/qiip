@@ -30,7 +30,11 @@ from pydantic import BaseModel, Field
 
 from inference_proxy.api.profile import enforce_mint_allowlist
 from inference_proxy.api.routes import router as inference_router
-from inference_proxy.api.templating import signin_response, templates
+from inference_proxy.api.templating import (
+    leaderboard_redirect,
+    signin_response,
+    templates,
+)
 from inference_proxy.auth.allowlist import SSOAllowlist
 from inference_proxy.auth.dependencies import (
     get_auth_store,
@@ -43,6 +47,7 @@ from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import (
     get_registry,
     get_settings,
+    require_fleet_viewer,
     session_user_has_full_access,
     viewer_role,
 )
@@ -581,18 +586,20 @@ async def leaderboard_page(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> HTMLResponse | RedirectResponse:
-    """Render the leaderboard + token dashboard HTML shell (normal users).
+    """Render the leaderboard + token dashboard HTML shell.
 
-    The page drives the normal-user onboarding endpoints, so admins are
-    sent to their token dashboard (``/dashboard``) and full-access users to
-    ``/profile``, exactly like ``start_page``. Anonymous visitors get the
-    sign-in page.
+    Admins keep every normal-user view: an admin with a browser session
+    sees the non-admin ranking, and the token manager half of the page stays
+    with normal users because the onboarding endpoints refuse admins (their
+    token manager is ``/profile``). ``leaderboard_redirect`` owns who is
+    sent elsewhere (the HTTP Basic admin to ``/dashboard``, full-access
+    users to ``/profile``); the navbar link uses the same rule. Anonymous
+    visitors get the sign-in page.
     """
     role = viewer_role(request, settings)
-    if role == "admin":
-        return RedirectResponse("/dashboard", status_code=302)
-    if role == "user" and session_user_has_full_access(request, settings):
-        return RedirectResponse("/profile", status_code=302)
+    target = leaderboard_redirect(request)
+    if target is not None:
+        return RedirectResponse(target, status_code=302)
     if role is None:
         return signin_response(
             request,
@@ -602,14 +609,20 @@ async def leaderboard_page(
     return templates.TemplateResponse(
         request=request,
         name="leaderboard.html",
-        context={"active_page": "leaderboard"},
+        context={"active_page": "leaderboard", "viewer_role": role},
     )
 
 
-@onboarding_router.get("/onboarding/leaderboard")
+@onboarding_router.get(
+    "/onboarding/leaderboard", dependencies=[Depends(require_fleet_viewer)]
+)
 async def leaderboard(
-    user: Annotated[User, Depends(require_profile_user)],
     store: Annotated[AuthStore, Depends(get_auth_store)],
 ) -> list[LeaderboardEntry]:
-    """Rank non-admin users by usage; admin rows are never listed."""
+    """Rank non-admin users by usage; admin rows are never listed.
+
+    Every authenticated viewer may read (admins keep every normal-user
+    view, and the same ranking renders on the admin surfaces); anonymous
+    callers get 401.
+    """
     return await asyncio.to_thread(store.list_leaderboard)

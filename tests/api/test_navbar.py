@@ -47,9 +47,8 @@ class _TemplateRequest:
     headers: dict[str, str] = {}
 
 
-@pytest.fixture
-def user_session_client(app: FastAPI, test_settings: Settings) -> TestClient:
-    """A signed-in normal user (not an admin), as in tests/api/test_onboarding.py."""
+def _signed_in_client(app: FastAPI, test_settings: Settings) -> TestClient:
+    """Return a TestClient signed in through the real /auth/callback."""
     test_settings.oauth = OAuthSettings(
         client_id="test-client",
         client_secret=SecretStr("test-secret"),
@@ -61,7 +60,24 @@ def user_session_client(app: FastAPI, test_settings: Settings) -> TestClient:
         "/auth/callback?code=code&state=state", follow_redirects=False
     )
     assert response.status_code == 302
-    assert response.headers["location"] == "/start"
+    return client
+
+
+@pytest.fixture
+def user_session_client(app: FastAPI, test_settings: Settings) -> TestClient:
+    """A signed-in normal user (not an admin), as in tests/api/test_onboarding.py."""
+    client = _signed_in_client(app, test_settings)
+    assert client.get("/start", follow_redirects=False).status_code == 200
+    return client
+
+
+@pytest.fixture
+def admin_session_client(app: FastAPI, test_settings: Settings) -> TestClient:
+    """A signed-in admin: the signed-in user row carries the admin role."""
+    client = _signed_in_client(app, test_settings)
+    store = app.state.auth_store
+    for user in store.list_users_with_stats():
+        store.set_user_admin(user.id, True)
     return client
 
 
@@ -146,6 +162,70 @@ class TestNavbarActiveState:
             '<a href="/profile" class="nav-link nav-link-active" aria-current="page">Profile</a>'
             in response.text
         )
+
+
+class TestNavbarLeaderboardLink:
+    """The link renders only where /leaderboard renders (one shared rule)."""
+
+    def test_normal_user_sees_the_leaderboard_link(
+        self, user_session_client: TestClient
+    ) -> None:
+        response = user_session_client.get("/leaderboard", follow_redirects=False)
+
+        assert response.status_code == 200
+        assert '<a href="/leaderboard"' in response.text
+
+    def test_admin_session_sees_the_leaderboard_link(
+        self, admin_session_client: TestClient
+    ) -> None:
+        response = admin_session_client.get("/dashboard")
+
+        assert response.status_code == 200
+        assert '<a href="/leaderboard"' in response.text
+        assert ">Leaderboard</a>" in response.text
+
+    def test_basic_admin_does_not_see_the_leaderboard_link(
+        self, client: TestClient
+    ) -> None:
+        # The route sends the session-less admin to /dashboard, so the link
+        # must not offer a page that bounces straight back.
+        response = client.get("/dashboard")
+
+        assert response.status_code == 200
+        assert '<a href="/leaderboard"' not in response.text
+
+    def test_full_access_user_does_not_see_the_leaderboard_link(
+        self, user_session_client: TestClient, test_settings: Settings
+    ) -> None:
+        test_settings.auth.admin_only_tokens_full_access.append("alice@example.com")
+
+        page = user_session_client.get("/profile", follow_redirects=False)
+        redirect = user_session_client.get("/leaderboard", follow_redirects=False)
+
+        assert page.status_code == 200
+        assert '<a href="/leaderboard"' not in page.text
+        assert redirect.status_code == 302
+        assert redirect.headers["location"] == "/profile"
+
+    def test_local_admin_session_sees_the_leaderboard_link(self, app: FastAPI) -> None:
+        client = TestClient(app)
+        client.post(
+            "/auth/local-admin",
+            json={"username": "test-admin", "password": "test-password"},
+        )
+
+        response = client.get("/profile", follow_redirects=False)
+
+        assert response.status_code == 200
+        assert '<a href="/leaderboard"' in response.text
+
+    def test_anonymous_sees_the_leaderboard_link(self, app: FastAPI) -> None:
+        # The link stays for anonymous visitors: the page itself serves them
+        # the sign-in form.
+        response = TestClient(app).get("/profile", follow_redirects=False)
+
+        assert response.status_code == 200
+        assert '<a href="/leaderboard"' in response.text
 
 
 class TestNavbarIsSingleSourceOfTruth:

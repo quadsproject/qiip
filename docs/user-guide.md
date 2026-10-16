@@ -85,6 +85,9 @@ token.
 The `Leaderboard` link in the header opens `/leaderboard`, a simple
 dashboard for signed-in users:
 
+Admins see the same ranking; the token sections below are for normal users,
+and admins manage their tokens on the profile page.
+
 - **Usage leaderboard**: every non-admin user ranked by total tokens.
   Admin users and their usage are never shown. Your own row is marked
   `(you)`. The `Rank` column is that standing, so it stays with each user
