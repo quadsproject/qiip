@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.22 (2026-10-16)
+
+### Bug Fixes
+
+- Give admins the leaderboard ranking
+  ([`13eee30`](https://github.com/quadsproject/qiip/commit/13eee3020c2d801013a441c8ca33e95a49f72086))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`19a6a17`](https://github.com/quadsproject/qiip/commit/19a6a179aa2a4962f021954b9d772dcb312d01a3))
+
+
 ## v0.2.0-dev.21 (2026-10-16)
 
 ### Bug Fixes
