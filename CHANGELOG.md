@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.21 (2026-10-16)
+
+### Bug Fixes
+
+- Gate the Google sign-in option on its provider
+  ([`a6c1445`](https://github.com/quadsproject/qiip/commit/a6c14451f4997d8832b8e714cac9cca553a04a7c))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`2ce74f2`](https://github.com/quadsproject/qiip/commit/2ce74f296c083b87993461c422b47dcf40a41209))
+
+
 ## v0.2.0-dev.20 (2026-10-16)
 
 ### Bug Fixes
