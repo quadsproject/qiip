@@ -55,6 +55,12 @@
                 </div>
             </section>
 
+            {% if viewer_role == "admin" %}
+            <section class="card">
+                <h2 class="card-title">Your tokens</h2>
+                <p class="muted-status">Admins manage tokens on the <a href="/profile">profile page</a> after a provider sign-in.</p>
+            </section>
+            {% else %}
             <section class="card">
                 <h2 class="card-title">Your tokens</h2>
                 <p class="muted-status" id="token-legacy-note" hidden>
@@ -86,13 +92,13 @@
                 <form id="token-form" class="setup-form">
                     <div class="token-field">
                         <label for="token-model">Model</label>
-                        <select id="token-model" aria-label="Model (optional)">
+                        <select id="token-model" class="setup-select" aria-label="Model (optional)">
                             <option value="">All models (optional)</option>
                         </select>
                     </div>
                     <div class="token-field">
                         <label for="token-harness">Agent harness</label>
-                        <select id="token-harness" aria-label="Agent harness (optional)">
+                        <select id="token-harness" class="setup-select" aria-label="Agent harness (optional)">
                             <option value="">None (skip config)</option>
                         </select>
                     </div>
@@ -102,6 +108,7 @@
                     </div>
                 </form>
             </section>
+            {% endif %}
         </main>
     </div>
 

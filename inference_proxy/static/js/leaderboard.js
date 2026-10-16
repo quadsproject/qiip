@@ -58,12 +58,16 @@
 
   function enableTableSort() {
     SORTABLE_TABLES.forEach((table) => {
+      // The token table only exists on the normal-user view (admins manage
+      // tokens on /profile), so absent tables are skipped.
+      if (!$(table.head) || !$(table.body)) return;
       window.tableSort.enable($(table.head), $(table.body));
     });
   }
 
   function reapplyTableSort() {
     SORTABLE_TABLES.forEach((table) => {
+      if (!$(table.head) || !$(table.body)) return;
       window.tableSort.reapply($(table.head), $(table.body));
     });
   }
@@ -338,10 +342,16 @@
 
   async function init() {
     enableTableSort();
-    wireTokenForm();
+    // The token manager is the normal-user half of the page: the admin
+    // shell has no token form, and the onboarding endpoints refuse admins,
+    // so the ranking alone loads for that view.
+    const tokenSection = $("token-form");
+    if (tokenSection) wireTokenForm();
     try {
-      me = await api("GET", "/auth/me");
-      await loadState();
+      if (tokenSection) {
+        me = await api("GET", "/auth/me");
+        await loadState();
+      }
       await loadLeaderboard();
       $("last-updated").textContent =
         "Updated " + new Date().toLocaleTimeString();

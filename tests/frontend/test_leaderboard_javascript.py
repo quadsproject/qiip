@@ -90,9 +90,20 @@ class Element {
 }
 
 function byId(id) {
+  if (ABSENT_IDS.indexOf(id) !== -1) return null;
   if (!elements.has(id)) elements.set(id, new Element("div"));
   return elements.get(id);
 }
+
+// The admin view renders the ranking alone: the template omits the token
+// cards, so their elements do not exist on the page. Kept in sync with the
+// absent id set asserted by tests/api/test_onboarding.py
+// (test_admin_sees_the_ranking_without_the_token_manager).
+const ADMIN_VIEW = IS_ADMIN;
+const ABSENT_IDS = ADMIN_VIEW
+  ? ["tokens-head", "tokens-table-body", "token-legacy-note", "token-form",
+     "token-model", "token-harness", "token-create-btn", "config-download-btn"]
+  : [];
 
 function buildHead(id, kinds) {
   const head = byId(id);
@@ -108,7 +119,7 @@ function buildHead(id, kinds) {
 buildHead("leaderboard-head", [null, "text", "number", "number", "number", "number", "number"]);
 // The template ships the server's ranking state on Total tokens.
 byId("leaderboard-head").children[0].children[6].setAttribute("aria-sort", "descending");
-buildHead("tokens-head", ["text", "text", "date", "date", "text", "text", null]);
+if (!ADMIN_VIEW) buildHead("tokens-head", ["text", "text", "date", "date", "text", "text", null]);
 
 const payloads = {
   "/auth/me": { id: 1, email: "me@example.com", name: "Me", picture: null },
@@ -174,16 +185,19 @@ vm.runInContext(source, sandbox);
   // The token row's prefix cell carries the clipboard icon. Click it and
   // record the reveal call, the clipboard write and the toast; then check the
   // legacy-token note and the Download config gating below.
-  const prefixCell = byId("tokens-table-body").children[0]
-    ? byId("tokens-table-body").children[0].children[1]
+  const tokenBody = ADMIN_VIEW ? null : byId("tokens-table-body");
+  const prefixCell = tokenBody && tokenBody.children[0]
+    ? tokenBody.children[0].children[1]
     : null;
   const copyButton = prefixCell && prefixCell.children[0] ? prefixCell.children[0] : null;
   const revealBeforeClick = calls.filter(function (call) {
     return call.url === "/onboarding/token/reveal";
   }).length;
-  byId("token-harness").value = "pi";
-  if (byId("token-harness").listeners.change) byId("token-harness").listeners.change({});
-  const downloadDisabled = byId("config-download-btn").disabled;
+  if (!ADMIN_VIEW) {
+    byId("token-harness").value = "pi";
+    if (byId("token-harness").listeners.change) byId("token-harness").listeners.change({});
+  }
+  const downloadDisabled = ADMIN_VIEW ? null : byId("config-download-btn").disabled;
   if (copyButton) {
     await copyButton.listeners.click({});
     await new Promise(function (resolve) { setTimeout(resolve, 20); });
@@ -200,7 +214,7 @@ vm.runInContext(source, sandbox);
     revealAfterClick: calls.filter(function (call) {
       return call.url === "/onboarding/token/reveal";
     }).length,
-    legacyNoteHidden: byId("token-legacy-note").hidden,
+    legacyNoteHidden: ADMIN_VIEW ? null : byId("token-legacy-note").hidden,
     downloadDisabled: downloadDisabled,
     clipboardWrites: clipboardWrites.slice(),
     toasts: toasts.slice(),
@@ -212,8 +226,8 @@ vm.runInContext(source, sandbox);
     for (let click = 0; click < CLICK_COUNT; click += 1) header.click();
   }
 
-  const tokenHeaders = byId("tokens-head").children[0].children;
-  if (TOKENS_SORT_INDEX >= 0) tokenHeaders[TOKENS_SORT_INDEX].click();
+  const tokenHeaders = ADMIN_VIEW ? [] : byId("tokens-head").children[0].children;
+  if (!ADMIN_VIEW && TOKENS_SORT_INDEX >= 0) tokenHeaders[TOKENS_SORT_INDEX].click();
 
   const ranks = function () {
     return byId("leaderboard-body").children.map(function (row) {
@@ -237,8 +251,10 @@ vm.runInContext(source, sandbox);
 
   // Creating a token reloads the leaderboard, so the table renders again and
   // the sorter has to re-apply the active choice over the fresh rows.
-  byId("token-form").listeners.submit({ preventDefault: function () {} });
-  await new Promise(function (resolve) { setTimeout(resolve, 20); });
+  if (!ADMIN_VIEW) {
+    byId("token-form").listeners.submit({ preventDefault: function () {} });
+    await new Promise(function (resolve) { setTimeout(resolve, 20); });
+  }
 
   process.stdout.write(JSON.stringify({
     ranks: snapshot.ranks,
@@ -255,8 +271,10 @@ vm.runInContext(source, sandbox);
     leaderboardFetches: calls.filter(function (call) {
       return call.url === "/onboarding/leaderboard";
     }).length,
+    fetches: calls.map(function (call) { return call.url; }),
+    errorBannerText: byId("error-banner").textContent,
     copy: copy,
-    tokenRows: byId("tokens-table-body").children.map(function (row) {
+    tokenRows: ADMIN_VIEW ? [] : byId("tokens-table-body").children.map(function (row) {
       return row.children[0] ? row.children[0].textContent : "";
     }),
   }));
@@ -273,12 +291,14 @@ def _run(
     click_count: int = 1,
     token: dict[str, Any] | None = None,
     tokens_sort_index: int = -1,
+    admin_view: bool = False,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
         pytest.fail("Node.js is required for leaderboard JS regressions")
     script = (
-        _HARNESS.replace("TOKENS_SORT_INDEX", str(tokens_sort_index))
+        _HARNESS.replace("IS_ADMIN", "true" if admin_view else "false")
+        .replace("TOKENS_SORT_INDEX", str(tokens_sort_index))
         .replace("SORT_INDEX", str(sort_index))
         .replace("CLICK_COUNT", str(click_count))
         .replace("LEADERBOARD_ROWS", json.dumps(users))
@@ -400,6 +420,24 @@ def test_you_marker_does_not_join_the_user_sort_key() -> None:
     assert result["users"][0] == "Sam (you)"
     assert result["users"][1] == "Sam"
     assert result["aria"][1] == "ascending"
+
+
+def test_admin_view_renders_the_ranking_alone() -> None:
+    # The admin shell omits the token cards (admins manage tokens on their
+    # profile page), so the ranking must render and sort without touching
+    # the onboarding endpoints, which answer 403 to admins.
+    bo = _user(1, "Bo", 30)
+    ann = _user(2, "Ann", 10)
+
+    result = _run([bo, ann], admin_view=True, sort_index=6, click_count=2)
+
+    assert result["users"] == ["Bo", "Ann"]
+    assert result["aria"][6] == "descending"
+    assert result["leaderboardFetches"] == 1
+    # The ranking alone loads: no identity, state, token or config request.
+    assert result["fetches"] == ["/onboarding/leaderboard"]
+    assert result["errorBannerText"] == ""
+    assert result["tokenRows"] == []
 
 
 def test_your_tokens_table_sorts_by_last_used() -> None:

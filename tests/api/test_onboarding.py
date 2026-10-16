@@ -1138,15 +1138,70 @@ class TestLeaderboard:
         assert response.status_code == 200
         assert "Google Auth" in response.text or "Local Admin" in response.text
 
-    def test_admin_is_redirected_to_dashboard(self, app: FastAPI) -> None:
+    def test_admin_sees_the_ranking_without_the_token_manager(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        user_id = auth_store.list_users_with_stats()[0].id
+        auth_store.set_user_admin(user_id, True)
+
+        page = user_client.get("/leaderboard", follow_redirects=False)
+
+        assert page.status_code == 200
+        assert "Usage leaderboard" in page.text
+        # The server still sends its ranking state on the Total tokens column.
+        assert page.text.count('aria-sort="descending"') == 1
+        # The normal-user token manager is not on the admin view; admins
+        # manage tokens on their profile page instead. This id set is the
+        # contract the JS harness models (tests/frontend/
+        # test_leaderboard_javascript.py, ABSENT_IDS).
+        for element_id in (
+            "token-form",
+            "token-model",
+            "token-harness",
+            "token-create-btn",
+            "config-download-btn",
+            "token-legacy-note",
+            "tokens-head",
+            "tokens-table-body",
+        ):
+            assert f'id="{element_id}"' not in page.text, element_id
+        assert "Admins manage tokens on the" in page.text
+        assert 'href="/profile"' in page.text
+        # The admin reads the same ranking, which never lists admins: the
+        # only user here is the promoted admin, so the board is empty.
+        assert user_client.get("/onboarding/leaderboard").json() == []
+
+    def test_local_admin_session_gets_the_leaderboard(self, app: FastAPI) -> None:
         client = TestClient(app)
         client.post(
             "/auth/local-admin",
             json={"username": "test-admin", "password": "test-password"},
         )
         response = client.get("/leaderboard", follow_redirects=False)
+        assert response.status_code == 200
+        assert "Usage leaderboard" in response.text
+        assert 'id="token-form"' not in response.text
+
+    def test_basic_admin_is_redirected_to_dashboard(self, client: TestClient) -> None:
+        # HTTP Basic carries no cookie for the page's own requests, so the
+        # session-less admin keeps the dashboard redirect.
+        response = client.get("/leaderboard", follow_redirects=False)
         assert response.status_code == 302
         assert response.headers["location"] == "/dashboard"
+
+    def test_every_authenticated_viewer_may_read_the_ranking(
+        self, app: FastAPI, client: TestClient
+    ) -> None:
+        # The admin viewers read the same ranking the normal-user page shows;
+        # anonymous callers stay locked out.
+        assert client.get("/onboarding/leaderboard").status_code == 200
+        local = TestClient(app)
+        local.post(
+            "/auth/local-admin",
+            json={"username": "test-admin", "password": "test-password"},
+        )
+        assert local.get("/onboarding/leaderboard").status_code == 200
+        assert TestClient(app).get("/onboarding/leaderboard").status_code == 401
 
 
 class TestConfigDownload:
