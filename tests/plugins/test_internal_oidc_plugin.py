@@ -39,6 +39,7 @@ class _DiscoveryResponse:
 def _fake_discovery(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """Keep initialize() off the network; tests opt into metadata per test."""
     monkeypatch.setattr(httpx, "get", _fake_get)
+    _DiscoveryResponse._metadata.clear()
     return _DiscoveryResponse._metadata
 
 
@@ -334,3 +335,19 @@ class TestLocalUserList:
         )
 
         assert plugin.issuer == _LOCAL_ISSUER
+
+    def test_issuer_prefers_discovery_document(
+        self, tmp_path: Path, _fake_discovery: dict[str, object]
+    ) -> None:
+        """The advertised ``issuer`` wins over the metadata-URL derivation, so
+        the Local Login form and the OIDC callback key rows identically when
+        the document is served from a different path than the issuer."""
+        _fake_discovery["issuer"] = "https://sso.example.com/realms/qiip"
+        _fake_discovery["user_email_domain"] = "example.com"
+        plugin = self._plugin(tmp_path, "alice:secret\n")
+        plugin._server_metadata_url = (
+            _LOCAL_ISSUER + "/.well-known/openid-configuration"
+        )
+
+        assert plugin._fetch_email_domain() == "example.com"
+        assert plugin.issuer == "https://sso.example.com/realms/qiip"

@@ -307,14 +307,18 @@ def test_node_detail_page_survives_backslash_in_hostname() -> None:
 
 
 def test_templates_have_no_raw_jinja_values_inside_scripts() -> None:
-    quoted_jinja = re.compile(r"""["']\s*\{\{.*?\}\}\s*["']""")
+    expression = re.compile(r"\{\{(.*?)\}\}", re.DOTALL)
+    # Every jinja value crossing into JS must be JSON-encoded; the poll
+    # expression is the one blessed numeric form.
+    safe = re.compile(r"^[^}]*\|\s*tojson\s*$|^\s*poll_interval \* 1000\s*$")
     violations: list[str] = []
 
-    for template in sorted(_TEMPLATES.glob("*.html")):
+    for template in sorted(_TEMPLATES.rglob("*.html")):
         for block in re.findall(
             r"<script(?:\s[^>]*)?>(.*?)</script>", template.read_text(), re.DOTALL
         ):
-            if quoted_jinja.search(block):
-                violations.append(template.name)
+            for expr in expression.finditer(block):
+                if not safe.match(expr.group(1).strip()):
+                    violations.append(template.name)
 
     assert violations == []

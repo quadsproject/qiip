@@ -1116,12 +1116,17 @@ so accounts never collide.
 2. Start the provider and point nginx at `/oidc/` (git checkout:
    `cp oidc-provider/users.txt.example oidc-provider/users.txt`, edit it,
    then `systemctl enable --now qiip-oidc`; the included nginx template
-   already proxies `/oidc/`). Set `OIDC_DOMAIN` to your site domain (e.g.
-   `somelab.example.com`) so bare usernames sign in as
+   already proxies `/oidc/` when nginx runs on the provider host. The
+   containerized nginx method (nginx.md Method 2) cannot reach the
+   loopback-bound provider, so the local OIDC provider needs Method 1.
+   Set `OIDC_DOMAIN` to your site domain (e.g. `somelab.example.com`) so
+   bare usernames sign in as
    `user1@somelab.example.com`; full emails in `users.txt` are used
    as-is (`OIDC_DOMAIN` goes in `/opt/inference-proxy/.env` for the git
    checkout unit, `/etc/qiip/oidc.env` for the RPM unit; restart
-   `qiip-oidc` after editing). Keep
+   `qiip-oidc` after editing). Set `OIDC_BASE_URL` there too, to the
+   public issuer URL: the external flow needs it and it is the issuer the
+   local form keys accounts by. Keep
    `INFERENCE_PROXY_OAUTH__ALLOWED_DOMAINS` (or leave it empty) in sync
    with that domain.
    The gateway fetches `server_metadata_url` and the token endpoint
@@ -1150,9 +1155,11 @@ so accounts never collide.
      `oauth.allowed_domains` (when set) must match the provider domain.
 
 RPM install layout: provider at `/usr/share/qiip/oidc-provider/`, the user
-list at `/etc/qiip/oidc-users.txt` (0600, `%config(noreplace)` — `sudo vi
-/etc/qiip/oidc-users.txt && sudo systemctl restart qiip-oidc` to change
-users), `OIDC_*` overrides in `/etc/qiip/oidc.env`, and the RSA signing key
+list at `/etc/qiip/oidc-users.txt` (0600, `%config(noreplace)`, installed
+comment-only so an unedited copy enables nothing; add users with `sudo vi
+/etc/qiip/oidc-users.txt && sudo systemctl restart qiip-oidc`, the sample
+list is `/usr/share/qiip/oidc-provider/users.txt.example`), `OIDC_*`
+overrides in `/etc/qiip/oidc.env`, and the RSA signing key
 under `/var/lib/qiip/oidc/`. The `qiip-oidc.service` unit is installed but
 not enabled by default. The packaged nginx template already proxies
 `/oidc/`; upgrades never clobber an edited `/etc/nginx/nginx.conf`, so an

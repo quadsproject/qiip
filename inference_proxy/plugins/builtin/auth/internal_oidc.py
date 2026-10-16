@@ -36,8 +36,8 @@ logger = structlog.get_logger()
 # own registry (registered as ``google``).
 _CLIENT_NAME = "oidc"
 
-# Standard OIDC metadata suffix; the issuer is the metadata URL without it
-# (true for both the vendored provider and common OIDC deployments).
+# Standard OIDC metadata suffix; the metadata URL without it is the issuer
+# fallback when the discovery document is unavailable.
 _METADATA_SUFFIX = "/.well-known/openid-configuration"
 _DEFAULT_DOMAIN = "localdomain"
 
@@ -69,6 +69,9 @@ class InternalOidcPlugin(AuthPlugin):
         # Local Login form and the OIDC flow mint identical emails (single
         # source; the old ``domain`` config key is gone).
         self._domain: str | None = None
+        # Issuer advertised by the discovery document; authoritative over the
+        # metadata-URL derivation when present.
+        self._discovery_issuer: str | None = None
 
     def initialize(self, plugin_manager: PluginManager | None = None) -> bool:
         """Build the OIDC client when opted in with credentials + provider URL.
@@ -114,18 +117,23 @@ class InternalOidcPlugin(AuthPlugin):
         return True
 
     def _fetch_email_domain(self) -> str | None:
-        """Read ``user_email_domain`` from the provider discovery document.
+        """Read the provider's discovery document.
 
         The vendored provider publishes its ``OIDC_DOMAIN`` there, so the
         Local Login form and the OIDC flow mint identical emails for the
-        same bare username from one source (review #231). A missing or
-        unfetchable document leaves the plain ``localdomain`` fallback;
-        providers that only ever mint full emails are unaffected.
+        same bare username from one source (review #231). The advertised
+        ``issuer`` is recorded too: authlib pins the ID-token ``iss`` to it,
+        and the Local Login form must key rows the same way. A missing or
+        unfetchable document leaves the plain ``localdomain`` fallback and
+        the metadata-URL issuer derivation; providers that only ever mint
+        full emails are unaffected.
         """
         try:
             response = httpx.get(self._server_metadata_url, timeout=10.0)
             response.raise_for_status()
-            raw = response.json().get("user_email_domain")
+            payload = response.json()
+            raw = payload.get("user_email_domain")
+            advertised = payload.get("issuer")
         except (httpx.HTTPError, ValueError) as exc:
             logger.warning(
                 "internal oidc discovery unavailable; bare usernames use the "
@@ -134,7 +142,10 @@ class InternalOidcPlugin(AuthPlugin):
                 error=str(exc),
             )
             self._domain = None
+            self._discovery_issuer = None
             return None
+        if isinstance(advertised, str) and advertised.strip():
+            self._discovery_issuer = advertised.strip()
         domain = str(raw).strip() if isinstance(raw, str) else ""
         if not domain:
             logger.warning(
@@ -202,12 +213,17 @@ class InternalOidcPlugin(AuthPlugin):
 
     @property
     def issuer(self) -> str:
-        """Return the provider issuer (metadata URL without the OIDC suffix).
+        """Return the provider issuer.
 
         Used to key users created by the Local Login form with the same
-        (issuer, sub) identity the provider flow produces.
+        (issuer, sub) identity the provider flow produces. The discovery
+        document's ``issuer`` wins (authlib validates the ID-token ``iss``
+        against it); the metadata URL without the OIDC suffix is the
+        fallback when the document is unavailable.
         """
-        return self._server_metadata_url.removesuffix(_METADATA_SUFFIX)
+        return self._discovery_issuer or self._server_metadata_url.removesuffix(
+            _METADATA_SUFFIX
+        )
 
     def verify_local_credentials(
         self, username: str, password: str, admin_username: str

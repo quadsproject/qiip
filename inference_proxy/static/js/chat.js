@@ -78,8 +78,26 @@ function setInputEnabled(enabled) {
   chatInput.disabled = !enabled || chatDisabled;
 }
 
+// Bound what gets re-sent: one long answer can fill the model's context and
+// every later turn would otherwise re-send the same oversized transcript.
+// Approximate budget (4 chars per token); the newest turn is always kept.
+var MAX_HISTORY_CHARS = 24000;
+
+function trimHistory() {
+  var start = Math.max(0, messages.length - 2);
+  var total = 0;
+  for (var i = start; i >= 2; i -= 2) {
+    var pair = messages[i - 2].content.length + messages[i - 1].content.length;
+    if (total + pair > MAX_HISTORY_CHARS) break;
+    total += pair;
+    start = i - 2;
+  }
+  if (start > 0) messages.splice(0, start);
+}
+
 function commitTurn(userMessage, assistantContent) {
   messages.push(userMessage, { role: "assistant", content: assistantContent });
+  trimHistory();
 }
 
 function extractedErrorMessage(errorData) {
