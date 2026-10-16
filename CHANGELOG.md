@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.23 (2026-10-16)
+
+### Bug Fixes
+
+- Drop the non-admin fleet client path
+  ([`49f53af`](https://github.com/quadsproject/qiip/commit/49f53afe68e264629e67109091260a30e6816f58))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`9654394`](https://github.com/quadsproject/qiip/commit/9654394375bc2dd734b65fb68adedc80c075c9f2))
+
+
 ## v0.2.0-dev.22 (2026-10-16)
 
 ### Bug Fixes
