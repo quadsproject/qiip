@@ -1,11 +1,10 @@
-"""Frontend JS harness tests for the dashboard role gate (regression).
+"""Frontend JS harness tests for the operations dashboard.
 
-The dashboard template declares ``const VIEWER_ROLE`` at top level, which does
-NOT create a ``window`` property. dashboard.js must resolve the role through
-the lexical binding -- the bug this suite guards against read
-``window.VIEWER_ROLE``, which is always ``undefined`` in a browser, so every
-visitor took the admin code path and fetched ``/admin/nodes`` (401 + Basic
-challenge) instead of ``/fleet/nodes``.
+The dashboard shell is admin-only (``api/dashboard.py``), so dashboard.js
+always renders the full operational view: node rows, state badges and the
+per-node link into the admin node detail page, fed by the ``/admin/*``
+endpoints. The former role gate (``VIEWER_ROLE``) and its ``/fleet/nodes``
+fallback were removed with the non-admin fleet view.
 """
 
 from __future__ import annotations
@@ -74,7 +73,6 @@ const sandbox = {
     captured.push({ url, options });
     const body = {
       "/admin/nodes": ADMIN_NODES,
-      "/fleet/nodes": FLEET_NODES,
       "/admin/metrics": { per_node: {} },
       "/admin/quads/status": { status: "connected", last_sync: new Date().toISOString() },
       "/admin/billing": { totals: null },
@@ -90,7 +88,6 @@ const sandbox = {
 
 vm.createContext(sandbox);
 vm.runInContext(setupSelectionSource, sandbox);
-__PRESCRIPT__
 vm.runInContext(source, sandbox);
 
 (async function () {
@@ -120,10 +117,7 @@ vm.runInContext(source, sandbox);
 
 
 def _run_harness(
-    lexical_role: str | None = None,
-    window_role: str | None = None,
     admin_nodes: list[dict[str, Any]] | None = None,
-    fleet_nodes: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -132,16 +126,7 @@ def _run_harness(
             "CI must install it explicitly"
         )
 
-    prescript = ""
-    if lexical_role is not None:
-        prescript += f"vm.runInContext('const VIEWER_ROLE = {json.dumps(lexical_role)};', sandbox);\n"
-    if window_role is not None:
-        prescript += f"vm.runInContext('window.VIEWER_ROLE = {json.dumps(window_role)};', sandbox);\n"
-    harness = (
-        _HARNESS.replace("__PRESCRIPT__", prescript)
-        .replace("ADMIN_NODES", json.dumps(admin_nodes or []))
-        .replace("FLEET_NODES", json.dumps(fleet_nodes or []))
-    )
+    harness = _HARNESS.replace("ADMIN_NODES", json.dumps(admin_nodes or []))
 
     result = subprocess.run(
         [node, "-e", harness, str(_DASHBOARD_JS)],
@@ -177,39 +162,20 @@ def test_unreachable_available_host_displays_blocker() -> None:
     node = _node_payload()
     reason = "blocked: SSH connection timed out"
     node.update(state="available", placement_blocker=reason)
-    result = _run_harness(lexical_role="admin", admin_nodes=[node])
+    result = _run_harness(admin_nodes=[node])
     assert {"text": "blocked", "title": reason} in result["badges"]
     assert all(badge["text"] != "available" for badge in result["badges"])
 
 
-def test_user_role_fetches_fleet_endpoint() -> None:
-    """The dashboard template renders `const VIEWER_ROLE` -- Lexical only."""
-    result = _run_harness(lexical_role="user")
-    # Regression: `window.VIEWER_ROLE` is undefined for top-level `const`, so
-    # the old code took the admin branch and fetched /admin/nodes.
-    assert result["captured"] == ["/fleet/nodes"]
-    assert result["nodeCount"] == "0 nodes"
-
-
-def test_non_admin_node_id_links_to_read_only_detail() -> None:
-    """A non-admin clicking a node id lands on the read-only node detail page
-    (node info, provisioning tasks, installation log) -- never the admin
-    sign-in page, never a native Basic pop-up."""
-    result = _run_harness(lexical_role="user", fleet_nodes=[_node_payload()])
-    assert result["nodeIdLink"]["tag"] == "a"
-    assert result["nodeIdLink"]["href"].endswith("/dashboard/nodes/gpu01")
-    assert result["nodeIdLink"]["text"] == "gpu01"
-
-
 def test_admin_node_id_links_to_node_detail() -> None:
-    result = _run_harness(lexical_role="admin", admin_nodes=[_node_payload()])
+    result = _run_harness(admin_nodes=[_node_payload()])
     assert result["nodeIdLink"]["tag"] == "a"
     assert result["nodeIdLink"]["href"].endswith("/dashboard/nodes/gpu01")
     assert result["nodeIdLink"]["text"] == "gpu01"
 
 
-def test_admin_role_fetches_admin_endpoints() -> None:
-    result = _run_harness(lexical_role="admin")
+def test_dashboard_fetches_admin_endpoints() -> None:
+    result = _run_harness()
     assert result["captured"] == [
         "/admin/nodes",
         "/admin/metrics",
@@ -217,18 +183,7 @@ def test_admin_role_fetches_admin_endpoints() -> None:
         "/admin/billing",
     ]
     # The render path must actually run: with the real array-shaped response
-    # the admin branch iterates nodes (the old {nodes: []} mock threw
+    # the table iterates nodes (the old {nodes: []} mock threw
     # 'not iterable' and landed in the retry catch without failing these
     # assertions).
-    assert result["nodeCount"] == "0 nodes"
-
-
-def test_window_role_fallback_keeps_legacy_shells_working() -> None:
-    result = _run_harness(window_role="user")
-    assert result["captured"] == ["/fleet/nodes"]
-
-
-def test_missing_role_defaults_to_admin_legacy() -> None:
-    result = _run_harness()
-    assert result["captured"][0] == "/admin/nodes"
     assert result["nodeCount"] == "0 nodes"

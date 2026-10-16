@@ -155,8 +155,8 @@
           if (resp.ok) {
             if (resp.headers.get("x-qiip-self-revoked") === "true") {
               // Self-revocation: the OAuth session stays valid, so land on
-              // the dashboard's trimmed fleet view directly — never the
-              // sign-in page, never a native Basic pop-up.
+              // /dashboard, which forwards a now-normal user to /start —
+              // never the sign-in page, never a native Basic pop-up.
               window.location.assign("/dashboard");
               return;
             }

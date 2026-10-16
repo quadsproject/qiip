@@ -422,7 +422,7 @@ Fleet (any signed-in user, or HTTP Basic local admin):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/fleet/nodes` | Fleet JSON for non-admin viewers: registered nodes without admin-only servers or operational actions (no page renders it for them any more; normal users live on `/start`) |
+| `GET` | `/fleet/nodes` | Fleet JSON for non-admin viewers: registered nodes without admin-only servers or operational actions (no page renders it for them any more; normal users live on `/start` and `/leaderboard`) |
 
 User-session-protected profile endpoints (require `auth.session_secret` and a
 signed-in session):
@@ -472,8 +472,8 @@ Admin-authenticated endpoints (HTTP Basic or admin-role session):
 | `GET` | `/admin/nodes/{hostname}/power` | Read Redfish power state |
 | `POST` | `/admin/nodes/{hostname}/power` | Execute an allowed Redfish power action |
 | `GET` | `/admin/nodes/{hostname}/recommendations` | Run hardware-aware model recommendations |
-| `GET` | `/dashboard` | Authenticated operations dashboard; anonymous visitors get the sign-in page |
-| `GET` | `/dashboard/nodes/{node_id}` | Authenticated node detail page |
+| `GET` | `/dashboard` | Admin-only operations dashboard (HTTP Basic admin or admin-role session); anonymous visitors get the sign-in page |
+| `GET` | `/dashboard/nodes/{node_id}` | Admin-only node detail page |
 | `GET` | `/dashboard/admin` | Admin page: manage admin-only inference servers (admin-role management lives on `/dashboard/tokens`) |
 
 ### Claude Code and Codex
@@ -556,8 +556,9 @@ curl -u "$INFERENCE_PROXY_ADMIN__USERNAME:$INFERENCE_PROXY_ADMIN__PASSWORD" \
   http://gateway.example.com/admin/nodes
 ```
 
-The fleet page (`/dashboard`) is available to every authenticated viewer:
-anonymous visitors receive a sign-in page with **Local Admin**
+The fleet page (`/dashboard`) is admin-only (the HTTP Basic local admin or
+an admin-role session). Anonymous visitors receive a sign-in page with
+**Local Admin**
 (a collapsible choice that expands to an in-page username/password form
 creating a signed admin session; the browser native Basic prompt is no longer
 used, though HTTP Basic requests and SSE still pass through unchanged) and

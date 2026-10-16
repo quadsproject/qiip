@@ -241,7 +241,6 @@
                 </div>
             </section>
 
-            {% if not read_only | default(false) %}
             <section class="card" id="attempt-history-panel">
                 <h2 class="card-title">Provisioning history</h2>
                 <div class="attempt-toolbar">
@@ -270,7 +269,6 @@
                 <div id="attempt-output" class="log-viewer" aria-label="Attempt log records"></div>
                 <button type="button" id="attempt-more" class="btn btn-secondary" hidden>Load more records</button>
             </section>
-            {% endif %}
 
             <section class="card" id="logs-panel">
                 <h2 class="card-title">
@@ -291,18 +289,12 @@
     <script>
         const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};
         const NODE_ID = {{ node_id | tojson }};
-        // Default false: any renderer without the flag gets the safe
-        // operational assumption (only guards never degrade instead of
-        // locking an admin out of the page).
-        const READ_ONLY = {{ read_only | default(false) | tojson }};
     </script>
     <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/config_download.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/setup_selection.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/llamacpp_relaunch.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/node_detail.js') }}"></script>
-    {% if not read_only | default(false) %}
     <script src="{{ static_asset_url(request, 'js/provisioning_history.js') }}"></script>
-    {% endif %}
 </body>
 </html>
