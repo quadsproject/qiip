@@ -2,19 +2,16 @@
 
 Per D-01: Dashboard served at /dashboard, separate from /admin/* JSON API.
 Per D-02: Client-side fetch -- HTML shell rendered by Jinja2, JS fetches
-/admin/nodes (admins) or /fleet/nodes (signed-in non-admins).
+the /admin/* endpoints.
 
-Viewer contract (RFE admin-only servers + admin roles):
-
-- The fleet page (``/dashboard``) is available to every authenticated
-  viewer: the HTTP Basic local admin, a signed-in Google user, or a Google
-  user granted the admin role. Anonymous visitors get the sign-in page with
-  the "Local Admin" and "Google Auth" options.
-- Node detail (``/dashboard/nodes/{id}``) is read-only for signed-in
-  non-admins (node info, provisioning tasks, installation log — no
-  operations); the model catalog, token dashboards, and the admin page
-  are admin-only (local admin or admin-role user); other viewers get the
-  sign-in page with an access notice.
+Viewer contract: every page served here is admin-only, the same authority
+as ``/admin/*`` (the HTTP Basic local admin or an admin-role session).
+Anonymous visitors get the sign-in page; signed-in non-admins are sent to
+``/start``, which forwards the full-access trust list on to ``/profile``.
+That is the non-admin surface: ``/start`` for the token home and
+``/leaderboard`` for the minimal usage board -- not this fleet page. The
+read-only ``/fleet/*`` JSON still answers non-admin viewers (see
+``api/fleet.py``), but no page renders it for them.
 """
 
 from __future__ import annotations
@@ -78,7 +75,6 @@ async def dashboard(
         context={
             "poll_interval": settings.dashboard.poll_interval,
             "active_page": "dashboard",
-            "viewer_role": role,
         },
     )
 
@@ -110,7 +106,6 @@ async def node_detail(
         name="node_detail.html",
         context={
             "node_id": node_id,
-            "read_only": role != "admin",
             "poll_interval": settings.dashboard.poll_interval,
             "active_page": "dashboard",
         },

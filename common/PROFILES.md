@@ -6,8 +6,14 @@ version, OS/ABI and NVSwitch presence, then matches one tested profile. GPU
 marketing names are never used for selection; they appear only in logs and
 the recorded reason. Measurement uses the first SELECTED device when an
 `AUTOVLLM_GPU_DEVICES` subset is pinned (the gateway's subset semantics),
-otherwise physical device 0; queries are physical, so the subset is sized
+or from the caller's `CUDA_VISIBLE_DEVICES` selection, otherwise physical
+device 0; queries are physical, so the subset is sized
 against its own cards.
+
+The CUDA execution proof preserves that selection and targets the selected
+profile's architecture, with PTX for newer selected cards. It does not compile
+for or execute on unselected cards. Driver mutations still require the entire
+NVIDIA stack to be idle.
 
 Status is honest: rows are `candidate` unless validated on a real fleet
 node. The consumer-ada (SM 8.9) row is validated by the matched L4 pilot,
@@ -18,17 +24,30 @@ for production, run the fleet validation procedure below and record the result.
 
 ## Profiles
 
-| Profile | Engine | SM | Min VRAM/device | Driver (tested; enforced at setup) | CUDA toolkit | Backend | OS/ABI | Fabric | Status |
+| Profile | Engine | SM | Min VRAM/device | Reusable driver policy; CUDA proof required | CUDA toolkit | Backend | OS/ABI | Fabric | Status |
 |---|---|---|---|---|---|---|---|---|---|
-| hopper | vllm, llamacpp | 9.0 | 80 GB | 580.126.09 | 13.0 | FlashInfer (vllm) | rhel9+, x86_64, glibc 2.34+ | when NVSwitch present | candidate |
-| ampere-a100 | vllm, llamacpp | 8.0 | 40 GB | 580.126.09 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | when NVSwitch present | candidate |
-| ampere-a30 | vllm, llamacpp | 8.0 | 24 GB | 580.126.09 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | when NVSwitch present | candidate |
-| ga102-dc | vllm, llamacpp | 8.6 | 48 GB (reported ≥44 GiB) | 580.126.09 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | when NVSwitch present | candidate |
-| consumer-ada | vllm, llamacpp | 8.9 | any (below DC cutoff) | 580.126.09 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | not required | candidate |
-| consumer-ampere | vllm, llamacpp | 8.6 | any (below DC cutoff) | 580.126.09 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | not required | candidate |
-| turing | vllm, llamacpp | 7.5 | 16 GB (reported ≥14 GiB) | 580.126.09 | 13.0 | default (vllm) | rhel9+, x86_64, glibc 2.34+ | not required | candidate |
-| consumer-turing | vllm, llamacpp | 7.5 | any (below DC cutoff) | 580.126.09 | 13.0 | default (vllm) | rhel9+, x86_64, glibc 2.34+ | not required | candidate |
-| volta | llamacpp | 7.0 | 16 GB | 580.126.09 | 12.9 | n/a (source-built) | rhel9+, x86_64, glibc 2.34+ | not required | candidate |
+| hopper | vllm, llamacpp | 9.0 | 80 GB | ≥580.65.06 | 13.0 | FlashInfer (vllm) | rhel9+, x86_64, glibc 2.34+ | when NVSwitch present | candidate |
+| ampere-a100 | vllm, llamacpp | 8.0 | 40 GB | ≥580.65.06 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | when NVSwitch present | candidate |
+| ampere-a30 | vllm, llamacpp | 8.0 | 24 GB | ≥580.65.06 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | when NVSwitch present | candidate |
+| ga102-dc | vllm, llamacpp | 8.6 | 48 GB (reported ≥44 GiB) | ≥580.65.06 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | when NVSwitch present | candidate |
+| consumer-ada | vllm, llamacpp | 8.9 | any (below DC cutoff) | ≥580.65.06 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | not required | candidate |
+| consumer-ampere | vllm, llamacpp | 8.6 | any (below DC cutoff) | ≥580.65.06 | 13.0 | FlashAttn (vllm) | rhel9+, x86_64, glibc 2.34+ | not required | candidate |
+| turing | vllm, llamacpp | 7.5 | 16 GB (reported ≥14 GiB) | ≥580.65.06 | 13.0 | default (vllm) | rhel9+, x86_64, glibc 2.34+ | not required | candidate |
+| consumer-turing | vllm, llamacpp | 7.5 | any (below DC cutoff) | ≥580.65.06 | 13.0 | default (vllm) | rhel9+, x86_64, glibc 2.34+ | not required | candidate |
+| volta | llamacpp | 7.0 | 16 GB | ≥575.57.08, branch ≤580 | 12.9 | n/a (source-built) | rhel9+, x86_64, glibc 2.34+ | not required | candidate |
+
+Driver limits are compatibility evidence, not new fleet validation results.
+The tested replacement artifact remains 580.126.09. NVIDIA documents
+[CUDA 13.x compatibility with R580 and newer](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/)
+and [CUDA 12.9 Update 2's full driver requirement](https://docs.nvidia.com/cuda/archive/12.9.2/cuda-toolkit-release-notes/).
+[R580 is the final branch supporting Volta](https://developer.nvidia.com/blog/whats-new-and-important-in-cuda-toolkit-13-0/).
+Every reuse decision also requires a CUDA kernel execution probe. Setup
+compiles for the measured architectures, runs the kernel on each CUDA device,
+and records the driver API/runtime versions. Fabric Manager must still match
+the actual installed driver on NVSwitch hosts. No cuda-compat shim is assumed.
+Compatible reuse does not require kernel headers or a replacement download.
+Repair and reboot handling are described in the
+[upgrade guide](../UPGRADING.md#13-prepare-for-strict-driver-and-cache-checks).
 
 Unlisted combinations (for example Blackwell sm 10.0/12.0, GTX 10xx sm 6.1,
 P100 sm 6.0, sm 8.0 with less than 24 GB, sm 9.0 with less than 80 GB) are

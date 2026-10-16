@@ -52,6 +52,8 @@ def _versioned_path(path: str) -> str:
             "/profile",
             (
                 "css/dashboard.css",
+                "js/table_sort.js",
+                "js/clipboard.js",
                 "js/profile.js",
             ),
         ),
@@ -60,6 +62,7 @@ def _versioned_path(path: str) -> str:
             (
                 "css/dashboard.css",
                 "js/confirm_dialog.js",
+                "js/table_sort.js",
                 "js/admin_tokens.js",
             ),
         ),
@@ -68,6 +71,7 @@ def _versioned_path(path: str) -> str:
             (
                 "css/dashboard.css",
                 "js/confirm_dialog.js",
+                "js/table_sort.js",
                 "js/admin_user_detail.js",
             ),
         ),

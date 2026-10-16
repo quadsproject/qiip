@@ -78,7 +78,7 @@ from inference_proxy.proxy.client import ProxyClient
 from inference_proxy.quads.client import QUADSClient
 from inference_proxy.quads.poller import QUADSPoller
 from inference_proxy.quads.schedule_enforcer import ScheduleEnforcer
-from inference_proxy.redfish.client import RedfishClient
+from inference_proxy.redfish.client import RedfishClient, make_bmc_auth_resolver
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
 from inference_proxy.resilience.health_checker import run_health_checker
 from inference_proxy.routing.connection_tracker import ConnectionTracker
@@ -299,6 +299,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 kwargs={
                     "connection_tracker": connection_tracker,
                     "lease_manager": lease_manager,
+                    "etcd_client": etcd_client,
                 },
                 daemon=True,
             )
@@ -317,8 +318,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             app.state.plugin_manager = plugin_manager
             auth_plugins = plugin_manager.get_plugins_by_type(AuthPlugin)
             if len(auth_plugins) > 1:
-                logger.warning(
-                    "multiple auth plugins loaded; using the first",
+                logger.info(
+                    "multiple auth plugins loaded; provider-less /auth/login "
+                    "uses the first",
                     plugins=[plugin.name for plugin in auth_plugins],
                 )
             auth_plugin = auth_plugins[0] if auth_plugins else None
@@ -426,15 +428,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "redfish HTTP client",
                     redfish_http.aclose,
                 )
+                default_auth = httpx.BasicAuth(
+                    username=redfish_username,
+                    password=redfish_password.get_secret_value(),
+                )
+                bmc_credentials = resolved_settings.redfish.bmc_credentials
+                auth_for = make_bmc_auth_resolver(
+                    default_auth,
+                    labs={
+                        ident: httpx.BasicAuth(
+                            cred.username, cred.password.get_secret_value()
+                        )
+                        for ident, cred in bmc_credentials.labs.items()
+                    },
+                    hosts={
+                        fqdn: httpx.BasicAuth(
+                            cred.username, cred.password.get_secret_value()
+                        )
+                        for fqdn, cred in bmc_credentials.hosts.items()
+                    },
+                )
                 redfish_client = RedfishClient(
                     redfish_http,
                     bmc_host_template=resolved_settings.redfish.bmc_host_template,
                     system_id=resolved_settings.redfish.system_id,
                     hostname_policy=endpoint_policy,
-                    auth=httpx.BasicAuth(
-                        username=redfish_username,
-                        password=redfish_password.get_secret_value(),
-                    ),
+                    auth_for=auth_for,
                     poll_timeout=resolved_settings.redfish.power_poll_timeout,
                     poll_interval=resolved_settings.redfish.power_poll_interval,
                 )
@@ -482,6 +501,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 hf_token=hf_token.get_secret_value() if hf_token else None,
                 nfs_export=resolved_settings.huggingface.nfs_export,
                 artifact_index=artifact_index,
+                hf_cache_dir=resolved_settings.huggingface.cache_dir,
             )
             app.state.provisioner = provisioner
             resources.push_async_callback(
@@ -567,6 +587,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     claims=ClaimStore(etcd_client),
                     suspensions=suspensions,
                     lookahead_hours=(resolved_settings.quads.schedule_lookahead_hours),
+                    quads_stale_after_seconds=(
+                        resolved_settings.quads.stale_after_seconds
+                    ),
                 )
                 placement_reconciler.start()
                 app.state.placement_reconciler = placement_reconciler

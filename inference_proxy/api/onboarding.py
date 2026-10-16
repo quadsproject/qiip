@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import re
 import shlex
+from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlsplit
 
@@ -29,19 +30,24 @@ from pydantic import BaseModel, Field
 
 from inference_proxy.api.profile import enforce_mint_allowlist
 from inference_proxy.api.routes import router as inference_router
-from inference_proxy.api.templating import signin_response, templates
+from inference_proxy.api.templating import (
+    leaderboard_redirect,
+    signin_response,
+    templates,
+)
 from inference_proxy.auth.allowlist import SSOAllowlist
 from inference_proxy.auth.dependencies import (
     get_auth_store,
     get_sso_allowlist,
     require_profile_user,
 )
-from inference_proxy.auth.models import ApiToken, User
+from inference_proxy.auth.models import ApiToken, LeaderboardEntry, User
 from inference_proxy.auth.scopes import has_admin_access, pickable_endpoints
 from inference_proxy.auth.store import AuthStore
 from inference_proxy.config.dependencies import (
     get_registry,
     get_settings,
+    require_fleet_viewer,
     session_user_has_full_access,
     viewer_role,
 )
@@ -67,10 +73,15 @@ _LINK_ID = re.compile(r"^[a-z0-9]{8,32}$")
 
 
 class TokenRequest(BaseModel):
-    """Body for minting the user's token."""
+    """Body for minting the user's token.
 
-    name: str = Field(min_length=1, max_length=60)
-    models: list[str] = Field(min_length=1, max_length=50)
+    ``name`` and ``models`` are optional: the dashboard flow lets the user
+    pick just a model (or nothing, meaning every model online right now),
+    and the server names the token when no name is given.
+    """
+
+    name: str | None = Field(default=None, max_length=60)
+    models: list[str] = Field(default_factory=list, max_length=50)
 
 
 class ModelsRequest(BaseModel):
@@ -81,6 +92,13 @@ class ModelsRequest(BaseModel):
 
 class SetupLinkRequest(BaseModel):
     """Body for creating a setup-script link."""
+
+    harness: str
+    models: list[str] = Field(min_length=1, max_length=50)
+
+
+class ConfigRequest(BaseModel):
+    """Body for downloading a harness config file."""
 
     harness: str
     models: list[str] = Field(min_length=1, max_length=50)
@@ -97,7 +115,7 @@ async def require_normal_user(
     pinned and agent-config tokens on /profile, so the flow must never run
     for them.
     """
-    if has_admin_access(user.email, settings, is_admin=user.is_admin):
+    if has_admin_access(user.email, user.issuer, settings, is_admin=user.is_admin):
         raise HTTPException(
             status_code=403, detail="Admins manage tokens from the profile page"
         )
@@ -130,7 +148,9 @@ def _available_models(
     """Model ids the user can reach right now, sorted and de-duplicated."""
     nodes = registry.get_all()
     pickable = set(
-        pickable_endpoints(user.email, settings, nodes, is_admin=user.is_admin)
+        pickable_endpoints(
+            user.email, user.issuer, settings, nodes, is_admin=user.is_admin
+        )
     )
     models: set[str] = set()
     for node in nodes:
@@ -163,7 +183,9 @@ def _model_details(
     """Describe verified profile runtimes, never infer capabilities from a name."""
     nodes = registry.get_all()
     pickable = set(
-        pickable_endpoints(user.email, settings, nodes, is_admin=user.is_admin)
+        pickable_endpoints(
+            user.email, user.issuer, settings, nodes, is_admin=user.is_admin
+        )
     )
     profiles = {(p.profile_id, p.version): p for p in BUILTIN_PROFILES}
     details: dict[str, dict[str, object]] = {}
@@ -237,6 +259,35 @@ def _require_available(models: list[str], available: list[str]) -> list[str]:
     return chosen
 
 
+async def _require_personal_token(store: AuthStore, user: User) -> ApiToken:
+    """Return the caller's active personal token.
+
+    Every path that narrows, exports or re-derives the user's own token needs
+    the same two refusals: no active token (404), and a token from before the
+    onboarding flow that cannot be narrowed or re-derived (409). Keeping them
+    here stops those credential paths from drifting apart.
+    """
+    token = await asyncio.to_thread(store.get_active_token, user.id)
+    if token is None:
+        raise HTTPException(status_code=404, detail="You don't have a token yet")
+    if token.purpose != "personal":
+        raise HTTPException(
+            status_code=409,
+            detail="This token was created the old way. Create a new token first.",
+        )
+    return token
+
+
+async def _widen_token_scope(
+    store: AuthStore, user_id: int, token: ApiToken, models: list[str]
+) -> None:
+    """Add *models* to the token's scope so the requested config always works."""
+    if token.model_scope is not None:
+        widened = list(dict.fromkeys([*token.model_scope, *models]))
+        if widened != token.model_scope:
+            await asyncio.to_thread(store.set_token_models, user_id, token.id, widened)
+
+
 @onboarding_router.get("/start", response_class=HTMLResponse, response_model=None)
 async def start_page(
     request: Request,
@@ -302,20 +353,49 @@ async def create_personal_token(
 ) -> dict[str, object]:
     """Mint the user's token, replacing (revoking) any previous one.
 
-    The raw secret is not returned: the user never needs to handle it, the
-    setup script delivers it straight into the harness config.
+    The raw secret is not returned here: the setup script and config
+    download deliver it into the harness config, and ``/onboarding/token/
+    reveal`` re-derives it on demand for the page's Copy action.
     """
     await enforce_mint_allowlist(user, settings, allowlist)
-    name = body.name.strip()
+    name = body.name if body.name is not None else "default"
+    name = name.strip()
     if not name:
         raise HTTPException(status_code=422, detail="Give your token a name")
-    models = _require_available(
-        body.models, _available_models(user, settings, registry)
-    )
+    available = _available_models(user, settings, registry)
+    if not body.models and not available:
+        raise HTTPException(status_code=400, detail="No models are online right now")
+    models = _require_available(body.models or available, available)
     created = await asyncio.to_thread(
         store.create_personal_token, user.id, name, models, _session_secret(settings)
     )
     return {"token": _token_view(created)}
+
+
+@onboarding_router.post("/onboarding/token/reveal")
+async def reveal_token(
+    user: Annotated[User, Depends(require_normal_user)],
+    store: Annotated[AuthStore, Depends(get_auth_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> dict[str, str]:
+    """Return the caller's own raw token so the page can copy it.
+
+    The pages hold only the prefix, so the Copy action asks for the value
+    here. It is re-derived server-side exactly like the setup script and the
+    config download do, and the value travels in a POST response body only,
+    so the secret never lands in a URL, a page payload or a log; every
+    non-static response is ``Cache-Control: no-store`` (api/middleware.py).
+    """
+    token = await _require_personal_token(store, user)
+    raw = await asyncio.to_thread(
+        store.reveal_personal_token, token.id, _session_secret(settings)
+    )
+    if raw is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This token can no longer be exported. Create a new token first.",
+        )
+    return {"token": raw}
 
 
 @onboarding_router.put("/onboarding/token/models")
@@ -331,24 +411,17 @@ async def update_token_models(
     Models already on the token stay selectable even when no node serves
     them at the moment, so an edit never silently drops one.
     """
-    token = await asyncio.to_thread(store.get_active_token, user.id)
-    if token is None:
-        raise HTTPException(status_code=404, detail="You don't have a token yet")
-    if token.purpose != "personal":
-        # Narrowing an unrestricted legacy or agent-config key cannot be undone
-        # here (a scope needs at least one model), so never do it implicitly.
-        raise HTTPException(
-            status_code=409,
-            detail="This token was created the old way. Create a new token first.",
-        )
+    # Narrowing an unrestricted legacy or agent-config key cannot be undone
+    # here (a scope needs at least one model), so never do it implicitly.
+    token = await _require_personal_token(store, user)
     allowed = _available_models(user, settings, registry) + (token.model_scope or [])
     models = _require_available(body.models, allowed)
     if not await asyncio.to_thread(store.set_token_models, user.id, token.id, models):
         raise HTTPException(
             status_code=409, detail="Your token changed. Reload and try again."
         )
-    token = await asyncio.to_thread(store.get_active_token, user.id)
-    return {"token": _token_view(token)}
+    refreshed = await asyncio.to_thread(store.get_active_token, user.id)
+    return {"token": _token_view(refreshed)}
 
 
 @onboarding_router.post("/onboarding/setup-link", status_code=201)
@@ -367,14 +440,7 @@ async def create_setup_link(
     harness = get_harness(body.harness)
     if harness is None or harness.requires_route not in _served_routes():
         raise HTTPException(status_code=400, detail="That tool isn't supported yet")
-    token = await asyncio.to_thread(store.get_active_token, user.id)
-    if token is None:
-        raise HTTPException(status_code=404, detail="You don't have a token yet")
-    if token.purpose != "personal":
-        raise HTTPException(
-            status_code=409,
-            detail="This token was created the old way. Create a new token first.",
-        )
+    token = await _require_personal_token(store, user)
     models = _require_available(
         body.models, _available_models(user, settings, registry)
     )
@@ -393,10 +459,7 @@ async def create_setup_link(
             detail="This token can no longer be exported. Create a new token first.",
         )
     base_url = public_base_url(settings)
-    if token.model_scope is not None:
-        widened = list(dict.fromkeys([*token.model_scope, *models]))
-        if widened != token.model_scope:
-            await asyncio.to_thread(store.set_token_models, user.id, token.id, widened)
+    await _widen_token_scope(store, user.id, token, models)
     link_id, expires = await asyncio.to_thread(
         store.create_setup_link,
         user.id,
@@ -414,6 +477,65 @@ async def create_setup_link(
         "harness": harness.id,
         "run_command": harness.command,
     }
+
+
+def _config_content_type(filename: str) -> str:
+    """Content type for a rendered harness config file."""
+    suffix = Path(filename).suffix
+    return {
+        ".json": "application/json",
+        ".yml": "application/yaml",
+        ".yaml": "application/yaml",
+        ".toml": "application/toml",
+    }.get(suffix, "text/plain")
+
+
+@onboarding_router.post("/onboarding/config", response_class=PlainTextResponse)
+async def download_config(
+    body: ConfigRequest,
+    user: Annotated[User, Depends(require_normal_user)],
+    store: Annotated[AuthStore, Depends(get_auth_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
+    registry: NodeRegistry = Depends(get_registry),
+) -> PlainTextResponse:
+    """Render the harness config file with the user's own token embedded.
+
+    The button on the leaderboard dashboard downloads exactly what the
+    setup script would write, so a user who only wants the file gets the
+    same config. Models outside the token's scope are added to it first
+    (same as setup links), and the raw token is re-derived server-side so
+    it never lands in a log or a URL.
+    """
+    harness = get_harness(body.harness)
+    if harness is None or harness.requires_route not in _served_routes():
+        raise HTTPException(status_code=400, detail="That tool isn't supported yet")
+    token = await _require_personal_token(store, user)
+    models = _require_available(
+        body.models, _available_models(user, settings, registry)
+    )
+    if not harness.multi_model and len(models) != 1:
+        raise HTTPException(
+            status_code=400, detail=f"{harness.label} works with exactly one model"
+        )
+    raw = await asyncio.to_thread(
+        store.reveal_personal_token, token.id, _session_secret(settings)
+    )
+    if raw is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This token can no longer be exported. Create a new token first.",
+        )
+    await _widen_token_scope(store, user.id, token, models)
+    filename = Path(harness.config_path).name
+    content = harness.render(public_base_url(settings), raw, models)
+    return PlainTextResponse(
+        content,
+        media_type=_config_content_type(filename),
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @onboarding_router.get("/s/{link_id}", response_class=PlainTextResponse)
@@ -457,3 +579,50 @@ async def setup_script(
         logger.warning("setup script could not be rendered", harness=harness.id)
         return expired
     return PlainTextResponse(script, headers=headers)
+
+
+@onboarding_router.get("/leaderboard", response_class=HTMLResponse, response_model=None)
+async def leaderboard_page(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> HTMLResponse | RedirectResponse:
+    """Render the leaderboard + token dashboard HTML shell.
+
+    Admins keep every normal-user view: an admin with a browser session
+    sees the non-admin ranking, and the token manager half of the page stays
+    with normal users because the onboarding endpoints refuse admins (their
+    token manager is ``/profile``). ``leaderboard_redirect`` owns who is
+    sent elsewhere (the HTTP Basic admin to ``/dashboard``, full-access
+    users to ``/profile``); the navbar link uses the same rule. Anonymous
+    visitors get the sign-in page.
+    """
+    role = viewer_role(request, settings)
+    target = leaderboard_redirect(request)
+    if target is not None:
+        return RedirectResponse(target, status_code=302)
+    if role is None:
+        return signin_response(
+            request,
+            oauth_enabled=settings.oauth.enabled,
+            sessions_available=settings.auth.session_secret is not None,
+        )
+    return templates.TemplateResponse(
+        request=request,
+        name="leaderboard.html",
+        context={"active_page": "leaderboard", "viewer_role": role},
+    )
+
+
+@onboarding_router.get(
+    "/onboarding/leaderboard", dependencies=[Depends(require_fleet_viewer)]
+)
+async def leaderboard(
+    store: Annotated[AuthStore, Depends(get_auth_store)],
+) -> list[LeaderboardEntry]:
+    """Rank non-admin users by usage; admin rows are never listed.
+
+    Every authenticated viewer may read (admins keep every normal-user
+    view, and the same ranking renders on the admin surfaces); anonymous
+    callers get 401.
+    """
+    return await asyncio.to_thread(store.list_leaderboard)

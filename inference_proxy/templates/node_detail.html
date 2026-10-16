@@ -51,7 +51,7 @@
                             </tr>
                         </thead>
                         <tbody id="node-info-body">
-                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -183,6 +183,35 @@
                 </dl>
             </section>
 
+            <section class="card" id="vllm-runtime-panel" hidden>
+                <h2 class="card-title">vLLM Runtime Configuration</h2>
+                <p id="vllm-runtime-status" class="runtime-status" role="status" aria-live="polite"></p>
+                <dl id="vllm-runtime-values" class="runtime-grid" hidden>
+                    <div><dt>Model selection</dt><dd id="vllm-runtime-selection"></dd></div>
+                    <div><dt>Selection reason</dt><dd id="vllm-runtime-model-reason"></dd></div>
+                    <div><dt>Effective model</dt><dd id="vllm-runtime-model"></dd></div>
+                    <div><dt>Requested model</dt><dd id="vllm-runtime-requested-model"></dd></div>
+                    <div><dt>Tensor parallel</dt><dd id="vllm-runtime-tp"></dd></div>
+                    <div><dt>Max model length</dt><dd id="vllm-runtime-context"></dd></div>
+                    <div><dt>Max batched tokens</dt><dd id="vllm-runtime-batched"></dd></div>
+                    <div><dt>GPU memory utilization</dt><dd id="vllm-runtime-util"></dd></div>
+                    <div><dt>Dtype</dt><dd id="vllm-runtime-dtype"></dd></div>
+                    <div><dt>Attention backend</dt><dd id="vllm-runtime-backend"></dd></div>
+                    <div><dt>Weights per GPU</dt><dd id="vllm-runtime-weights"></dd></div>
+                    <div><dt>Estimate quality</dt><dd id="vllm-runtime-approximate"></dd></div>
+                    <div><dt>KV cache</dt><dd id="vllm-runtime-kv"></dd></div>
+                    <div><dt>Runtime overhead</dt><dd id="vllm-runtime-overhead"></dd></div>
+                    <div><dt>Reserve</dt><dd id="vllm-runtime-reserve"></dd></div>
+                    <div><dt>Usable budget</dt><dd id="vllm-runtime-budget"></dd></div>
+                    <div><dt>Free VRAM at plan</dt><dd id="vllm-runtime-free"></dd></div>
+                    <div><dt>Attempt</dt><dd id="vllm-runtime-attempt"></dd></div>
+                    <div class="runtime-grid-wide"><dt>Reason</dt><dd id="vllm-runtime-reason"></dd></div>
+                    <div class="runtime-grid-wide"><dt>Adjustments</dt><dd><ul id="vllm-runtime-adjustments" class="runtime-gpu-list"></ul></dd></div>
+                    <div class="runtime-grid-wide"><dt>Post-load GPU memory</dt><dd><ul id="vllm-runtime-gpus" class="runtime-gpu-list"></ul></dd></div>
+                    <div class="runtime-grid-wide"><dt>Observed</dt><dd id="vllm-runtime-observed"></dd></div>
+                </dl>
+            </section>
+
             <section class="card" id="recommendations-panel">
                 <h2 class="card-title">
                     Model Recommendations
@@ -212,7 +241,6 @@
                 </div>
             </section>
 
-            {% if not read_only | default(false) %}
             <section class="card" id="attempt-history-panel">
                 <h2 class="card-title">Provisioning history</h2>
                 <div class="attempt-toolbar">
@@ -241,7 +269,6 @@
                 <div id="attempt-output" class="log-viewer" aria-label="Attempt log records"></div>
                 <button type="button" id="attempt-more" class="btn btn-secondary" hidden>Load more records</button>
             </section>
-            {% endif %}
 
             <section class="card" id="logs-panel">
                 <h2 class="card-title">
@@ -262,18 +289,12 @@
     <script>
         const POLL_INTERVAL_MS = {{ poll_interval * 1000 }};
         const NODE_ID = {{ node_id | tojson }};
-        // Default false: any renderer without the flag gets the safe
-        // operational assumption (only guards never degrade instead of
-        // locking an admin out of the page).
-        const READ_ONLY = {{ read_only | default(false) | tojson }};
     </script>
     <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/config_download.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/setup_selection.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/llamacpp_relaunch.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/node_detail.js') }}"></script>
-    {% if not read_only | default(false) %}
     <script src="{{ static_asset_url(request, 'js/provisioning_history.js') }}"></script>
-    {% endif %}
 </body>
 </html>

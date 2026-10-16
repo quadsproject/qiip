@@ -6,6 +6,7 @@ import hashlib
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -868,6 +869,11 @@ def _build_fixture(
     operation_log = tmp_path / "operations.log"
     fake_bin = tmp_path / "fake bin -- tools"
     fake_bin.mkdir()
+    # Use the test interpreter for node helpers so subprocess coverage can
+    # measure the actual shell-driven setup path, including its CLI commands.
+    _write_executable(
+        fake_bin / "python3", f'#!/bin/bash\nexec {shlex.quote(sys.executable)} "$@"\n'
+    )
     archive_content = "verified llama.cpp source fixture"
     digest = hashlib.sha256(archive_content.encode()).hexdigest()
     if not valid_checksum:
@@ -928,6 +934,7 @@ if [[ "${1:-}" == '--build' ]]; then
     mkdir -p "$build_dir/bin"
     cat > "$build_dir/bin/llama-server" <<'EOF'
 #!/bin/bash
+if [ "$*" = '--list-devices' ]; then echo 'CUDA0: NVIDIA fixture'; exit 0; fi
 if [ "$*" != '--version' ]; then
     printf 'server' >> "$AUTOLLAMACPP_TEST_LOG"
     printf ' <%s>' "$@" >> "$AUTOLLAMACPP_TEST_LOG"
@@ -950,14 +957,15 @@ printf '\n' >> "$AUTOLLAMACPP_TEST_LOG"
 metadata='--parallel 1 --kv-unified --gpu-layers all --verbosity 5 --version'
 estimate='--ctx-size 4096 --parallel 2 --kv-unified --gpu-layers all --cache-type-k q8_0 --cache-type-v q8_0 --flash-attn on --fit-print on --verbosity 0 --version'
 case "$*" in
-    "$metadata"|"$estimate") ;;
+    "$metadata"|"$estimate"|'--version') ;;
     *) exit 45 ;;
 esac
 echo 'version: 0.4.1 (build 0, commit v0.4.1)' >&2
 EOF
     cat > "$build_dir/bin/llama-quantize" <<'EOF'
 #!/bin/bash
-exit 0
+echo 'usage: llama-quantize [--help] model-f32.gguf type'
+exit 1
 EOF
     chmod +x "$build_dir/bin/llama-server" "$build_dir/bin/llama-fit-params" "$build_dir/bin/llama-quantize"
 fi
@@ -965,13 +973,33 @@ fi
     )
     _write_executable(
         fake_bin / "nvcc",
-        "#!/bin/bash\necho 'Cuda compilation tools, release 13.0, V13.0.88'\n",
+        """#!/bin/bash
+if [ "$*" = '--version' ]; then
+    echo 'Cuda compilation tools, release 13.0, V13.0.88'
+else
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = '-o' ]; then
+            printf '#!/bin/bash\\necho CUDA_EXECUTED\\n' > "$2"
+            chmod +x "$2"
+            exit 0
+        fi
+        shift
+    done
+    exit 1
+fi
+""",
+    )
+    _write_executable(fake_bin / "rpm", "#!/bin/bash\nexit 0\n")
+    _write_executable(fake_bin / "dnf", "#!/bin/bash\nexit 0\n")
+    _write_executable(
+        fake_bin / "ldd",
+        "#!/bin/bash\nif [ \"$*\" = --version ]; then echo 'ldd (GNU libc) 2.34'; else echo 'not a dynamic executable' >&2; exit 1; fi\n",
     )
     _write_executable(
         fake_bin / "nvidia-smi",
         """#!/bin/bash
 if [[ "$*" == *'--query-gpu=compute_cap'* ]]; then
-    printf '8.0\n9.0\n'
+    if [[ "$*" == *' -i '* ]]; then printf '8.0\n'; else printf '8.0\n9.0\n'; fi
     exit 0
 fi
 exit 1
@@ -989,6 +1017,8 @@ exec "$@"
 
     install_root = tmp_path / "install -- root"
     link_dir = tmp_path / "links -- bin"
+    cpuinfo = tmp_path / "cpuinfo"
+    cpuinfo.write_text("processor : 0\nflags : sse2 avx avx2 fma f16c\n")
     env = {
         **os.environ,
         "PATH": f"{fake_bin}:/usr/bin:/bin",
@@ -1001,6 +1031,7 @@ exec "$@"
         "AUTOLLAMACPP_INSTALL_ROOT": str(install_root),
         "AUTOLLAMACPP_LINK_DIR": str(link_dir),
         "AUTOLLAMACPP_NVCC": str(fake_bin / "nvcc"),
+        "AUTOLLAMACPP_CPUINFO": str(cpuinfo),
         "AUTOLLAMACPP_TEST_LOG": str(operation_log),
         "AUTOLLAMACPP_TEST_ARCHIVE": archive_content,
     }
@@ -1037,8 +1068,10 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     configure = next(line for line in operations if line.startswith("cmake <-S>"))
     assert "<-G> <Unix Makefiles>" in configure
     assert "<-DGGML_CUDA=ON>" in configure
-    assert "<-DGGML_NATIVE=OFF>" in configure
-    assert "<-DCMAKE_CUDA_ARCHITECTURES=native>" in configure
+    assert "<-DGGML_NATIVE=ON>" in configure
+    for feature in ("AVX", "AVX2", "AVX512", "FMA", "F16C"):
+        assert f"-DGGML_{feature}=" not in configure
+    assert "<-DCMAKE_CUDA_ARCHITECTURES=80;90>" in configure
     assert "<-DBUILD_SHARED_LIBS=OFF>" in configure
     assert "<-DLLAMA_BUILD_TESTS=OFF>" in configure
     assert "<-DLLAMA_BUILD_EXAMPLES=OFF>" in configure
@@ -1068,12 +1101,13 @@ def test_install_builds_verified_cuda_source_with_minimal_targets(
     assert (link_dir / "llama-quantize").resolve().is_file()
     marker = (link_dir / "llama-server").resolve().parents[1] / "BUILD-INFO"
     marker_text = marker.read_text()
-    assert "build_profile=cuda-portable-cpu-v2-fit-concurrency" in marker_text
+    assert "build_profile=cuda-native-cpu-v4-artifact" in marker_text
     assert (
         "fit_cli_patch_sha256="
         "58917efc78ca760a2a1dd162d84e6cf1930c5b62a8dd9710bb4579ca4f2d69dc"
     ) in marker_text
     assert "compute_capabilities=8.0,9.0" in marker_text
+    assert "compiled_cuda_architectures=80,90" in marker_text
 
 
 def test_install_resolves_nvcc_after_toolkit_install(tmp_path: Path) -> None:
@@ -1199,18 +1233,22 @@ def test_install_rebuilds_when_resolved_cuda_toolkit_changes(
 ) -> None:
     env, operation_log, link_dir = _build_fixture(tmp_path)
     nvcc = Path(env["AUTOLLAMACPP_NVCC"])
-    _write_executable(
-        nvcc, "#!/bin/bash\necho 'Cuda compilation tools, release 12.9, V12.9.86'\n"
+    nvcc_body = nvcc.read_text()
+    _write_executable(nvcc, nvcc_body.replace("13.0, V13.0.88", "12.9, V12.9.86"))
+    first = _run_shell(
+        _source_setup("PROFILE_CUDA_TOOLKIT_VERSION=12.9\ninstall_llamacpp"), env=env
     )
-    first = _run_shell(_source_setup("install_llamacpp"), env=env)
     assert first.returncode == 0, first.stderr
     old_binary = (link_dir / "llama-server").resolve()
 
     _write_executable(
         nvcc,
-        f"#!/bin/bash\necho 'Cuda compilation tools, release {next_version.rsplit('.', 1)[0]}, V{next_version}'\n",
+        nvcc_body.replace(
+            "13.0, V13.0.88", f"{next_version.rsplit('.', 1)[0]}, V{next_version}"
+        ),
     )
-    second = _run_shell(_source_setup("install_llamacpp"), env=env)
+    command = f"PROFILE_CUDA_TOOLKIT_VERSION={next_version.rsplit('.', 1)[0]}\ninstall_llamacpp"
+    second = _run_shell(_source_setup(command), env=env)
     assert second.returncode == 0, second.stderr
     new_binary = (link_dir / "llama-server").resolve()
     assert new_binary != old_binary
@@ -1218,7 +1256,7 @@ def test_install_rebuilds_when_resolved_cuda_toolkit_changes(
         f"cuda_toolkit={next_version}"
         in (new_binary.parents[1] / "BUILD-INFO").read_text()
     )
-    third = _run_shell(_source_setup("install_llamacpp"), env=env)
+    third = _run_shell(_source_setup(command), env=env)
     assert third.returncode == 0, third.stderr
     assert (link_dir / "llama-server").resolve() == new_binary
     assert (
@@ -1233,14 +1271,16 @@ def test_install_rejects_unverifiable_cuda_toolkit(
 ) -> None:
     env, operation_log, link_dir = _build_fixture(tmp_path)
     _write_executable(Path(env["AUTOLLAMACPP_NVCC"]), f"#!/bin/bash\n{nvcc_body}\n")
-    result = _run_shell(_source_setup("install_llamacpp"), env=env)
+    result = _run_shell(
+        _source_setup("install_cuda_toolkit() { :; }\ninstall_llamacpp"), env=env
+    )
     assert result.returncode != 0
     assert (
         f"FATAL: could not determine CUDA toolkit version from {env['AUTOLLAMACPP_NVCC']}"
         in result.stderr
     )
     assert not link_dir.exists()
-    assert not operation_log.exists()
+    assert not operation_log.exists() or "wget" not in operation_log.read_text()
 
 
 def test_build_tag_pins_build_number_and_rejects_other_version(
@@ -1637,3 +1677,78 @@ def test_storage_preflight_verifies_match_or_fails_on_wrong_export(
     bad = _run_shell(_source_start("run_storage_preflight"), env=env)
     assert bad.returncode != 0
     assert "not the expected export" in bad.stderr
+
+
+class TestLlamacppInstallVerifier:
+    """Resuming ``llamacpp_install`` must republish the runtime selection."""
+
+    def test_verifier_republishes_runtime_selection(self, tmp_path: Path) -> None:
+        runtime = tmp_path / "build"
+        runtime.mkdir()
+        selection = tmp_path / "selection"
+        cmd = (
+            f"export QIIP_RUNTIME_SELECTION={shlex.quote(str(selection))}\n"
+            "llamacpp_artifact_tool() { printf '%s\\n' \"$AUTOLLAMACPP_TEST_RUNTIME\"; }\n"
+            "llamacpp_host_identity() { printf 'identity\\n'; }\n"
+            "verify_llamacpp_binaries() { return 0; }\n"
+            "verify_llamacpp_cuda() { return 0; }\n"
+            "qiip_verify_llamacpp_install\n"
+        )
+        env = {**os.environ, "AUTOLLAMACPP_TEST_RUNTIME": str(runtime)}
+        result = _run_shell(_source_setup(cmd), env=env)
+        assert result.returncode == 0, result.stderr
+        assert selection.read_text().strip() == str(runtime)
+
+    def test_verifier_rejects_unverifiable_binaries(self, tmp_path: Path) -> None:
+        selection = tmp_path / "selection"
+        cmd = (
+            f"export QIIP_RUNTIME_SELECTION={shlex.quote(str(selection))}\n"
+            "llamacpp_artifact_tool() { printf '%s\\n' /opt/llama.cpp/build; }\n"
+            "llamacpp_host_identity() { printf 'identity\\n'; }\n"
+            "verify_llamacpp_binaries() { return 1; }\n"
+            "verify_llamacpp_cuda() { return 0; }\n"
+            "qiip_verify_llamacpp_install\n"
+        )
+        result = _run_shell(_source_setup(cmd))
+        assert result.returncode != 0
+        assert not selection.exists()
+
+    def test_verifier_rejects_failed_cuda_proof(self, tmp_path: Path) -> None:
+        # llama.cpp defers cuda_proof to the installer, so a resumed install
+        # must re-prove CUDA execution before it can be skipped; a failure has
+        # to rerun the stage rather than adopt the stale runtime.
+        selection = tmp_path / "selection"
+        cmd = (
+            f"export QIIP_RUNTIME_SELECTION={shlex.quote(str(selection))}\n"
+            "llamacpp_artifact_tool() { printf '%s\\n' /opt/llama.cpp/build; }\n"
+            "llamacpp_host_identity() { printf 'identity\\n'; }\n"
+            "verify_llamacpp_binaries() { return 0; }\n"
+            "verify_llamacpp_cuda() { return 10; }\n"
+            "qiip_verify_llamacpp_install\n"
+        )
+        result = _run_shell(_source_setup(cmd))
+        assert result.returncode != 0
+        assert not selection.exists()
+
+    def test_binary_verification_propagates_cli_failures(self, tmp_path: Path) -> None:
+        # ``cmd || return 1`` disables errexit inside the function, so the CLI
+        # checks must be explicit or a bad binary passes verification.
+        runtime = tmp_path / "build"
+        (runtime / "bin").mkdir(parents=True)
+        _write_executable(
+            runtime / "bin" / "llama-quantize",
+            "#!/bin/bash\necho 'usage: llama-quantize'\nexit 0\n",
+        )
+        cmd = (
+            "installed_llamacpp_version() { printf '%s\\n' \"$LLAMACPP_VERSION\"; }\n"
+            "verify_managed_server_cli() { return 1; }\n"
+            "verify_fit_params_cli() { return 0; }\n"
+            f"if verify_llamacpp_binaries {shlex.quote(str(runtime))} >/dev/null 2>&1; then\n"
+            "    echo PROPAGATED_OK\n"
+            "else\n"
+            "    echo PROPAGATED_FAIL\n"
+            "fi\n"
+        )
+        env = {**os.environ, "LLAMACPP_VERSION": "b7000"}
+        result = _run_shell(_source_setup(cmd), env=env)
+        assert "PROPAGATED_FAIL" in result.stdout

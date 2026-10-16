@@ -1,16 +1,18 @@
 """Fleet endpoints for signed-in viewers (admin-only node visibility contract).
 
-``GET /fleet/nodes`` backs the fleet page for non-admin signed-in users
-(and local-admin sessions via Basic): it returns registered nodes with
+``GET /fleet/nodes`` is an API for non-admin signed-in users (and
+local-admin sessions via Basic): it returns registered nodes with
 admin-only servers removed, operational actions stripped, and nodes owned
 by another user excluded (RFE-107 privacy, matching ``/v1/models`` and the
 endpoint picker). Admins keep the full operational view through
 ``GET /admin/nodes``, so the fleet endpoint never needs to return
-admin-only identity — admin-only servers stay off this surface.
+admin-only identity — admin-only servers stay off this surface. No page
+renders this endpoint: the fleet page and node detail are admin-only (see
+``api/dashboard.py``), and normal users live on ``/start`` and
+``/leaderboard``.
 
 The per-node read-only surface (``/fleet/nodes/{node_id}`` plus its tasks
-and provisioning-log stream) backs the read-only node detail page: a
-signed-in non-admin can inspect a node their fleet view allows, but every
+and provisioning-log stream) serves the same non-admin API viewer: every
 operational endpoint stays behind ``require_admin_auth``.
 """
 
@@ -84,7 +86,7 @@ def _visible_node(
 
     The same visibility contract as ``/fleet/nodes`` applies (no admin-only
     nodes, no nodes owned by someone else, no absent nodes), so the
-    read-only detail surface can never disclose more than the fleet list.
+    per-node surface can never disclose more than the fleet list.
     """
     node = next(
         (
@@ -158,8 +160,8 @@ async def fleet_node_logs(
 ) -> StreamingResponse:
     """Stream provisioning log entries as SSE for a visible node.
 
-    Mirrors ``GET /admin/provisioning/{hostname}/logs`` for the read-only
-    viewer: no provisioning buffer, no configuration, just the existing
+    Mirrors ``GET /admin/provisioning/{hostname}/logs`` for the non-admin
+    API viewer: no provisioning buffer, no configuration, just the existing
     installation log — with credential-shaped content redacted, including
     retained (already-buffered) entries.
     """

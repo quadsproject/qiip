@@ -1,5 +1,14 @@
 // Shared catalog-backed setup selection for the fleet and node-detail pages.
 
+const SETUP_RESUME_LABELS = new Map([
+  ["reboot_required", "Reboot required"],
+  ["maintenance_required", "Maintenance required"],
+]);
+
+function formatSetupResumeState(value) {
+  return SETUP_RESUME_LABELS.get(value) || "Setup paused";
+}
+
 function formatInferenceEngine(value) {
   if (value === "vllm") return "vLLM";
   if (value === "llama_cpp") return "llama.cpp";

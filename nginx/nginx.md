@@ -504,6 +504,7 @@ For the container, nginx logs are host files under
 | --- | --- | --- |
 | `413 Request Entity Too Large` | Body over the deliberate 50 MiB cap (OMP archived image frames fit under it) | Raise `client_max_body_size` in the config (bounded step, e.g. 64m), `nginx -t`, restart. |
 | `502 Bad Gateway` | Gateway down, or wrong upstream | Confirm the gateway is up: `curl -s http://localhost:5000/health`; start it with `uv run uvicorn inference_proxy.main:create_app --factory --host 0.0.0.0 --port 5000`. Container: confirm the planted config has `host.containers.internal:5000`. |
+| `/oidc/` returns `502 Bad Gateway` | The opt-in local OIDC provider listens on `127.0.0.1:8081`; the pasta container is a separate network namespace and cannot reach the host loopback | Run nginx on the provider host (Method 1): the containerized method does not serve the local OIDC provider. |
 | `504 Gateway Timeout` | `proxy_read_timeout 3600` exceeded or upstream wedged | Fix/hold the node; only raise the timeout for legitimately very long generations. |
 | SSE arrives in bursts | `proxy_buffering` on or `gzip` on | Confirm `proxy_buffering off` and `gzip off`. |
 | `Permission denied` on the cert | SELinux label missing | Ensure `:Z` on the `Volume=`/mount; `sudo chcon -R -t container_file_t ~/.config/qiip-nginx/certs`, then restart. |

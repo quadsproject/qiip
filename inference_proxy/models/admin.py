@@ -27,7 +27,9 @@ from inference_proxy.models.node import (
     LlamaCppRuntimeRequest,
     LlamaCppRuntimeState,
     VllmParams,
+    VllmRuntimeState,
 )
+from inference_proxy.provisioning.state import ProvisioningResumeState
 
 _HOSTNAME_RE = re.compile(r"[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?")
 
@@ -71,6 +73,7 @@ class AdminNodeResponse(BaseModel):
     engine: InferenceEngine | None = None
     artifact_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     llamacpp_runtime: LlamaCppRuntimeState | None = None
+    vllm_runtime: VllmRuntimeState | None = None
     state: str = ""
     actions: list[str] = []
     gpu_vendor: str | None = None
@@ -81,8 +84,14 @@ class AdminNodeResponse(BaseModel):
     admin_only: bool = False
     failed_step: str | None = None
     error: str | None = None
+    resume_state: ProvisioningResumeState | None = None
     placement_blocker: str | None = None
     owner: str = ""
+    attempt_number: int | None = None
+    retry_count: int = 0
+    progress: dict[str, object] | None = None
+    failure_class: str | None = None
+    next_action: str | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -237,6 +246,12 @@ class TaskStatusResponse(BaseModel):
     updated_at: datetime
     failed_step: str | None = None
     error: str | None = None
+    resume_state: ProvisioningResumeState | None = None
+    attempt_number: int | None = None
+    retry_count: int = 0
+    progress: dict[str, object] | None = None
+    failure_class: str | None = None
+    next_action: str | None = None
 
 
 class QUADSStatusResponse(BaseModel):

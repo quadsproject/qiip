@@ -6,11 +6,12 @@ signed in (the client decides from ``/auth/me``). The JSON endpoints under
 ``/profile/*`` are guarded by ``require_profile_user`` (AUTH-03).
 
 Per AUTH-02 a minted token's raw secret is returned exactly once, at
-creation; the list endpoints return only the token prefix for display. The
-one exception is ``name: agent-config``: that request returns the user's
-reusable derived config key (same value on every download, see
-``AuthStore.get_or_create_config_token``), which is intentionally not
-one-time.
+creation; the list endpoints return only the token prefix for display. Two
+tokens are intentionally not one-time: ``name: agent-config`` returns the
+user's reusable derived config key (same value on every download, see
+``AuthStore.get_or_create_config_token``), and a normal user's ``personal``
+onboarding token is re-derived on demand by the onboarding surface
+(``/onboarding/token/reveal``, the setup script and the config download).
 """
 
 from __future__ import annotations
@@ -69,7 +70,9 @@ async def enforce_mint_allowlist(
     list bypasses it. Admin-role users must still pass, otherwise the use
     time check (auth/dependencies.py) would 401 every call of the new token.
     """
-    if not settings.auth.enforce_sso_whitelist or is_full_access(user.email, settings):
+    if not settings.auth.enforce_sso_whitelist or is_full_access(
+        user.email, user.issuer, settings
+    ):
         return
     try:
         allowed = await enforce_allowlist(user.email, allowlist)
@@ -152,7 +155,7 @@ async def create_token(
     may route to: an unknown hostname is rejected (400) and a node owned by
     someone else is rejected (403). Admins may pin any registered node.
     """
-    admin = has_admin_access(user.email, settings, is_admin=user.is_admin)
+    admin = has_admin_access(user.email, user.issuer, settings, is_admin=user.is_admin)
     if not admin:
         # Normal users own exactly one model-scoped token, minted on /start.
         # Minting here (including the agent-config key) would hand them a
@@ -217,7 +220,9 @@ async def list_pickable_endpoints(
 ) -> list[dict[str, str]]:
     """List endpoints the signed-in user may pin a token to."""
     nodes = registry.get_all()
-    pickable = pickable_endpoints(user.email, settings, nodes, is_admin=user.is_admin)
+    pickable = pickable_endpoints(
+        user.email, user.issuer, settings, nodes, is_admin=user.is_admin
+    )
     by_id = {node.node_id: node for node in nodes}
     return [{"node_id": node_id, "model": by_id[node_id].model} for node_id in pickable]
 

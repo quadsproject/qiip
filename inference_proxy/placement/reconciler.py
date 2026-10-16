@@ -93,6 +93,17 @@ logger = structlog.get_logger()
 # A process-list probe must not inherit the long setup command deadlines.
 _REMOTE_PROBE_TIMEOUT_SECONDS = 10.0
 
+# A fresh host refused at launch sits out this long before the pass decides
+# again. A pending move usually ends in minutes, far sooner than the
+# remote-work backoff, and the stale-snapshot and unreadable-moves refusals
+# reuse the same short recheck.
+_LAUNCH_REFUSAL_RECHECK_SECONDS = 60.0
+# The pending-move set is broader than a reclaim: QUADS lists a host from the
+# moment its cloud no longer matches what its schedule implies, which includes
+# a move into an assignment that has just started.
+_PENDING_MOVE_REASON = "QUADS has a pending move for the host"
+_MOVES_UNKNOWN_REASON = "QUADS pending moves could not be read at launch"
+
 # Node states that mean a placement's server was registered and is being
 # health-checked. Automation never rebuilds one of these.
 _SERVING_NODE_STATUSES = frozenset(
@@ -165,6 +176,7 @@ class PlacementReconciler:
         profiles: Sequence[ModelProfile] = BUILTIN_PROFILES,
         clock: Callable[[], datetime] = utcnow,
         holder: str | None = None,
+        quads_stale_after_seconds: int = 900,
     ) -> None:
         self._settings = settings
         self._quads = quads_client
@@ -175,6 +187,7 @@ class PlacementReconciler:
         self._claims = claims
         self._suspensions = suspensions
         self._lookahead_hours = lookahead_hours
+        self._quads_stale_after = timedelta(seconds=quads_stale_after_seconds)
         self._profiles = tuple(profiles)
         self._clock = clock
         self._holder = holder or uuid.uuid4().hex
@@ -186,6 +199,8 @@ class PlacementReconciler:
         # Unclaimed hosts a launch was refused on: when to ask again, and why.
         # In memory on purpose: a restarted gateway simply asks the host again.
         self._deferred: dict[str, tuple[datetime, str]] = {}
+        # Launches refused at the launch-time QUADS re-check this pass, and why.
+        self._refused: dict[str, str] = {}
         self._status = PlacementStatus(enabled=settings.enabled, holder=self._holder)
 
     @property
@@ -250,8 +265,27 @@ class PlacementReconciler:
             self._status = status
             return status
 
+    def _quads_stale_reason(self) -> str | None:
+        """Why the poller's inventory is too old to decide from, or ``None``.
+
+        Read against the clock now, not the pass start: the snapshot keeps
+        ageing through the catalog scan, the claim reads and the host probes.
+        """
+        last_sync = self._poller.last_sync
+        if last_sync is None:
+            return "QUADS inventory has not synchronized yet"
+        age = self._clock() - last_sync
+        if age > self._quads_stale_after:
+            seconds = int(age.total_seconds())
+            return (
+                f"QUADS inventory is stale ({seconds}s old, last synchronized "
+                f"{last_sync:%Y-%m-%d %H:%M:%S} UTC)"
+            )
+        return None
+
     async def _reconcile(self) -> PlacementStatus:
         now = self._clock()
+        self._refused = {}
         base = PlacementStatus(
             enabled=self._settings.enabled, holder=self._holder, last_run_at=now
         )
@@ -283,11 +317,10 @@ class PlacementReconciler:
                 missing_artifacts=resolution.missing,
             )
         known_claims = tuple(item.claim for item in claims)
-        if self._poller.last_sync is None:
+        stale = self._quads_stale_reason()
+        if stale is not None:
             return failed(
-                "QUADS inventory has not synchronized yet",
-                missing_artifacts=resolution.missing,
-                claims=known_claims,
+                stale, missing_artifacts=resolution.missing, claims=known_claims
             )
         try:
             window_end = availability_window_end(self._lookahead_hours)
@@ -298,6 +331,16 @@ class PlacementReconciler:
         except Exception as exc:
             return failed(
                 f"QUADS availability is unknown: {exc}",
+                missing_artifacts=resolution.missing,
+                claims=known_claims,
+            )
+        try:
+            # Available by schedule, but QUADS has a move to run on these
+            # before they are safe to provision.
+            pending_moves = await self._quads.get_pending_moves()
+        except Exception as exc:
+            return failed(
+                f"QUADS pending moves are unknown: {exc}",
                 missing_artifacts=resolution.missing,
                 claims=known_claims,
             )
@@ -323,7 +366,7 @@ class PlacementReconciler:
         hosts = {canonical_hostname(host.hostname): host for host in self._poller.hosts}
         blocked = {item.claim.hostname for item in settled} | set(unreadable)
         candidates, skipped = self._candidates(
-            available, blocked | suspended, planned, now
+            available, blocked | suspended, planned, now, pending_moves
         )
         skipped.extend(
             SkippedHost(host, "automatic placement suspended by an administrator")
@@ -353,6 +396,11 @@ class PlacementReconciler:
                 or claim.hostname not in available
             ):
                 continue
+            if claim.hostname in pending_moves:
+                # Neither a failed attempt nor a policy refusal: keep the claim
+                # as it is and ask again next pass.
+                skipped.append(SkippedHost(claim.hostname, _PENDING_MOVE_REASON))
+                continue
             # A retry is a placement decision like any other: the same policy
             # applies, evaluated now, not as it stood when the host was claimed.
             refusal = self._policy_refusal(
@@ -378,6 +426,10 @@ class PlacementReconciler:
             if await self._launch(resolved, claim.hostname, claim.gpu_class, stored):
                 started.append(claim.hostname)
                 budget -= 1
+            elif claim.hostname in self._refused:
+                skipped.append(
+                    SkippedHost(claim.hostname, self._refused[claim.hostname])
+                )
 
         for assignment in plan.assignments:
             if budget <= 0:
@@ -390,6 +442,10 @@ class PlacementReconciler:
             ):
                 started.append(assignment.hostname)
                 budget -= 1
+            elif assignment.hostname in self._refused:
+                skipped.append(
+                    SkippedHost(assignment.hostname, self._refused[assignment.hostname])
+                )
             elif assignment.hostname in self._deferred:
                 skipped.append(
                     SkippedHost(
@@ -510,6 +566,7 @@ class PlacementReconciler:
         blocked: set[str],
         planned: Sequence[PlannedProfile],
         now: datetime,
+        pending_moves: set[str],
     ) -> tuple[list[Candidate], list[SkippedHost]]:
         candidates: list[Candidate] = []
         skipped: list[SkippedHost] = []
@@ -528,6 +585,9 @@ class PlacementReconciler:
             if reason is None:
                 if hostname not in available:
                     reason = "not free for the whole QUADS scheduling window"
+                elif hostname in pending_moves:
+                    # Before the probes: QUADS has a move to run on it.
+                    reason = _PENDING_MOVE_REASON
                 elif node is not None and not _is_free_pool_node(node):
                     reason = f"already has a {node.status.value} node record"
                 elif self._provisioner.host_operation_in_progress(hostname):
@@ -685,6 +745,24 @@ class PlacementReconciler:
             hostname
         ) or await self._stored_node_blocker(hostname, existing)
 
+    async def _pending_move_blocker(self, hostname: str) -> str | None:
+        """Why QUADS forbids touching *hostname* right now, or ``None``.
+
+        A pending move is listed until QUADS has run it, so a move that cannot
+        be ruled out is not acted on: an unreadable endpoint refuses as well.
+        """
+        try:
+            pending = await self._quads.get_pending_moves()
+        except Exception as exc:
+            detail = str(exc) or type(exc).__name__
+            logger.warning(
+                "placement_moves_check_failed", hostname=hostname, error=detail
+            )
+            return f"{_MOVES_UNKNOWN_REASON}: {detail}"
+        if hostname in pending:
+            return _PENDING_MOVE_REASON
+        return None
+
     async def _stored_node_blocker(
         self, hostname: str, existing: StoredClaim | None
     ) -> str | None:
@@ -715,10 +793,39 @@ class PlacementReconciler:
                 running = await self._provisioner.remote_lifecycle_processes(hostname)
         except Exception as exc:
             detail = str(exc) or type(exc).__name__
-            return f"could not verify that no earlier provisioning is running: {detail}"
+            error = (
+                f"could not verify that no earlier provisioning is running: {detail}"
+            )
+            # Reachable hosts never touch the BMC: power is read only when the
+            # probe fails. A host the BMC reports Off runs no earlier setup,
+            # so the failed probe does not block; anything else keeps the
+            # SSH error.
+            if await self._host_is_powered_off(hostname):
+                return None
+            return error
         if running:
             return "an earlier provisioning command is still running on the host"
         return None
+
+    async def _host_is_powered_off(self, hostname: str) -> bool:
+        """True only when the BMC reports the host off; unknown reads as on.
+
+        Called only when the SSH probe failed. A host the BMC reports ``Off``
+        runs no earlier setup, so the failed probe does not block. Redfish
+        being unconfigured, a read error, a deadline, or a transitional state
+        all keep the SSH error: unknown is never read as off.
+        """
+        try:
+            async with asyncio.timeout(_REMOTE_PROBE_TIMEOUT_SECONDS):
+                state = await self._provisioner.power_state(hostname)
+        except Exception as exc:
+            logger.debug(
+                "power_state_probe_failed",
+                hostname=hostname,
+                error=str(exc) or type(exc).__name__,
+            )
+            return False
+        return state == "Off"
 
     async def _ready_candidates(
         self, candidates: list[Candidate]
@@ -833,6 +940,24 @@ class PlacementReconciler:
                     retry_at=None,
                     last_error=existing.claim.last_error
                     or "the attempt limit was reached",
+                )
+                return False
+            # Re-check QUADS under the lease: the snapshot may have gone stale or
+            # an assignment may have ended since the pass planned. No attempt is
+            # made and an existing claim is left as it is.
+            refusal = self._quads_stale_reason() or await self._pending_move_blocker(
+                hostname
+            )
+            if refusal is not None:
+                self._refused[hostname] = refusal
+                if existing is None:
+                    self._deferred[hostname] = (
+                        self._clock()
+                        + timedelta(seconds=_LAUNCH_REFUSAL_RECHECK_SECONDS),
+                        refusal,
+                    )
+                logger.info(
+                    "placement_launch_refused", hostname=hostname, reason=refusal
                 )
                 return False
             blocker = await self._launch_blocker(hostname, existing)

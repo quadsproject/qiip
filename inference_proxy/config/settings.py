@@ -264,14 +264,14 @@ class PricingSettings(BaseModel):
 
     The estimates are equivalence figures: what the recorded prompt and
     completion token mix would cost at this per-million-token rate. The
-    defaults track Anthropic Claude Opus-class 1M-context pricing
-    (input $5/MTok, output $25/MTok); deployments can override when the
-    reference model changes.
+    defaults track the published Anthropic Claude Sonnet MSRP (Sonnet 5,
+    1M context at standard pricing: input $2/MTok, output $10/MTok);
+    deployments can override when the reference model changes.
     """
 
-    input_rate_per_mtok: float = Field(default=5.0, gt=0)
-    output_rate_per_mtok: float = Field(default=25.0, gt=0)
-    model_label: str = Field(default="claude-opus-4.8", min_length=1)
+    input_rate_per_mtok: float = Field(default=2.0, gt=0)
+    output_rate_per_mtok: float = Field(default=10.0, gt=0)
+    model_label: str = Field(default="claude-sonnet-5", min_length=1)
 
     @field_validator("model_label")
     @classmethod
@@ -313,6 +313,7 @@ class ProvisioningSettings(BaseModel):
     min_disk_gb: int = 20
     drain_timeout: int = 30
     scripts_dir: Path = Path("auto-vllm")
+    generation_root: Path = Path("/opt/qiip")
     boot_wait_timeout: int = 300  # D-05: 5 minutes for cold boot
     boot_wait_interval: int = 10
     max_concurrent_provisions: int = Field(default=32, ge=1)
@@ -341,8 +342,36 @@ class ProvisioningSettings(BaseModel):
     llamacpp_version: str = DEFAULT_LLAMACPP_VERSION
     llamacpp_sha256: str = DEFAULT_LLAMACPP_SHA256
     llamacpp_source_url: str = DEFAULT_LLAMACPP_SOURCE_URL
+    llamacpp_artifact_catalog_url: str = ""
+    llamacpp_artifact_catalog_sha256: str = ""
+    llamacpp_allow_source_build: bool = True
+    llamacpp_build_jobs: int = Field(default=0, ge=0)
     llamacpp_setup_timeout: float = Field(default=7200.0, gt=0)
     llamacpp_fit_target_mib: int = Field(default=512, ge=1)
+    # Bounded total automatic-mode vLLM launch attempts (initial plan plus
+    # retries). Attempt zero is the initial memory-aware plan; each retry
+    # applies one logged adjustment from the ordered policy.
+    vllm_memory_retry_max_attempts: int = Field(default=4, ge=1, le=5)
+    # Issue #133: stage-specific total deadline for the vLLM setup phase
+    # (package download, dependency resolution, and virtualenv sync). llama.cpp
+    # keeps its longer build deadline in ``llamacpp_setup_timeout``.
+    vllm_setup_timeout: float = Field(default=3600.0, gt=0)
+    # Bounded automatic retry of recognized transient setup failures
+    # (download/repository/SSH). Configuration, unsupported-hardware, and
+    # maintenance failures are never retried automatically.
+    stage_retry_max_attempts: int = Field(default=3, ge=1, le=6)
+    stage_retry_base_delay: float = Field(default=5.0, gt=0, le=600)
+    stage_retry_max_delay: float = Field(default=120.0, gt=0, le=3600)
+    stage_retry_jitter: float = Field(default=0.25, ge=0, lt=1)
+
+    @field_validator("generation_root")
+    @classmethod
+    def generation_root_is_absolute(cls, value: Path) -> Path:
+        if not value.is_absolute() or len(value.parts) < 2 or ".." in value.parts:
+            raise ValueError("generation_root must be a dedicated absolute directory")
+        if any(ord(c) < 32 for c in str(value)):
+            raise ValueError("generation_root must not contain control characters")
+        return value
 
     @field_validator("log_remote_root")
     @classmethod
@@ -452,6 +481,30 @@ class ProvisioningSettings(BaseModel):
         return self.llamacpp_source_url.format(version=self.llamacpp_version)
 
     @model_validator(mode="after")
+    def llamacpp_artifact_catalog_is_pinned(self) -> Self:
+        url = self.llamacpp_artifact_catalog_url
+        checksum = self.llamacpp_artifact_catalog_sha256
+        if bool(url) != bool(checksum):
+            raise ValueError("llamacpp artifact catalog requires both URL and SHA-256")
+        if url:
+            parsed = urlsplit(url)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.fragment
+                or any(ord(character) < 32 for character in url)
+            ):
+                raise ValueError(
+                    "llamacpp artifact catalog URL must be a plain HTTP(S) URL"
+                )
+            self.llamacpp_artifact_catalog_sha256 = _validate_sha256(
+                checksum, setting="provisioning.llamacpp_artifact_catalog_sha256"
+            )
+        return self
+
+    @model_validator(mode="after")
     def log_entry_limit_fits_host_budget(self) -> Self:
         """A single retained line cannot exceed the host-wide byte budget."""
         if self.log_max_entry_bytes > self.log_max_bytes_per_host:
@@ -499,10 +552,19 @@ class QUADSSettings(BaseModel):
     base_url: str | None = None
     server_timezone: str | None = None
     timeout: float = 10.0
-    poll_interval: int = 300
+    poll_interval: int = Field(default=300, ge=1)
     verify_ssl: bool = True
-    schedule_check_interval: int = 300
-    schedule_lookahead_hours: int = 24
+    # The schedule enforcer sleeps this long between checks, like the poller.
+    schedule_check_interval: int = Field(default=300, ge=1)
+    # Placement, manual setup and the schedule enforcer all require a host to
+    # be free for this whole window, so a value below an hour narrows it to
+    # nothing.
+    schedule_lookahead_hours: int = Field(default=24, ge=1)
+    # Placement makes no decision from an inventory snapshot older than this.
+    # Settings requires at least twice poll_interval where placement runs: the
+    # bound is headroom over the poll cadence, not a guarantee about missed
+    # polls, since request time and failed polls also age the snapshot.
+    stale_after_seconds: int = Field(default=900, ge=60)
 
     @model_validator(mode="after")
     def server_timezone_matches_quads_clock(self) -> Self:
@@ -794,12 +856,49 @@ class AuthSettings(BaseModel):
     sso_whitelist_extra_users: list[str] = Field(default_factory=list)
     sso_whitelist_extra_domains: list[str] = Field(default_factory=list)
     admin_only_tokens_full_access: list[str] = Field(default_factory=list)
+    admin_only_tokens_full_access_by_issuer: dict[str, list[str]] = Field(
+        default_factory=dict
+    )
 
     @field_validator("admin_only_tokens_full_access")
     @classmethod
     def admin_only_tokens_full_access_are_emails(cls, value: list[str]) -> list[str]:
-        """Require valid email addresses for the full-access trust list."""
+        """Require valid email addresses for the Google full-access list."""
         return _clean_emails(value, "auth.admin_only_tokens_full_access")
+
+    @field_validator("admin_only_tokens_full_access_by_issuer")
+    @classmethod
+    def admin_only_tokens_full_access_by_issuer_are_emails(
+        cls, value: dict[str, list[str]]
+    ) -> dict[str, list[str]]:
+        """Scope full-access email lists to specific OIDC issuers.
+
+        The plain ``admin_only_tokens_full_access`` list keeps its
+        pre-local-OIDC meaning (Google accounts only), so a local identity
+        asserting a listed email gains no scope. Other issuers (e.g. the
+        local OIDC provider) must be granted explicitly here by their
+        ``iss`` URL, which must be an absolute http(s) URL (RFC 8414).
+        """
+        cleaned: dict[str, list[str]] = {}
+        for issuer, emails in value.items():
+            normalized = issuer.strip()
+            if not normalized or any(
+                ord(char) < 32 or char.isspace() for char in normalized
+            ):
+                raise ValueError(
+                    "auth.admin_only_tokens_full_access_by_issuer "
+                    "keys must be OIDC issuer URLs"
+                )
+            parsed = urlsplit(normalized)
+            if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+                raise ValueError(
+                    "auth.admin_only_tokens_full_access_by_issuer "
+                    "keys must be absolute http(s) issuer URLs"
+                )
+            cleaned[normalized] = _clean_emails(
+                emails, "auth.admin_only_tokens_full_access_by_issuer"
+            )
+        return cleaned
 
     @field_validator("sso_whitelist_extra_users")
     @classmethod
@@ -915,6 +1014,80 @@ class AuthSettings(BaseModel):
         return value
 
 
+class BmcCredential(BaseModel):
+    """A single BMC username/password pair."""
+
+    username: str
+    password: SecretStr
+
+
+class BmcCredentials(BaseModel):
+    """Per-lab and per-host BMC credential overrides.
+
+    ``labs`` maps a hostname identifier, a dotted FQDN segment such as
+    ``rdu2.scalelab``, to its credentials. ``hosts`` maps a full node FQDN (not
+    the BMC hostname that ``bmc_host_template`` renders, such as ``mgmt-...``)
+    to an exact override that wins over any lab. A hostname matching nothing
+    here falls back to ``redfish.bmc_username`` / ``bmc_password``.
+    """
+
+    labs: dict[str, BmcCredential] = Field(
+        default_factory=dict,
+        description="Hostname identifier -> BMC credentials.",
+    )
+    hosts: dict[str, BmcCredential] = Field(
+        default_factory=dict,
+        description="Full node FQDN -> BMC credentials (highest precedence).",
+    )
+
+    @model_validator(mode="after")
+    def keys_are_normalized(self) -> Self:
+        """Normalize keys and reject keys that can never match a hostname.
+
+        Matching is done against a lowercased hostname on dot boundaries, so
+        surrounding whitespace and case are folded here. A key that strips to
+        empty, starts with a dot, or (for ``labs``) ends with one can never
+        match, and keys that differ only by case or whitespace silently shadow
+        the last one; all of these are startup errors instead of quiet misses.
+        """
+        self.labs = _normalized_keys(self.labs, section="labs", trailing_dot=False)
+        self.hosts = _normalized_keys(self.hosts, section="hosts", trailing_dot=True)
+        return self
+
+
+def _normalized_keys(
+    values: dict[str, BmcCredential],
+    *,
+    section: str,
+    trailing_dot: bool,
+) -> dict[str, BmcCredential]:
+    normalized: dict[str, BmcCredential] = {}
+    for key, credential in values.items():
+        cleaned = key.strip()
+        if not cleaned:
+            raise ValueError(
+                f"redfish.bmc_credentials.{section} keys must not be empty"
+            )
+        if cleaned.startswith("."):
+            raise ValueError(
+                f"redfish.bmc_credentials.{section} key {key!r} starts with a dot "
+                "and can never match a hostname"
+            )
+        if not trailing_dot and cleaned.endswith("."):
+            raise ValueError(
+                f"redfish.bmc_credentials.{section} key {key!r} ends with a dot "
+                "and can never match a hostname"
+            )
+        folded = cleaned.lower().rstrip(".") if trailing_dot else cleaned.lower()
+        if folded in normalized:
+            raise ValueError(
+                f"redfish.bmc_credentials.{section} key {key!r} duplicates "
+                f"{folded!r} after normalization"
+            )
+        normalized[folded] = credential
+    return normalized
+
+
 class RedfishSettings(BaseModel):
     """Redfish BMC configuration.
 
@@ -931,6 +1104,7 @@ class RedfishSettings(BaseModel):
     power_poll_timeout: float = 60.0
     power_poll_interval: float = 5.0
     verify_ssl: bool = False  # D-05: always False for self-signed BMC certs
+    bmc_credentials: BmcCredentials = Field(default_factory=BmcCredentials)
 
     @field_validator("bmc_host_template")
     @classmethod
@@ -973,6 +1147,17 @@ class RedfishSettings(BaseModel):
         if self.bmc_username is not None and self.bmc_password is None:
             raise ValueError(
                 "redfish.bmc_password must be configured with bmc_username"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def credentials_require_default(self) -> Self:
+        """Per-lab/host overrides need the default pair they fall back to."""
+        overrides = self.bmc_credentials.labs or self.bmc_credentials.hosts
+        if overrides and self.bmc_username is None:
+            raise ValueError(
+                "redfish.bmc_credentials requires bmc_username and bmc_password, "
+                "the default used when no host or lab matches"
             )
         return self
 
@@ -1151,5 +1336,31 @@ class Settings(BaseSettings):
             raise ValueError(
                 "etcd.node_lease_ttl must be greater than three times "
                 "resilience.health_check_interval"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def stale_bound_outlasts_the_poll_cadence(self) -> Self:
+        """Refuse a stale bound at or too close to the poll cadence.
+
+        Only placement reads the bound, and only through the poller's
+        ``last_sync``, so the rule applies where placement can run: QUADS
+        configured and placement enabled. A deployment without QUADS, or with
+        placement opted out, may tune the poll interval on its own.
+
+        The poller sleeps ``poll_interval`` after each poll finishes and only a
+        successful poll refreshes ``last_sync``, so a bound at or below one
+        interval reads a healthy poller as stale whenever a pass lands late in
+        the cycle. Twice the interval is minimum headroom, not a promise about
+        how many failed polls are tolerated: request time ages the snapshot too.
+        """
+        if not self.placement.enabled or self.quads.base_url is None:
+            return self
+        if self.quads.stale_after_seconds < 2 * self.quads.poll_interval:
+            raise ValueError(
+                "quads.stale_after_seconds must be at least twice "
+                f"quads.poll_interval ({2 * self.quads.poll_interval}s for a "
+                f"{self.quads.poll_interval}s poll interval), got "
+                f"{self.quads.stale_after_seconds}s"
             )
         return self

@@ -15,7 +15,7 @@ import re
 import sqlite3
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,9 +23,117 @@ from typing import Any
 
 _SOURCE_RECORD_BUDGET = 201
 
+# Ordered setup stages whose completion is checkpointed by ``[STEP:...]``.
+# This module is uploaded to nodes and must stay stdlib-only, so the canonical
+# order lives here and ``recovery`` imports it for its bounded progress view.
+# ``tests/provisioning/test_setup_script.py`` asserts this tuple matches the
+# ``[STEP:...]`` markers the engine scripts actually emit, so the list cannot
+# silently drift from the scripts again.
+SETUP_STAGE_ORDER: tuple[str, ...] = (
+    "check_install_capacity",
+    "system_prerequisites",
+    "runtime_prerequisites",
+    "nvidia_driver",
+    "cuda_toolkit",
+    "fabric_manager",
+    "cuda_proof",
+    "llamacpp_toolchain",
+    "vllm_install",
+    "llamacpp_install",
+    "nfs_mount",
+    "firewall",
+    "llmfit_install",
+    "generation_activate",
+    "vllm_unit",
+)
+
+# The stages each engine can emit, in pipeline order. A single union order
+# cannot distinguish an optional stage from a required one, so progress is
+# computed per engine and reaches 100% when the terminal stage completes.
+SETUP_ENGINE_STAGES: dict[str, tuple[str, ...]] = {
+    "vllm": (
+        "check_install_capacity",
+        "system_prerequisites",
+        "runtime_prerequisites",
+        "nvidia_driver",
+        "cuda_toolkit",
+        "fabric_manager",
+        "cuda_proof",
+        "vllm_install",
+        "nfs_mount",
+        "firewall",
+        "llmfit_install",
+        "generation_activate",
+        "vllm_unit",
+    ),
+    "llama_cpp": (
+        "check_install_capacity",
+        "system_prerequisites",
+        "runtime_prerequisites",
+        "nvidia_driver",
+        "fabric_manager",
+        "llamacpp_toolchain",
+        "cuda_toolkit",
+        "cuda_proof",
+        "llamacpp_install",
+        "nfs_mount",
+        "firewall",
+        "llmfit_install",
+        "generation_activate",
+    ),
+}
+
+# Only these stage names may be checkpointed. ``generation_activate`` is
+# deliberately absent from the resumable set: it is the cheap step that makes
+# a freshly separated upload live and must run on every attempt.
+NON_RESUMABLE_STAGES = frozenset({"generation_activate"})
+_ALLOWED_CHECKPOINT_STAGES = frozenset(SETUP_STAGE_ORDER)
+_MAX_CHECKPOINTS = 32
+
 
 def timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()  # noqa: UP017 - node Python 3.9
+
+
+def _stage_order(engine: str | None) -> tuple[str, ...]:
+    if engine:
+        return SETUP_ENGINE_STAGES.get(engine, SETUP_STAGE_ORDER)
+    return SETUP_STAGE_ORDER
+
+
+def setup_progress(
+    completed: dict[str, Any], *, engine: str | None = None
+) -> dict[str, Any]:
+    """Summarize checkpoint state for operators.
+
+    Only known stages count, so an unknown vendor marker cannot report 100%
+    early. ``percent`` measures pipeline position, not the fraction of every
+    possible stage: a stage a host legitimately does not need (an already
+    compatible driver, a skipped source build) must not cap the bar below 100%
+    once the terminal stage completes.
+    """
+    stages = _stage_order(engine)
+    indexes = {stage: index for index, stage in enumerate(stages)}
+    done = [
+        stage
+        for stage in stages
+        if str(completed.get(stage, "")).lower() in {"completed", "skipped"}
+    ]
+    passed = max((indexes[stage] + 1 for stage in done), default=0)
+    failed = sorted(
+        stage
+        for stage, status in completed.items()
+        if str(status).lower() == "failed" and stage in indexes
+    )
+    total = len(stages)
+    return {
+        "completed_stages": done,
+        "completed_count": len(done),
+        "stages_passed": passed,
+        "total_stages": total,
+        "percent": round(100 * passed / total, 1) if total else 0.0,
+        "failed_stages": failed,
+    }
 
 
 class AttemptLogStore:
@@ -129,6 +237,8 @@ class AttemptLogStore:
         bundle_version: str = "unknown",
         operation: str = "provision",
         attempt_id: str | None = None,
+        plan_id: str | None = None,
+        setup_inputs: dict[str, Any] | None = None,
     ) -> str:
         attempt_id = attempt_id or uuid.uuid4().hex
         metadata: dict[str, Any] = dict(
@@ -145,6 +255,16 @@ class AttemptLogStore:
             sources={},
             issues=[],
             finished_at=None,
+            # Issue #133: stage checkpoints are bound to the setup plan so a
+            # compatible retry can resume verified work and a changed plan
+            # invalidates it. Extra keys are additive to the manifest.
+            plan_id=plan_id,
+            setup_inputs=dict(setup_inputs or {}),
+            checkpoints={},
+            progress=None,
+            failure_class=None,
+            next_action=None,
+            transient_retries=0,
         )
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -409,6 +529,115 @@ class AttemptLogStore:
                 "ORDER BY MAX(created) DESC"
             ).fetchall()
             return [row["hostname"] for row in rows]
+
+    def _mutate_metadata(
+        self, attempt_id: str, mutate: Callable[[dict[str, Any]], None]
+    ) -> dict[str, Any]:
+        """Atomically read-modify-write one attempt manifest."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT metadata FROM attempts WHERE id=?", (attempt_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(attempt_id)
+            metadata: dict[str, Any] = json.loads(row[0])
+            mutate(metadata)
+            self._update(db, attempt_id, metadata)
+            return metadata
+
+    def record_checkpoint(
+        self,
+        attempt_id: str,
+        stage: str,
+        status: str,
+        *,
+        evidence: str | None = None,
+    ) -> None:
+        """Persist completion evidence for one setup stage.
+
+        Idempotent and atomic: concurrent retries cannot interleave a partial
+        checkpoint map. ``completed_at`` is set once for terminal statuses so a
+        resumed attempt keeps the original evidence timestamp.
+        """
+        if stage not in _ALLOWED_CHECKPOINT_STAGES:
+            return
+        terminal = status in {"completed", "skipped", "failed"}
+
+        def mutate(metadata: dict[str, Any]) -> None:
+            checkpoints = metadata.setdefault("checkpoints", {})
+            if stage not in checkpoints and len(checkpoints) >= _MAX_CHECKPOINTS:
+                return
+            current = checkpoints.get(stage) or {}
+            now = timestamp()
+            checkpoint = {
+                "stage": stage,
+                "status": status,
+                "plan_id": metadata.get("plan_id"),
+                "attempt_id": attempt_id,
+                "attempt_number": metadata.get("attempt_number"),
+                "started_at": current.get("started_at") or now,
+                "completed_at": current.get("completed_at")
+                or (now if terminal else None),
+                "evidence": (evidence or current.get("evidence") or "")[:1024] or None,
+            }
+            if status in {"running", "failed"}:
+                # Re-running invalidates the previous terminal evidence.
+                checkpoint["completed_at"] = None if status == "running" else now
+            checkpoints[stage] = checkpoint
+            metadata["checkpoints"] = checkpoints
+            metadata["current_stage"] = stage
+            metadata["progress"] = setup_progress(
+                {name: cp.get("status") for name, cp in checkpoints.items()},
+                engine=metadata.get("engine"),
+            )
+            if status == "running":
+                # A fresh stage means the previous failure is superseded.
+                metadata["failure_class"] = None
+                metadata["next_action"] = None
+
+        self._mutate_metadata(attempt_id, mutate)
+
+    def increment_transient_retry(self, attempt_id: str) -> int:
+        """Count one automatic transient retry and return the new total."""
+
+        def mutate(metadata: dict[str, Any]) -> None:
+            metadata["transient_retries"] = (
+                int(metadata.get("transient_retries") or 0) + 1
+            )
+            metadata["last_transient_retry_at"] = timestamp()
+
+        metadata = self._mutate_metadata(attempt_id, mutate)
+        return int(metadata["transient_retries"])
+
+    def resumable_checkpoints(
+        self, hostname: str, plan_id: str
+    ) -> dict[str, dict[str, Any]]:
+        """Return verified stages for the newest compatible retry chain.
+
+        Newest attempt first, so a stage re-run and failed in a later attempt
+        blocks an older completion. A changed ``plan_id`` invalidates every
+        checkpoint, which is exactly the plan-identity contract.
+        """
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT metadata FROM attempts WHERE hostname=? "
+                "ORDER BY created DESC, id DESC",
+                (hostname,),
+            ).fetchall()
+        merged: dict[str, dict[str, Any]] = {}
+        decided: set[str] = set()
+        for row in rows:
+            metadata = json.loads(row[0])
+            if metadata.get("plan_id") != plan_id:
+                continue
+            for stage, checkpoint in (metadata.get("checkpoints") or {}).items():
+                if stage in NON_RESUMABLE_STAGES or stage in decided:
+                    continue
+                decided.add(stage)
+                if checkpoint.get("status") in {"completed", "skipped"}:
+                    merged[stage] = checkpoint
+        return merged
 
     def update_phase(self, attempt_id: str, phase: str, **changes: Any) -> None:
         """Atomically merge a node worker's phase state with current metadata."""

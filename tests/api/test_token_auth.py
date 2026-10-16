@@ -174,6 +174,161 @@ class TestInvalidTokenWhenNotEnforced:
         assert "www-authenticate" not in response.headers
 
 
+class TestRequiredTokenHeader:
+    """``X-Qiip-Require-Token`` refuses silent degradation to anonymous.
+
+    A caller that presents a credential in order to be attributed (the chat
+    playground) must not have it treated as anonymous when it no longer
+    resolves. Without the header, the enforcement-off fallback stays exactly
+    as it was.
+    """
+
+    @staticmethod
+    def _headers(token: str) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {token}",
+            "X-Qiip-Require-Token": "1",
+        }
+
+    def test_unresolvable_token_is_refused(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        _add_node(test_registry)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json=_BODY,
+            headers=self._headers("qiip_totally-made-up"),
+        )
+
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "invalid_api_key"
+        assert len(httpx_mock.get_requests()) == 0
+
+    def test_revoked_token_is_refused(
+        self,
+        client: TestClient,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        """The race the playground closes: the page revealed a token that was
+        revoked before the turn reached the gateway."""
+        user_id, token = _create_user_token(auth_store)
+        _add_node(test_registry)
+        token_id = auth_store.list_tokens(user_id)[0].id
+        assert auth_store.revoke_token(user_id, token_id) is True
+
+        response = client.post(
+            "/v1/chat/completions",
+            json=_STREAM_BODY,
+            headers=self._headers(token),
+        )
+
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "invalid_api_key"
+        assert len(httpx_mock.get_requests()) == 0
+
+    def test_missing_token_is_refused(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+    ) -> None:
+        _add_node(test_registry)
+
+        response = client.post(
+            "/v1/chat/completions",
+            json=_BODY,
+            headers={"X-Qiip-Require-Token": "1"},
+        )
+
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "invalid_api_key"
+
+    def test_revoked_token_is_refused_on_the_messages_api(
+        self,
+        client: TestClient,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        """Every inference route that reads the header is strict."""
+        user_id, token = _create_user_token(auth_store)
+        _add_node(test_registry)
+        token_id = auth_store.list_tokens(user_id)[0].id
+        assert auth_store.revoke_token(user_id, token_id) is True
+
+        response = client.post(
+            "/v1/messages",
+            json=_BODY,
+            headers=self._headers(token),
+        )
+
+        assert response.status_code == 401
+        assert response.json()["type"] == "error"
+        assert response.json()["error"]["code"] == "invalid_api_key"
+        assert len(httpx_mock.get_requests()) == 0
+
+    def test_revoked_x_api_key_is_refused_on_messages(
+        self,
+        client: TestClient,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        """Claude Code's shape: the token arrives as x-api-key."""
+        user_id, token = _create_user_token(auth_store)
+        _add_node(test_registry)
+        token_id = auth_store.list_tokens(user_id)[0].id
+        assert auth_store.revoke_token(user_id, token_id) is True
+
+        response = client.post(
+            "/v1/messages",
+            json=_BODY,
+            headers={"x-api-key": token, "X-Qiip-Require-Token": "1"},
+        )
+
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "invalid_api_key"
+        assert len(httpx_mock.get_requests()) == 0
+
+    def test_valid_token_still_authenticates(
+        self,
+        client: TestClient,
+        auth_store: AuthStore,
+        test_registry: NodeRegistry,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        user_id, token = _create_user_token(auth_store)
+        _add_node(test_registry)
+        httpx_mock.add_response(
+            url=_CHAT_URL,
+            status_code=200,
+            json={
+                "id": "chatcmpl-1",
+                "model": "llama-3",
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            },
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json=_BODY,
+            headers=self._headers(token),
+        )
+
+        assert response.status_code == 200
+        summary = auth_store.get_usage_summary(user_id)
+        assert [row.total_tokens for row in summary] == [15]
+
+
 class TestTokenUsageRecording:
     def test_non_streaming_usage_is_recorded(
         self,

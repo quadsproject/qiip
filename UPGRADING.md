@@ -16,6 +16,10 @@ The guide separates three kinds of change:
 - [Self-service onboarding](#27-self-service-onboarding-moves-normal-users-to-start)
 - [Catalog profiles and automatic placement](#28-catalog-profiles-and-automatic-model-placement)
 - [Node command transport and CUDA build identity](#29-node-command-transport-and-cuda-build-identity)
+- [Reuse verified llama.cpp artifacts](#30-reuse-verified-llamacpp-artifacts-and-bound-source-builds)
+- [Size managed vLLM launches from available memory](#31-size-managed-vllm-launches-from-available-memory)
+- [Setup resume and bounded transient retries](#32-setup-resume-and-bounded-transient-retries)
+- [The chat playground requires a signed-in viewer](#33-the-chat-playground-requires-a-signed-in-viewer)
 - [Artifact sources and mirror policy](#artifact-sources-and-mirror-policy)
 - [Client-visible compatibility changes](#client-visible-compatibility-changes)
 - [RPM install migration](#rpm-install-migration)
@@ -75,7 +79,7 @@ INFERENCE_PROXY_ADMIN__USERNAME=operator
 INFERENCE_PROXY_ADMIN__PASSWORD=replace-me
 ```
 
-HTTP Basic authentication protects `/admin/*` and `/dashboard*`. The inference endpoints, chat page, and `/health` remain public. HTTP Basic sends a reusable base64-encoded credential on every request. Plain HTTP is an accepted deployment choice on a trusted work LAN; use a TLS terminator whenever the network path is not trusted.
+HTTP Basic authentication protects `/admin/*` and `/dashboard*`. The inference endpoints and `/health` remain public; the chat playground requires a signed-in viewer (section 33). HTTP Basic sends a reusable base64-encoded credential on every request. Plain HTTP is an accepted deployment choice on a trusted work LAN; use a TLS terminator whenever the network path is not trusted.
 
 State-changing admin endpoints accept JSON only. Cross-origin JSON and DELETE requests require a browser preflight, which is part of the current CSRF boundary. Do not add form-encoded, multipart, or plain-text state-changing admin endpoints without adding explicit CSRF protection.
 
@@ -191,7 +195,17 @@ Changing the version requires explicitly supplying the matching digest. The gate
 
 ### 13. Prepare for strict driver and cache checks
 
-Provisioning no longer reports success merely because `nvidia-smi` exists. If the installed driver differs from `INFERENCE_PROXY_PROVISIONING__NVIDIA_DRIVER_VERSION`, setup fails and prints both versions. Align the configured version with each fleet or update the node deliberately; setup does not hot-swap a live kernel driver.
+Setup probes the host before preparing its runtime. An installed driver can be reused when its version satisfies the selected profile and a compiled CUDA kernel executes successfully on every visible CUDA device. `nvidia-smi` alone does not establish readiness. CUDA 13.0 profiles accept drivers from 580.65.06 onward; the CUDA 12.9 Volta profile requires at least 575.57.08 and caps the driver branch at R580, the last branch supporting Volta. These limits follow NVIDIA's [CUDA 13 compatibility contract](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-toolkit-release-notes/) and [CUDA 12.9 release requirements](https://docs.nvidia.com/cuda/archive/12.9.2/cuda-toolkit-release-notes/). The configured `INFERENCE_PROXY_PROVISIONING__NVIDIA_DRIVER_VERSION` now identifies the replacement artifact, rather than an exact version required on working nodes.
+
+Ordinary setup installs only absent prerequisites. Both engines need the profile toolkit and its host compiler; vLLM additionally needs Python 3.12 and `python3.12-devel` for Triton's runtime helper compilation, while llama.cpp needs CMake and Make for its source build. Setup no longer runs a broad OS package update or requires kernel-devel/kernel-headers on a working stack. An active, trained Fabric Manager matching the installed driver is reused without a restart. Exact running-kernel build dependencies are installed only for driver installation or module rebuilding. A present unloaded NVIDIA module is loaded first; a compatible RPM or runfile/DKMS stack with a missing module can be rebuilt before falling back to replacement. If the broken stack prevents hardware measurements, setup restores a potentially compatible module or the pinned bootstrap driver first and then selects the measured profile before installing the toolkit or engine. For llama.cpp recovery before measurements, the driver must satisfy the Volta limits (575.57.08 through R580); the measured profile's limits apply afterward.
+
+The CUDA proof preserves `AUTOVLLM_GPU_DEVICES` or the caller's `CUDA_VISIBLE_DEVICES` selection and compiles for the selected profile's architecture. Busy or unsupported cards outside that selection do not enter the execution probe. Driver replacement still requires idleness across the whole NVIDIA stack because the driver is shared by all cards.
+
+Before rebuilding or replacing a driver, setup downloads and verifies the fallback installer and checks both compute-process inventory and NVIDIA GPU device users, including DRM nodes identified by their PCI vendor. Other vendors' DRM clients, such as BMC consoles, do not block repair. It checks idleness again after installing build dependencies. Active GPU clients, unavailable matching headers, or unprovable idleness stop setup with `resume_state: maintenance_required`. Known leaf modules such as `nvidia_peermem` are unloaded first. If a module still cannot unload, setup reports its holders as maintenance rather than requesting repeated reboots. RPM removal covers installed NVIDIA driver, kmod/akmod, and Xorg driver packages even without the `nvidia-driver-cuda` subpackage. No GPU client is killed to make replacement possible. A CUDA execution failure on an otherwise compatible version also requires maintenance; setup does not blindly reinstall that driver.
+
+Driver activation or CUDA execution that needs another boot stops setup with `resume_state: reboot_required`. The failed task retains the reason and remains eligible for a setup retry; no engine is launched or registered healthy. Setup records the current boot ID in `/var/lib/qiip/setup/driver-reboot` (standalone scripts can set `AUTOVLLM_DRIVER_STATE_DIR`). A retry on the same boot stops before repeating the installer. After the operator reboots and retries setup, profile selection, driver compatibility, Fabric Manager readiness, and CUDA execution run again. The marker is removed only after successful CUDA execution. Setup never reboots the node itself. Compilation and installer failures remain ordinary failures with their diagnostics.
+
+For either resume state, drain the node and inspect the logged reason. Stop GPU services and clients before required replacement, supply matching kernel dependencies when missing, or reboot when requested. Then use the normal setup retry with the original engine/model selection. Do not clear the reboot marker to bypass revalidation. The additive `resume_state` field is exposed by `/admin/provisioning/tasks` and `/admin/nodes`; `current_step` and node status remain `failed` so existing retry clients continue to work.
 
 The committed default pair is NVIDIA driver 580.126.09 with SHA-256 `4cac53e48f8adff661d47c8788ed24059a248c9fd8098ceafd088a498986ec26`. Changing that version requires an explicit `INFERENCE_PROXY_PROVISIONING__NVIDIA_DRIVER_SHA256`. Downloaded driver and LLMFit artifacts are verified before any privileged installer consumes them.
 
@@ -291,8 +305,9 @@ to CPU inference. Direct use of the scripts retains the existing standalone CPU
 branch, but it is outside QIIP's managed-node support boundary. Validate a
 disposable node from each GPU family before fleet rollout because the build is
 specialized for the attached CUDA architecture. The supporting CPU backend is
-built with `GGML_NATIVE=OFF` to avoid host-specific compiler/assembler feature
-mismatches; this fixed profile is part of the immutable build identity.
+built with `GGML_NATIVE=ON`; its producer CPU feature requirements are part of
+the immutable build identity, and consumers must support those features. See §30
+for artifact compatibility and rebuilding earlier profiles.
 
 ### 21. Use exact immutable GGUF artifacts
 
@@ -550,13 +565,20 @@ configuration is required; read it before upgrading a gateway that already has
 Google users.
 
 - **One page for normal users.** After sign-in they land on `/start`, and
-  `/dashboard`, node detail pages, `/models`, `/chat`, `/profile`, and the
+  `/dashboard`, node detail pages, `/models`, `/profile`, and the
   token and admin pages all redirect them there. The read-only fleet and node
   views they had before are gone. Admin-role users and the local admin keep
   every page and are redirected away from `/start`. Users on the
   `auth.admin_only_tokens_full_access` trust list are sent to `/profile`
   instead, where they keep minting pinned and unscoped tokens; the `/start`
   flow refuses them because its mint would revoke those tokens.
+- **Admins keep the leaderboard.** `/leaderboard` renders the non-admin
+  ranking for admin-role users and the local-admin session; admin rows are
+  never listed, and the token manager half of the page stays with normal
+  users (admins manage tokens on `/profile`). The HTTP Basic admin has no
+  session for the page's own requests and is redirected to `/dashboard`. The
+  ranking endpoint (`GET /onboarding/leaderboard`) answers every
+  authenticated viewer.
 - **`POST /profile/tokens` is admin-only** (admin role or the full-access
   trust list). Other normal users get `403`, including
   for `name: agent-config`. Scripts that minted tokens as a normal user must
@@ -689,6 +711,36 @@ using only the catalog models and their pinned configurations. Set
   restarts applies to existing claims, and a successful provision resets the
   count. Every launch, including the first on a host and the first after a
   claim reset, asks the host for running setup or start commands first.
+- **Placement waits for a pending QUADS move.** When an assignment ends,
+  QUADS reports the host available at once but runs the move back to its
+  default cloud minutes later, and that move powers the host off. Placement
+  now reads `GET /api/v3/moves` on every pass and again at launch, and a host
+  with a pending move is skipped as "QUADS has a pending move for the host":
+  no attempt spent, claim and error untouched, reconsidered on the next pass.
+  A host already listed in the pass snapshot is skipped before any probe; one
+  that only starts moving after the pass planned is refused at the launch.
+  Manual managed setup (`POST /admin/nodes/setup`) answers `409` for such a
+  host and `503` when the moves cannot be read. The gateway needs read access
+  to `/api/v3/moves` (served by QUADS 3.0.2); a pass whose moves read fails
+  places nothing, also skips claim settling and teardown bookkeeping for that
+  pass (the schedule enforcer is unaffected) and reports it in `error`, and a
+  QUADS without the endpoint leaves placement idle until it is upgraded.
+- **New `quads.stale_after_seconds` (default 900).** A pass makes no decision
+  from a QUADS inventory snapshot older than this. A pass that is already
+  stale reports the snapshot age in `error`; a launch refused because the
+  snapshot aged during the pass reports the same age under that host in
+  `skipped_hosts`. The poller keeps its last good data through an outage, and
+  the default leaves room for roughly two missed polls at the default
+  interval; request time and failed polls age the snapshot too, so this is
+  headroom, not a fixed tolerance. `quads.poll_interval`,
+  `quads.schedule_check_interval` and `quads.schedule_lookahead_hours` must
+  each be at least 1, and the bound must be at least 60 and at least twice
+  the interval, checked at startup where placement runs (QUADS configured and
+  `placement.enabled`); a deployment with placement off, or without QUADS, is
+  unaffected by the interlock. The 900 default is checked too, so a
+  deployment that already sets `quads.poll_interval` above 450 must raise
+  `stale_after_seconds` to twice the interval, or lower the interval, before
+  restarting.
 - **Before upgrading with placement enabled:** configure QUADS, download each profile's files
   with `POST /admin/models/download` at the revisions the catalog pins, check
   `GET /admin/placement` shows every profile's files as present, list any host
@@ -704,10 +756,147 @@ arguments. Manual script environment variables and managed relaunch settings are
 unchanged, and provisioning log redaction still applies.
 
 llama.cpp `BUILD-INFO` now records `cuda_toolkit`, the full version reported by the
-resolved `nvcc`. Setup rebuilds when that version changes, including a toolkit
-patch update. Existing installations without this marker rebuild once on their
-next setup. An unreadable compiler version stops setup before a cached build can
-be reused.
+resolved `nvcc`. That full version is part of each source-built installation's
+identity, so a source fallback produces a different installation when it changes,
+including a toolkit patch update. Compatible selected-profile packages can be
+reused across local toolkit patch updates as described in §30. Existing
+installations without this marker need a new package on their next setup. A
+source fallback requires a readable compiler version before compiling.
+
+### 30. Reuse verified llama.cpp artifacts and bound source builds
+
+New llama.cpp setups use the `cuda-native-cpu-v4-artifact` profile and schema 4.
+Its sealed package includes all three tools, a CUDA execution probe, native CPU
+settings, bundled CUDA/compiler libraries, and source/transformation/compiler/OS
+identity. Every consumer CPU must support all recorded producer CPU features;
+source builds require uniform CPU features on the producer. Executables embed
+`$ORIGIN/../lib` as their RPATH so direct tools and diagnostics load bundled
+libraries without a toolkit or `LD_LIBRARY_PATH`.
+Older installations remain available for rollback; their next setup needs a new
+package. Compatible local packages are reused without downloading a catalog or
+installing a toolchain. A selected-profile package no longer rebuilds solely
+because a local compiler or CUDA toolkit patch version changes.
+
+To distribute builds between nodes, publish packages on representative GPU
+producers and configure both `LLAMACPP_ARTIFACT_CATALOG_URL` and
+`LLAMACPP_ARTIFACT_CATALOG_SHA256` under `INFERENCE_PROXY_PROVISIONING__`.
+`LLAMACPP_ALLOW_SOURCE_BUILD=false` requires a verified matching local or remote
+artifact; the default remains `true`. Catalog updates require a new pinned
+digest. See the [producer workflow](auto-llamacpp/README.md#produce-and-distribute-a-catalog).
+
+Source fallback now reserves 2 GiB of available RAM and budgets 4 GiB per job,
+with `LLAMACPP_BUILD_JOBS` as an optional ceiling (`0` means automatic). The
+defaults require at least 6 GiB available RAM, 12 GiB of build space, and 4 GiB
+of installation space. Requirements add when both paths share a filesystem.
+Setup can choose alternate scratch storage for both the CUDA probe and the
+engine build, and proves CUDA execution before compiling the engine.
+Source/archive checksums and transactional activation
+remain mandatory. Check artifact hit/miss, fallback reason, resource and timing
+markers in attempt logs before fleet rollout.
+
+### 31. Size managed vLLM launches from available memory
+
+Managed vLLM setup now sizes the launch on the gateway from the selected
+devices' free VRAM, the model's weights and quantization, the KV cache, and a
+per-profile runtime overhead. The planner chooses context, batching, tensor
+parallelism, dtype, and attention backend consistently with the selected
+runtime profile, records its estimate and reserve, and emits a
+`qiip_vllm_plan` record. When the operator requests no model, the largest
+catalog model the budget supports is selected and the selection policy is
+recorded; an explicitly requested model is never replaced. A value the operator
+set explicitly — context, tensor-parallel size, utilization, or dtype — is never
+silently rewritten: if it does not fit, provisioning stops with a reason.
+
+Automatic utilization is capped to the measured free VRAM so the plan pre-empts
+vLLM's own free-memory refusal instead of tripping it. Recognized memory
+failures during an automatic launch are retried under a bounded, logged policy
+that stops the failed engine, recomputes the plan from current memory, and
+records each adjustment. The attempt budget is
+`INFERENCE_PROXY_PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS` (total attempts,
+default 4; 1 disables retries). A fully explicit configuration yields no
+adjustments and is never retried. The requested and effective settings, the
+adjustment reasons, and the memory estimate are persisted with the node as
+`vllm_runtime` and shown on the node-detail dashboard. Hosts whose GPU memory
+cannot be measured fall back to the previous single-attempt launch and record
+no runtime state.
+
+### 32. Setup resume and bounded transient retries
+
+Setup now persists its plan inputs, per-stage checkpoints, attempt
+relationships, and retry history in the durable attempt database instead of
+re-running every stage after an interruption. Each attempt derives a plan id
+from a canonical digest of the inputs that change what setup does: the engine,
+model and artifact, NFS export, the content digest of the uploaded script
+bundle, and the API port. A later attempt resumes only stages whose recorded
+checkpoint carries the same plan id and whose stage-specific verifier still
+passes on the node. Changing any input invalidates every checkpoint, so the
+affected stages run again. `generation_activate` is always re-run and never
+resumed because it is the cheap step that makes a freshly separated engine
+upload live.
+
+The vLLM sync and the llama.cpp source build are now resumed rather than
+repeated: each verifier re-derives the sealed runtime from the same marker and
+republishes the runtime selection the way a fresh install would. The CUDA probe
+(`cuda_proof`) intentionally re-runs every attempt because it must reflect the
+current driver and device state before a reboot decision. For llama.cpp the
+proof is deferred to the installer, so the `llamacpp_install` verifier re-runs
+it before the stage can be skipped; a proof failure re-runs the stage and
+reaches the same reboot handling.
+
+Only recognized transient download, repository, and SSH transport failures are
+retried automatically, under bounded exponential backoff with jitter
+(`STAGE_RETRY_MAX_ATTEMPTS`, `STAGE_RETRY_BASE_DELAY`, `STAGE_RETRY_MAX_DELAY`,
+`STAGE_RETRY_JITTER`). The gateway reconciles remote ownership and stops a
+failed engine before each retry. Invalid configuration (bad credentials,
+missing immutable artifacts, untrusted certificates), unsupported hardware,
+and explicit maintenance boundaries are never retried automatically. Setup now
+runs under an engine-specific total deadline — `LLAMACPP_SETUP_TIMEOUT` or the
+new `VLLM_SETUP_TIMEOUT` — and a run that exhausts its own deadline is terminal
+rather than being mistaken for a socket timeout and retried.
+
+Operators see the attempt number, retry count, current stage, the percent of
+ordered setup stages passed, and the next operator action on the provisioning
+history and node-detail views. The stage-progress percentage uses pipeline
+position per engine, so a host that legitimately skips an optional stage still
+reaches 100% when the terminal stage completes.
+
+### 33. The chat playground requires a signed-in viewer
+
+This changes who can use the browser playground at `/chat` and how its requests
+are authenticated. No configuration is required.
+
+- **The playground is no longer public.** An anonymous visitor gets the
+  sign-in page instead of the chat shell.
+- **A signed-in normal user chats with their own token.** The page reveals it
+  through `POST /onboarding/token/reveal` (the endpoint the token Copy action
+  already uses) before every turn, so a token replaced in another `/start` tab
+  is followed, and sends it as a bearer token plus `X-Qiip-Require-Token: 1` on
+  every `/v1` call. Each turn is recorded against that token (AUTH-04) with the
+  usage the backend reports for the stream (`stream_options.include_usage`),
+  the model selector lists only the models that token may use, and node
+  selection resolves to the user's non-admin scope. Under
+  `auth.enforce_api_tokens=true` the playground authenticates like any other
+  client instead of failing with `401`.
+- **A credential that no longer resolves is refused, never anonymized.** The
+  strict-auth request header asks the gateway to reject an absent or
+  unresolvable token with `401 invalid_api_key` even while anonymous access is
+  enabled, so a token revoked between the reveal and the turn can never be
+  served as an anonymous, unrecorded request. Ordinary clients keep the
+  documented enforcement-off fallback exactly as before.
+- **Admins keep the anonymous playground.** The page shell tells the script
+  that an admin viewer (admin role, the full-access trust list, or the local
+  admin) chats anonymously, so it never asks for a token: their calls carry no
+  credential and are not attributed, exactly as before. The reveal endpoint
+  refuses those viewers anyway (`403` for an admin role or a full-access user,
+  `401` for the local admin, which has no user row).
+- **A failed reveal disables the playground instead of falling back to
+  anonymous calls.** Without a personal token, or with a pre-onboarding token
+  whose value cannot be re-derived, the model selector stays disabled and shows
+  the reveal endpoint's message with a link to `/start`.
+- **Admin-only servers stay out of the playground.** Anonymous calls (the admin
+  playground included) and a signed-in normal user's token both resolve to a
+  non-admin node scope, so a model served only by an admin-only node is neither
+  listed nor routed to.
 
 ## Artifact Sources and Mirror Policy
 
@@ -718,7 +907,8 @@ There is no single global mirror switch. Each source has a different trust and c
 | NVIDIA `.run` installer used by `setup.sh` | Node-side `NVIDIA_DRIVER_URL`; the gateway does not forward a URL setting | `AUTOVLLM_NVIDIA_DRIVER_SHA256`, normally populated from `PROVISIONING__NVIDIA_DRIVER_SHA256` | Point the node-side variable at a mirror serving byte-identical content, or configure the matching custom digest with the custom version. |
 | LLMFit archive used by `setup.sh` | Node-side `LLMFIT_URL`; the gateway forwards version and digest but not this URL | `AUTOVLLM_LLMFIT_SHA256`, normally populated from `LLMFIT__SHA256` | Point the node-side variable at byte-identical mirrored content. When invoking setup through QIIP, arrange the variable in the node's SSH environment or customize the shipped bundle. |
 | On-demand LLMFit runner install | `INFERENCE_PROXY_LLMFIT__INSTALL_URL` | `INFERENCE_PROXY_LLMFIT__SHA256` | Set the validated HTTP(S) `{version}` URL template and matching digest. Configure this separately from the setup-script URL. |
-| llama.cpp source archive | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` with the pinned `LLAMACPP_VERSION` | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256`; verification happens before extraction or build | Point the validated `{version}` URL template at a mirror serving byte-identical tag archives, or configure the matching digest with a custom version. Managed nodes compile CUDA-enabled binaries locally because the pinned release has no Linux CUDA archive. |
+| llama.cpp source archive | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` with the pinned `LLAMACPP_VERSION` | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256`; verification happens before extraction or build | Point the validated `{version}` URL template at a mirror serving byte-identical tag archives, or configure the matching digest with a custom version. Source fallback compiles CUDA-enabled binaries when allowed and no compatible artifact is available. |
+| llama.cpp build catalog and packages | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_ARTIFACT_CATALOG_URL` | The catalog SHA-256 pins package URLs, archive digests, sizes and source/profile/ABI identities; setup validates the complete package and CUDA execution | Publish verified packages to the mirror first, then atomically publish its catalog and update the gateway's catalog digest. |
 | HuggingFace model snapshots and GGUF files | Repository ID, optional requested revision, and exact GGUF file set in the administrative download request | Download status records the resolved immutable commit; native discovery binds that commit to one standalone GGUF or complete split family and an exact entrypoint | Pre-seed the standard HuggingFace cache on the declared NFS export. QIIP does not provide a separate model-hub mirror URL. A resolved commit records reproducibility but is not an independently configured content digest. |
 | uv bootstrap binary | Pinned GitHub release in `setup.sh` and `auto-vllm/.uv-version` | Vendored checksum from Astral's release assets | Air-gapped nodes may preinstall the exact pinned uv version at the expected path. Changing the download source requires a reviewed bundle change. |
 | vLLM, FlashInfer, and Python dependencies | `auto-vllm/pyproject.toml` plus `auto-vllm/uv.lock` | Registry artifact hashes for the full installable closure; source builds are refused | Regenerate and review the node project and lock for a custom index. Runtime `FLASHINFER_INDEX_URL` overrides are rejected. A pre-seeded uv cache may be used only when it satisfies the frozen lock. |
@@ -786,6 +976,8 @@ until every gateway that may provision or display the node understands it.
 | **New surface** | `/admin/nodes[]` now includes nullable `artifact_id`. Managed llama.cpp nodes report the exact discovered GGUF generation selected at setup; vLLM, older, manual, and QUADS-only records can report `null`. | Preserve the field when correlating a node with the GGUF catalog, but continue to handle `null` during rolling upgrades and for non-artifact-backed nodes. |
 | **New surface** | `/admin/nodes[]` now includes nullable `llamacpp_runtime`. Successful managed llama.cpp setup records requested sizing, verified effective context/concurrency/cache/offload values, per-GPU post-load memory, and an ISO-8601 UTC observation time. The node-detail dashboard renders the same state as a read-only card. | Treat the GPU values as a timestamped post-load snapshot, not live telemetry. Handle `null` for older records, vLLM nodes, QUADS-only hosts, and llama.cpp nodes that have not completed setup on the new version. |
 | **New surface** | `llamacpp_runtime.requested` can represent either automatic sizing or a complete gateway-authorized custom policy with `context_per_slot`, `slots`, and `cache_type`. Identity-preserving llama.cpp retries inherit the persisted policy: automatic policy recomputes, while custom policy replays exact values and revalidates fit. Host-ambient sizing overrides remain rejected. | Continue to omit selection fields for an identity-preserving retry. Preserve the complete `requested` object in clients and do not treat gateway-authorized sizing as permission to set ambient `AUTOLLAMACPP_*` or `LLAMA_ARG_*` overrides. |
+| **New surface** | `/admin/nodes[]` now includes nullable `vllm_runtime`. Successful managed vLLM setup records the requested overrides, the effective context/batching/tensor-parallel/dtype/attention values, the memory estimate and reserve, per-adjustment reasons, the model-selection policy, and an ISO-8601 UTC observation time. The node-detail dashboard renders the same state as a read-only card. | Handle `null` for older records, llama.cpp nodes, QUADS-only hosts, and hosts whose GPU memory could not be measured. Treat `approximate: true` as a name-derived estimate rather than a measured checkpoint. |
+| **Behavioral break** | Managed vLLM setup now plans context, batching, tensor parallelism, dtype, attention backend, and utilization from measured free VRAM and a per-profile overhead, and retries recognized automatic-mode memory failures up to `PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS` total attempts (default 4). Automatic utilization is capped to available free memory. Explicit context, tensor-parallel size, utilization, or dtype are never silently changed; a non-fitting explicit configuration fails with a reason. | Review the persisted `vllm_runtime.effective` and its adjustment reasons before pinning workload limits. Lower the retry budget to 1 to disable automatic retries, and provide an explicit model or tensor-parallel size to keep the previous fixed-settings behavior. |
 | **New surface** | `POST /admin/nodes/{hostname}/llamacpp/relaunch` accepts a strict typed automatic or custom policy for a healthy managed llama.cpp node. It drains traffic, performs a verified background relaunch, and rolls back to the previous requested policy on failure. New lifecycle states are `relaunching` and teardown-only `relaunch_failed`; both are excluded from routing and model listing. | Require 202 handling and follow the existing provisioning task and log endpoints. Treat 409 as an ineligible or busy node, 422 as an invalid policy, 429 as lifecycle capacity exhaustion, and 503 as unavailable connection tracking. Never route to either relaunch lifecycle state. |
 | **New surface** | The node-detail llama.cpp runtime card supersedes its read-only form with a typed automatic/custom policy editor. It seeds the persisted requested reserve and custom tuple, validates fixed limits before submission, confirms downtime, and follows relaunch task and log progress. Dirty forms become stale rather than being overwritten when another session changes the verified runtime. | Use Reset to adopt the latest persisted policy before submitting stale edits. Treat the aggregate context preview as arithmetic, not a fit guarantee; server-side estimator and post-load verification remain authoritative. |
 | **New surface** | Custom llama.cpp sizing can persist `allow_estimator_overrun=true`, exposed as **Attempt launch if estimate exceeds target** in the node-detail editor. It bypasses only a valid estimator non-fit result; estimator failures, static limits, full GPU offload, and the actual post-load free-VRAM target remain fail-closed. Automatic sizing cannot enable it. | Use this only to calibrate a known-conservative estimator on an otherwise dedicated GPU. A failed attempt invokes transactional rollback. Preserve the field when replaying a previously verified custom policy, and use `effective.estimator_overrun_used` to distinguish permission from an overrun that was actually needed. |
@@ -797,12 +989,13 @@ until every gateway that may provision or display the node understands it.
 | **Correctness fix** | Recommendation targets must be registered or currently QUADS-available and must pass the endpoint allowlist. | Do not use the recommendation endpoint as an unrestricted SSH target. |
 | **Correctness fix** | `GracefulRestart` and `ForceRestart` always issue a Redfish reset even when the machine is already On. Only `On` and `ForceOff` are idempotent shortcuts. Malformed or unsupported BMC power states return a structured 502. | Do not use a restart action as a state probe; expect it to restart a running machine. |
 | **Security fix** | Chat Markdown is rendered through vendored Marked and DOMPurify assets. All HTML attributes are removed, so model output cannot create event handlers, remote-image loads, or navigable URLs. | Do not depend on model-generated raw HTML, image sources, or link targets surviving rendering. Update the vendored assets through their documented review process. |
-| **New surface** | Admin-only token management: `GET /admin/users`, `GET /admin/tokens`, `GET /admin/users/{id}`, `DELETE /admin/tokens/{id}`, `GET /admin/billing`, plus the `/dashboard/tokens` and `/dashboard/users/{id}` pages, all behind the existing HTTP Basic admin gate. `GET /profile/usage` gains `estimated_premium_cost_usd` and `model_label`. | No action required; optional `INFERENCE_PROXY_PRICING__*` variables tune the premium-equivalent rate used for the estimate (defaults: $5/$25 per MTok, `claude-opus-4.8`). |
+| **New surface** | Admin-only token management: `GET /admin/users`, `GET /admin/tokens`, `GET /admin/users/{id}`, `DELETE /admin/tokens/{id}`, `GET /admin/billing`, plus the `/dashboard/tokens` and `/dashboard/users/{id}` pages, all behind the existing HTTP Basic admin gate. `GET /profile/usage` gains `estimated_premium_cost_usd` and `model_label`. | No action required; optional `INFERENCE_PROXY_PRICING__*` variables tune the premium-equivalent rate used for the estimate (defaults: $2/$10 per MTok, `claude-sonnet-5`). Estimates recompute from the configured rate at read time, so this default change lowers every displayed figure. |
 | **Behavioral break** | The fleet dashboard no longer 401s anonymous visitors: `/dashboard`, `/models`, `/dashboard/tokens`, `/dashboard/users/{id}`, and `/dashboard/nodes/{id}` render a sign-in page (HTTP 200) with **Sign in with Local Admin** and **Sign in with Google Auth** choices instead. Local admin sign-in is an in-page username/password form that creates a session cookie (no native Basic challenge popup); HTTP Basic requests and the admin JSON API still authenticate exactly as before. The admin JSON API (`/admin/*`) still 401s without valid credentials — but the 401 no longer carries a `WWW-Authenticate: Basic` challenge, so browsers never get a native auth dialog. | Scripts and monitoring unaffected as long as they send credentials preemptively: `curl -u user:pass` sends Basic up front, while challenge-driven clients behave differently — `curl --anyauth` and `wget --user/--password` only retry after a `WWW-Authenticate` challenge, so use `wget --auth-no-challenge` (or an explicit `Authorization: Basic` header) with this release. Browser users must sign in before reaching the fleet; `auth.session_secret` is required for browser sign-in (both the local-admin form and Google OAuth store state in …
 | **Behavioral break** | The admin surface now also accepts a signed-in Google user with the admin role: `require_admin_auth` (all `/admin/*` endpoints and admin-only pages) succeeds with Basic credentials **or** an admin-role session. The HTTP Basic user is the bootstrap authority and can grant/revoke roles at `POST`/`DELETE /admin/users/{id}/admin` and via the `/dashboard/tokens` page. | Existing Basic clients keep working if they send credentials preemptively (`curl -u`, `wget --auth-no-challenge`, or an explicit `Authorization: Basic` header); challenge-driven retries no longer trigger because the 401 carries no `WWW-Authenticate` header. Grant roles only to trusted Google users; a demoted user loses admin access on their next request. |
+| **New surface** | Opt-in local OIDC auth: the `auth.internal_oidc` plugin and vendored toy provider turn the sign-in page's **Local Admin** form into **Local Login** (non-admin usernames are checked against the provider's user list; the external flow stays reachable via `/auth/login?provider=internal_oidc`). Off by default and the page is unchanged without it; `/auth/login` still works provider-less (first configured provider). User rows are keyed by (issuer, sub): on first startup the `users` table is rebuilt once to add the `issuer` column and replace the single-column `UNIQUE(google_sub)` key — existing rows are preserved and backfilled with `https://accounts.google.com`. External auth plugins that build `AuthIdentity` without `issuer` now default to that Google issuer. | Nothing to do unless you enable the option (see README "Local OIDC provider"). The one-time `users` rebuild is automatic; no operator step. An identity from another provider must declare its issuer (the bundled Google and local plugins do). |
 | **Correctness fix** | Generated agent-config keys are now identified by an internal `purpose` marker instead of their display name. Tokens that users themselves created with the name `agent-config` (an allowed name in earlier builds) are preserved untouched — including their endpoint pins — and are no longer revoked or replaced by a config download. Only purpose-marked keys are governed by the one-active-per-user invariant. | Legacy `agent-config`-named rows keep working exactly as before (they appear in the profile token list and can be revoked like any other token). Keys generated before this build remain valid: with the same session secret the next config download reuses and marks the recognizable generated key. If the session secret changed before that migration, the old unmarked key can no longer be recognized and stays valid — revoke it explicitly, since secret rotation alone does not invalidate it. |
 | **New surface** | `POST /admin/nodes/pool` accepts `"admin_only": true` (implies `"self_setup": true`) to register an admin-only inference server from an existing OpenAI-compatible URL, plus an optional operator-facing `"name"` shown in the admin fleet view. Admin-only nodes are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never appear in `/fleet/nodes` or public `/v1/models`, render bold with an `admin_only` badge on the admin fleet page, and are removed with the normal pool deletion endpoint. `/admin/nodes[]` gains `admin_only` and `name`. | No action unless you adopt admin-only servers; the admin-only flag and name are additive and default to false/empty for all existing records. |
-| **New surface** | `GET /fleet/nodes` returns the registered-node view for signed-in non-admins: admin-only servers removed, operational actions stripped, and nodes owned by another user excluded (endpoint/model/engine/artifact/GPU identity stays private per RFE-107, matching `/v1/models` and the endpoint picker). The dashboard JS uses it for non-admin viewers while admins keep `/admin/nodes`. | Signed-in non-admin users now see the fleet (unowned nodes plus their own); treat `/fleet/nodes` as org-internal inventory that never enumerates another user's private nodes. |
+| **New surface** | `GET /fleet/nodes` returns the registered-node view for signed-in non-admins: admin-only servers removed, operational actions stripped, and nodes owned by another user excluded (endpoint/model/engine/artifact/GPU identity stays private per RFE-107, matching `/v1/models` and the endpoint picker). No page consumes it any more (the fleet page and node detail are admin-only; see section 27), and admins keep `/admin/nodes`. | Signed-in non-admin users now see the fleet (unowned nodes plus their own); treat `/fleet/nodes` as org-internal inventory that never enumerates another user's private nodes. |
 
 ## RPM install migration
 

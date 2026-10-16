@@ -14,14 +14,29 @@ def test_ci_enforces_branch_coverage_floor() -> None:
     coverage = project["tool"]["coverage"]
 
     assert coverage["run"]["branch"] is True
-    assert coverage["run"]["source"] == ["inference_proxy"]
+    assert coverage["run"]["source"] == ["inference_proxy", "common"]
+    assert coverage["report"]["omit"] == ["common/provision-logs.py"]
+    assert coverage["run"]["patch"] == ["subprocess", "execv", "_exit"]
+    assert coverage["run"]["parallel"] is True
     assert coverage["report"]["fail_under"] == 93
     assert coverage["report"]["precision"] == 2
     assert coverage["report"]["show_missing"] is True
 
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "ci.yml").read_text()
     assert workflow.count("uv run --frozen coverage run -m pytest") == 1
+    assert workflow.count("uv run --frozen coverage combine") == 1
     assert workflow.count("uv run --frozen coverage report") == 1
+
+    readme = (PROJECT_ROOT / "README.md").read_text()
+    commands = [
+        "uv run --frozen coverage run -m pytest",
+        "uv run --frozen coverage combine",
+        "uv run --frozen coverage report",
+    ]
+    assert [readme.index(command) for command in commands] == sorted(
+        readme.index(command) for command in commands
+    )
+    assert ".coverage.*" in (PROJECT_ROOT / ".gitignore").read_text().splitlines()
 
 
 def test_ci_exercises_badge_extraction_without_blocking_on_publication() -> None:

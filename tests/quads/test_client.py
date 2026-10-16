@@ -350,3 +350,45 @@ class TestResponseErrors:
             quads = QUADSClient(client, QUADS_URL)
             with pytest.raises(error_type, match="programming defect"):
                 await quads.get_available()
+
+
+class TestGetPendingMoves:
+    async def test_returns_normalized_hostnames(self, httpx_mock: HTTPXMock) -> None:
+        httpx_mock.add_response(
+            url=f"{QUADS_URL}/api/v3/moves",
+            json=[
+                {"host": "GPU01.example.com.", "new": "cloud01", "current": "cloud07"},
+                {"host": "gpu02.example.com", "new": "cloud01", "current": "cloud09"},
+            ],
+        )
+        async with httpx.AsyncClient() as client:
+            quads = QUADSClient(client, QUADS_URL)
+            pending = await quads.get_pending_moves()
+
+        assert pending == {"gpu01.example.com", "gpu02.example.com"}
+
+    async def test_empty_when_nothing_is_moving(self, httpx_mock: HTTPXMock) -> None:
+        httpx_mock.add_response(url=f"{QUADS_URL}/api/v3/moves", json=[])
+        async with httpx.AsyncClient() as client:
+            quads = QUADSClient(client, QUADS_URL)
+            assert await quads.get_pending_moves() == set()
+
+    @pytest.mark.parametrize(
+        "body",
+        [{"host": "gpu01"}, ["gpu01"], [{"new": "cloud01"}], [{"host": 7}]],
+    )
+    async def test_rejects_unexpected_shapes(
+        self, httpx_mock: HTTPXMock, body: object
+    ) -> None:
+        httpx_mock.add_response(url=f"{QUADS_URL}/api/v3/moves", json=body)
+        async with httpx.AsyncClient() as client:
+            quads = QUADSClient(client, QUADS_URL)
+            with pytest.raises(QUADSConnectionError, match="invalid QUADS response"):
+                await quads.get_pending_moves()
+
+    async def test_raises_on_http_error(self, httpx_mock: HTTPXMock) -> None:
+        httpx_mock.add_response(url=f"{QUADS_URL}/api/v3/moves", status_code=500)
+        async with httpx.AsyncClient() as client:
+            quads = QUADSClient(client, QUADS_URL)
+            with pytest.raises(QUADSConnectionError):
+                await quads.get_pending_moves()

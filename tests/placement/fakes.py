@@ -102,6 +102,14 @@ class FakeQuads:
     def __init__(self, available: list[str]) -> None:
         self.available = available
         self.fail = False
+        # Hosts QUADS has a move to run, reclaims and moves into a new
+        # assignment alike; the real endpoint is keyed the same way.
+        self.pending_moves: set[str] = set()
+        self.moves_fail = False
+        self.move_reads = 0
+        # Called on every pending-moves read, before the answer: a test's hook
+        # for a release that starts between planning and launch.
+        self.on_moves_read: Callable[[int], None] | None = None
 
     async def get_available(self, end: datetime | None = None) -> list[str]:
         assert end is not None, "placement must ask for the whole lookahead window"
@@ -109,11 +117,36 @@ class FakeQuads:
             raise ConnectionError("QUADS is down")
         return list(self.available)
 
+    async def get_pending_moves(self) -> set[str]:
+        self.move_reads += 1
+        if self.on_moves_read is not None:
+            self.on_moves_read(self.move_reads)
+        if self.moves_fail:
+            raise ConnectionError("QUADS is down")
+        return set(self.pending_moves)
+
 
 class FakePoller:
-    def __init__(self, hosts: list[QUADSHost]) -> None:
+    """A poller whose snapshot is as fresh as the rig's clock unless a test says."""
+
+    def __init__(
+        self, hosts: list[QUADSHost], clock: Callable[[], datetime] | None = None
+    ) -> None:
         self.hosts = hosts
-        self.last_sync: datetime | None = datetime(2026, 9, 19, tzinfo=UTC)
+        self._clock: Callable[[], datetime] = clock or (lambda: datetime.now(UTC))
+        self._last_sync: datetime | None = None
+        self._follow_clock = True
+
+    @property
+    def last_sync(self) -> datetime | None:
+        if self._follow_clock:
+            return self._clock()
+        return self._last_sync
+
+    @last_sync.setter
+    def last_sync(self, value: datetime | None) -> None:
+        self._follow_clock = False
+        self._last_sync = value
 
 
 class FakeArtifactIndex:
@@ -189,6 +222,11 @@ class FakeProvisioner:
         # ``None`` for a record that cannot be parsed.
         self.stored_nodes: dict[str, Node | None] = {}
         self.stored_node_error: Exception | None = None
+        # BMC power as placement reads it: an absent host is "unknown" (None).
+        self.power_states: dict[str, str] = {}
+        self.power_state_error: Exception | None = None
+        self.power_state_delay: float = 0.0
+        self.power_state_checks: list[str] = []
 
     async def try_reserve_host(self, hostname: str) -> HostLifecycleLease | None:
         return await self.lifecycle.try_acquire(hostname)
@@ -213,6 +251,14 @@ class FakeProvisioner:
             return True, self.stored_nodes[hostname]
         node = self.registry.get(hostname)
         return node is not None, node
+
+    async def power_state(self, hostname: str) -> str | None:
+        self.power_state_checks.append(hostname)
+        if self.power_state_delay:
+            await asyncio.sleep(self.power_state_delay)
+        if self.power_state_error is not None:
+            raise self.power_state_error
+        return self.power_states.get(hostname)
 
     async def cancel_active_provision(self, hostname: str) -> None:
         """Explicit cancel: stops the task and, like the real one, the remote worker."""

@@ -35,7 +35,7 @@
             <div class="message-area-inner">
                 <div class="empty-state" id="empty-state">
                     <h2>Start a conversation</h2>
-                    <p>Select a model above and type a message to begin.</p>
+                    <p id="empty-state-text">Select a model above and type a message to begin.</p>
                 </div>
             </div>
         </div>
@@ -51,6 +51,7 @@
     <script src="{{ static_asset_url(request, 'vendor/marked-18.0.7/marked.umd.js') }}"></script>
     <script src="{{ static_asset_url(request, 'vendor/dompurify-3.4.12/purify.min.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
+    <script>const ANONYMOUS_PLAYGROUND = {{ anonymous_playground | tojson }};</script>
     <script src="{{ static_asset_url(request, 'js/chat.js') }}"></script>
 </body>
 </html>

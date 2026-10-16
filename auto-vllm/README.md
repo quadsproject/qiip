@@ -14,8 +14,15 @@ Provision and run vLLM directly on bare-metal GPU nodes.
 Node Python packages are managed only by the dedicated `uv` project in this
 directory. `setup.sh` installs the pinned `uv` release after verifying its
 published SHA-256, then performs an exact, frozen, wheel-only synchronization
-into `/opt/vllm-venv`. Re-running setup removes packages that are not present in
-`uv.lock`.
+at `/opt/vllm-venv-generations/<identity>`. The identity retains the dependency
+lock, project, Python, uv, and runtime profile. Setup validates imports, required
+executables, and the managed CLI before selecting the installation. A completed
+environment is never synchronized again or moved after creation.
+
+The engine and shared scripts, runtime, and setup configuration are selected
+together through `/opt/qiip/vllm/current`. The previous generation stays
+available for rollback. See [transactional provisioning](../docs/transactional-provisioning.md)
+for paths, interruption recovery, and rollback commands.
 
 The `uv` version is recorded in `.uv-version`. Its checksum comes from Astral's
 published release asset:
@@ -88,9 +95,21 @@ LLMFit, mount NFS, and open the firewall:
 AUTOVLLM_NFS_EXPORT=storage.example.com:/exports/huggingface ./setup.sh
 ```
 
-An already-installed NVIDIA driver must exactly match
-`AUTOVLLM_NVIDIA_DRIVER_VERSION`; setup refuses to hot-swap a different live
-kernel driver. Custom NVIDIA or LLMFit versions require matching SHA-256 values.
+A compatible installed NVIDIA driver is reused after a CUDA execution probe,
+even when it differs from `AUTOVLLM_NVIDIA_DRIVER_VERSION`. That setting selects
+the fallback installer. Working drivers do not require kernel headers; setup
+installs only missing prerequisites, including `python3.12-devel` for Triton's
+runtime helper compilation, and does not update the OS. The CUDA proof preserves
+`AUTOVLLM_GPU_DEVICES` or the caller's `CUDA_VISIBLE_DEVICES` selection. Replacement
+requires a verified artifact, an idle node, and matching running-kernel build
+dependencies. Custom replacement NVIDIA or LLMFit versions require matching
+SHA-256 values.
+
+`[RESUME:maintenance_required:...]` and `[RESUME:reboot_required:...]` stop setup
+before engine installation. Resolve the logged reason and retry setup. Reboot
+requests are remembered across retries, and the driver and CUDA runtime are
+validated again after a new boot. See the
+[driver maintenance runbook](../UPGRADING.md#13-prepare-for-strict-driver-and-cache-checks).
 
 Setup and start select a tested runtime profile from measured hardware
 (compute capability, VRAM, OS/ABI), not GPU marketing names. `setup.sh`
@@ -138,10 +157,46 @@ tensor-parallel size up to the CUDA-visible count, derives the same default
 tensor-parallel size the launcher would pick when none is set explicitly, and
 rejects device indices that are not present, duplicate, or non-numeric. The
 effective device set, tensor-parallel size, and model are written to
-`/etc/vllm/vllm.env` only after a verified engine start; a failed launch
+the selected generation's `vllm.env` only after a verified engine start; a failed launch
 leaves the previous file in place, so `vllm.service` keeps the last working
-allocation on a restart. Profiles assume a homogeneous GPU family: with a
+allocation on a restart. These saved settings apply to all service Exec lines,
+including preflight; fresh gateway and manual launches use their supplied
+settings and defaults. Setup clears the selected generation's saved settings,
+including when reactivating the same generation. Profiles assume a homogeneous GPU family: with a
 subset, model, VRAM, and compute-cap detection use the first selected card.
+
+## Memory planning and automatic retry
+
+Managed launches are planned before the engine starts. The gateway reads each
+selected device's total and free VRAM, estimates weights, KV cache, runtime
+overhead, and a reserve, and emits a `qiip_vllm_plan` record whose effective
+context, batching, tensor-parallel size, dtype, and attention backend stay
+consistent with the selected runtime profile. When no model is requested, the
+largest catalog model the budget supports is selected; an explicitly requested
+model is never replaced. Explicit context, tensor-parallel size, utilization,
+and dtype are never rewritten, and a non-fitting explicit value fails the plan
+with a reason instead of being silently clamped.
+
+When the gateway plans a launch it also passes the plan back as
+`AUTOVLLM_FIT_BUDGET_MIB` (per-device MiB the plan reserved),
+`AUTOVLLM_FIT_RESERVE_MIB`, and `AUTOVLLM_FIT_OVERHEAD_MIB`. Preflight then
+verifies that every selected device still has at least the planned budget free
+and fails closed when a device's free memory is missing or non-numeric, so a
+concurrent job cannot push the engine past its own free-memory gate.
+`AUTOVLLM_ATTENTION_BACKEND` pins the planned backend, and an unsupported
+combination (for example `FLASHINFER` below SM90) is rejected before launch.
+The budget and reserve are reported in the configuration banner.
+
+vLLM refuses to start when a device's free memory is below
+`ceil(total * gpu_memory_utilization)`. The gateway caps automatic utilization
+to the measured free VRAM so the plan pre-empts that refusal. If a recognized
+memory failure still occurs during an automatic launch, the gateway stops the
+failed engine cleanly, recomputes the plan from current memory under a bounded
+policy (`INFERENCE_PROXY_PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS`, total
+attempts, default 4), and retries. Each reduction is logged with its reason and
+persisted with the node as `vllm_runtime`, alongside the requested overrides,
+the memory estimate, and the model-selection policy. Standalone script runs
+select a model themselves but record no gateway plan.
 
 ## Health check
 

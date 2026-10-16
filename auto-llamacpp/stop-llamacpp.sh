@@ -1,6 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
+# Resolve the generation once, before sourcing any scripts or choosing tools.
+if [ "${QIIP_GENERATION_PINNED:-0}" != "1" ] \
+    && [ -L "${QIIP_GENERATION_ROOT:-/opt/qiip/llama_cpp}/current" ]; then
+    _qiip_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    exec python3 "${_qiip_script_dir}/../common/generations.py" exec \
+        "${QIIP_GENERATION_ROOT:-/opt/qiip/llama_cpp}" "$_qiip_script_dir" stop-llamacpp.sh "$@"
+fi
+
 PID_FILE="${AUTOLLAMACPP_PID_FILE:-/var/run/llamacpp.pid}"
 PROC_ROOT="${AUTOLLAMACPP_PROC_ROOT:-/proc}"
 STOP_TIMEOUT="${AUTOLLAMACPP_STOP_TIMEOUT:-30}"
