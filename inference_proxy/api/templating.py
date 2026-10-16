@@ -32,12 +32,38 @@ def static_asset_url(request: Request, path: str) -> str:
     return f"{request.url_for('static', path=path)}?v={digest}"
 
 
+def _google_auth_available(request: Request) -> bool:
+    """Return True when a loaded auth plugin named ``google`` is configured.
+
+    The Google button links to ``/auth/login?provider=google``, which
+    resolves a loaded plugin by name over ``get_plugins_by_type(AuthPlugin)``
+    (``_configured_auth_plugins``), so this mirrors that rule instead of the
+    manager key (which equals ``auth.<name>`` only for built-ins). A plugin
+    that is disabled or unconfigured is not loaded at all, or reports itself
+    unconfigured. The template combines this with the OAuth integration's own
+    precondition (``oauth_enabled``), which the route needs for every
+    provider: without ``redirect_uri`` ``/auth/login`` answers 503.
+    """
+    manager = getattr(request.app.state, "plugin_manager", None)
+    if manager is None:
+        return False
+    return any(
+        isinstance(plugin, AuthPlugin)
+        and plugin.name == "google"
+        and plugin.is_configured()
+        for plugin in manager.get_plugins_by_type(AuthPlugin)
+    )
+
+
 def _local_auth_available(request: Request) -> bool:
     """Return True when the opt-in local OIDC auth plugin is loaded and configured.
 
     The plugin is opt-in (off unless ``plugins.config`` enables it and
     supplies the provider discovery URL), so a default deployment renders
-    the sign-in page exactly as before.
+    the sign-in page exactly as before. The Local Login form's credential
+    resolver reads the plugin by its qualified key, so the label follows the
+    same lookup: a different plugin that merely happens to be named
+    ``internal_oidc`` must not advertise a form that ignores it.
     """
     manager = getattr(request.app.state, "plugin_manager", None)
     if manager is None:
@@ -57,7 +83,10 @@ def signin_response(
 
     The local admin option is a username/password form (no native Basic
     challenge popup) and needs ``auth.session_secret``; the Google option
-    starts the OAuth flow and needs the OAuth integration enabled; the
+    starts the OAuth flow and needs the Google provider plugin loaded and
+    configured *and* the OAuth integration configured (the credential triple
+    alone is not enough when the provider is disabled and replaced, and a
+    configured replacement alone is not enough without ``redirect_uri``); the
     local OIDC option starts the local provider flow and needs the opt-in
     auth.internal_oidc plugin loaded. Options that would fail (404/503) are
     hidden and replaced by an HTTP-Basic hint.
@@ -69,6 +98,7 @@ def signin_response(
             "notice": notice,
             "active_page": "dashboard",
             "oauth_enabled": oauth_enabled,
+            "google_enabled": _google_auth_available(request),
             "local_auth_enabled": _local_auth_available(request),
             "sessions_available": sessions_available,
         },

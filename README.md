@@ -1389,7 +1389,14 @@ the service user's privileges. They can never share a registered name with a
 built-in plugin, so to make an external plugin the active implementation of a
 category, give it a distinct name (e.g. `auth.okta`) and disable the built-in
 (`INFERENCE_PROXY_PLUGINS__DISABLED=["auth.google"]`); the built-in keeps its
-name and wins on any collision.
+name and wins on any collision. The sign-in page only offers a provider whose
+plugin is loaded and configured, and only with the OAuth integration
+configured as well (the credential triple: `/auth/login` cannot start a flow
+without `redirect_uri`), so disabling a built-in also removes its button
+instead of leaving one that answers 404. A replacement registered
+under a different name has no button of its own: its flow stays reachable
+through the provider-less `/auth/login` link (the first loaded provider),
+the same direct-link convention as the local OIDC provider.
 
 ### SSH and provisioning commands
 

@@ -34,7 +34,8 @@
                     </form>
                 </details>
                 {% endif %}
-                {% if oauth_enabled %}
+                {# /auth/login cannot start a flow without the credential triple #}
+                {% if oauth_enabled and google_enabled %}
                 <a class="btn signin-option" href="/auth/login?provider=google">Google Auth</a>
                 {% endif %}
                 {% if not sessions_available and not oauth_enabled %}

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -537,9 +538,10 @@ class TestDashboardRoles:
         app: FastAPI,
         test_settings: Settings,
     ) -> None:
-        # With the OAuth integration configured both sign-in options render;
-        # with OAuth off the Google button is hidden (see the Basic-only
-        # regression in test_admin_auth.py).
+        # With the OAuth integration configured and the google provider
+        # loaded both sign-in options render; with OAuth off or the provider
+        # disabled the Google button is hidden (see the Basic-only and
+        # provider-gating regressions in test_admin_auth.py).
         enabled = test_settings.model_copy(
             deep=True,
             update={
@@ -553,6 +555,12 @@ class TestDashboardRoles:
             },
         )
         app.dependency_overrides[get_settings] = lambda: enabled
+        google = FakeAuthPlugin()
+        google.name = "google"
+        app.state.plugin_manager = SimpleNamespace(
+            get_plugin=lambda name: google if name == "auth.google" else None,
+            get_plugins_by_type=lambda _plugin_type: [google],
+        )
 
         response = TestClient(app).get("/dashboard")
 
