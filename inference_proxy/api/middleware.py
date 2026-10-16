@@ -24,8 +24,8 @@ logger = structlog.get_logger()
 class NoStoreMiddleware(BaseHTTPMiddleware):
     """Forbid browser caching of dynamic responses.
 
-    Every non-static response is either an HTML shell that embeds the
-    viewer's role (``VIEWER_ROLE``) or a JSON endpoint returning
+    Every non-static response is either an HTML shell whose markup depends
+    on the viewer (identity, role-gated pages) or a JSON endpoint returning
     user-specific data, so a stale cached copy can render the wrong surface
     (e.g. a cached admin shell for a non-admin session, causing admin
     fetches, Basic popups, and endless retries). Static assets are

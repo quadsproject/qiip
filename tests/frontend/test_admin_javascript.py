@@ -65,7 +65,7 @@ function byId(id) {{
 
 const sandbox = {{
   console,
-  NODE_ID: "gpu01", READ_ONLY: false,
+  NODE_ID: "gpu01",
   POLL_INTERVAL_MS: 10000,
   document: {{
     getElementById: byId,
@@ -134,7 +134,7 @@ function byId(id) {
   return elements.get(id);
 }
 const sandbox = {
-  console, NODE_ID: "gpu01", READ_ONLY: false, POLL_INTERVAL_MS: 10000,
+  console, NODE_ID: "gpu01", POLL_INTERVAL_MS: 10000,
   document: {
     getElementById: byId, addEventListener() {}, querySelectorAll() { return []; },
     querySelector() { return element(); }, createElement() { return element(); },
@@ -338,7 +338,7 @@ class FakeDate extends Date {
 
 const sandbox = {
   console,
-  NODE_ID: "gpu01", READ_ONLY: false,
+  NODE_ID: "gpu01",
   POLL_INTERVAL_MS: 10000,
   Date: FakeDate,
   document: {
@@ -563,6 +563,7 @@ console.log(JSON.stringify({
     assert result["lines"] == 1500
     assert result["retained"] == 0
     assert result["cursor"] == {"attempt": "attempt", "after": 1500}
+    assert result["url"].startswith("/admin/provisioning/gpu01/logs")
     assert result["url"].endswith("?attempt_id=attempt&after=1500")
 
 

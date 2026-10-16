@@ -902,7 +902,9 @@ class TestNodeDetailReadOnly:
         response = client.get("/dashboard/nodes/gpu01")
 
         assert response.status_code == 200
-        assert "READ_ONLY = false" in response.text
+        # The operational panels and their script are rendered.
+        assert 'id="attempt-history-panel"' in response.text
+        assert "js/provisioning_history.js" in response.text
 
     def test_anonymous_gets_signin_page(
         self,
