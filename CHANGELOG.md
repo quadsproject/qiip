@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.20 (2026-10-16)
+
+### Bug Fixes
+
+- Guard the same-issuer refresh and check the ID-token audience
+  ([`52e17b7`](https://github.com/quadsproject/qiip/commit/52e17b73d23b402545ebc601f05c79e1dcf1e154))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`f79e442`](https://github.com/quadsproject/qiip/commit/f79e442f9343df7abab15e1dae4669a76fab887d))
+
+
 ## v0.2.0-dev.19 (2026-10-16)
 
 ### Bug Fixes
