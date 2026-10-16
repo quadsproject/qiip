@@ -385,9 +385,9 @@ jobs:
           if [[ "$status" == stale ]]; then
             echo "$nvr has a Copr build but no RPM in the repository." >&2
             echo "::error title=$nvr is not installable::$nvr has a Copr build but no RPM in the repository"
-            echo "Delete that build in Copr (quadsdev/qiip, Builds tab, the ids above)," >&2
-            echo "then re-run this job with 'Re-run failed jobs'. A new push on the" >&2
-            echo "same commit releases nothing." >&2
+            echo "Wait for that build to finish, then delete it only if it ended" >&2
+            echo "without publishing. Re-run this job with 'Re-run failed jobs'; a" >&2
+            echo "new push on the same commit releases nothing." >&2
             exit 1
           fi
           echo "Submitting $srpm_file to quadsdev/qiip"
@@ -495,7 +495,7 @@ jobs:
             echo "Artifacts:"
             echo
             for artifact in "${artifacts[@]}"; do
-              echo "- \`$artifact\`"
+              echo "- <$artifact>"
             done
           } >> body.md
           prerelease=(--prerelease=false)

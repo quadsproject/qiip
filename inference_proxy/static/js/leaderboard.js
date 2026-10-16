@@ -75,6 +75,9 @@
   function renderLeaderboard(rows) {
     const body = $("leaderboard-body");
     clearChildren(body);
+    // Set before the empty-state return so the note never stays "Loading...".
+    $("board-note").textContent =
+      rows.length + " users ranked by total tokens (admins excluded)";
     if (rows.length === 0) {
       const tr = document.createElement("tr");
       const td = document.createElement("td");
@@ -108,8 +111,6 @@
       body.appendChild(tr);
     });
     reapplyTableSort();
-    $("board-note").textContent =
-      rows.length + " users ranked by total tokens (admins excluded)";
   }
 
   // ------------------------------------------------------------------

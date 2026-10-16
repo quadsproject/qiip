@@ -573,6 +573,13 @@ vm.runInContext(source, sandbox);
   domReady();
   for (let tick = 0; tick < 10; tick += 1) await Promise.resolve();
   byId("model-select").value = "org/model";
+  if (scenario === "long_history") {
+    // Seed an oversized transcript (40 turns of 4k chars) before the turn.
+    for (let turn = 0; turn < 40; turn += 1) {
+      sandbox.messages.push({ role: "user", content: "u".repeat(2000) });
+      sandbox.messages.push({ role: "assistant", content: "a".repeat(2000) });
+    }
+  }
   byId("chat-input").value = "first";
   await sandbox.sendMessage();
   for (let tick = 0; tick < 10; tick += 1) await Promise.resolve();
@@ -720,3 +727,24 @@ def test_anonymous_playground_viewer_calls_v1_anonymously() -> None:
     assert all("Authorization" not in call["headers"] for call in calls)
     assert all("X-Qiip-Require-Token" not in call["headers"] for call in calls)
     assert result["disabled"] is False
+
+
+def test_history_is_bounded_before_it_is_resent() -> None:
+    """A long session must not re-send an oversized transcript forever."""
+    result = _run_node(_CREDENTIAL_HARNESS, "long_history")
+
+    history = result["history"]
+    # The seeded 80 messages (160k chars) are trimmed to the older turns that
+    # fit the budget plus the two newest turns; alternation is preserved.
+    assert len(history) == 14
+    assert [message["role"] for message in history] == ["user", "assistant"] * 7
+    assert history[-2:] == [
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "hello"},
+    ]
+    total = sum(len(message["content"]) for message in history)
+    assert total <= 24000 + 10
+    resent = _completions(result)[-1]["body"]["messages"]
+    assert sum(len(message["content"]) for message in resent) <= (
+        24000 + len("first") + len("hello") + len("second")
+    )

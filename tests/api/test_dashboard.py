@@ -413,7 +413,7 @@ class TestNodeDetailPage:
         assert 'id="artifact-select"' in response.text
         info_body_start = response.text.index('id="node-info-body"')
         first_row_end = response.text.index("</tr>", info_body_start)
-        assert response.text[info_body_start:first_row_end].count("<td>") == 9
+        assert response.text[info_body_start:first_row_end].count("<td>") == 8
 
     def test_node_detail_contains_vllm_dtype_control(self, client: TestClient) -> None:
         response = client.get("/dashboard/nodes/test-node")

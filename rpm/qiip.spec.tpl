@@ -98,16 +98,22 @@ EOF
 chmod 0600 %{buildroot}%{_sysconfdir}/qiip/qiip.env
 # Toy OIDC provider: the user list is the operator's to edit (0600,
 # %config noreplace), and overrides live in their own env file so
-# INFERENCE_PROXY_* secrets stay in qiip.env.
-install -m 0600 oidc-provider/users.txt.example \
-    %{buildroot}%{_sysconfdir}/qiip/oidc-users.txt
+# INFERENCE_PROXY_* secrets stay in qiip.env. It is installed
+# comments-only so an unedited file cannot enable a working account;
+# the sample list ships under %{_datadir}/qiip/oidc-provider/.
+cat > %{buildroot}%{_sysconfdir}/qiip/oidc-users.txt <<'EOF'
+# Local OIDC users: one "username:password" per line.
+# Bare names sign in as <name>@<OIDC_DOMAIN>; full emails are used as-is.
+# Sample accounts: /usr/share/qiip/oidc-provider/users.txt.example
+EOF
+chmod 0600 %{buildroot}%{_sysconfdir}/qiip/oidc-users.txt
 cat > %{buildroot}%{_sysconfdir}/qiip/oidc.env <<'EOF'
 # OIDC_* overrides for the qiip-oidc provider (opt-in local auth).
 # OIDC_BASE_URL=https://<host>/oidc          # public issuer URL
 # OIDC_REDIRECT_URI=https://<host>/auth/callback
 # OIDC_DOMAIN=localdomain                   # email suffix appended to bare usernames
 # OIDC_CLIENT_ID=my-qiip-client              # must match INFERENCE_PROXY_OAUTH__CLIENT_ID
-# OIDC_CLIENT_SECRET=change-me               # must match INFERENCE_PROXY_OAUTH__CLIENT_SECRET
+# OIDC_CLIENT_SECRET=generate-a-random-secret  # must match INFERENCE_PROXY_OAUTH__CLIENT_SECRET
 EOF
 chmod 0600 %{buildroot}%{_sysconfdir}/qiip/oidc.env
 
