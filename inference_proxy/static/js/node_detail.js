@@ -645,18 +645,9 @@ async function refreshDetail() {
   var lastUpdatedEl = document.getElementById("last-updated");
 
   try {
-    // Read-only viewers load exactly what their fleet view allows: the
-    // single node, its tasks, and (separately) the log stream -- never the
-    // admin node/metrics endpoints.
-    var nodeResponse = READ_ONLY
-      ? fetch("/fleet/nodes/" + encodeURIComponent(NODE_ID))
-      : fetch("/admin/nodes");
-    var metricsResponse = READ_ONLY
-      ? Promise.resolve(null)
-      : fetch("/admin/metrics");
-    var tasksResponse = READ_ONLY
-      ? fetch("/fleet/nodes/" + encodeURIComponent(NODE_ID) + "/tasks")
-      : fetch("/admin/provisioning/tasks");
+    var nodeResponse = fetch("/admin/nodes");
+    var metricsResponse = fetch("/admin/metrics");
+    var tasksResponse = fetch("/admin/provisioning/tasks");
     var [nodesResp, metricsResp, tasksResp] = await Promise.all([
       nodeResponse,
       metricsResponse,
@@ -696,31 +687,22 @@ async function refreshDetail() {
       renderVllmRuntime(null);
     } else {
       stateEl.textContent = node.state;
-      if (!READ_ONLY) {
-        setupSelection.setPreferredNode(node);
-        renderLlamaCppRuntime(node, currentRelaunchObservation);
-      }
+      setupSelection.setPreferredNode(node);
+      renderLlamaCppRuntime(node, currentRelaunchObservation);
       renderOriginTag(node);
       renderVllmRuntime(node);
       document.getElementById("setup-config-panel").style.display =
-        READ_ONLY || node.self_setup ? "none" : "";
+        node.self_setup ? "none" : "";
 
       // Self-setup nodes are externally owned: QIIP must not send BMC power
       // actions or install software on them, and the server rejects those
-      // operations outright. Hide the matching controls here (read-only
-      // viewers already had every operational panel hidden).
-      if (READ_ONLY) {
-        document.getElementById("power-state").style.display = "none";
-        document.getElementById("power-actions").style.display = "none";
-        document.getElementById("recommendations-panel").style.display = "none";
-      } else {
-        document.getElementById("power-state").style.display =
-          node.self_setup ? "none" : "";
-        document.getElementById("power-actions").style.display =
-          node.self_setup ? "none" : "";
-        document.getElementById("recommendations-panel").style.display =
-          node.self_setup ? "none" : "";
-      }
+      // operations outright. Hide the matching controls here too.
+      document.getElementById("power-state").style.display =
+        node.self_setup ? "none" : "";
+      document.getElementById("power-actions").style.display =
+        node.self_setup ? "none" : "";
+      document.getElementById("recommendations-panel").style.display =
+        node.self_setup ? "none" : "";
 
       infoBody.textContent = "";
       var tr = document.createElement("tr");
@@ -745,22 +727,20 @@ async function refreshDetail() {
 
       var tdRq = document.createElement("td"); tdRq.className = "num"; tdRq.textContent = node.state === "available" ? "—" : (perNode[node.node_id] || 0); tr.appendChild(tdRq);
 
-      if (!READ_ONLY) {
-        var enabledActions = node.actions || [];
-        if (!setupSelection.isValid()) {
-          enabledActions = enabledActions.filter(function (a) { return a !== "setup"; });
-        }
-        var nodeActionsContainer = document.getElementById("node-actions");
-        nodeActionsContainer.textContent = "";
-        nodeActionsContainer.appendChild(createActionsDropdown(node.node_id, enabledActions, node));
+      var enabledActions = node.actions || [];
+      if (!setupSelection.isValid()) {
+        enabledActions = enabledActions.filter(function (a) { return a !== "setup"; });
       }
+      var nodeActionsContainer = document.getElementById("node-actions");
+      nodeActionsContainer.textContent = "";
+      nodeActionsContainer.appendChild(createActionsDropdown(node.node_id, enabledActions, node));
 
       infoBody.appendChild(tr);
 
       var cfgPanel = document.getElementById("config-download-panel");
       var cfgHint = document.getElementById("config-download-hint");
       var cfgButtons = document.getElementById("config-download-buttons");
-      if (!READ_ONLY && node.state === "healthy" && node.model) {
+      if (node.state === "healthy" && node.model) {
         cfgPanel.style.display = "";
         cfgHint.textContent = "Download agent configuration pointing at the inference proxy.";
         cfgButtons.textContent = "";
@@ -959,10 +939,8 @@ function connectLogStream() {
   status.textContent = "connecting";
   status.className = "badge badge-in-progress";
 
-  var logUrl = READ_ONLY
-    ? "/fleet/nodes/" + encodeURIComponent(NODE_ID) + "/logs"
-    : "/admin/provisioning/" + encodeURIComponent(NODE_ID) + "/logs";
-  if (!READ_ONLY && logResumeCursor) {
+  var logUrl = "/admin/provisioning/" + encodeURIComponent(NODE_ID) + "/logs";
+  if (logResumeCursor) {
     logUrl += "?attempt_id=" + encodeURIComponent(logResumeCursor.attempt) + "&after=" + logResumeCursor.after;
   }
   var es = new EventSource(logUrl);
@@ -1506,25 +1484,7 @@ async function fetchCatalog() {
   }
 }
 
-function hideOperationalPanels() {
-  ["power-state", "power-actions", "node-actions", "setup-config-panel",
-    "config-download-panel", "recommendations-panel", "llamacpp-runtime-panel",
-  ].forEach(function (id) {
-    var el = document.getElementById(id);
-    if (el) el.style.display = "none";
-  });
-}
-
 document.addEventListener("DOMContentLoaded", function () {
-  // Read-only viewers get no operational surface: the interactive panels are
-  // hidden and their admin-only fetches never run (node info, provisioning
-  // tasks, and the installation log still load from /fleet/nodes/*).
-  if (READ_ONLY) {
-    hideOperationalPanels();
-    refreshDetail();
-    setInterval(refreshDetail, POLL_INTERVAL_MS);
-    return;
-  }
   var relaunchForm = document.getElementById("llamacpp-relaunch-form");
   if (relaunchForm && llamaCppRelaunch) {
     relaunchForm.addEventListener("submit", function (event) {

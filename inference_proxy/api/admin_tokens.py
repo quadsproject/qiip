@@ -182,9 +182,9 @@ async def revoke_admin_role(
     """Revoke the admin role from a Google-authenticated user.
 
     When an admin revokes their own role, the browser session stays valid
-    (the user row still exists) — the UI redirects to the dashboard, whose
-    trimmed fleet view now applies. The session never gets a Basic
-    challenge, so no native browser auth pop-up can appear.
+    (the user row still exists) — the UI redirects to ``/dashboard``, which
+    forwards the now-normal user to ``/start``. The session never gets a
+    Basic challenge, so no native browser auth pop-up can appear.
     """
     updated = await asyncio.to_thread(store.set_user_admin, user_id, False)
     if not updated:
