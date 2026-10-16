@@ -35,11 +35,27 @@ from inference_proxy.routing.connection_tracker import ConnectionTracker
 from inference_proxy.routing.node_selector import NodeSelector
 from inference_proxy.routing.request_metrics import RequestMetrics
 from inference_proxy.services.unified_nodes import UnifiedNodeService
+from tests.auth.conftest import FakeAuthPlugin
 
 
 def _basic_header(username: str, password: str) -> dict[str, str]:
     token = base64.b64encode(f"{username}:{password}".encode()).decode()
     return {"Authorization": f"Basic {token}"}
+
+
+def _google_manager(app: FastAPI) -> None:
+    """Attach a manager serving a configured ``google`` provider.
+
+    The sign-in page offers a provider only when its plugin is loaded and
+    configured, so a test that expects the Google option has to stand in for
+    the plugin the lifespan would load.
+    """
+    plugin = FakeAuthPlugin()
+    plugin.name = "google"
+    app.state.plugin_manager = SimpleNamespace(
+        get_plugin=lambda name: plugin if name == "auth.google" else None,
+        get_plugins_by_type=lambda _plugin_type: [plugin],
+    )
 
 
 async def _request(
@@ -305,8 +321,8 @@ class TestAdminBasicAuthentication:
     ) -> None:
         """Anonymous visitors get the two-option sign-in page; Basic admins pass.
 
-        OAuth must be configured for the Google option to render (it is gated
-        off with the default test settings; see TestBasicOnlyDeployment).
+        The Google option needs the credential triple set *and* the google
+        provider loaded (issue #267); the local admin form is always folded.
         """
         enabled = test_settings.model_copy(
             deep=True,
@@ -321,6 +337,7 @@ class TestAdminBasicAuthentication:
             },
         )
         app.dependency_overrides[get_settings] = lambda: enabled
+        _google_manager(app)
         unauthenticated = await _request(app, "GET", path)
         authenticated = await _request(
             app,
@@ -442,6 +459,34 @@ class TestLocalAuthSigninOption:
         assert "Local Admin" in response.text
         assert "Local Auth" not in response.text
 
+    async def test_flat_external_plugin_named_internal_oidc_keeps_local_admin(
+        self,
+        app: FastAPI,
+    ) -> None:
+        """The label follows the form's resolver, which reads the qualified key.
+
+        An external plugin registered flat under the key ``internal_oidc`` is
+        not what ``_local_login_identity`` consults, so offering Local Login
+        for it would render a form that ignores the provider (review
+        finding). The built-in key stays the only trigger.
+        """
+        from inference_proxy.plugins.builtin.auth.internal_oidc import (
+            InternalOidcPlugin,
+        )
+
+        plugin = InternalOidcPlugin()
+        plugin._client = object()  # configured marker (is_configured)
+        app.state.plugin_manager = SimpleNamespace(
+            get_plugin=lambda name: plugin if name == "internal_oidc" else None,
+            get_plugins_by_type=lambda _plugin_type: [plugin],
+        )
+
+        response = await _request(app, "GET", "/dashboard")
+
+        assert response.status_code == 200
+        assert "Local Admin" in response.text
+        assert "Local Login" not in response.text
+
     async def test_shown_as_local_login_when_local_plugin_configured(
         self,
         app: FastAPI,
@@ -468,6 +513,115 @@ class TestLocalAuthSigninOption:
         assert "/auth/login?provider=internal_oidc" not in response.text
         # The opt-in provider is not enabled here, so Google stays gated off.
         assert "Google Auth" not in response.text
+
+
+class TestGoogleSigninOption:
+    """The Google button appears only when its provider is loaded (issue #267).
+
+    The credential triple alone is not enough: an operator replacing the
+    built-in provider (``plugins.disabled: ["auth.google"]``) while the
+    triple stays set must not get a button that answers 404.
+    """
+
+    def _enabled_settings(self, test_settings: Settings) -> Settings:
+        return test_settings.model_copy(
+            deep=True,
+            update={
+                "oauth": test_settings.oauth.model_copy(
+                    update={
+                        "client_id": "test-client",
+                        "client_secret": SecretStr("test-secret"),
+                        "redirect_uri": "https://gateway.example.com/auth/callback",
+                    }
+                )
+            },
+        )
+
+    async def test_hidden_when_the_provider_is_not_loaded(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+    ) -> None:
+        # The deployment shape from the issue: the triple stays set while the
+        # built-in google plugin is disabled and another provider is loaded.
+        other = FakeAuthPlugin()
+        other.name = "internal_oidc"
+        app.state.plugin_manager = SimpleNamespace(
+            get_plugin=lambda name: other if name == "auth.internal_oidc" else None,
+            get_plugins_by_type=lambda _plugin_type: [other],
+        )
+        app.dependency_overrides[get_settings] = lambda: self._enabled_settings(
+            test_settings
+        )
+
+        response = await _request(app, "GET", "/dashboard")
+        login = await _request(app, "GET", "/auth/login?provider=google")
+
+        assert response.status_code == 200
+        assert "Local Login" in response.text
+        assert "Google Auth" not in response.text
+        # The option is hidden because the button would land on this 404.
+        assert login.status_code == 404
+        assert login.json()["detail"] == "Auth provider is not configured: google"
+
+    async def test_hidden_when_the_provider_is_unconfigured(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+    ) -> None:
+        unconfigured = FakeAuthPlugin(error="boom")
+        unconfigured.name = "google"
+        app.state.plugin_manager = SimpleNamespace(
+            get_plugin=lambda name: unconfigured if name == "auth.google" else None,
+            get_plugins_by_type=lambda _plugin_type: [unconfigured],
+        )
+        app.dependency_overrides[get_settings] = lambda: self._enabled_settings(
+            test_settings
+        )
+
+        response = await _request(app, "GET", "/dashboard")
+
+        assert response.status_code == 200
+        assert "Google Auth" not in response.text
+
+    async def test_hidden_without_the_oauth_redirect_uri(
+        self,
+        app: FastAPI,
+    ) -> None:
+        """A configured provider alone must not offer a link that answers 503.
+
+        ``/auth/login`` rejects every provider when
+        ``settings.oauth.redirect_uri`` is unset, so a plugin that reports
+        itself configured without the deployment's credential triple would
+        otherwise get a button whose target fails.
+        """
+        _google_manager(app)
+
+        response = await _request(app, "GET", "/dashboard")
+        login = await _request(app, "GET", "/auth/login?provider=google")
+
+        assert response.status_code == 200
+        assert "Google Auth" not in response.text
+        assert login.status_code == 503
+        assert login.json()["detail"] == "OAuth redirect URI is not configured"
+
+    async def test_shown_when_the_provider_is_configured(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+    ) -> None:
+        _google_manager(app)
+        app.dependency_overrides[get_settings] = lambda: self._enabled_settings(
+            test_settings
+        )
+
+        response = await _request(app, "GET", "/dashboard")
+        login = await _request(app, "GET", "/auth/login?provider=google")
+
+        assert response.status_code == 200
+        assert "/auth/login?provider=google" in response.text
+        assert "Google Auth" in response.text
+        assert login.status_code == 302
 
 
 class TestLocalLoginForm:
