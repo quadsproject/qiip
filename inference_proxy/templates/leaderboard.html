@@ -21,6 +21,12 @@
             <div>
                 <h1>Leaderboard</h1>
                 <p id="board-note">Loading...</p>
+                {% if viewer_role == "admin" %}
+                <label class="muted-status board-toggle" for="include-admins">
+                    <input type="checkbox" id="include-admins" name="include_admins">
+                    Include admin users
+                </label>
+                {% endif %}
             </div>
             <div class="header-right">
                 <p id="last-updated"></p>
