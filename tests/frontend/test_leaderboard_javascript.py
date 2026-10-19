@@ -11,6 +11,7 @@ shows the note explaining why it cannot be copied or downloaded.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -22,6 +23,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 _LEADERBOARD_JS = _ROOT / "inference_proxy/static/js/leaderboard.js"
 _TABLE_SORT_JS = _ROOT / "inference_proxy/static/js/table_sort.js"
 _CLIPBOARD_JS = _ROOT / "inference_proxy/static/js/clipboard.js"
+_FORMAT_USD_JS = _ROOT / "inference_proxy/static/js/format_usd.js"
 
 _HARNESS = r"""
 const fs = require("fs");
@@ -29,6 +31,7 @@ const vm = require("vm");
 const sortSource = fs.readFileSync(process.argv[1], "utf8");
 const clipboardSource = fs.readFileSync(process.argv[2], "utf8");
 const source = fs.readFileSync(process.argv[3], "utf8");
+const formatSource = fs.readFileSync(process.argv[4], "utf8");
 
 const elements = new Map();
 const calls = [];
@@ -116,7 +119,7 @@ function buildHead(id, kinds) {
   head.appendChild(row);
 }
 
-buildHead("leaderboard-head", [null, "text", "number", "number", "number", "number", "number"]);
+buildHead("leaderboard-head", [null, "text", "number", "number", "number", "number", "number", "number"]);
 // The template ships the server's ranking state on Total tokens.
 byId("leaderboard-head").children[0].children[6].setAttribute("aria-sort", "descending");
 if (!ADMIN_VIEW) buildHead("tokens-head", ["text", "text", "date", "date", "text", "text", null]);
@@ -176,6 +179,7 @@ sandbox.window = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(sortSource, sandbox);
 vm.runInContext(clipboardSource, sandbox);
+vm.runInContext(formatSource, sandbox);
 vm.runInContext(source, sandbox);
 
 (async function () {
@@ -245,6 +249,13 @@ vm.runInContext(source, sandbox);
     tokens: byId("leaderboard-body").children.map(function (row) {
       return row.children[2] ? row.children[2].textContent : "";
     }),
+    costs: byId("leaderboard-body").children.map(function (row) {
+      return row.children[7] ? row.children[7].textContent : "";
+    }),
+    emptyColSpan: byId("leaderboard-body").children[0] &&
+      byId("leaderboard-body").children[0].children[0]
+      ? byId("leaderboard-body").children[0].children[0].colSpan
+      : null,
     aria: headers.map(function (cell) { return cell.getAttribute("aria-sort"); }),
     tokensAria: tokenHeaders.map(function (cell) { return cell.getAttribute("aria-sort"); }),
   };
@@ -260,6 +271,8 @@ vm.runInContext(source, sandbox);
     ranks: snapshot.ranks,
     users: snapshot.users,
     tokens: snapshot.tokens,
+    costs: snapshot.costs,
+    emptyColSpan: snapshot.emptyColSpan,
     aria: snapshot.aria,
     tokensAria: snapshot.tokensAria,
     ranksAfterRerender: ranks(),
@@ -292,6 +305,7 @@ def _run(
     token: dict[str, Any] | None = None,
     tokens_sort_index: int = -1,
     admin_view: bool = False,
+    lang: str = "en_US.UTF-8",
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -312,11 +326,13 @@ def _run(
             str(_TABLE_SORT_JS),
             str(_CLIPBOARD_JS),
             str(_LEADERBOARD_JS),
+            str(_FORMAT_USD_JS),
         ],
         check=False,
         capture_output=True,
         text=True,
         timeout=3,
+        env={**os.environ, "LANG": lang, "LC_ALL": lang},
     )
     assert result.returncode == 0, result.stderr
     parsed: object = json.loads(result.stdout)
@@ -335,6 +351,7 @@ def _user(user_id: int, name: str, tokens: int, requests: int = 1) -> dict[str, 
         "prompt_tokens": tokens * 10,
         "completion_tokens": tokens * 5,
         "total_tokens": tokens * 15,
+        "estimated_cost_usd": tokens * 0.01,
     }
 
 
@@ -347,6 +364,7 @@ def test_unsorted_leaderboard_keeps_server_ranking() -> None:
     # other header starts unsorted.
     assert result["aria"][6] == "descending"
     assert set(result["aria"][:6]) == {None}
+    assert result["aria"][7] is None
 
 
 def test_leaderboard_sorts_by_total_tokens_descending() -> None:
@@ -377,6 +395,48 @@ def test_tokens_column_sorts_by_total_count_not_display_text() -> None:
     assert result["aria"][2] == "ascending"
 
 
+def test_cost_column_formats_usd_and_sorts_by_numeric_value() -> None:
+    # Both rows render "$9.00", so only the raw data-sort-value can order them.
+    low = _user(1, "Bo", 900)
+    low["estimated_cost_usd"] = 9.001
+    high = _user(2, "Ann", 1000)
+    high["estimated_cost_usd"] = 9.004
+
+    result = _run([high, low], sort_index=7)
+
+    assert result["costs"] == ["$9.00", "$9.00"]
+    assert result["users"] == ["Bo (you)", "Ann"]
+    assert result["aria"][7] == "ascending"
+
+
+def test_cost_cell_renders_zero_for_no_usage() -> None:
+    result = _run([_user(1, "Bo", 0)])
+
+    assert result["costs"] == ["$0.00"]
+
+
+def test_cost_cell_renders_zero_when_the_field_is_missing() -> None:
+    # An older cached API response has no estimated_cost_usd.
+    user = _user(1, "Bo", 10)
+    del user["estimated_cost_usd"]
+
+    result = _run([user])
+
+    assert result["costs"] == ["$0.00"]
+
+
+def test_cost_cell_stays_us_formatted_under_a_german_locale() -> None:
+    result = _run([_user(1, "Bo", 900)], lang="de_DE.UTF-8")
+
+    assert result["costs"] == ["$9.00"]
+
+
+def test_empty_leaderboard_spans_all_columns() -> None:
+    result = _run([])
+
+    assert result["emptyColSpan"] == 8
+
+
 def test_rank_column_is_fixed_and_keeps_each_users_rank() -> None:
     bo = _user(1, "Bo", 10, requests=1)
     bo["total_tokens"] = 900
@@ -391,6 +451,7 @@ def test_rank_column_is_fixed_and_keeps_each_users_rank() -> None:
     assert unsorted["ranks"] == ["1", "2", "3"]
     assert unsorted["aria"][6] == "descending"
     assert set(unsorted["aria"][:6]) == {None}
+    assert unsorted["aria"][7] is None
 
     sorted_by_requests = _run([bo, cy, ann], sort_index=3, click_count=2)
 

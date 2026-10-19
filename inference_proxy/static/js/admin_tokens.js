@@ -25,13 +25,6 @@
     return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
   }
 
-  function formatUsd(amount) {
-    return "$" + Number(amount).toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    });
-  }
-
   // ponytail: only a null scope means full access; [] is pinned to nothing.
   function scopeLabel(scope) {
     if (scope === null) return "Full access";
@@ -132,7 +125,9 @@
       row.appendChild(tdCell(String(user.prompt_tokens)));
       row.appendChild(tdCell(String(user.completion_tokens)));
       row.appendChild(tdCell(String(user.total_tokens)));
-      row.appendChild(tdCell(formatUsd(user.estimated_cost_usd), user.estimated_cost_usd));
+      row.appendChild(
+        tdCell(qiipFormatUsd(user.estimated_cost_usd), user.estimated_cost_usd)
+      );
       const actions = document.createElement("td");
       const view = document.createElement("a");
       view.href = "/dashboard/users/" + encodeURIComponent(user.id);

@@ -46,10 +46,11 @@
                                 {# The server sends the ranking by total tokens DESC (#}
                                 {# store.list_leaderboard), so the column carries its state. #}
                                 <th scope="col" data-sort="number" aria-sort="descending"><button type="button" class="th-sort">Total tokens</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Est. premium cost @ {{ model_label }}</button></th>
                             </tr>
                         </thead>
                         <tbody id="leaderboard-body">
-                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -121,6 +122,7 @@
     <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/table_sort.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/clipboard.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/format_usd.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/leaderboard.js') }}"></script>
 </body>
 </html>

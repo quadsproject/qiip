@@ -18,7 +18,8 @@ from pydantic import SecretStr
 from inference_proxy.auth import store as store_module
 from inference_proxy.auth.dependencies import get_auth_plugin
 from inference_proxy.auth.store import AuthStore
-from inference_proxy.config.settings import OAuthSettings, Settings
+from inference_proxy.config.dependencies import get_settings
+from inference_proxy.config.settings import OAuthSettings, PricingSettings, Settings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.onboarding.harness import HARNESSES, get_harness
@@ -1102,6 +1103,69 @@ class TestLeaderboard:
         assert rows[0]["total_tokens"] == 2000
         assert rows[1]["total_tokens"] == 1000
         assert rows[2]["total_tokens"] == 0
+        assert rows[2]["estimated_cost_usd"] == 0.0
+
+    def test_rows_include_estimated_premium_cost(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        me = auth_store.list_users_with_stats()[0]
+        bob = auth_store.upsert_google_user(
+            google_sub="sub-bob", email="bob@example.com", name="Bob", picture=""
+        )
+        bob_token = auth_store.create_token(bob.id, "bob-ci")
+        auth_store.record_usage(
+            user_id=bob.id,
+            token_id=bob_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            prompt_tokens=1_000_000,
+            completion_tokens=500_000,
+            total_tokens=1_500_000,
+        )
+
+        rows = user_client.get("/onboarding/leaderboard").json()
+
+        by_id = {row["id"]: row for row in rows}
+        assert by_id[bob.id]["estimated_cost_usd"] == pytest.approx(7.0)
+        assert by_id[me.id]["estimated_cost_usd"] == 0.0
+
+    def test_rows_use_configured_pricing(
+        self,
+        app: FastAPI,
+        user_client: TestClient,
+        auth_store: AuthStore,
+        test_settings: Settings,
+    ) -> None:
+        configured = test_settings.model_copy(
+            update={
+                "pricing": PricingSettings(
+                    input_rate_per_mtok=8.5,
+                    output_rate_per_mtok=42.0,
+                    model_label="gpt-neo-test",
+                )
+            }
+        )
+        app.dependency_overrides[get_settings] = lambda: configured
+        bob = auth_store.upsert_google_user(
+            google_sub="sub-bob", email="bob@example.com", name="Bob", picture=""
+        )
+        bob_token = auth_store.create_token(bob.id, "bob-ci")
+        auth_store.record_usage(
+            user_id=bob.id,
+            token_id=bob_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            prompt_tokens=1_000_000,
+            completion_tokens=500_000,
+            total_tokens=1_500_000,
+        )
+
+        rows = user_client.get("/onboarding/leaderboard").json()
+        by_id = {row["id"]: row for row in rows}
+        assert by_id[bob.id]["estimated_cost_usd"] == pytest.approx(29.5)
+        assert (
+            "Est. premium cost @ gpt-neo-test" in user_client.get("/leaderboard").text
+        )
 
     def test_page_renders_for_signed_in_user(self, user_client: TestClient) -> None:
         html = user_client.get("/leaderboard").text
@@ -1114,7 +1178,12 @@ class TestLeaderboard:
         html = user_client.get("/leaderboard").text
 
         assert "js/table_sort.js" in html
-        for asset in ("js/table_sort.js", "js/leaderboard.js", "js/confirm_dialog.js"):
+        for asset in (
+            "js/table_sort.js",
+            "js/format_usd.js",
+            "js/leaderboard.js",
+            "js/confirm_dialog.js",
+        ):
             assert re.search(rf"/static/{re.escape(asset)}\?v=[0-9a-f]{{12}}", html)
         kinds = re.findall(r'data-sort="([^"]*)"', html)
         assert kinds
@@ -1132,6 +1201,7 @@ class TestLeaderboard:
         assert re.search(
             r'aria-sort="descending"[^>]*>\s*<button[^>]*>Total tokens', html
         )
+        assert "Est. premium cost @ claude-sonnet-5" in html
 
     def test_anonymous_gets_signin(self, app: FastAPI) -> None:
         response = TestClient(app).get("/leaderboard")
@@ -1148,6 +1218,7 @@ class TestLeaderboard:
 
         assert page.status_code == 200
         assert "Usage leaderboard" in page.text
+        assert "Est. premium cost" in page.text
         # The server still sends its ranking state on the Total tokens column.
         assert page.text.count('aria-sort="descending"') == 1
         # The normal-user token manager is not on the admin view; admins
