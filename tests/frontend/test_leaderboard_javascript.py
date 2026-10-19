@@ -106,7 +106,7 @@ const ADMIN_VIEW = IS_ADMIN;
 const ABSENT_IDS = ADMIN_VIEW
   ? ["tokens-head", "tokens-table-body", "token-legacy-note", "token-form",
      "token-model", "token-harness", "token-create-btn", "config-download-btn"]
-  : [];
+  : ["include-admins"];
 
 function buildHead(id, kinds) {
   const head = byId(id);
@@ -133,6 +133,7 @@ const payloads = {
     token: TOKEN,
   },
   "/onboarding/leaderboard": LEADERBOARD_ROWS,
+  "/onboarding/leaderboard?include_admins=1": LEADERBOARD_ROWS,
   "/onboarding/token": { name: "default" },
   "/onboarding/token/reveal": { token: "qiip_revealed_value" },
 };
@@ -267,6 +268,23 @@ vm.runInContext(source, sandbox);
     await new Promise(function (resolve) { setTimeout(resolve, 20); });
   }
 
+  // Admin view only: the Include admin users toggle refetches with the
+  // parameter and swaps the note phrasing (RFE #271).
+  const includeToggle = byId("include-admins");
+  const noteBefore = byId("board-note").textContent;
+  if (includeToggle) {
+    includeToggle.checked = true;
+    await includeToggle.listeners.change({});
+    await new Promise(function (resolve) { setTimeout(resolve, 20); });
+  }
+  const include = {
+    before: noteBefore,
+    fetches: calls.filter(function (call) {
+      return call.url === "/onboarding/leaderboard?include_admins=1";
+    }).length,
+    note: byId("board-note").textContent,
+  };
+
   process.stdout.write(JSON.stringify({
     ranks: snapshot.ranks,
     users: snapshot.users,
@@ -286,6 +304,7 @@ vm.runInContext(source, sandbox);
     }).length,
     fetches: calls.map(function (call) { return call.url; }),
     errorBannerText: byId("error-banner").textContent,
+    include: include,
     copy: copy,
     tokenRows: ADMIN_VIEW ? [] : byId("tokens-table-body").children.map(function (row) {
       return row.children[0] ? row.children[0].textContent : "";
@@ -496,7 +515,12 @@ def test_admin_view_renders_the_ranking_alone() -> None:
     assert result["aria"][6] == "descending"
     assert result["leaderboardFetches"] == 1
     # The ranking alone loads: no identity, state, token or config request.
-    assert result["fetches"] == ["/onboarding/leaderboard"]
+    # (The admin harness then works its Include admin users toggle, which
+    # refetches with the widen parameter -- RFE #271.)
+    assert set(result["fetches"]) == {
+        "/onboarding/leaderboard",
+        "/onboarding/leaderboard?include_admins=1",
+    }
     assert result["errorBannerText"] == ""
     assert result["tokenRows"] == []
 
@@ -566,6 +590,29 @@ def test_legacy_token_has_no_copy_icon_and_explains_itself() -> None:
     assert copy["legacyNoteHidden"] is False
     assert copy["downloadDisabled"] is True
     assert copy["toasts"] == []
+
+
+def test_admin_toggle_fetches_with_include_and_swaps_note() -> None:
+    """The admin view's Include admin users checkbox refetches the ranking
+    with include_admins=1 and the note says admins included (RFE #271)."""
+    result = _run([_user(1, "Bo", 30), _user(2, "Ann", 10)], admin_view=True)
+
+    include = result["include"]
+    assert include["before"].endswith("users ranked by total tokens (admins excluded)")
+    assert include["fetches"] == 1
+    assert "users ranked by total tokens (admins included)" in include["note"]
+
+
+def test_normal_view_has_no_include_toggle() -> None:
+    """The checkbox element does not exist for non-admin viewers, so nothing
+    is fetched with the parameter (RFE #271)."""
+    result = _run([_user(1, "Bo", 30), _user(2, "Ann", 10)])
+
+    assert result["include"]["fetches"] == 0
+    assert result["include"]["note"].endswith(
+        "users ranked by total tokens (admins excluded)"
+    )
+    assert "/onboarding/leaderboard?include_admins=1" not in result["fetches"]
 
 
 def test_no_token_hides_the_note_and_offers_no_copy_icon() -> None:

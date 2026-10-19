@@ -1173,11 +1173,15 @@ class AuthStore:
             for row in rows
         ]
 
-    def list_leaderboard(self) -> list[LeaderboardEntry]:
-        """Return non-admin users with token and usage counts, usage-first.
+    def list_leaderboard(
+        self, *, include_admins: bool = False
+    ) -> list[LeaderboardEntry]:
+        """Return users with token and usage counts, usage-first.
 
-        Admin-role users are never listed: their tokens and usage stay out
-        of the user-facing leaderboard (RFE #156).
+        Admin-role users are excluded by default: their tokens and usage
+        stay out of the user-facing leaderboard (RFE #156). ``include_admins``
+        widens the set for admin viewers who opt in (RFE #271); callers gate
+        that on the viewer role, never on the client.
         """
         with self._lock:
             rows = self._conn.execute(
@@ -1197,7 +1201,9 @@ class AuthStore:
                        COALESCE((SELECT SUM(total_tokens) FROM usage w
                                    WHERE w.user_id = u.id), 0) AS total_tokens
                   FROM users u
-                 WHERE u.is_admin = 0
+                """
+                + ("" if include_admins else " WHERE u.is_admin = 0")
+                + """
                  ORDER BY total_tokens DESC, request_count DESC,
                           u.created_at ASC, u.id ASC
                 """
