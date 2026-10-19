@@ -622,16 +622,20 @@ async def leaderboard_page(
     "/onboarding/leaderboard", dependencies=[Depends(require_fleet_viewer)]
 )
 async def leaderboard(
-    store: Annotated[AuthStore, Depends(get_auth_store)],
+    request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
+    store: Annotated[AuthStore, Depends(get_auth_store)],
+    include_admins: bool = False,
 ) -> list[LeaderboardEntry]:
-    """Rank non-admin users by usage; admin rows are never listed.
+    """Rank users by usage; admin rows are never listed for non-admin viewers.
 
-    Every authenticated viewer may read (admins keep every normal-user
-    view, and the same ranking renders on the admin surfaces); anonymous
-    callers get 401.
+    ``include_admins=1`` widens the ranking to admin-role users, but only
+    when the *viewer* is an admin (RFE #271): non-admin callers are ignored
+    so the client can never widen the set for itself. Every authenticated
+    viewer may read the default ranking; anonymous callers get 401.
     """
-    rows = await asyncio.to_thread(store.list_leaderboard)
+    include = include_admins and viewer_role(request, settings) == "admin"
+    rows = await asyncio.to_thread(store.list_leaderboard, include_admins=include)
     pricing = settings.pricing
     return [
         row.model_copy(

@@ -1105,6 +1105,12 @@ class TestLeaderboard:
         assert rows[2]["total_tokens"] == 0
         assert rows[2]["estimated_cost_usd"] == 0.0
 
+        # A non-admin client asking for admins gets the same ranking: the
+        # widen flag only honors admin viewers (RFE #271).
+        wide = user_client.get("/onboarding/leaderboard?include_admins=1").json()
+        assert [row["id"] for row in wide] == [bob.id, carol.id, me.id]
+        assert "admin@example.com" not in {row["email"] for row in wide}
+
     def test_rows_include_estimated_premium_cost(
         self, user_client: TestClient, auth_store: AuthStore
     ) -> None:
@@ -1173,6 +1179,8 @@ class TestLeaderboard:
         assert "leaderboard.js" in html
         assert "Usage leaderboard" in html
         assert 'id="token-legacy-note"' in html
+        # The Include admin users toggle is admin-view only (RFE #271).
+        assert 'id="include-admins"' not in html
 
     def test_page_declares_sortable_columns(self, user_client: TestClient) -> None:
         html = user_client.get("/leaderboard").text
@@ -1238,9 +1246,34 @@ class TestLeaderboard:
             assert f'id="{element_id}"' not in page.text, element_id
         assert "Admins manage tokens on the" in page.text
         assert 'href="/profile"' in page.text
+        # The admin view offers the Include admin users toggle (RFE #271).
+        assert 'id="include-admins"' in page.text
         # The admin reads the same ranking, which never lists admins: the
         # only user here is the promoted admin, so the board is empty.
         assert user_client.get("/onboarding/leaderboard").json() == []
+
+    def test_admin_viewer_may_include_admins(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        """An admin viewer opting in sees admin rows and their usage; the
+        ordering stays usage-first (RFE #271)."""
+        me = auth_store.list_users_with_stats()[0]
+        auth_store.set_user_admin(me.id, True)
+        admin_token = auth_store.create_token(me.id, "admin-ci")
+        auth_store.record_usage(
+            user_id=me.id,
+            token_id=admin_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            total_tokens=999_000,
+        )
+
+        default_rows = user_client.get("/onboarding/leaderboard").json()
+        wide_rows = user_client.get("/onboarding/leaderboard?include_admins=1").json()
+
+        assert default_rows == []
+        assert [row["email"] for row in wide_rows] == ["alice@example.com"]
+        assert wide_rows[0]["total_tokens"] == 999_000
 
     def test_local_admin_session_gets_the_leaderboard(self, app: FastAPI) -> None:
         client = TestClient(app)

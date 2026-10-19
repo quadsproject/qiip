@@ -80,8 +80,11 @@
     const body = $("leaderboard-body");
     clearChildren(body);
     // Set before the empty-state return so the note never stays "Loading...".
+    // The admin viewer's Include admin users toggle swaps the phrasing (RFE #271).
+    const include = $("include-admins");
+    const scope = include && include.checked ? "included" : "excluded";
     $("board-note").textContent =
-      rows.length + " users ranked by total tokens (admins excluded)";
+      rows.length + " users ranked by total tokens (admins " + scope + ")";
     if (rows.length === 0) {
       const tr = document.createElement("tr");
       const td = document.createElement("td");
@@ -339,12 +342,21 @@
   }
 
   async function loadLeaderboard() {
-    const rows = await api("GET", "/onboarding/leaderboard");
+    const include = $("include-admins");
+    const url =
+      include && include.checked
+        ? "/onboarding/leaderboard?include_admins=1"
+        : "/onboarding/leaderboard";
+    const rows = await api("GET", url);
     renderLeaderboard(rows);
   }
 
   async function init() {
     enableTableSort();
+    const includeToggle = $("include-admins");
+    if (includeToggle) {
+      includeToggle.addEventListener("change", loadLeaderboard);
+    }
     // The token manager is the normal-user half of the page: the admin
     // shell has no token form, and the onboarding endpoints refuse admins,
     // so the ranking alone loads for that view.
