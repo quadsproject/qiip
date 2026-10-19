@@ -10,6 +10,7 @@ selections into the hidden multi-select used for token creation.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,6 +22,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 _PROFILE_JS = _ROOT / "inference_proxy/static/js/profile.js"
 _TABLE_SORT_JS = _ROOT / "inference_proxy/static/js/table_sort.js"
 _CLIPBOARD_JS = _ROOT / "inference_proxy/static/js/clipboard.js"
+_FORMAT_USD_JS = _ROOT / "inference_proxy/static/js/format_usd.js"
 
 _HARNESS = r"""
 const fs = require("fs");
@@ -28,6 +30,7 @@ const vm = require("vm");
 const source = fs.readFileSync(process.argv[1], "utf8");
 const sortSource = fs.readFileSync(process.argv[2], "utf8");
 const clipboardSource = fs.readFileSync(process.argv[3], "utf8");
+const formatSource = fs.readFileSync(process.argv[4], "utf8");
 
 const calls = [];
 const toasts = [];
@@ -108,7 +111,12 @@ const sandbox = {
       "/auth/me": USER,
       "/profile/tokens": TOKENS,
       "/profile/endpoints": ENDPOINTS,
-      "/profile/usage": { totals: { request_count: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }, rows: USAGE_ROWS },
+      "/profile/usage": {
+        totals: { request_count: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        rows: USAGE_ROWS,
+        estimated_premium_cost_usd: 9.0,
+        model_label: "gpt-neo-test",
+      },
     }[url];
     return {
       ok: url !== "/auth/me" || USER !== null,
@@ -139,6 +147,7 @@ sandbox.window = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(sortSource, sandbox);
 vm.runInContext(clipboardSource, sandbox);
+vm.runInContext(formatSource, sandbox);
 vm.runInContext(source, sandbox);
 
 (async function () {
@@ -217,6 +226,7 @@ vm.runInContext(source, sandbox);
     rowScopes: body.children.map(function (row) {
       return row.children[5] ? row.children[5].textContent : "";
     }),
+    savings: byId("usage-savings").textContent,
     usageRows: byId("usage-table-body").children.map(function (row) {
       return row.children[0] ? row.children[0].textContent : "";
     }),
@@ -253,6 +263,7 @@ def _run(
     usage: list[dict[str, Any]] | None = None,
     sort_usage: bool = False,
     created_token: dict[str, Any] | None = None,
+    lang: str = "en_US.UTF-8",
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -274,11 +285,20 @@ def _run(
         )
     )
     result = subprocess.run(
-        [node, "-e", script, str(_PROFILE_JS), str(_TABLE_SORT_JS), str(_CLIPBOARD_JS)],
+        [
+            node,
+            "-e",
+            script,
+            str(_PROFILE_JS),
+            str(_TABLE_SORT_JS),
+            str(_CLIPBOARD_JS),
+            str(_FORMAT_USD_JS),
+        ],
         check=False,
         capture_output=True,
         text=True,
         timeout=3,
+        env={**os.environ, "LANG": lang, "LC_ALL": lang},
     )
     assert result.returncode == 0, result.stderr
     parsed: object = json.loads(result.stdout)
@@ -437,3 +457,12 @@ def test_created_token_is_copied_from_the_reveal_box() -> None:
         ["Token created.", "success"],
         ["Token copied to clipboard.", "success"],
     ]
+
+
+def test_premium_estimate_is_us_formatted_under_a_german_locale() -> None:
+    result = _run([_token(1, False)], [], lang="de_DE.UTF-8")
+
+    assert result["savings"] == (
+        "Estimated premium-equivalent cost (token budget saved): $9.00 "
+        "\u00b7 model: gpt-neo-test"
+    )

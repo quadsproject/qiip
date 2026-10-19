@@ -85,7 +85,7 @@
     if (rows.length === 0) {
       const tr = document.createElement("tr");
       const td = document.createElement("td");
-      td.colSpan = 7;
+      td.colSpan = 8;
       td.textContent = "No other users yet.";
       td.className = "muted-status";
       tr.appendChild(td);
@@ -112,6 +112,9 @@
       tr.appendChild(tdCell(String(row.prompt_tokens)));
       tr.appendChild(tdCell(String(row.completion_tokens)));
       tr.appendChild(tdCell(String(row.total_tokens)));
+      tr.appendChild(
+        tdCell(qiipFormatUsd(row.estimated_cost_usd), row.estimated_cost_usd)
+      );
       body.appendChild(tr);
     });
     reapplyTableSort();

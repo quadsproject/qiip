@@ -203,7 +203,7 @@ async def test_late_startup_failure_closes_constructed_resources(
 
 
 async def _wait_for_server_start(server: uvicorn.Server) -> None:
-    deadline = asyncio.get_running_loop().time() + 2
+    deadline = asyncio.get_running_loop().time() + 5
     while not server.started:
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError("Uvicorn did not start before the test deadline")
@@ -258,23 +258,26 @@ async def test_uvicorn_drains_inflight_request_before_lifespan_cleanup(
             ),
         ):
             serve_task = asyncio.create_task(server.serve(sockets=[listener]))
-            await asyncio.wait_for(_wait_for_server_start(server), timeout=2.5)
-            async with httpx.AsyncClient(timeout=2) as client:
+            await asyncio.wait_for(_wait_for_server_start(server), timeout=6)
+            # The request is held open until the cleanup check; this test
+            # asserts drain ordering, not latency, so leave room for a loaded
+            # runner before the client or deadlines give up.
+            async with httpx.AsyncClient(timeout=10) as client:
                 request_task = asyncio.create_task(
                     client.get(f"http://{host}:{port}/_test/inflight")
                 )
-                await asyncio.wait_for(request_started.wait(), timeout=1)
+                await asyncio.wait_for(request_started.wait(), timeout=5)
                 server.should_exit = True
 
                 with pytest.raises(TimeoutError):
                     await asyncio.wait_for(cleanup_started.wait(), timeout=0.2)
 
                 release_request.set()
-                response = await asyncio.wait_for(request_task, timeout=1)
+                response = await asyncio.wait_for(request_task, timeout=5)
                 assert response.status_code == 200
                 assert response.json() == {"status": "complete"}
 
-            await asyncio.wait_for(serve_task, timeout=3)
+            await asyncio.wait_for(serve_task, timeout=10)
             assert cleanup_started.is_set()
     finally:
         release_request.set()
@@ -283,5 +286,5 @@ async def test_uvicorn_drains_inflight_request_before_lifespan_cleanup(
             request_task.cancel()
             await asyncio.gather(request_task, return_exceptions=True)
         if serve_task is not None and not serve_task.done():
-            await asyncio.wait_for(serve_task, timeout=3)
+            await asyncio.wait_for(serve_task, timeout=10)
         listener.close()

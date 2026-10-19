@@ -14,20 +14,29 @@ _ROOT = Path(__file__).resolve().parents[2]
 _ADMIN_TOKENS_JS = _ROOT / "inference_proxy/static/js/admin_tokens.js"
 _ADMIN_USER_DETAIL_JS = _ROOT / "inference_proxy/static/js/admin_user_detail.js"
 _TABLE_SORT_JS = _ROOT / "inference_proxy/static/js/table_sort.js"
+_FORMAT_USD_JS = _ROOT / "inference_proxy/static/js/format_usd.js"
 
 
 def _run_node(source: Path, harness: str) -> dict[str, Any]:
     """Run a harness against ``source`` with the shared sorter loaded first.
 
-    The module is handed to the harness as ``process.argv[2]``, mirroring the
-    template order (``js/table_sort.js`` before the page script).
+    The module is handed to the harness as ``process.argv[1]``, the shared
+    sorter at ``process.argv[2]``, and the USD formatter at
+    ``process.argv[3]``, mirroring the template order.
     """
     node = shutil.which("node")
     if node is None:
         pytest.fail("Node.js is required for admin token JS regressions")
 
     result = subprocess.run(
-        [node, "-e", harness, str(source), str(_TABLE_SORT_JS)],
+        [
+            node,
+            "-e",
+            harness,
+            str(source),
+            str(_TABLE_SORT_JS),
+            str(_FORMAT_USD_JS),
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -46,6 +55,7 @@ const vm = require("vm");
 const path = require("path");
 const source = fs.readFileSync(process.argv[1], "utf8");
 const sortSource = fs.readFileSync(process.argv[2], "utf8");
+const formatSource = fs.readFileSync(process.argv[3], "utf8");
 const elements = new Map();
 let domReady = null;
 
@@ -105,6 +115,7 @@ const sandbox = {{
 vm.createContext(sandbox);
 sandbox.window = sandbox;
 vm.runInContext(sortSource, sandbox);
+vm.runInContext(formatSource, sandbox);
 {scripts}
 vm.runInContext(source, sandbox);
 
@@ -182,6 +193,7 @@ const fs = require("fs");
 const vm = require("vm");
 const source = fs.readFileSync(process.argv[1], "utf8");
 const sortSource = fs.readFileSync(process.argv[2], "utf8");
+const formatSource = fs.readFileSync(process.argv[3], "utf8");
 const elements = new Map();
 const calls = [];
 let domReady = null;
@@ -246,6 +258,7 @@ const sandbox = {{
 vm.createContext(sandbox);
 sandbox.window = sandbox;
 vm.runInContext(sortSource, sandbox);
+vm.runInContext(formatSource, sandbox);
 vm.runInContext(source, sandbox);
 
 (async function () {{
@@ -345,6 +358,7 @@ const fs = require("fs");
 const vm = require("vm");
 const source = fs.readFileSync(process.argv[1], "utf8");
 const sortSource = fs.readFileSync(process.argv[2], "utf8");
+const formatSource = fs.readFileSync(process.argv[3], "utf8");
 const elements = new Map();
 let domReady = null;
 
@@ -421,6 +435,7 @@ const sandbox = {
 vm.createContext(sandbox);
 sandbox.window = sandbox;
 vm.runInContext(sortSource, sandbox);
+vm.runInContext(formatSource, sandbox);
 vm.runInContext(source, sandbox);
 
 (async function () {
@@ -618,6 +633,7 @@ const fs = require("fs");
 const vm = require("vm");
 const source = fs.readFileSync(process.argv[1], "utf8");
 const sortSource = fs.readFileSync(process.argv[2], "utf8");
+const formatSource = fs.readFileSync(process.argv[3], "utf8");
 const elements = new Map();
 let domReady = null;
 
@@ -705,6 +721,7 @@ const sandbox = {{
 vm.createContext(sandbox);
 sandbox.window = sandbox;
 vm.runInContext(sortSource, sandbox);
+vm.runInContext(formatSource, sandbox);
 vm.runInContext(source, sandbox);
 
 (async function () {{

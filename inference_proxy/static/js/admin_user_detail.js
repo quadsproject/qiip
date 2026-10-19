@@ -25,13 +25,6 @@
     return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
   }
 
-  function formatUsd(amount) {
-    return "$" + Number(amount).toLocaleString(undefined, {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    });
-  }
-
   // ------------------------------------------------------------------
   // Column sorting (shared js/table_sort.js)
   // ------------------------------------------------------------------
@@ -109,8 +102,9 @@
       avatar.hidden = true;
     }
     document.getElementById("user-savings").textContent =
-      "Estimated premium-equivalent cost: " + formatUsd(detail.estimated_cost_usd) +
-      " \u00b7 model: " + (detail.model_label || "n/a");
+      "Estimated premium-equivalent cost: " +
+        qiipFormatUsd(detail.estimated_cost_usd) +
+        " \u00b7 model: " + (detail.model_label || "n/a");
   }
 
   function renderTokens(tokens, body) {

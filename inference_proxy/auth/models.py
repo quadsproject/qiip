@@ -195,6 +195,9 @@ class LeaderboardEntry(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    # Store rows carry usage only; the leaderboard endpoint always fills this
+    # in from settings.pricing before returning it.
+    estimated_cost_usd: float = 0.0
 
 
 class AdminUserStats(BaseModel):
