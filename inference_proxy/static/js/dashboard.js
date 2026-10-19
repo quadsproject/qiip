@@ -243,10 +243,7 @@ async function refreshDashboard() {
         budgetEl.textContent =
           `Token budget saved for all token-attributed requests: ${total.toLocaleString()} tokens` +
           ` (${billing.totals.request_count.toLocaleString()} requests), ` +
-          `equivalent to $${Number(billing.estimated_cost_usd).toLocaleString(
-            undefined,
-            { minimumFractionDigits: 2, maximumFractionDigits: 2 }
-          )} at ${billing.model_label} rates`;
+          `equivalent to ${qiipFormatUsd(billing.estimated_cost_usd)} at ${billing.model_label} rates`;
         budgetEl.hidden = false;
       } else {
         budgetEl.hidden = true;

@@ -361,11 +361,8 @@
     const savings = $("usage-savings");
     if (data.estimated_premium_cost_usd !== undefined) {
       savings.textContent =
-        "Estimated premium-equivalent cost (token budget saved): $" +
-        Number(data.estimated_premium_cost_usd).toLocaleString(undefined, {
-          minimumFractionDigits: 2,
-          maximumFractionDigits: 2,
-        }) +
+        "Estimated premium-equivalent cost (token budget saved): " +
+        qiipFormatUsd(data.estimated_premium_cost_usd) +
         " \u00b7 model: " + (data.model_label || "n/a");
       savings.hidden = false;
     } else {

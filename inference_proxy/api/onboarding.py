@@ -36,6 +36,7 @@ from inference_proxy.api.templating import (
     templates,
 )
 from inference_proxy.auth.allowlist import SSOAllowlist
+from inference_proxy.auth.billing import premium_equivalent_cost
 from inference_proxy.auth.dependencies import (
     get_auth_store,
     get_sso_allowlist,
@@ -609,7 +610,11 @@ async def leaderboard_page(
     return templates.TemplateResponse(
         request=request,
         name="leaderboard.html",
-        context={"active_page": "leaderboard", "viewer_role": role},
+        context={
+            "active_page": "leaderboard",
+            "viewer_role": role,
+            "model_label": settings.pricing.model_label,
+        },
     )
 
 
@@ -618,6 +623,7 @@ async def leaderboard_page(
 )
 async def leaderboard(
     store: Annotated[AuthStore, Depends(get_auth_store)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> list[LeaderboardEntry]:
     """Rank non-admin users by usage; admin rows are never listed.
 
@@ -625,4 +631,18 @@ async def leaderboard(
     view, and the same ranking renders on the admin surfaces); anonymous
     callers get 401.
     """
-    return await asyncio.to_thread(store.list_leaderboard)
+    rows = await asyncio.to_thread(store.list_leaderboard)
+    pricing = settings.pricing
+    return [
+        row.model_copy(
+            update={
+                "estimated_cost_usd": premium_equivalent_cost(
+                    row.prompt_tokens,
+                    row.completion_tokens,
+                    input_rate_per_mtok=pricing.input_rate_per_mtok,
+                    output_rate_per_mtok=pricing.output_rate_per_mtok,
+                )
+            }
+        )
+        for row in rows
+    ]

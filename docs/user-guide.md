@@ -91,7 +91,9 @@ and admins manage their tokens on the profile page.
 - **Usage leaderboard**: every non-admin user ranked by total tokens.
   Admin users and their usage are never shown. Your own row is marked
   `(you)`. The `Rank` column is that standing, so it stays with each user
-  when you sort by another column.
+  when you sort by another column. Each row also shows the estimated
+  premium-equivalent cost at the configured pricing model, labelled
+  `Est. premium cost @ <model_label>`.
 - **Your tokens**: your token with its status and models, the clipboard icon
   next to its prefix (the same copy action as the home screen) and a Delete
   button. Deleting revokes the token; tools configured with it stop
