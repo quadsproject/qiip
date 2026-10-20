@@ -156,6 +156,14 @@ provisioning:
   # Bounded number of automatic vLLM launches per setup, including the initial
   # memory-aware plan (N allows N-1 recognized-OOM retries); 1-5.
   vllm_memory_retry_max_attempts: 4
+  # A node is only routable after the started server proves its model and
+  # runtime identity and answers one bounded inference request. These bounds
+  # apply after /health, so they are short.
+  vllm_verify_timeout: 30.0
+  vllm_inference_probe_timeout: 120.0
+  vllm_inference_probe_max_tokens: 1
+  # Slack when comparing process age (ps etimes) to this launch duration.
+  vllm_process_start_slack: 30.0
   # Total deadline for one vLLM setup run (dependency resolution and venv sync).
   vllm_setup_timeout: 3600.0
   # Bounded automatic retry of transient download/repository/SSH failures. Only

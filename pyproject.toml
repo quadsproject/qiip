@@ -57,6 +57,9 @@ prerelease_token = "dev"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "real_vllm_serving: exercise the real vLLM serving verification gate",
+]
 
 [tool.coverage.run]
 branch = true

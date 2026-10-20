@@ -46,7 +46,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Operations dashboard** -- interactive web UI at `/dashboard` with real-time node and engine identity, catalog-backed setup controls, detail pages, and provisioning status
 - **QUADS integration** -- background polling of QUADS inventory and availability; unified view merging QUADS hosts with etcd-registered nodes
 - **QUADS schedule enforcement** -- automated teardown of managed nodes when QUADS reports an upcoming scheduling conflict
-- **End-to-end node provisioning** -- SSH-based pipeline: BMC power-on, NVIDIA GPU verification, driver and CUDA toolkit install, inference engine setup (vLLM or llama.cpp), NFS mount, firewall, health poll, and etcd registration
+- **End-to-end node provisioning** -- SSH-based pipeline: BMC power-on, NVIDIA GPU verification, driver and CUDA toolkit install, inference engine setup (vLLM or llama.cpp), NFS mount, firewall, health poll, model/runtime identity plus a bounded inference probe, and etcd registration
 - **Node teardown** -- graceful shutdown with connection draining, force teardown option, and provisioning task cancellation
 - **Provisioning log streaming** -- live SSE stream of provisioning and inference engine logs viewable in the dashboard
 - **BMC power management (Redfish)** -- query and control node power state; supports On, ForceOff, GracefulRestart, and ForceRestart

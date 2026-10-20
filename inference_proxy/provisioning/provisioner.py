@@ -64,6 +64,7 @@ from inference_proxy.models.node import (
     VllmRuntimeEffective,
     VllmRuntimeRequest,
     VllmRuntimeState,
+    VllmServingVerification,
 )
 from inference_proxy.provisioning.bundles import (
     bundle_files,
@@ -107,6 +108,15 @@ from inference_proxy.provisioning.vllm_fit import (
     is_memory_failure,
     plan_vllm_launch,
     vllm_profile_bucket,
+)
+from inference_proxy.provisioning.vllm_serving import (
+    VllmServingError,
+    fetch_server_identity,
+    parse_vllm_processes,
+    probe_inference,
+    revision_from_root,
+    select_model,
+    select_process,
 )
 from inference_proxy.redfish.client import RedfishClient
 from inference_proxy.redfish.errors import RedfishError
@@ -3457,6 +3467,136 @@ class NodeProvisioner:
         stderr = getattr(failure, "stderr", "")
         return is_memory_failure(f"{failure}\n{stderr}")
 
+    def _selected_generation(self, hostname: str) -> dict[str, object] | None:
+        """Return the generation the start script selected for this attempt."""
+        store = self._log_buffer.store
+        attempt_id = self._log_buffer.attempts.get(hostname)
+        if store is None or attempt_id is None:
+            return None
+        with suppress(Exception):
+            selected = store.get(attempt_id).get("selected_generation")
+            if isinstance(selected, dict):
+                return selected
+        return None
+
+    async def _read_vllm_model_revision(self, hostname: str, model: str) -> str | None:
+        """Resolve the cached Hugging Face commit when the model card lacks it."""
+        if model.startswith("/") or "/" not in model:
+            return None
+        slug = model.replace("/", "--")
+        path = f"{self._settings.nfs_mount_point}/hub/models--{slug}/refs/main"
+        try:
+            output = await self._ssh_run_command(
+                hostname, f"cat -- {shlex.quote(path)} 2>/dev/null || true"
+            )
+        except Exception:
+            logger.debug(
+                "vllm_model_revision_unavailable",
+                hostname=hostname,
+                model=model,
+                exc_info=True,
+            )
+            return None
+        revision = output.strip()
+        return revision if re.fullmatch(r"[0-9a-f]{40}", revision) else None
+
+    async def _verify_vllm_serving(
+        self,
+        hostname: str,
+        *,
+        expected_model: str,
+        started_at: datetime,
+        expected_max_model_len: int | None = None,
+    ) -> VllmServingVerification:
+        """Fail closed unless this attempt's server answers real inference.
+
+        The process check proves the listener belongs to this attempt and, when
+        a generation was selected, that it runs the exact published runtime.
+        The server's own ``/version`` and ``/v1/models`` responses then prove
+        the model and version, and one bounded completion proves the model can
+        serve. A failure must never reach registration.
+        """
+        base_url = self.validate_endpoint(hostname)
+        selected = self._selected_generation(hostname) or {}
+        runtime_path = selected.get("runtime_path")
+        generation_id = selected.get("generation_id")
+        runtime_path = runtime_path if isinstance(runtime_path, str) else None
+        generation_id = generation_id if isinstance(generation_id, str) else None
+        attempt_elapsed = max(0.0, (datetime.now(UTC) - started_at).total_seconds())
+        process_output = await self._ssh_run_command(
+            hostname, "ps -eo pid=,etimes=,args="
+        )
+        try:
+            process = select_process(
+                parse_vllm_processes(process_output),
+                port=self._settings.vllm_port,
+                expected_model=expected_model,
+                runtime_path=runtime_path,
+                attempt_elapsed_seconds=attempt_elapsed,
+                slack_seconds=self._settings.vllm_process_start_slack,
+            )
+            async with httpx.AsyncClient() as client:
+                identity = await fetch_server_identity(
+                    client,
+                    base_url,
+                    timeout=self._settings.vllm_verify_timeout,
+                )
+                card = select_model(identity.models, expected_model)
+                if (
+                    expected_max_model_len is not None
+                    and card.max_model_len is not None
+                    and card.max_model_len != expected_max_model_len
+                ):
+                    raise VllmServingError(
+                        "the server reports max_model_len "
+                        f"{card.max_model_len}, planned {expected_max_model_len}"
+                    )
+                probe = await probe_inference(
+                    client,
+                    base_url,
+                    model=card.model_id,
+                    timeout=self._settings.vllm_inference_probe_timeout,
+                    max_tokens=self._settings.vllm_inference_probe_max_tokens,
+                )
+        except VllmServingError as exc:
+            self._log(hostname, "error", f"vLLM serving verification failed: {exc}")
+            raise ProvisioningError(str(exc)) from exc
+
+        revision = revision_from_root(card.root)
+        if revision is None:
+            revision = await self._read_vllm_model_revision(hostname, card.model_id)
+        evidence = VllmServingVerification(
+            served_model=card.model_id,
+            runtime_version=identity.version,
+            generation_id=generation_id,
+            runtime_path=runtime_path,
+            model_revision=revision,
+            model_max_model_len=card.max_model_len,
+            process_id=process.pid,
+            process_age_seconds=process.age_seconds,
+            task=probe.task,
+            endpoint=probe.endpoint,
+            latency_ms=round(probe.latency_ms, 2),
+            prompt_tokens=probe.prompt_tokens,
+            completion_tokens=probe.completion_tokens,
+            finish_reason=probe.finish_reason,
+            verified_at=datetime.now(UTC),
+        )
+        self._log(
+            hostname,
+            "info",
+            "vLLM serving verified: "
+            f"model={evidence.served_model} "
+            f"runtime_version={evidence.runtime_version} "
+            f"revision={evidence.model_revision or 'unknown'} "
+            f"generation={evidence.generation_id or 'legacy'} "
+            f"pid={evidence.process_id} "
+            f"task={evidence.task} endpoint={evidence.endpoint} "
+            f"latency_ms={evidence.latency_ms:g} "
+            f"completion_tokens={evidence.completion_tokens}",
+        )
+        return evidence
+
     async def _verify_vllm_runtime(
         self,
         hostname: str,
@@ -3464,6 +3604,7 @@ class NodeProvisioner:
         plan: VllmFitPlan,
         vllm_params: VllmParams | None,
         selected: tuple[VllmDeviceMemory, ...],
+        serving: VllmServingVerification | None = None,
     ) -> VllmRuntimeState:
         """Persist the authorized plan and observe post-load selected-device memory."""
         memory_text = await self._ssh_run_command(
@@ -3546,6 +3687,7 @@ class NodeProvisioner:
             reason=plan.reason,
             approximate=plan.approximate,
             gpus=tuple(sorted(rows, key=lambda row: row.index)),
+            serving=serving,
             observed_at=datetime.now(UTC),
         )
         used = ",".join(str(row.used_mib) for row in runtime.gpus)
@@ -3603,6 +3745,10 @@ class NodeProvisioner:
                 if plan is not None
                 else vllm_params
             )
+            # Verification compares process age to this specific launch, not
+            # the whole attempt, so a survivor from an earlier retry cannot
+            # pass as freshly started.
+            launch_started_at = datetime.now(UTC)
             try:
                 model_name = await self._run_start_vllm(
                     hostname,
@@ -3648,11 +3794,30 @@ class NodeProvisioner:
                     raise
                 attempt, plan, selected = retry
                 continue
-            if plan is None:
-                return model_name, None
+            if on_step is not None:
+                on_step("vllm_serving_verify")
+            expected_model = plan.effective.model if plan is not None else model_name
             try:
+                serving = await self._verify_vllm_serving(
+                    hostname,
+                    expected_model=expected_model,
+                    started_at=launch_started_at,
+                    expected_max_model_len=(
+                        plan.effective.max_model_len if plan is not None else None
+                    ),
+                )
+                if plan is None:
+                    # A host without a memory plan keeps the legacy return
+                    # shape, but inference is still proven before routing.
+                    return model_name, None
+                if on_step is not None:
+                    on_step("vllm_runtime_verify")
                 runtime = await self._verify_vllm_runtime(
-                    hostname, plan=plan, vllm_params=vllm_params, selected=selected
+                    hostname,
+                    plan=plan,
+                    vllm_params=vllm_params,
+                    selected=selected,
+                    serving=serving,
                 )
             except Exception:
                 # A runtime we cannot verify must not stay running and
