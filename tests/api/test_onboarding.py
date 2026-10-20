@@ -1255,8 +1255,8 @@ class TestLeaderboard:
     def test_admin_viewer_may_include_admins(
         self, user_client: TestClient, auth_store: AuthStore
     ) -> None:
-        """An admin viewer opting in sees admin rows and their usage; the
-        ordering stays usage-first (RFE #271)."""
+        """An admin viewer opting in sees admin rows ranked alongside
+        non-admin users by total tokens, with their token counts (RFE #271)."""
         me = auth_store.list_users_with_stats()[0]
         auth_store.set_user_admin(me.id, True)
         admin_token = auth_store.create_token(me.id, "admin-ci")
@@ -1267,13 +1267,33 @@ class TestLeaderboard:
             endpoint="/v1/chat/completions",
             total_tokens=999_000,
         )
+        bob = auth_store.upsert_google_user(
+            google_sub="sub-bob-include",
+            email="bob@example.com",
+            name="Bob",
+            picture="",
+        )
+        bob_token = auth_store.create_token(bob.id, "bob-ci")
+        auth_store.record_usage(
+            user_id=bob.id,
+            token_id=bob_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            total_tokens=1_000,
+        )
 
         default_rows = user_client.get("/onboarding/leaderboard").json()
         wide_rows = user_client.get("/onboarding/leaderboard?include_admins=1").json()
 
-        assert default_rows == []
-        assert [row["email"] for row in wide_rows] == ["alice@example.com"]
+        assert [row["email"] for row in default_rows] == ["bob@example.com"]
+        assert [row["email"] for row in wide_rows] == [
+            "alice@example.com",
+            "bob@example.com",
+        ]
         assert wide_rows[0]["total_tokens"] == 999_000
+        assert wide_rows[0]["token_count"] == 1
+        assert wide_rows[0]["active_token_count"] == 1
+        assert wide_rows[1]["total_tokens"] == 1_000
 
     def test_local_admin_session_gets_the_leaderboard(self, app: FastAPI) -> None:
         client = TestClient(app)
@@ -1285,6 +1305,10 @@ class TestLeaderboard:
         assert response.status_code == 200
         assert "Usage leaderboard" in response.text
         assert 'id="token-form"' not in response.text
+        # The local-admin session is an admin viewer: it gets the Include
+        # admin users toggle and may widen the ranking (RFE #271).
+        assert 'id="include-admins"' in response.text
+        assert client.get("/onboarding/leaderboard?include_admins=1").status_code == 200
 
     def test_basic_admin_is_redirected_to_dashboard(self, client: TestClient) -> None:
         # HTTP Basic carries no cookie for the page's own requests, so the

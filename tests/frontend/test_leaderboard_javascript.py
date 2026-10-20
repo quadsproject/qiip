@@ -133,7 +133,7 @@ const payloads = {
     token: TOKEN,
   },
   "/onboarding/leaderboard": LEADERBOARD_ROWS,
-  "/onboarding/leaderboard?include_admins=1": LEADERBOARD_ROWS,
+  "/onboarding/leaderboard?include_admins=1": HAVE_INCLUDE ? INCLUDE_ROWS : undefined,
   "/onboarding/token": { name: "default" },
   "/onboarding/token/reveal": { token: "qiip_revealed_value" },
 };
@@ -269,9 +269,11 @@ vm.runInContext(source, sandbox);
   }
 
   // Admin view only: the Include admin users toggle refetches with the
-  // parameter and swaps the note phrasing (RFE #271).
+  // parameter and swaps the note phrasing; unchecking restores the default
+  // scope (RFE #271 criteria 1-4).
   const includeToggle = byId("include-admins");
   const noteBefore = byId("board-note").textContent;
+  let uncheck = null;
   if (includeToggle) {
     includeToggle.checked = true;
     await includeToggle.listeners.change({});
@@ -283,7 +285,24 @@ vm.runInContext(source, sandbox);
       return call.url === "/onboarding/leaderboard?include_admins=1";
     }).length,
     note: byId("board-note").textContent,
+    users: users(),
+    toasts: toasts.slice(),
   };
+  if (includeToggle) {
+    const plainBefore = calls.filter(function (call) {
+      return call.url === "/onboarding/leaderboard";
+    }).length;
+    includeToggle.checked = false;
+    await includeToggle.listeners.change({});
+    await new Promise(function (resolve) { setTimeout(resolve, 20); });
+    uncheck = {
+      plainFetches: calls.filter(function (call) {
+        return call.url === "/onboarding/leaderboard";
+      }).length - plainBefore,
+      note: byId("board-note").textContent,
+      users: users(),
+    };
+  }
 
   process.stdout.write(JSON.stringify({
     ranks: snapshot.ranks,
@@ -305,6 +324,7 @@ vm.runInContext(source, sandbox);
     fetches: calls.map(function (call) { return call.url; }),
     errorBannerText: byId("error-banner").textContent,
     include: include,
+    uncheck: uncheck,
     copy: copy,
     tokenRows: ADMIN_VIEW ? [] : byId("tokens-table-body").children.map(function (row) {
       return row.children[0] ? row.children[0].textContent : "";
@@ -324,6 +344,8 @@ def _run(
     token: dict[str, Any] | None = None,
     tokens_sort_index: int = -1,
     admin_view: bool = False,
+    include_users: list[dict[str, Any]] | None = None,
+    include_ok: bool = True,
     lang: str = "en_US.UTF-8",
 ) -> dict[str, Any]:
     node = shutil.which("node")
@@ -335,6 +357,8 @@ def _run(
         .replace("SORT_INDEX", str(sort_index))
         .replace("CLICK_COUNT", str(click_count))
         .replace("LEADERBOARD_ROWS", json.dumps(users))
+        .replace("INCLUDE_ROWS", json.dumps(include_users or users))
+        .replace("HAVE_INCLUDE", "true" if include_ok else "false")
         .replace("TOKEN", json.dumps(token))
     )
     result = subprocess.run(
@@ -513,14 +537,15 @@ def test_admin_view_renders_the_ranking_alone() -> None:
 
     assert result["users"] == ["Bo", "Ann"]
     assert result["aria"][6] == "descending"
-    assert result["leaderboardFetches"] == 1
+    assert result["leaderboardFetches"] == 2
     # The ranking alone loads: no identity, state, token or config request.
-    # (The admin harness then works its Include admin users toggle, which
-    # refetches with the widen parameter -- RFE #271.)
-    assert set(result["fetches"]) == {
+    # (The admin harness then works its Include admin users toggle: one
+    # widen fetch, then one plain fetch from unchecking -- RFE #271.)
+    assert result["fetches"] == [
         "/onboarding/leaderboard",
         "/onboarding/leaderboard?include_admins=1",
-    }
+        "/onboarding/leaderboard",
+    ]
     assert result["errorBannerText"] == ""
     assert result["tokenRows"] == []
 
@@ -594,13 +619,45 @@ def test_legacy_token_has_no_copy_icon_and_explains_itself() -> None:
 
 def test_admin_toggle_fetches_with_include_and_swaps_note() -> None:
     """The admin view's Include admin users checkbox refetches the ranking
-    with include_admins=1 and the note says admins included (RFE #271)."""
-    result = _run([_user(1, "Bo", 30), _user(2, "Ann", 10)], admin_view=True)
+    with include_admins=1, repaints the widened board, and unchecking
+    restores the default scope (RFE #271 criteria 1-4)."""
+    narrow = [_user(1, "Bo", 30), _user(2, "Ann", 10)]
+    wide = [
+        _user(3, "Root", 5000),
+        _user(1, "Bo", 30),
+        _user(2, "Ann", 10),
+    ]
+    result = _run(narrow, include_users=wide, admin_view=True)
 
     include = result["include"]
     assert include["before"].endswith("users ranked by total tokens (admins excluded)")
     assert include["fetches"] == 1
     assert "users ranked by total tokens (admins included)" in include["note"]
+    # The widened payload (not just a URL swap) repaints the table.
+    assert include["users"] == ["Root", "Bo", "Ann"]
+
+    uncheck = result["uncheck"]
+    assert uncheck["plainFetches"] == 1
+    assert uncheck["note"].endswith("users ranked by total tokens (admins excluded)")
+    assert uncheck["users"] == ["Bo", "Ann"]
+
+
+def test_admin_toggle_failure_reports_toast_and_keeps_scope() -> None:
+    """A failed toggle fetch surfaces a toast and leaves the board on the
+    scope that is actually rendered (RFE #271)."""
+    result = _run(
+        [_user(1, "Bo", 30), _user(2, "Ann", 10)],
+        admin_view=True,
+        include_ok=False,
+    )
+
+    include = result["include"]
+    assert include["note"].endswith("users ranked by total tokens (admins excluded)")
+    assert include["users"] == ["Bo", "Ann"]
+    assert include["toasts"][0][0].startswith("Could not update the leaderboard:")
+    assert include["toasts"][0][1] == "error"
+    # The default-scope render is untouched by the failed toggle.
+    assert result["uncheck"]["users"] == ["Bo", "Ann"]
 
 
 def test_normal_view_has_no_include_toggle() -> None:

@@ -341,13 +341,20 @@
     updateDownloadButton();
   }
 
+  // Monotonic request id so a stale leaderboard response can never repaint
+  // the board over a newer scope the viewer already switched to (same pattern
+  // as admin_tokens.js).
+  let leaderboardRequest = 0;
+
   async function loadLeaderboard() {
+    const request = ++leaderboardRequest;
     const include = $("include-admins");
     const url =
       include && include.checked
         ? "/onboarding/leaderboard?include_admins=1"
         : "/onboarding/leaderboard";
     const rows = await api("GET", url);
+    if (request !== leaderboardRequest) return;
     renderLeaderboard(rows);
   }
 
@@ -355,7 +362,13 @@
     enableTableSort();
     const includeToggle = $("include-admins");
     if (includeToggle) {
-      includeToggle.addEventListener("change", loadLeaderboard);
+      includeToggle.addEventListener("change", async () => {
+        try {
+          await loadLeaderboard();
+        } catch (err) {
+          showToast("Could not update the leaderboard: " + err.message, "error");
+        }
+      });
     }
     // The token manager is the normal-user half of the page: the admin
     // shell has no token form, and the onboarding endpoints refuse admins,

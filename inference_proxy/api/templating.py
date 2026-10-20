@@ -138,8 +138,9 @@ def leaderboard_redirect(request: Request) -> str | None:
     """Where a viewer who cannot render ``/leaderboard`` is sent, else None.
 
     One rule for the page route and the navbar link, so the two never
-    disagree: an admin with a browser session sees the non-admin ranking, a
-    normal user without full access sees the page, the HTTP Basic admin is
+    disagree: an admin with a browser session sees the non-admin ranking
+    (which they may widen with the Include admin users checkbox, RFE #271),
+    a normal user without full access sees the page, the HTTP Basic admin is
     sent to ``/dashboard`` (no cookie for the page's own requests) and the
     full-access user to ``/profile`` (their token manager lives there, and
     the page's onboarding endpoints refuse them). Anonymous visitors get the
