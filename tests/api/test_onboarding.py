@@ -1295,7 +1295,9 @@ class TestLeaderboard:
         assert wide_rows[0]["active_token_count"] == 1
         assert wide_rows[1]["total_tokens"] == 1_000
 
-    def test_local_admin_session_gets_the_leaderboard(self, app: FastAPI) -> None:
+    def test_local_admin_session_gets_the_leaderboard(
+        self, app: FastAPI, auth_store: AuthStore
+    ) -> None:
         client = TestClient(app)
         client.post(
             "/auth/local-admin",
@@ -1308,7 +1310,27 @@ class TestLeaderboard:
         # The local-admin session is an admin viewer: it gets the Include
         # admin users toggle and may widen the ranking (RFE #271).
         assert 'id="include-admins"' in response.text
-        assert client.get("/onboarding/leaderboard?include_admins=1").status_code == 200
+        other_admin = auth_store.upsert_google_user(
+            google_sub="sub-local-admin-widen",
+            email="local-admin-widen@example.com",
+            name="Widen Admin",
+            picture="",
+        )
+        auth_store.set_user_admin(other_admin.id, True)
+        other_token = auth_store.create_token(other_admin.id, "local-admin-widen-ci")
+        auth_store.record_usage(
+            user_id=other_admin.id,
+            token_id=other_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            total_tokens=5_000,
+        )
+        default_rows = client.get("/onboarding/leaderboard").json()
+        wide_rows = client.get("/onboarding/leaderboard?include_admins=1").json()
+        assert "local-admin-widen@example.com" not in {
+            row["email"] for row in default_rows
+        }
+        assert "local-admin-widen@example.com" in {row["email"] for row in wide_rows}
 
     def test_basic_admin_is_redirected_to_dashboard(self, client: TestClient) -> None:
         # HTTP Basic carries no cookie for the page's own requests, so the

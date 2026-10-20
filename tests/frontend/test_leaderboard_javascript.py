@@ -309,7 +309,18 @@ vm.runInContext(source, sandbox);
   const noteBefore = byId("board-note").textContent;
   let uncheck = null;
   if (includeToggle) {
-    if (OVERLAP) {
+    if (STALE_SUCCESS) {
+      // The widen stays in flight while the viewer unchecks and that plain
+      // fetch fails; the late widen success must sync the control and note
+      // to the scope it renders (RFE #271).
+      includeToggle.checked = true;
+      const widen = includeToggle.listeners.change({});
+      includeToggle.checked = false;
+      await includeToggle.listeners.change({});
+      if (deferredInclude.length > 0) deferredInclude[0]();
+      await widen;
+      await new Promise(function (resolve) { setTimeout(resolve, 20); });
+    } else if (OVERLAP) {
       // The widen fetch (first include, held by DEFER_INCLUDE) stays in
       // flight while the viewer unchecks (a newer request); then a final
       // re-check starts while the stale widen is still held, so the stale
@@ -422,6 +433,7 @@ def _run(
     defer_include: bool = False,
     fail_include_first: bool = False,
     overlap: bool = False,
+    stale_success: bool = False,
     lang: str = "en_US.UTF-8",
 ) -> dict[str, Any]:
     node = shutil.which("node")
@@ -440,6 +452,7 @@ def _run(
         .replace("DEFER_INCLUDE", "true" if defer_include else "false")
         .replace("FAIL_INCLUDE_FIRST", "true" if fail_include_first else "false")
         .replace("OVERLAP", "true" if overlap else "false")
+        .replace("STALE_SUCCESS", "true" if stale_success else "false")
         .replace("TOKEN", json.dumps(token))
     )
     result = subprocess.run(
@@ -810,6 +823,30 @@ def test_stale_failed_toggle_does_not_clobber_newer_toggle() -> None:
     assert include["users"] == ["Root", "Bo", "Ann"]
     assert include["toasts"][0][0].startswith("Could not update the leaderboard:")
     assert include["toasts"][0][1] == "error"
+
+
+def test_stale_widen_success_syncs_control_and_note() -> None:
+    """A widen held in flight must sync the checkbox and note when it wins
+    after the viewer's uncheck fetch failed (RFE #271)."""
+    narrow = [_user(1, "Bo", 30), _user(2, "Ann", 10)]
+    wide = [
+        _user(3, "Root", 5000),
+        _user(1, "Bo", 30),
+        _user(2, "Ann", 10),
+    ]
+    result = _run(
+        narrow,
+        include_users=wide,
+        admin_view=True,
+        defer_include=True,
+        fail_plain_after=1,
+        stale_success=True,
+    )
+
+    include = result["include"]
+    assert include["checked"] is True
+    assert include["note"].endswith("users ranked by total tokens (admins included)")
+    assert include["users"] == ["Root", "Bo", "Ann"]
 
 
 def test_stale_init_response_does_not_repaint_widened_scope() -> None:
