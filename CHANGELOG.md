@@ -2,6 +2,41 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.25 (2026-10-20)
+
+### Bug Fixes
+
+- Harden leaderboard toggle, cover review criteria, update docs (refs #271)
+  ([`f2f4d4c`](https://github.com/quadsproject/qiip/commit/f2f4d4cce4c97d6059c13424520145dfdf3fe04b))
+
+- Render last successful response and guard stale failure revert (refs #271)
+  ([`abb6159`](https://github.com/quadsproject/qiip/commit/abb615947d4884ee950b2e81e8c3930e1d880d00))
+
+- Restore rendered scope on toggle failure; cover double-failure desync (refs #271)
+  ([`60ce3c9`](https://github.com/quadsproject/qiip/commit/60ce3c9b76d099dd1112e0e62381a4823677e402))
+
+- Revert toggle control on failed fetch; pin request-id guard in harness (refs #271)
+  ([`b594513`](https://github.com/quadsproject/qiip/commit/b5945134b99215df5001eff5cfb70ef1f5fcd925))
+
+- Sync leaderboard scope and cover local-admin widen
+  ([`f28b736`](https://github.com/quadsproject/qiip/commit/f28b73681c50ae1cb855aaca091ba64d93584a9d))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`bfd1ee4`](https://github.com/quadsproject/qiip/commit/bfd1ee4741a25459f09464014816c3123ee81242))
+
+### Features
+
+- Add admin toggle to include admins in usage leaderboard (fixes #271)
+  ([`cca9722`](https://github.com/quadsproject/qiip/commit/cca9722faad4c24a94eb9f30e57b9cf685c7d142))
+
+### Testing
+
+- Exercise the stale-failure guard with overlapping in-flight toggles (refs #271)
+  ([`991bcbb`](https://github.com/quadsproject/qiip/commit/991bcbb174c1bc11ec978d4a31eb4cbd52748d0e))
+
+
 ## v0.2.0-dev.24 (2026-10-20)
 
 ### Chores
