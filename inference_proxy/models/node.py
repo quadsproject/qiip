@@ -490,6 +490,39 @@ class VllmGPUState(BaseModel):
     free_mib: int = Field(ge=0)
 
 
+class VllmServingVerification(BaseModel):
+    """Timestamped proof that this attempt's server can serve inference.
+
+    The inference probe records latency and completion metadata only; the
+    generated text is not asserted, so any valid model response passes.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    served_model: str = Field(min_length=1, max_length=512)
+    runtime_version: str = Field(min_length=1, max_length=128)
+    generation_id: str | None = Field(default=None, max_length=64)
+    runtime_path: str | None = Field(default=None, max_length=1024)
+    model_revision: str | None = Field(default=None, max_length=128)
+    model_max_model_len: int | None = Field(default=None, ge=1)
+    process_id: int = Field(ge=1)
+    process_age_seconds: int = Field(ge=0)
+    task: str = Field(min_length=1, max_length=32)
+    endpoint: str = Field(min_length=1, max_length=128)
+    latency_ms: float = Field(ge=0)
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    completion_tokens: int | None = Field(default=None, ge=0)
+    finish_reason: str | None = Field(default=None, max_length=64)
+    verified_at: datetime
+
+    @field_validator("verified_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("verified_at must include a timezone")
+        return value
+
+
 class VllmRuntimeState(BaseModel):
     """Verified vLLM plan, its adjustments, and the post-load observation."""
 
@@ -503,6 +536,7 @@ class VllmRuntimeState(BaseModel):
     reason: str = Field(min_length=1, max_length=512)
     approximate: bool = False
     gpus: tuple[VllmGPUState, ...] = Field(min_length=1)
+    serving: VllmServingVerification | None = None
     observed_at: datetime
 
     @field_validator("observed_at")
@@ -511,6 +545,16 @@ class VllmRuntimeState(BaseModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("observed_at must include a timezone")
         return value
+
+    @model_serializer(mode="wrap")
+    def serialize_state(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        """Keep the wire shape of nodes verified before serving evidence."""
+        values: dict[str, object] = handler(self)
+        if values.get("serving") is None:
+            values.pop("serving", None)
+        return values
 
 
 class NodeGPU(BaseModel):

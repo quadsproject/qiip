@@ -352,6 +352,17 @@ class ProvisioningSettings(BaseModel):
     # retries). Attempt zero is the initial memory-aware plan; each retry
     # applies one logged adjustment from the ordered policy.
     vllm_memory_retry_max_attempts: int = Field(default=4, ge=1, le=5)
+    # Issue #134: a provisioned vLLM node is only routable after the server
+    # proves its identity and answers one bounded inference request. These
+    # bounds apply after /health succeeds, so they are short compared to the
+    # model-loading poll above.
+    vllm_verify_timeout: float = Field(default=30.0, gt=0, le=300)
+    vllm_inference_probe_timeout: float = Field(default=120.0, gt=0, le=600)
+    vllm_inference_probe_max_tokens: int = Field(default=1, ge=1, le=16)
+    # Process age (ps etimes) advances on the node's own monotonic clock, so
+    # this only covers rounding and the gap between recording the launch
+    # timestamp and process creation.
+    vllm_process_start_slack: float = Field(default=30.0, ge=0, le=3600)
     # Issue #133: stage-specific total deadline for the vLLM setup phase
     # (package download, dependency resolution, and virtualenv sync). llama.cpp
     # keeps its longer build deadline in ``llamacpp_setup_timeout``.
