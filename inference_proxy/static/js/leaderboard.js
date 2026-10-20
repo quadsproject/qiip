@@ -343,12 +343,13 @@
 
   // Monotonic request id so a stale leaderboard response can never repaint
   // the board over a newer scope the viewer already switched to (same pattern
-  // as admin_tokens.js). ``renderedRequest`` is the id of the last request
-  // that actually rendered: a response is dropped only when a *newer*
-  // render happened, never when a newer request merely started and failed.
-  // ``renderedInclude`` is the scope of that render: a failed toggle restores
-  // the control to it, so the checkbox and the board never disagree (even
-  // after several failures).
+  // as admin_tokens.js). A successful response is dropped only when a *newer
+  // render* happened; a failed response is swallowed when a newer request has
+  // started, because that request owns the page state and will render or
+  // report its own failure. If the newer request also fails before anything
+  // renders, its failure raises the page banner and no "Updated" stamp is
+  // left over the skeleton. ``renderedInclude`` is the scope of the last
+  // successful render: a failed newest toggle restores the control to it.
   let leaderboardRequest = 0;
   let renderedRequest = 0;
   let renderedInclude = false;
@@ -360,11 +361,22 @@
     const url = wanted
       ? "/onboarding/leaderboard?include_admins=1"
       : "/onboarding/leaderboard";
-    const rows = await api("GET", url);
+    let rows;
+    try {
+      rows = await api("GET", url);
+    } catch (err) {
+      // A superseded failure must not report: the newer request owns the
+      // page state and will render or report its own failure.
+      if (request !== leaderboardRequest) return;
+      throw err;
+    }
     if (request < renderedRequest) return;
     renderedRequest = request;
     renderedInclude = wanted;
     if (include) include.checked = wanted;
+    $("last-updated").textContent = "Updated " + new Date().toLocaleTimeString();
+    $("error-banner").textContent = "";
+    $("error-banner").hidden = true;
     renderLeaderboard(rows, wanted);
   }
 
@@ -373,15 +385,17 @@
     const includeToggle = $("include-admins");
     if (includeToggle) {
       includeToggle.addEventListener("change", async () => {
-        const requestId = leaderboardRequest + 1;
         try {
           await loadLeaderboard();
         } catch (err) {
-          // Put the control back in step with the board (the last successful
-          // render), but only when this failure is still the newest request:
-          // a stale failure must not clobber a newer in-flight action.
-          if (requestId === leaderboardRequest) {
-            includeToggle.checked = renderedInclude;
+          // The board still renders the last successful scope; a stale
+          // failure never reaches this catch (loadLeaderboard filters it).
+          // If nothing has rendered yet, the page banner is the durable
+          // signal; otherwise the board stays and the toast is enough.
+          includeToggle.checked = renderedInclude;
+          if (renderedRequest === 0) {
+            $("error-banner").textContent = "Could not load the page: " + err.message;
+            $("error-banner").hidden = false;
           }
           showToast("Could not update the leaderboard: " + err.message, "error");
         }
@@ -398,8 +412,6 @@
         await loadState();
       }
       await loadLeaderboard();
-      $("last-updated").textContent =
-        "Updated " + new Date().toLocaleTimeString();
     } catch (err) {
       $("error-banner").textContent = "Could not load the page: " + err.message;
       $("error-banner").hidden = false;
