@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.24 (2026-10-20)
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`154971a`](https://github.com/quadsproject/qiip/commit/154971ad05619a25b7b01abca243e11be9eef238))
+
+### Features
+
+- Show token cost on the leaderboard
+  ([`ff311dd`](https://github.com/quadsproject/qiip/commit/ff311dda68e0f077da4bd7edc09adf5b05c9e33d))
+
+
 ## v0.2.0-dev.23 (2026-10-16)
 
 ### Bug Fixes
