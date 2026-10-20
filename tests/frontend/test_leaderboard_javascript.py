@@ -39,6 +39,7 @@ const toasts = [];
 const clipboardWrites = [];
 const deferred = [];
 const deferredInclude = [];
+const BOTH_FAIL = __BOTH_FAIL__;
 
 class Element {
   constructor(tag) {
@@ -122,8 +123,9 @@ function buildHead(id, kinds) {
 }
 
 buildHead("leaderboard-head", [null, "text", "number", "number", "number", "number", "number", "number"]);
-// The template ships the server's ranking state on Total tokens.
+// The template ships the ranking state and a hidden error banner.
 byId("leaderboard-head").children[0].children[6].setAttribute("aria-sort", "descending");
+byId("error-banner").hidden = true;
 if (!ADMIN_VIEW) buildHead("tokens-head", ["text", "text", "date", "date", "text", "text", null]);
 
 const payloads = {
@@ -168,7 +170,10 @@ const sandbox = {
     const includeIndex = calls.filter(function (call) {
       return call.url === "/onboarding/leaderboard?include_admins=1";
     }).length - 1;
-    const failed = (FAIL_PLAIN_AFTER >= 0
+    const failed = (FAIL_FIRST_PLAIN
+        && url === "/onboarding/leaderboard"
+        && plainIndex === 0)
+      || (FAIL_PLAIN_AFTER >= 0
         && url === "/onboarding/leaderboard"
         && plainIndex >= FAIL_PLAIN_AFTER)
       || (FAIL_INCLUDE_FIRST
@@ -297,7 +302,7 @@ vm.runInContext(source, sandbox);
 
   // Creating a token reloads the leaderboard, so the table renders again and
   // the sorter has to re-apply the active choice over the fresh rows.
-  if (!ADMIN_VIEW) {
+  if (!ADMIN_VIEW && !NO_INTERACTION) {
     byId("token-form").listeners.submit({ preventDefault: function () {} });
     await new Promise(function (resolve) { setTimeout(resolve, 20); });
   }
@@ -308,8 +313,34 @@ vm.runInContext(source, sandbox);
   const includeToggle = byId("include-admins");
   const noteBefore = byId("board-note").textContent;
   let uncheck = null;
-  if (includeToggle) {
-    if (STALE_SUCCESS) {
+  if (includeToggle && !NO_INTERACTION) {
+    if (BOTH_FAIL) {
+      // Hold the init fetch, check the box, then fail the widen and the init
+      // in the requested completion order. Nothing renders, so the newest
+      // failure must raise the page banner and no timestamp may be stamped.
+      includeToggle.checked = true;
+      const widen = includeToggle.listeners.change({});
+      if (BOTH_FAIL === "init-last") {
+        if (deferredInclude.length > 0) deferredInclude[0]();
+        await widen;
+        if (deferred.length > 0) deferred[0]();
+      } else {
+        if (deferred.length > 0) deferred[0]();
+        if (deferredInclude.length > 0) deferredInclude[0]();
+        await widen;
+      }
+      await new Promise(function (resolve) { setTimeout(resolve, 20); });
+    } else if (STALE_INIT) {
+      // The widen is held while the init fetch fails; the init failure is
+      // superseded by the newer widen request and must not raise the banner.
+      includeToggle.checked = true;
+      const widen = includeToggle.listeners.change({});
+      if (deferred.length > 0) deferred[0]();
+      await new Promise(function (resolve) { setTimeout(resolve, 20); });
+      if (deferredInclude.length > 0) deferredInclude[0]();
+      await widen;
+      await new Promise(function (resolve) { setTimeout(resolve, 20); });
+    } else if (STALE_SUCCESS) {
       // The widen stays in flight while the viewer unchecks and that plain
       // fetch fails; the late widen success must sync the control and note
       // to the scope it renders (RFE #271).
@@ -324,10 +355,9 @@ vm.runInContext(source, sandbox);
       // The widen fetch (first include, held by DEFER_INCLUDE) stays in
       // flight while the viewer unchecks (a newer request); then a final
       // re-check starts while the stale widen is still held, so the stale
-      // failure lands with the re-check in flight. Without the newest-
-      // request guard the catch rewrites the checkbox to the last rendered
-      // scope under the re-check, which then renders widened rows against
-      // an unchecked box (RFE #271).
+      // failure lands with the re-check in flight. loadLeaderboard swallows
+      // that superseded failure, so the re-check owns the state and renders
+      // the widened scope without a toast (RFE #271, issue #274).
       includeToggle.checked = true;
       const widen = includeToggle.listeners.change({});
       includeToggle.checked = false;
@@ -359,7 +389,7 @@ vm.runInContext(source, sandbox);
   // now that the widen response has rendered, and confirm the stale response
   // cannot repaint the board or the note (RFE #271).
   let defer = null;
-  if (deferred.length > 0) {
+  if (deferred.length > 0 && !STALE_INIT && !BOTH_FAIL) {
     deferred[0]();
     await new Promise(function (resolve) { setTimeout(resolve, 20); });
     defer = {
@@ -367,7 +397,7 @@ vm.runInContext(source, sandbox);
       users: users(),
     };
   }
-  if (includeToggle && !OVERLAP) {
+  if (includeToggle && !OVERLAP && !NO_INTERACTION && !STALE_INIT && !BOTH_FAIL) {
     const plainBefore = calls.filter(function (call) {
       return call.url === "/onboarding/leaderboard";
     }).length;
@@ -404,6 +434,8 @@ vm.runInContext(source, sandbox);
     }).length,
     fetches: calls.map(function (call) { return call.url; }),
     errorBannerText: byId("error-banner").textContent,
+    errorBannerHidden: byId("error-banner").hidden,
+    lastUpdated: byId("last-updated").textContent,
     include: include,
     defer: defer,
     uncheck: uncheck,
@@ -434,6 +466,10 @@ def _run(
     fail_include_first: bool = False,
     overlap: bool = False,
     stale_success: bool = False,
+    fail_first_plain: bool = False,
+    no_interaction: bool = False,
+    stale_init: bool = False,
+    both_fail: str = "",
     lang: str = "en_US.UTF-8",
 ) -> dict[str, Any]:
     node = shutil.which("node")
@@ -453,6 +489,10 @@ def _run(
         .replace("FAIL_INCLUDE_FIRST", "true" if fail_include_first else "false")
         .replace("OVERLAP", "true" if overlap else "false")
         .replace("STALE_SUCCESS", "true" if stale_success else "false")
+        .replace("FAIL_FIRST_PLAIN", "true" if fail_first_plain else "false")
+        .replace("NO_INTERACTION", "true" if no_interaction else "false")
+        .replace("STALE_INIT", "true" if stale_init else "false")
+        .replace("__BOTH_FAIL__", json.dumps(both_fail))
         .replace("TOKEN", json.dumps(token))
     )
     result = subprocess.run(
@@ -821,8 +861,9 @@ def test_stale_failed_toggle_does_not_clobber_newer_toggle() -> None:
     assert include["checked"] is True
     assert include["note"].endswith("users ranked by total tokens (admins included)")
     assert include["users"] == ["Root", "Bo", "Ann"]
-    assert include["toasts"][0][0].startswith("Could not update the leaderboard:")
-    assert include["toasts"][0][1] == "error"
+    # The superseded failure is swallowed: the newer request owns the state,
+    # so the stale widen reports no toast.
+    assert include["toasts"] == []
 
 
 def test_stale_widen_success_syncs_control_and_note() -> None:
@@ -847,6 +888,100 @@ def test_stale_widen_success_syncs_control_and_note() -> None:
     assert include["checked"] is True
     assert include["note"].endswith("users ranked by total tokens (admins included)")
     assert include["users"] == ["Root", "Bo", "Ann"]
+
+
+@pytest.mark.parametrize("order", ["init-last", "widen-last"])
+def test_both_fail_before_any_render_shows_banner_and_no_timestamp(order: str) -> None:
+    """When the init fetch and the first toggle both fail before anything
+    renders, the banner reports the newest failure and no stale 'Updated'
+    stamp is left over the skeleton (issue #274)."""
+    result = _run(
+        [_user(1, "Bo", 30)],
+        admin_view=True,
+        defer_first=True,
+        fail_first_plain=True,
+        defer_include=True,
+        fail_include_first=True,
+        both_fail=order,
+    )
+
+    assert result["errorBannerText"].startswith("Could not load the page:")
+    assert result["errorBannerHidden"] is False
+    assert result["lastUpdated"] == ""
+    assert result["include"]["checked"] is False
+    assert result["include"]["users"] == []
+    assert result["include"]["toasts"][0][0].startswith(
+        "Could not update the leaderboard:"
+    )
+
+
+def test_stale_init_failure_does_not_show_banner_over_rendered_board() -> None:
+    """The initial fetch failing after a toggle rendered must not unhide the
+    page error banner over a correct board (issue #274)."""
+    narrow = [_user(1, "Bo", 30), _user(2, "Ann", 10)]
+    wide = [
+        _user(3, "Root", 5000),
+        _user(1, "Bo", 30),
+        _user(2, "Ann", 10),
+    ]
+    result = _run(
+        narrow,
+        include_users=wide,
+        admin_view=True,
+        defer_first=True,
+        fail_first_plain=True,
+    )
+
+    defer = result["defer"]
+    assert defer["note"].endswith("users ranked by total tokens (admins included)")
+    assert defer["users"] == ["Root", "Bo", "Ann"]
+    assert result["errorBannerText"] == ""
+    assert result["errorBannerHidden"] is True
+    assert result["lastUpdated"].startswith("Updated ")
+
+
+def test_init_failure_while_widen_in_flight_does_not_show_banner() -> None:
+    """A superseded init failure that lands before the widen renders must not
+    raise the banner once the widen succeeds (issue #274)."""
+    narrow = [_user(1, "Bo", 30), _user(2, "Ann", 10)]
+    wide = [
+        _user(3, "Root", 5000),
+        _user(1, "Bo", 30),
+        _user(2, "Ann", 10),
+    ]
+    result = _run(
+        narrow,
+        include_users=wide,
+        admin_view=True,
+        defer_first=True,
+        defer_include=True,
+        fail_first_plain=True,
+        stale_init=True,
+    )
+
+    include = result["include"]
+    assert include["checked"] is True
+    assert include["note"].endswith("users ranked by total tokens (admins included)")
+    assert include["users"] == ["Root", "Bo", "Ann"]
+    assert result["errorBannerText"] == ""
+    assert result["errorBannerHidden"] is True
+    assert result["lastUpdated"].startswith("Updated ")
+
+
+def test_newest_init_failure_still_shows_the_banner() -> None:
+    """A newest initial fetch failure still reports through the page banner."""
+    result = _run(
+        [_user(1, "Bo", 30)],
+        admin_view=True,
+        defer_first=True,
+        fail_first_plain=True,
+        no_interaction=True,
+    )
+
+    assert result["defer"]["users"] == []
+    assert result["errorBannerText"].startswith("Could not load the page:")
+    assert result["errorBannerHidden"] is False
+    assert result["lastUpdated"] == ""
 
 
 def test_stale_init_response_does_not_repaint_widened_scope() -> None:
