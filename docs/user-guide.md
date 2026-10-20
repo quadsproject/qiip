@@ -89,7 +89,8 @@ Admins see the same ranking; the token sections below are for normal users,
 and admins manage their tokens on the profile page.
 
 - **Usage leaderboard**: every non-admin user ranked by total tokens.
-  Admin users and their usage are never shown. Your own row is marked
+  Admin rows are excluded by default; an admin viewer can opt in with the
+  **Include admin users** checkbox (RFE #271). Your own row is marked
   `(you)`. The `Rank` column is that standing, so it stays with each user
   when you sort by another column. Each row also shows the estimated
   premium-equivalent cost at the configured pricing model, labelled
