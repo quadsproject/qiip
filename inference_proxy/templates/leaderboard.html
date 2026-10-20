@@ -20,7 +20,7 @@
         <header class="dashboard-header">
             <div>
                 <h1>Leaderboard</h1>
-                <p id="board-note">Loading...</p>
+                <p id="board-note" role="status" aria-live="polite">Loading...</p>
                 {% if viewer_role == "admin" %}
                 <label class="muted-status board-toggle" for="include-admins">
                     <input type="checkbox" id="include-admins" name="include_admins">

@@ -590,10 +590,11 @@ async def leaderboard_page(
     """Render the leaderboard + token dashboard HTML shell.
 
     Admins keep every normal-user view: an admin with a browser session
-    sees the non-admin ranking, and the token manager half of the page stays
-    with normal users because the onboarding endpoints refuse admins (their
-    token manager is ``/profile``). ``leaderboard_redirect`` owns who is
-    sent elsewhere (the HTTP Basic admin to ``/dashboard``, full-access
+    sees the non-admin ranking unless they opt in with the **Include admin
+    users** checkbox (RFE #271), and the token manager half of the page
+    stays with normal users because the onboarding endpoints refuse admins
+    (their token manager is ``/profile``). ``leaderboard_redirect`` owns who
+    is sent elsewhere (the HTTP Basic admin to ``/dashboard``, full-access
     users to ``/profile``); the navbar link uses the same rule. Anonymous
     visitors get the sign-in page.
     """
