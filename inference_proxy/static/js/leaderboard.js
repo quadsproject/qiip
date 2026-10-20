@@ -343,18 +343,22 @@
 
   // Monotonic request id so a stale leaderboard response can never repaint
   // the board over a newer scope the viewer already switched to (same pattern
-  // as admin_tokens.js).
+  // as admin_tokens.js). ``renderedInclude`` is the scope of the last
+  // successful render: a failed toggle restores the control to it, so the
+  // checkbox and the board never disagree (even after several failures).
   let leaderboardRequest = 0;
+  let renderedInclude = false;
 
   async function loadLeaderboard() {
     const request = ++leaderboardRequest;
     const include = $("include-admins");
-    const url =
-      include && include.checked
-        ? "/onboarding/leaderboard?include_admins=1"
-        : "/onboarding/leaderboard";
+    const wanted = !!(include && include.checked);
+    const url = wanted
+      ? "/onboarding/leaderboard?include_admins=1"
+      : "/onboarding/leaderboard";
     const rows = await api("GET", url);
     if (request !== leaderboardRequest) return;
+    renderedInclude = wanted;
     renderLeaderboard(rows);
   }
 
@@ -363,15 +367,15 @@
     const includeToggle = $("include-admins");
     if (includeToggle) {
       includeToggle.addEventListener("change", async () => {
-        const attempted = includeToggle.checked;
+        const requestId = leaderboardRequest + 1;
         try {
           await loadLeaderboard();
         } catch (err) {
-          // The board still renders the last successful scope; put the
-          // control back in step with it -- unless the viewer already
-          // flipped it again (a newer request owns the state).
-          if (includeToggle.checked === attempted) {
-            includeToggle.checked = !attempted;
+          // Put the control back in step with the board (the last successful
+          // render), but only when this failure is still the newest request:
+          // a stale failure must not clobber a newer in-flight action.
+          if (requestId === leaderboardRequest) {
+            includeToggle.checked = renderedInclude;
           }
           showToast("Could not update the leaderboard: " + err.message, "error");
         }
