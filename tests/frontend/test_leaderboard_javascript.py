@@ -38,6 +38,7 @@ const calls = [];
 const toasts = [];
 const clipboardWrites = [];
 const deferred = [];
+const deferredInclude = [];
 
 class Element {
   constructor(tag) {
@@ -164,9 +165,15 @@ const sandbox = {
     const plainIndex = calls.filter(function (call) {
       return call.url === "/onboarding/leaderboard";
     }).length - 1;
-    const failed = FAIL_PLAIN_AFTER >= 0
-      && url === "/onboarding/leaderboard"
-      && plainIndex >= FAIL_PLAIN_AFTER;
+    const includeIndex = calls.filter(function (call) {
+      return call.url === "/onboarding/leaderboard?include_admins=1";
+    }).length - 1;
+    const failed = (FAIL_PLAIN_AFTER >= 0
+        && url === "/onboarding/leaderboard"
+        && plainIndex >= FAIL_PLAIN_AFTER)
+      || (FAIL_INCLUDE_FIRST
+        && url === "/onboarding/leaderboard?include_admins=1"
+        && includeIndex === 0);
     const respond = function () {
       return {
         ok: !failed && body !== undefined,
@@ -181,6 +188,14 @@ const sandbox = {
       // request-id guard's stale-response path is exercised (RFE #271).
       return new Promise(function (resolve) {
         deferred.push(function () { resolve(respond()); });
+      });
+    }
+    if (DEFER_INCLUDE && url === "/onboarding/leaderboard?include_admins=1"
+        && deferredInclude.length === 0) {
+      // Hold the first widen fetch so a newer toggle can start while it is
+      // still in flight (RFE #271).
+      return new Promise(function (resolve) {
+        deferredInclude.push(function () { resolve(respond()); });
       });
     }
     return respond();
@@ -294,9 +309,25 @@ vm.runInContext(source, sandbox);
   const noteBefore = byId("board-note").textContent;
   let uncheck = null;
   if (includeToggle) {
-    includeToggle.checked = true;
-    await includeToggle.listeners.change({});
-    await new Promise(function (resolve) { setTimeout(resolve, 20); });
+    if (OVERLAP) {
+      // The widen fetch (first include, held by DEFER_INCLUDE) stays in
+      // flight while the viewer unchecks (a newer request); the held widen
+      // response then fails, so its catch runs against a superseded
+      // request id, and a final re-check must still win (RFE #271).
+      includeToggle.checked = true;
+      const widen = includeToggle.listeners.change({});
+      includeToggle.checked = false;
+      await includeToggle.listeners.change({});
+      if (deferredInclude.length > 0) deferredInclude[0]();
+      await widen;
+      includeToggle.checked = true;
+      await includeToggle.listeners.change({});
+      await new Promise(function (resolve) { setTimeout(resolve, 20); });
+    } else {
+      includeToggle.checked = true;
+      await includeToggle.listeners.change({});
+      await new Promise(function (resolve) { setTimeout(resolve, 20); });
+    }
   }
   const include = {
     before: noteBefore,
@@ -320,7 +351,7 @@ vm.runInContext(source, sandbox);
       users: users(),
     };
   }
-  if (includeToggle) {
+  if (includeToggle && !OVERLAP) {
     const plainBefore = calls.filter(function (call) {
       return call.url === "/onboarding/leaderboard";
     }).length;
@@ -383,6 +414,9 @@ def _run(
     include_ok: bool = True,
     defer_first: bool = False,
     fail_plain_after: int = -1,
+    defer_include: bool = False,
+    fail_include_first: bool = False,
+    overlap: bool = False,
     lang: str = "en_US.UTF-8",
 ) -> dict[str, Any]:
     node = shutil.which("node")
@@ -398,6 +432,9 @@ def _run(
         .replace("HAVE_INCLUDE", "true" if include_ok else "false")
         .replace("DEFER_FIRST", "true" if defer_first else "false")
         .replace("FAIL_PLAIN_AFTER", str(fail_plain_after))
+        .replace("DEFER_INCLUDE", "true" if defer_include else "false")
+        .replace("FAIL_INCLUDE_FIRST", "true" if fail_include_first else "false")
+        .replace("OVERLAP", "true" if overlap else "false")
         .replace("TOKEN", json.dumps(token))
     )
     result = subprocess.run(
@@ -723,6 +760,51 @@ def test_two_consecutive_failures_keep_control_on_rendered_scope() -> None:
     assert result["uncheck"]["users"] == ["Bo", "Ann"]
     assert len(result["uncheck"]["toasts"]) == 2
     assert all(toast[1] == "error" for toast in result["uncheck"]["toasts"])
+
+
+def test_failed_newer_toggle_does_not_drop_init_render() -> None:
+    """The only successful response must render even when a newer request
+    started and failed: the init plain fetch resolves after the widen fetch
+    failed and must still paint the default scope (RFE #271)."""
+    result = _run(
+        [_user(1, "Bo", 30), _user(2, "Ann", 10)],
+        admin_view=True,
+        defer_first=True,
+        include_ok=False,
+    )
+
+    defer = result["defer"]
+    assert defer["note"].endswith("users ranked by total tokens (admins excluded)")
+    assert defer["users"] == ["Bo", "Ann"]
+    assert result["errorBannerText"] == ""
+    assert result["include"]["toasts"][0][1] == "error"
+
+
+def test_stale_failed_toggle_does_not_clobber_newer_toggle() -> None:
+    """A failed widen superseded by a newer toggle must not revert the
+    control out from under the newer fetch: the final re-check still wins
+    and renders the widened scope (RFE #271)."""
+    narrow = [_user(1, "Bo", 30), _user(2, "Ann", 10)]
+    wide = [
+        _user(3, "Root", 5000),
+        _user(1, "Bo", 30),
+        _user(2, "Ann", 10),
+    ]
+    result = _run(
+        narrow,
+        include_users=wide,
+        admin_view=True,
+        defer_include=True,
+        fail_include_first=True,
+        overlap=True,
+    )
+
+    include = result["include"]
+    assert include["checked"] is True
+    assert include["note"].endswith("users ranked by total tokens (admins included)")
+    assert include["users"] == ["Root", "Bo", "Ann"]
+    assert include["toasts"][0][0].startswith("Could not update the leaderboard:")
+    assert include["toasts"][0][1] == "error"
 
 
 def test_stale_init_response_does_not_repaint_widened_scope() -> None:
