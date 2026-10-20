@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.26 (2026-10-20)
+
+### Bug Fixes
+
+- Ignore stale leaderboard load failures
+  ([`c2592fd`](https://github.com/quadsproject/qiip/commit/c2592fd8a4f1daa25b4cad5209dcf57dbd69d388))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`19e9a13`](https://github.com/quadsproject/qiip/commit/19e9a137974d0e06e7fddf7c75200df8d3572805))
+
+
 ## v0.2.0-dev.25 (2026-10-20)
 
 ### Bug Fixes
