@@ -343,10 +343,14 @@
 
   // Monotonic request id so a stale leaderboard response can never repaint
   // the board over a newer scope the viewer already switched to (same pattern
-  // as admin_tokens.js). ``renderedInclude`` is the scope of the last
-  // successful render: a failed toggle restores the control to it, so the
-  // checkbox and the board never disagree (even after several failures).
+  // as admin_tokens.js). ``renderedRequest`` is the id of the last request
+  // that actually rendered: a response is dropped only when a *newer*
+  // render happened, never when a newer request merely started and failed.
+  // ``renderedInclude`` is the scope of that render: a failed toggle restores
+  // the control to it, so the checkbox and the board never disagree (even
+  // after several failures).
   let leaderboardRequest = 0;
+  let renderedRequest = 0;
   let renderedInclude = false;
 
   async function loadLeaderboard() {
@@ -357,7 +361,8 @@
       ? "/onboarding/leaderboard?include_admins=1"
       : "/onboarding/leaderboard";
     const rows = await api("GET", url);
-    if (request !== leaderboardRequest) return;
+    if (request < renderedRequest) return;
+    renderedRequest = request;
     renderedInclude = wanted;
     renderLeaderboard(rows);
   }
