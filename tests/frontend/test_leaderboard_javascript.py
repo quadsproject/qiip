@@ -161,11 +161,19 @@ const sandbox = {
   fetch: async function (url, options) {
     calls.push({ url: url, method: (options && options.method) || "GET" });
     const body = payloads[url];
+    const plainIndex = calls.filter(function (call) {
+      return call.url === "/onboarding/leaderboard";
+    }).length - 1;
+    const failed = FAIL_PLAIN_AFTER >= 0
+      && url === "/onboarding/leaderboard"
+      && plainIndex >= FAIL_PLAIN_AFTER;
     const respond = function () {
       return {
-        ok: body !== undefined,
-        status: body !== undefined ? 200 : 404,
-        json: async function () { return body === undefined ? {} : body; },
+        ok: !failed && body !== undefined,
+        status: !failed && body !== undefined ? 200 : 404,
+        json: async function () {
+          return failed || body === undefined ? {} : body;
+        },
       };
     };
     if (DEFER_FIRST && url === "/onboarding/leaderboard" && deferred.length === 0) {
@@ -325,6 +333,8 @@ vm.runInContext(source, sandbox);
       }).length - plainBefore,
       note: byId("board-note").textContent,
       users: users(),
+      checked: includeToggle ? includeToggle.checked : null,
+      toasts: toasts.slice(),
     };
   }
 
@@ -372,6 +382,7 @@ def _run(
     include_users: list[dict[str, Any]] | None = None,
     include_ok: bool = True,
     defer_first: bool = False,
+    fail_plain_after: int = -1,
     lang: str = "en_US.UTF-8",
 ) -> dict[str, Any]:
     node = shutil.which("node")
@@ -386,6 +397,7 @@ def _run(
         .replace("INCLUDE_ROWS", json.dumps(include_users or users))
         .replace("HAVE_INCLUDE", "true" if include_ok else "false")
         .replace("DEFER_FIRST", "true" if defer_first else "false")
+        .replace("FAIL_PLAIN_AFTER", str(fail_plain_after))
         .replace("TOKEN", json.dumps(token))
     )
     result = subprocess.run(
@@ -688,6 +700,29 @@ def test_admin_toggle_failure_reports_toast_and_keeps_scope() -> None:
     assert include["toasts"][0][1] == "error"
     # The default-scope render is untouched by the failed toggle.
     assert result["uncheck"]["users"] == ["Bo", "Ann"]
+
+
+def test_two_consecutive_failures_keep_control_on_rendered_scope() -> None:
+    """Check then uncheck before either response settles, with both fetches
+    failing: the control must end on the scope the board renders, not on
+    the last attempted one (RFE #271)."""
+    result = _run(
+        [_user(1, "Bo", 30), _user(2, "Ann", 10)],
+        admin_view=True,
+        include_ok=False,
+        fail_plain_after=1,
+    )
+
+    # The init render (scope excluded) is the only successful render; the
+    # widen and the uncheck fetches both fail.
+    assert result["include"]["checked"] is False
+    assert result["uncheck"]["checked"] is False
+    assert result["uncheck"]["note"].endswith(
+        "users ranked by total tokens (admins excluded)"
+    )
+    assert result["uncheck"]["users"] == ["Bo", "Ann"]
+    assert len(result["uncheck"]["toasts"]) == 2
+    assert all(toast[1] == "error" for toast in result["uncheck"]["toasts"])
 
 
 def test_stale_init_response_does_not_repaint_widened_scope() -> None:
