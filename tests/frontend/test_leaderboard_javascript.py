@@ -190,10 +190,10 @@ const sandbox = {
         deferred.push(function () { resolve(respond()); });
       });
     }
-    if (DEFER_INCLUDE && url === "/onboarding/leaderboard?include_admins=1"
-        && deferredInclude.length === 0) {
-      // Hold the first widen fetch so a newer toggle can start while it is
-      // still in flight (RFE #271).
+    if (DEFER_INCLUDE && url === "/onboarding/leaderboard?include_admins=1") {
+      // Hold widen fetches so the driver can choose the order in which they
+      // resolve (RFE #271): with overlap mode the stale widen failure must
+      // land while the re-check is still in flight to exercise the guard.
       return new Promise(function (resolve) {
         deferredInclude.push(function () { resolve(respond()); });
       });
@@ -311,17 +311,22 @@ vm.runInContext(source, sandbox);
   if (includeToggle) {
     if (OVERLAP) {
       // The widen fetch (first include, held by DEFER_INCLUDE) stays in
-      // flight while the viewer unchecks (a newer request); the held widen
-      // response then fails, so its catch runs against a superseded
-      // request id, and a final re-check must still win (RFE #271).
+      // flight while the viewer unchecks (a newer request); then a final
+      // re-check starts while the stale widen is still held, so the stale
+      // failure lands with the re-check in flight. Without the newest-
+      // request guard the catch rewrites the checkbox to the last rendered
+      // scope under the re-check, which then renders widened rows against
+      // an unchecked box (RFE #271).
       includeToggle.checked = true;
       const widen = includeToggle.listeners.change({});
       includeToggle.checked = false;
       await includeToggle.listeners.change({});
+      includeToggle.checked = true;
+      const recheck = includeToggle.listeners.change({});
       if (deferredInclude.length > 0) deferredInclude[0]();
       await widen;
-      includeToggle.checked = true;
-      await includeToggle.listeners.change({});
+      if (deferredInclude.length > 1) deferredInclude[1]();
+      await recheck;
       await new Promise(function (resolve) { setTimeout(resolve, 20); });
     } else {
       includeToggle.checked = true;
