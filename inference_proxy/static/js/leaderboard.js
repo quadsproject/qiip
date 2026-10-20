@@ -363,9 +363,16 @@
     const includeToggle = $("include-admins");
     if (includeToggle) {
       includeToggle.addEventListener("change", async () => {
+        const attempted = includeToggle.checked;
         try {
           await loadLeaderboard();
         } catch (err) {
+          // The board still renders the last successful scope; put the
+          // control back in step with it -- unless the viewer already
+          // flipped it again (a newer request owns the state).
+          if (includeToggle.checked === attempted) {
+            includeToggle.checked = !attempted;
+          }
           showToast("Could not update the leaderboard: " + err.message, "error");
         }
       });

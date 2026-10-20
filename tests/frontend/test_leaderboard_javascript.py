@@ -37,6 +37,7 @@ const elements = new Map();
 const calls = [];
 const toasts = [];
 const clipboardWrites = [];
+const deferred = [];
 
 class Element {
   constructor(tag) {
@@ -160,11 +161,21 @@ const sandbox = {
   fetch: async function (url, options) {
     calls.push({ url: url, method: (options && options.method) || "GET" });
     const body = payloads[url];
-    return {
-      ok: body !== undefined,
-      status: body !== undefined ? 200 : 404,
-      json: async function () { return body === undefined ? {} : body; },
+    const respond = function () {
+      return {
+        ok: body !== undefined,
+        status: body !== undefined ? 200 : 404,
+        json: async function () { return body === undefined ? {} : body; },
+      };
     };
+    if (DEFER_FIRST && url === "/onboarding/leaderboard" && deferred.length === 0) {
+      // Hold the init plain fetch until the driver releases it, so the
+      // request-id guard's stale-response path is exercised (RFE #271).
+      return new Promise(function (resolve) {
+        deferred.push(function () { resolve(respond()); });
+      });
+    }
+    return respond();
   },
   setTimeout,
   setInterval() { return 1; },
@@ -287,7 +298,20 @@ vm.runInContext(source, sandbox);
     note: byId("board-note").textContent,
     users: users(),
     toasts: toasts.slice(),
+    checked: includeToggle ? includeToggle.checked : null,
   };
+  // With DEFER_FIRST the init plain fetch is still pending here: release it
+  // now that the widen response has rendered, and confirm the stale response
+  // cannot repaint the board or the note (RFE #271).
+  let defer = null;
+  if (deferred.length > 0) {
+    deferred[0]();
+    await new Promise(function (resolve) { setTimeout(resolve, 20); });
+    defer = {
+      note: byId("board-note").textContent,
+      users: users(),
+    };
+  }
   if (includeToggle) {
     const plainBefore = calls.filter(function (call) {
       return call.url === "/onboarding/leaderboard";
@@ -324,6 +348,7 @@ vm.runInContext(source, sandbox);
     fetches: calls.map(function (call) { return call.url; }),
     errorBannerText: byId("error-banner").textContent,
     include: include,
+    defer: defer,
     uncheck: uncheck,
     copy: copy,
     tokenRows: ADMIN_VIEW ? [] : byId("tokens-table-body").children.map(function (row) {
@@ -346,6 +371,7 @@ def _run(
     admin_view: bool = False,
     include_users: list[dict[str, Any]] | None = None,
     include_ok: bool = True,
+    defer_first: bool = False,
     lang: str = "en_US.UTF-8",
 ) -> dict[str, Any]:
     node = shutil.which("node")
@@ -359,6 +385,7 @@ def _run(
         .replace("LEADERBOARD_ROWS", json.dumps(users))
         .replace("INCLUDE_ROWS", json.dumps(include_users or users))
         .replace("HAVE_INCLUDE", "true" if include_ok else "false")
+        .replace("DEFER_FIRST", "true" if defer_first else "false")
         .replace("TOKEN", json.dumps(token))
     )
     result = subprocess.run(
@@ -632,6 +659,7 @@ def test_admin_toggle_fetches_with_include_and_swaps_note() -> None:
     include = result["include"]
     assert include["before"].endswith("users ranked by total tokens (admins excluded)")
     assert include["fetches"] == 1
+    assert include["checked"] is True
     assert "users ranked by total tokens (admins included)" in include["note"]
     # The widened payload (not just a URL swap) repaints the table.
     assert include["users"] == ["Root", "Bo", "Ann"]
@@ -654,10 +682,38 @@ def test_admin_toggle_failure_reports_toast_and_keeps_scope() -> None:
     include = result["include"]
     assert include["note"].endswith("users ranked by total tokens (admins excluded)")
     assert include["users"] == ["Bo", "Ann"]
+    # The control is put back in step with the still-rendered scope.
+    assert include["checked"] is False
     assert include["toasts"][0][0].startswith("Could not update the leaderboard:")
     assert include["toasts"][0][1] == "error"
     # The default-scope render is untouched by the failed toggle.
     assert result["uncheck"]["users"] == ["Bo", "Ann"]
+
+
+def test_stale_init_response_does_not_repaint_widened_scope() -> None:
+    """The request-id guard: the init (plain) response resolving *after*
+    the toggle's widen response must not repaint the rows or note (RFE #271)."""
+    narrow = [_user(1, "Bo", 30), _user(2, "Ann", 10)]
+    wide = [
+        _user(3, "Root", 5000),
+        _user(1, "Bo", 30),
+        _user(2, "Ann", 10),
+    ]
+    result = _run(
+        narrow,
+        include_users=wide,
+        admin_view=True,
+        defer_first=True,
+    )
+
+    include = result["include"]
+    defer = result["defer"]
+    assert include["note"].endswith("users ranked by total tokens (admins included)")
+    assert include["users"] == ["Root", "Bo", "Ann"]
+    # The released stale init response was dropped: rows and note still
+    # come from the widened payload.
+    assert defer["note"].endswith("users ranked by total tokens (admins included)")
+    assert defer["users"] == ["Root", "Bo", "Ann"]
 
 
 def test_normal_view_has_no_include_toggle() -> None:
