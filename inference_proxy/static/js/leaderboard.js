@@ -76,13 +76,13 @@
   // Leaderboard
   // ------------------------------------------------------------------
 
-  function renderLeaderboard(rows) {
+  function renderLeaderboard(rows, includeAdmins) {
     const body = $("leaderboard-body");
     clearChildren(body);
     // Set before the empty-state return so the note never stays "Loading...".
-    // The admin viewer's Include admin users toggle swaps the phrasing (RFE #271).
-    const include = $("include-admins");
-    const scope = include && include.checked ? "included" : "excluded";
+    // The note follows the scope of the response that rendered, not the live
+    // checkbox, so a late success cannot leave the two out of step (RFE #271).
+    const scope = includeAdmins ? "included" : "excluded";
     $("board-note").textContent =
       rows.length + " users ranked by total tokens (admins " + scope + ")";
     if (rows.length === 0) {
@@ -364,7 +364,8 @@
     if (request < renderedRequest) return;
     renderedRequest = request;
     renderedInclude = wanted;
-    renderLeaderboard(rows);
+    if (include) include.checked = wanted;
+    renderLeaderboard(rows, wanted);
   }
 
   async function init() {
