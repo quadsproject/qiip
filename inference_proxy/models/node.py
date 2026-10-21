@@ -546,16 +546,6 @@ class VllmRuntimeState(BaseModel):
             raise ValueError("observed_at must include a timezone")
         return value
 
-    @model_serializer(mode="wrap")
-    def serialize_state(
-        self, handler: SerializerFunctionWrapHandler
-    ) -> dict[str, object]:
-        """Keep the wire shape of nodes verified before serving evidence."""
-        values: dict[str, object] = handler(self)
-        if values.get("serving") is None:
-            values.pop("serving", None)
-        return values
-
 
 class NodeGPU(BaseModel):
     """One physical GPU observed on the node with ``nvidia-smi``."""

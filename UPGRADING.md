@@ -20,6 +20,7 @@ The guide separates three kinds of change:
 - [Size managed vLLM launches from available memory](#31-size-managed-vllm-launches-from-available-memory)
 - [Setup resume and bounded transient retries](#32-setup-resume-and-bounded-transient-retries)
 - [The chat playground requires a signed-in viewer](#33-the-chat-playground-requires-a-signed-in-viewer)
+- [Managed vLLM nodes prove identity before registration](#34-managed-vllm-nodes-prove-identity-before-registration)
 - [Artifact sources and mirror policy](#artifact-sources-and-mirror-policy)
 - [Client-visible compatibility changes](#client-visible-compatibility-changes)
 - [RPM install migration](#rpm-install-migration)
@@ -819,7 +820,8 @@ adjustments and is never retried. The requested and effective settings, the
 adjustment reasons, and the memory estimate are persisted with the node as
 `vllm_runtime` and shown on the node-detail dashboard. Hosts whose GPU memory
 cannot be measured fall back to the previous single-attempt launch and record
-no runtime state.
+no runtime state, but they still run the serving gate described in section 34;
+that evidence lands in the durable attempt log instead.
 
 ### 32. Setup resume and bounded transient retries
 
@@ -898,6 +900,47 @@ are authenticated. No configuration is required.
   playground included) and a signed-in normal user's token both resolve to a
   non-admin node scope, so a model served only by an admin-only node is neither
   listed nor routed to.
+
+### 34. Managed vLLM nodes prove identity before registration
+
+A managed vLLM setup that reaches `/health` is no longer registered as healthy
+on the strength of the health endpoint alone. Before registration, the gateway
+requires evidence that belongs to the current launch:
+
+- The process listening on the configured API port must be a `vllm serve`
+  process, report the requested model, run the selected runtime path when one
+  was published, and be young enough to belong to this launch.
+- `/version` and `/v1/models` must report the expected runtime and model. When
+  the model card reports `max_model_len`, it must match the planned value.
+- One bounded chat or completion request must produce a real completion. The
+  completion fallback is intentional: a model without a chat template can be
+  certified through `/v1/completions`.
+
+Any failure after `/health` is terminal. The gateway stops the engine, does not
+register the node, and does not hand the failure to the memory-retry policy,
+because a wrong process or model is not repaired by shrinking the context. On
+planned hosts the verified model, runtime version, revision, generation, and
+process id are persisted under `vllm_runtime.serving`; plan-less hosts keep the
+legacy runtime shape and record the same evidence in the attempt log. A node
+that was verified before this change keeps its stored state; a newly verified
+node adds `serving` and exposes it on the node-detail dashboard.
+
+Four settings bound the gate under
+`INFERENCE_PROXY_PROVISIONING__`:
+
+- `VLLM_VERIFY_TIMEOUT` (default 30 seconds) is the total deadline for each
+  `/version` and `/v1/models` identity request.
+- `VLLM_INFERENCE_PROBE_TIMEOUT` (default 120 seconds) is the total deadline for
+  the bounded inference probe.
+- `VLLM_INFERENCE_PROBE_MAX_TOKENS` (default 1) is the token budget for that
+  probe.
+- `VLLM_PROCESS_START_SLACK` (default 30 seconds) is the tolerance when
+  comparing process age to the launch duration; it covers `etimes` rounding and
+  a backward gateway clock step.
+
+If the first managed setup after upgrading fails at this gate, inspect the
+attempt log for the rejected endpoint, the serving model, or the stale-listener
+reason before changing the model or the memory plan.
 
 ## Artifact Sources and Mirror Policy
 

@@ -1456,6 +1456,10 @@ controlled source fallback for the attached NVIDIA GPUs. Gateway settings:
 | `INFERENCE_PROXY_PROVISIONING__STAGE_RETRY_MAX_DELAY` | `120.0` | Upper bound on a single retry delay (seconds) |
 | `INFERENCE_PROXY_PROVISIONING__STAGE_RETRY_JITTER` | `0.25` | Fractional jitter applied to each retry delay (`0`-.`1`) |
 | `INFERENCE_PROXY_PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS` | `4` | Total automatic-mode vLLM launch attempts, including the first; `1` disables memory-failure retries |
+| `INFERENCE_PROXY_PROVISIONING__VLLM_VERIFY_TIMEOUT` | `30` | Total deadline for each `/version` and `/v1/models` identity request after `/health` (seconds) |
+| `INFERENCE_PROXY_PROVISIONING__VLLM_INFERENCE_PROBE_TIMEOUT` | `120` | Total deadline for the bounded chat or completion probe after identity checks (seconds) |
+| `INFERENCE_PROXY_PROVISIONING__VLLM_INFERENCE_PROBE_MAX_TOKENS` | `1` | Maximum tokens requested by the managed-vLLM inference probe |
+| `INFERENCE_PROXY_PROVISIONING__VLLM_PROCESS_START_SLACK` | `30` | Tolerance when comparing process age to the launch duration; covers `etimes` rounding and a backward gateway clock step (seconds) |
 
 Changing `LLAMACPP_VERSION` requires an explicitly configured matching digest.
 Artifact production, compatibility rules, source resource budgets, and rollout
@@ -1515,8 +1519,16 @@ an automatic launch are retried under a bounded policy
 (`INFERENCE_PROXY_PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS`, total attempts,
 default 4): the failed engine is stopped, the plan is recomputed from live
 memory, and each adjustment is logged with its reason and persisted as the
-effective configuration. See [auto-vllm](auto-vllm/README.md) for the direct
-script contract and the plan record.
+effective configuration. After `/health` succeeds, the managed server must also
+prove which process owns the configured port, report the expected model and
+runtime through `/version` and `/v1/models`, and answer one bounded chat or
+completion request before the node is registered. A failure at that gate stops
+the engine and is terminal; it is not retried by the memory policy. Planned
+hosts persist the verified serving evidence under `vllm_runtime.serving` and
+show it on the node-detail dashboard, while hosts without a memory plan keep
+the legacy runtime shape and record the evidence in the attempt log. See
+[auto-vllm](auto-vllm/README.md) for the direct script contract and the plan
+record.
 
 LLMFit has one version setting: `INFERENCE_PROXY_LLMFIT__VERSION`.
 

@@ -359,9 +359,9 @@ class ProvisioningSettings(BaseModel):
     vllm_verify_timeout: float = Field(default=30.0, gt=0, le=300)
     vllm_inference_probe_timeout: float = Field(default=120.0, gt=0, le=600)
     vllm_inference_probe_max_tokens: int = Field(default=1, ge=1, le=16)
-    # Process age (ps etimes) advances on the node's own monotonic clock, so
-    # this only covers rounding and the gap between recording the launch
-    # timestamp and process creation.
+    # The process is created after ``launch_started_at`` is recorded, so its
+    # ``ps etimes`` is smaller than the observed launch duration. This slack
+    # covers etimes rounding and a backward step of the gateway clock.
     vllm_process_start_slack: float = Field(default=30.0, ge=0, le=3600)
     # Issue #133: stage-specific total deadline for the vLLM setup phase
     # (package download, dependency resolution, and virtualenv sync). llama.cpp

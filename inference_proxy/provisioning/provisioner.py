@@ -3467,17 +3467,33 @@ class NodeProvisioner:
         stderr = getattr(failure, "stderr", "")
         return is_memory_failure(f"{failure}\n{stderr}")
 
-    def _selected_generation(self, hostname: str) -> dict[str, object] | None:
-        """Return the generation the start script selected for this attempt."""
+    def _selected_generation(
+        self, hostname: str
+    ) -> tuple[dict[str, object] | None, bool]:
+        """Return the selected generation and whether the attempt store was read.
+
+        A missing attempt is a legacy launch and returns ``(None, True)``. A
+        missing store or a failed read returns ``(None, False)`` so the caller
+        can distinguish "no generation marker" from "evidence unavailable".
+        """
         store = self._log_buffer.store
         attempt_id = self._log_buffer.attempts.get(hostname)
-        if store is None or attempt_id is None:
-            return None
-        with suppress(Exception):
+        if store is None:
+            return None, False
+        if attempt_id is None:
+            return None, True
+        try:
             selected = store.get(attempt_id).get("selected_generation")
-            if isinstance(selected, dict):
-                return selected
-        return None
+        except Exception as exc:
+            self._log(
+                hostname,
+                "warning",
+                f"could not read the selected vLLM generation: {exc}",
+            )
+            return None, False
+        if isinstance(selected, dict):
+            return selected, True
+        return None, True
 
     async def _read_vllm_model_revision(self, hostname: str, model: str) -> str | None:
         """Resolve the cached Hugging Face commit when the model card lacks it."""
@@ -3507,6 +3523,7 @@ class NodeProvisioner:
         expected_model: str,
         started_at: datetime,
         expected_max_model_len: int | None = None,
+        revision_fallback: str | None = None,
     ) -> VllmServingVerification:
         """Fail closed unless this attempt's server answers real inference.
 
@@ -3517,7 +3534,8 @@ class NodeProvisioner:
         serve. A failure must never reach registration.
         """
         base_url = self.validate_endpoint(hostname)
-        selected = self._selected_generation(hostname) or {}
+        selected, generation_available = self._selected_generation(hostname)
+        selected = selected or {}
         runtime_path = selected.get("runtime_path")
         generation_id = selected.get("generation_id")
         runtime_path = runtime_path if isinstance(runtime_path, str) else None
@@ -3562,7 +3580,7 @@ class NodeProvisioner:
             self._log(hostname, "error", f"vLLM serving verification failed: {exc}")
             raise ProvisioningError(str(exc)) from exc
 
-        revision = revision_from_root(card.root)
+        revision = revision_from_root(card.root) or revision_fallback
         if revision is None:
             revision = await self._read_vllm_model_revision(hostname, card.model_id)
         evidence = VllmServingVerification(
@@ -3582,6 +3600,11 @@ class NodeProvisioner:
             finish_reason=probe.finish_reason,
             verified_at=datetime.now(UTC),
         )
+        generation_label = (
+            evidence.generation_id
+            if evidence.generation_id is not None
+            else ("legacy" if generation_available else "unavailable")
+        )
         self._log(
             hostname,
             "info",
@@ -3589,7 +3612,7 @@ class NodeProvisioner:
             f"model={evidence.served_model} "
             f"runtime_version={evidence.runtime_version} "
             f"revision={evidence.model_revision or 'unknown'} "
-            f"generation={evidence.generation_id or 'legacy'} "
+            f"generation={generation_label} "
             f"pid={evidence.process_id} "
             f"task={evidence.task} endpoint={evidence.endpoint} "
             f"latency_ms={evidence.latency_ms:g} "
@@ -3771,6 +3794,11 @@ class NodeProvisioner:
                     raise
                 attempt, plan, selected = retry
                 continue
+            # Capture the cache ref now, while it still describes the launch
+            # that just started, rather than after the model has loaded.
+            launch_revision = await self._read_vllm_model_revision(
+                hostname, model or model_name
+            )
             if on_step is not None:
                 on_step("health_poll")
             await self._update_state(
@@ -3796,7 +3824,9 @@ class NodeProvisioner:
                 continue
             if on_step is not None:
                 on_step("vllm_serving_verify")
-            expected_model = plan.effective.model if plan is not None else model_name
+            expected_model = (
+                plan.effective.model if plan is not None else (model or model_name)
+            )
             try:
                 serving = await self._verify_vllm_serving(
                     hostname,
@@ -3805,6 +3835,7 @@ class NodeProvisioner:
                     expected_max_model_len=(
                         plan.effective.max_model_len if plan is not None else None
                     ),
+                    revision_fallback=launch_revision,
                 )
                 if plan is None:
                     # A host without a memory plan keeps the legacy return

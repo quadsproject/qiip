@@ -16,6 +16,7 @@ while a server that answers health but cannot serve inference fails.
 
 from __future__ import annotations
 
+import asyncio
 import posixpath
 import re
 import time
@@ -122,9 +123,7 @@ def parse_vllm_processes(output: str) -> tuple[VllmProcess, ...]:
             serve_index = arguments.index("serve")
         except ValueError:
             continue
-        if serve_index == 0:
-            continue
-        executable = _vllm_executable(arguments[:serve_index])
+        executable = _vllm_serve_executable(arguments, serve_index)
         if executable is None:
             continue
         model = arguments[serve_index + 1] if serve_index + 1 < len(arguments) else ""
@@ -239,15 +238,16 @@ async def probe_inference(
     """
     primary = choose_task(model)
     tasks = (primary, "completion" if primary == "chat" else "chat")
-    failure: VllmServingError | None = None
+    failures: list[str] = []
     for task in tasks:
         path = CHAT_PATH if task == "chat" else COMPLETION_PATH
         url = _join(base_url, path)
         body = _probe_body(task, model, max_tokens)
         started = time.monotonic()
         try:
-            response = await client.post(url, json=body, timeout=timeout)
-        except httpx.TimeoutException as exc:
+            async with asyncio.timeout(timeout):
+                response = await client.post(url, json=body, timeout=timeout)
+        except (TimeoutError, httpx.TimeoutException) as exc:
             raise VllmServingError(
                 f"inference probe at {path} timed out after {timeout:g}s"
             ) from exc
@@ -255,9 +255,8 @@ async def probe_inference(
             raise VllmServingError(f"inference probe at {path} failed: {exc}") from exc
         latency_ms = (time.monotonic() - started) * 1000.0
         if response.status_code in _UNSUPPORTED_TASK_STATUSES:
-            failure = VllmServingError(
-                f"the server does not support {path} "
-                f"(HTTP {response.status_code}): {response.text[:200]}"
+            failures.append(
+                f"{path} returned HTTP {response.status_code}: {response.text[:200]}"
             )
             continue
         if response.status_code != 200:
@@ -272,8 +271,9 @@ async def probe_inference(
                 f"inference probe at {path} returned invalid JSON"
             ) from exc
         return _probe_result(task, path, payload, latency_ms)
-    assert failure is not None
-    raise failure
+    raise VllmServingError(
+        "the server does not support a usable inference task: " + "; ".join(failures)
+    )
 
 
 def revision_from_root(root: str | None) -> str | None:
@@ -287,10 +287,23 @@ def revision_from_root(root: str | None) -> str | None:
     return candidate if _COMMIT_PATTERN.fullmatch(candidate) else None
 
 
-def _vllm_executable(arguments: tuple[str, ...]) -> str | None:
-    for argument in reversed(arguments):
-        if PurePosixPath(argument).name == "vllm":
-            return argument
+def _vllm_serve_executable(arguments: tuple[str, ...], serve_index: int) -> str | None:
+    """Return the vLLM executable only for the managed launch argv shapes.
+
+    ``start-vllm.sh`` execs either ``<venv>/bin/vllm serve ...`` or
+    ``<venv>/bin/python <venv>/bin/vllm serve ...``. Requiring ``vllm`` to be
+    the directly preceding argument, with a direct binary or Python launcher,
+    keeps ``grep``/``pgrep`` command lines that merely contain the words from
+    looking like a server on the default port.
+    """
+    if serve_index == 1 and PurePosixPath(arguments[0]).name == "vllm":
+        return arguments[0]
+    if serve_index == 2:
+        launcher = PurePosixPath(arguments[0]).name
+        if launcher.startswith("python") and (
+            PurePosixPath(arguments[1]).name == "vllm"
+        ):
+            return arguments[1]
     return None
 
 
@@ -319,8 +332,9 @@ async def _fetch_runtime_version(
 ) -> str:
     url = _join(base_url, VERSION_PATH)
     try:
-        response = await client.get(url, timeout=timeout)
-    except httpx.TimeoutException as exc:
+        async with asyncio.timeout(timeout):
+            response = await client.get(url, timeout=timeout)
+    except (TimeoutError, httpx.TimeoutException) as exc:
         raise VllmServingError(
             f"runtime version probe timed out after {timeout:g}s"
         ) from exc
@@ -348,8 +362,9 @@ async def _fetch_model_cards(
 ) -> tuple[VllmModelCard, ...]:
     url = _join(base_url, MODELS_PATH)
     try:
-        response = await client.get(url, timeout=timeout)
-    except httpx.TimeoutException as exc:
+        async with asyncio.timeout(timeout):
+            response = await client.get(url, timeout=timeout)
+    except (TimeoutError, httpx.TimeoutException) as exc:
         raise VllmServingError(f"model discovery timed out after {timeout:g}s") from exc
     except httpx.HTTPError as exc:
         raise VllmServingError(f"model discovery failed: {exc}") from exc
@@ -420,6 +435,11 @@ def _probe_result(
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
         raise VllmServingError(f"inference probe at {path} returned no choices")
     choice = choices[0]
+    if task == "chat":
+        if not isinstance(choice.get("message"), dict):
+            raise VllmServingError(f"inference probe at {path} returned no message")
+    elif not isinstance(choice.get("text"), str):
+        raise VllmServingError(f"inference probe at {path} returned no text")
     finish_reason_value = choice.get("finish_reason")
     finish_reason = (
         finish_reason_value if isinstance(finish_reason_value, str) else None

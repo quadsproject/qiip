@@ -494,6 +494,7 @@ function renderVllmRuntime(node) {
   var requested = runtime.requested || {};
   var effective = runtime.effective || {};
   var estimate = runtime.estimate || {};
+  var serving = runtime.serving;
   var automatic = effective.model_selection === "automatic";
 
   document.getElementById("vllm-runtime-selection").textContent =
@@ -531,6 +532,18 @@ function renderVllmRuntime(node) {
     formatRuntimeCount(estimate.free_per_gpu_mib) + " MiB per GPU";
   document.getElementById("vllm-runtime-attempt").textContent =
     String((runtime.attempt || 0) + 1);
+  document.getElementById("vllm-runtime-served-model").textContent =
+    serving && serving.served_model ? serving.served_model : "Not recorded";
+  document.getElementById("vllm-runtime-version").textContent =
+    serving && serving.runtime_version ? serving.runtime_version : "Not recorded";
+  document.getElementById("vllm-runtime-revision").textContent =
+    serving && serving.model_revision ? serving.model_revision : "Unknown";
+  document.getElementById("vllm-runtime-generation").textContent =
+    serving ? (serving.generation_id || "legacy") : "Not recorded";
+  document.getElementById("vllm-runtime-pid").textContent =
+    serving && serving.process_id !== null && serving.process_id !== undefined
+      ? String(serving.process_id)
+      : "Not recorded";
   document.getElementById("vllm-runtime-reason").textContent =
     runtime.reason || "—";
 
