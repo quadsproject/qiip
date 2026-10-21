@@ -1520,13 +1520,14 @@ an automatic launch are retried under a bounded policy
 default 4): the failed engine is stopped, the plan is recomputed from live
 memory, and each adjustment is logged with its reason and persisted as the
 effective configuration. After `/health` succeeds, the managed server must also
-prove which process owns the configured port, report the expected model and
-runtime through `/version` and `/v1/models`, and answer one bounded chat or
-completion request before the node is registered. A failure at that gate stops
-the engine and is terminal; it is not retried by the memory policy. Planned
-hosts persist the verified serving evidence under `vllm_runtime.serving` and
-show it on the node-detail dashboard, while hosts without a memory plan keep
-the legacy runtime shape and record the evidence in the attempt log. See
+prove which process owns the configured port, report a runtime version
+through `/version` and the expected model through `/v1/models`, and answer one
+bounded chat or completion request before the node is registered. A failure at
+that gate stops the engine and is terminal; it is not retried by the memory
+policy. Planned hosts persist the verified serving evidence under
+`vllm_runtime.serving` and show it on the node-detail dashboard, while hosts
+without a memory plan keep the legacy runtime shape and record the evidence in
+the attempt log. See
 [auto-vllm](auto-vllm/README.md) for the direct script contract and the plan
 record.
 

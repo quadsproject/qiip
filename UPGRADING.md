@@ -910,8 +910,9 @@ requires evidence that belongs to the current launch:
 - The process listening on the configured API port must be a `vllm serve`
   process, report the requested model, run the selected runtime path when one
   was published, and be young enough to belong to this launch.
-- `/version` and `/v1/models` must report the expected runtime and model. When
-  the model card reports `max_model_len`, it must match the planned value.
+- `/version` must report a runtime version; `/v1/models` must report the
+  expected model. When the model card reports `max_model_len`, it must match
+  the planned value.
 - One bounded chat or completion request must produce a real completion. The
   completion fallback is intentional: a model without a chat template can be
   certified through `/v1/completions`.

@@ -539,7 +539,7 @@ function renderVllmRuntime(node) {
   document.getElementById("vllm-runtime-revision").textContent =
     serving && serving.model_revision ? serving.model_revision : "Unknown";
   document.getElementById("vllm-runtime-generation").textContent =
-    serving ? (serving.generation_id || "legacy") : "Not recorded";
+    serving && serving.generation_id ? serving.generation_id : "Not recorded";
   document.getElementById("vllm-runtime-pid").textContent =
     serving && serving.process_id !== null && serving.process_id !== undefined
       ? String(serving.process_id)
