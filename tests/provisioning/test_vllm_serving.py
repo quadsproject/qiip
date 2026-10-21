@@ -452,6 +452,23 @@ async def test_fetch_server_identity_bounds_the_total_request_time() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_server_identity_bounds_the_total_model_discovery_time() -> None:
+    async def slow_models(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(200, json=_version_payload())
+        await asyncio.sleep(1)
+        return httpx.Response(200, json=_models_payload())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(slow_models)) as client:
+        with pytest.raises(
+            VllmServingError, match="model discovery timed out after 0.05s"
+        ):
+            await vllm_serving.fetch_server_identity(
+                client, "http://host1:8000", timeout=0.05
+            )
+
+
+@pytest.mark.asyncio
 async def test_probe_inference_bounds_the_total_request_time() -> None:
     async def slow(_request: httpx.Request) -> httpx.Response:
         await asyncio.sleep(1)
@@ -646,6 +663,7 @@ async def test_start_with_retries_persists_serving_evidence(
     ssh_client.run_streaming = _streaming(commands)
     provisioner = _make_provisioner(ssh_client=ssh_client)
     steps: list[str] = []
+    order: list[str] = []
     cat_reads = 0
 
     async def ssh_run(_hostname: str, command: str) -> str:
@@ -653,6 +671,7 @@ async def test_start_with_retries_persists_serving_evidence(
         if command.startswith("ps -eo"):
             return _process_line()
         if command.startswith("cat --"):
+            order.append("revision_read")
             cat_reads += 1
             # A later read would see a different ref; the launch-time value is
             # the evidence the running process actually loaded.
@@ -660,6 +679,9 @@ async def test_start_with_retries_persists_serving_evidence(
         if "nvidia-smi" in command:
             return "0, 81920, 40000, 41920\n"
         raise AssertionError(command)
+
+    async def poll_health(*_args: object, **_kwargs: object) -> None:
+        order.append("health_poll")
 
     httpx_mock.add_response(url="http://host1:8000/version", json=_version_payload())
     httpx_mock.add_response(
@@ -677,7 +699,7 @@ async def test_start_with_retries_persists_serving_evidence(
             return_value=(VllmDeviceMemory(0, 81_920, 80_000, "9.0"),),
         ),
         patch.object(provisioner, "_stop_failed_vllm_start", new_callable=AsyncMock),
-        patch.object(provisioner, "_poll_health", new_callable=AsyncMock),
+        patch.object(provisioner, "_poll_health", new=poll_health),
         patch.object(
             provisioner, "_ssh_run_command", new=AsyncMock(side_effect=ssh_run)
         ),
@@ -696,6 +718,7 @@ async def test_start_with_retries_persists_serving_evidence(
         "vllm_serving_verify",
         "vllm_runtime_verify",
     ]
+    assert order == ["revision_read", "health_poll"]
     assert model == _MODEL
     assert isinstance(result, VllmRuntimeState)
     assert result.serving is not None
@@ -1210,6 +1233,34 @@ def test_selected_generation_ignores_unusable_or_failing_store_rows() -> None:
 
     store.get.side_effect = OSError("database is locked")
     assert provisioner._selected_generation("host1") == (None, False)
+
+
+@pytest.mark.asyncio
+async def test_serving_verification_labels_an_unreadable_generation(
+    httpx_mock: HTTPXMock,
+) -> None:
+    provisioner, _ssh, _stop = _provisioner()
+    store = MagicMock()
+    store.get.side_effect = OSError("database is locked")
+    provisioner._log_buffer.store = store
+    provisioner._log_buffer.attempts["host1"] = "attempt-1"
+    httpx_mock.add_response(url="http://host1:8000/version", json=_version_payload())
+    httpx_mock.add_response(url="http://host1:8000/v1/models", json=_models_payload())
+    httpx_mock.add_response(
+        url="http://host1:8000/v1/chat/completions",
+        json={"choices": [{"index": 0, "message": {"content": "x"}}]},
+    )
+
+    with patch.object(provisioner, "_log") as log:
+        evidence = await provisioner._verify_vllm_serving(
+            "host1",
+            expected_model=_MODEL,
+            started_at=datetime.now(UTC),
+        )
+
+    assert evidence.generation_id is None
+    assert any("generation=unavailable" in call.args[2] for call in log.call_args_list)
+    store.append.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -442,6 +442,44 @@ def _run_node_detail_scenario(scenario: str) -> dict[str, Any]:
     )
 
 
+def _run_vllm_serving_scenario(serving: object) -> dict[str, Any]:
+    runtime = {
+        "requested": {
+            "model": "Qwen/Qwen2.5-32B-Instruct",
+            "params": {"max_model_len": 8192},
+        },
+        "effective": {
+            "model": "Qwen/Qwen2.5-32B-Instruct",
+            "model_selection": "automatic",
+            "tensor_parallel_size": 1,
+            "max_model_len": 8192,
+            "max_num_batched_tokens": 8192,
+            "gpu_memory_utilization": 0.9,
+        },
+        "estimate": {},
+        "adjustments": [],
+        "attempt": 0,
+        "reason": "Automatic plan fitted",
+        "approximate": False,
+        "serving": serving,
+        "gpus": [
+            {"index": 0, "total_mib": 81920, "used_mib": 66000, "free_mib": 15920}
+        ],
+        "observed_at": "2026-08-05T21:55:24Z",
+    }
+    scenario = """
+installDetailFetch([], true, "vllm", null, undefined, __RUNTIME__);
+(async function () {
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    servedModel: byId("vllm-runtime-served-model").textContent,
+    generation: byId("vllm-runtime-generation").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+""".replace("__RUNTIME__", json.dumps(runtime))
+    return _run_node_detail_scenario(scenario)
+
+
 def test_node_detail_self_setup_hides_setup_and_shows_tag() -> None:
     result = _run_node_detail_scenario(
         r"""
@@ -1539,6 +1577,22 @@ installDetailFetch([], true, "vllm", null, undefined, {
     }
     assert result["observed"].startswith("Post-load snapshot at ")
     assert result["observed"] != "Post-load snapshot at —"
+
+
+def test_node_detail_marks_an_unrecorded_vllm_generation_as_not_recorded() -> None:
+    absent = _run_vllm_serving_scenario(None)
+    unreadable = _run_vllm_serving_scenario(
+        {
+            "served_model": "Qwen/Qwen2.5-32B-Instruct",
+            "runtime_version": "0.26.0",
+            "model_revision": "a" * 40,
+            "generation_id": None,
+            "process_id": 4321,
+        }
+    )
+
+    assert absent == {"servedModel": "Not recorded", "generation": "Not recorded"}
+    assert unreadable["generation"] == "Not recorded"
 
 
 def test_node_detail_explains_missing_vllm_runtime_state() -> None:

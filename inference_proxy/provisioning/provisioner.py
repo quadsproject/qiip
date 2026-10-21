@@ -3485,10 +3485,14 @@ class NodeProvisioner:
         try:
             selected = store.get(attempt_id).get("selected_generation")
         except Exception as exc:
-            self._log(
-                hostname,
-                "warning",
-                f"could not read the selected vLLM generation: {exc}",
+            # Do not write the warning through the attempt store that just
+            # failed; a missing or corrupt row would raise again and abort the
+            # gate instead of letting it report generation=unavailable.
+            logger.warning(
+                "vllm_generation_read_failed",
+                hostname=hostname,
+                error=str(exc),
+                exc_info=True,
             )
             return None, False
         if isinstance(selected, dict):
