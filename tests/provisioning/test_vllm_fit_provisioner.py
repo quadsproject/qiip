@@ -98,6 +98,11 @@ def _streaming(
     return streaming
 
 
+def _start_commands(commands: list[str]) -> list[str]:
+    """Return only engine start commands, excluding post-start evidence reads."""
+    return [command for command in commands if "start-vllm.sh" in command]
+
+
 @pytest.mark.asyncio
 async def test_fitting_plan_reaches_the_start_script_and_is_persisted() -> None:
     commands: list[str] = []
@@ -135,8 +140,9 @@ async def test_fitting_plan_reaches_the_start_script_and_is_persisted() -> None:
     assert runtime.gpus[0].used_mib == 40_000
     # The incumbent engine is stopped once before the first measurement.
     stop.assert_awaited_once()
-    assert len(commands) == 1
-    command = commands[0]
+    starts = _start_commands(commands)
+    assert len(starts) == 1
+    command = starts[0]
     assert "AUTOVLLM_MODEL=Qwen/Qwen2.5-32B-Instruct" in command
     assert "AUTOVLLM_MAX_MODEL_LEN=8192" in command
     assert "AUTOVLLM_MAX_BATCHED_TOKENS=8192" in command
@@ -304,13 +310,14 @@ async def test_recognized_oom_is_retried_once_with_a_smaller_context() -> None:
 
     assert runtime is not None
     assert runtime.attempt == 1
-    assert len(commands) == 2
+    starts = _start_commands(commands)
+    assert len(starts) == 2
     assert len(runtime.adjustments) == 1
     adjustment = runtime.adjustments[0]
     assert adjustment.field == "max_model_len"
     assert adjustment.reason == "oom_retry"
-    assert "AUTOVLLM_MAX_MODEL_LEN=8192" in commands[0]
-    assert "AUTOVLLM_MAX_MODEL_LEN=4096" in commands[1]
+    assert "AUTOVLLM_MAX_MODEL_LEN=8192" in starts[0]
+    assert "AUTOVLLM_MAX_MODEL_LEN=4096" in starts[1]
     # Once before planning and once before the retry.
     assert stop.await_count == 2
 
@@ -382,8 +389,9 @@ async def test_unmeasured_host_falls_back_to_the_legacy_start_path() -> None:
 
     assert runtime is None
     poll.assert_awaited_once()
-    assert len(commands) == 1
-    assert "AUTOVLLM_FIT_BUDGET_MIB" not in commands[0]
+    starts = _start_commands(commands)
+    assert len(starts) == 1
+    assert "AUTOVLLM_FIT_BUDGET_MIB" not in starts[0]
 
 
 @pytest.mark.asyncio
@@ -469,6 +477,8 @@ async def test_registration_persists_the_requested_and_effective_plan() -> None:
     )
     assert stored["vllm_runtime"]["approximate"] is False
     assert stored["vllm_runtime"]["estimate"]["usable_budget_mib"] == 73_728
+    assert stored["vllm_runtime"]["serving"]["served_model"] == _AUTO_MODEL
+    assert stored["vllm_runtime"]["serving"]["runtime_version"] == "0.26.0"
     # The requested model is absent because the operator did not name one.
     assert "model" not in stored["vllm_runtime"]["requested"]
 
@@ -521,7 +531,7 @@ async def test_oom_observed_during_health_poll_is_retried() -> None:
 
     assert runtime is not None
     assert runtime.attempt == 1
-    assert len(commands) == 2
+    assert len(_start_commands(commands)) == 2
     assert poll.await_count == 2
     # Pre-planning teardown and the retry teardown.
     assert stop.await_count == 2
@@ -556,7 +566,7 @@ async def test_unrecognized_start_failure_is_not_retried() -> None:
             started_at=datetime.now(UTC),
         )
 
-    assert len(commands) == 1
+    assert len(_start_commands(commands)) == 1
     # Pre-planning teardown and the terminal failure cleanup.
     assert stop.await_count == 2
 
@@ -735,7 +745,7 @@ async def test_unrecognized_health_failure_stops_cleanly_and_raises() -> None:
             started_at=datetime.now(UTC),
         )
 
-    assert len(commands) == 1
+    assert len(_start_commands(commands)) == 1
     # Pre-planning teardown and the terminal failure cleanup.
     assert stop.await_count == 2
 

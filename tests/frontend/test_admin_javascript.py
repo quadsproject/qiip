@@ -1451,6 +1451,13 @@ installDetailFetch([], true, "vllm", null, undefined, {
   attempt: 1,
   reason: "Automatic plan fitted after one bounded adjustment",
   approximate: false,
+  serving: {
+    served_model: "Qwen/Qwen2.5-32B-Instruct",
+    runtime_version: "0.26.0",
+    model_revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    generation_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    process_id: 4321,
+  },
   gpus: [{ index: 0, total_mib: 81920, used_mib: 66000, free_mib: 15920 }],
   observed_at: "2026-08-05T21:55:24Z",
 });
@@ -1478,6 +1485,11 @@ installDetailFetch([], true, "vllm", null, undefined, {
     budget: byId("vllm-runtime-budget").textContent,
     free: byId("vllm-runtime-free").textContent,
     attempt: byId("vllm-runtime-attempt").textContent,
+    servedModel: byId("vllm-runtime-served-model").textContent,
+    version: byId("vllm-runtime-version").textContent,
+    revision: byId("vllm-runtime-revision").textContent,
+    generation: byId("vllm-runtime-generation").textContent,
+    pid: byId("vllm-runtime-pid").textContent,
     reason: byId("vllm-runtime-reason").textContent,
     adjustment: byId("vllm-runtime-adjustments").children[0].textContent,
     adjustmentCount: byId("vllm-runtime-adjustments").children.length,
@@ -1511,6 +1523,11 @@ installDetailFetch([], true, "vllm", null, undefined, {
         "budget": "73,728 MiB per GPU",
         "free": "80,000 MiB per GPU",
         "attempt": "2",
+        "servedModel": "Qwen/Qwen2.5-32B-Instruct",
+        "version": "0.26.0",
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "generation": "b" * 64,
+        "pid": "4321",
         "reason": "Automatic plan fitted after one bounded adjustment",
         "adjustment": (
             "max_model_len: 32768 → 8192 (context reduced to fit the KV cache)"

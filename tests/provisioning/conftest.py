@@ -52,6 +52,7 @@ def stub_vllm_serving_verification(request: pytest.FixtureRequest) -> Any:
         expected_model: str,
         started_at: datetime,
         expected_max_model_len: int | None = None,
+        revision_fallback: str | None = None,
     ) -> VllmServingVerification:
         return _serving_evidence(expected_model, max_model_len=expected_max_model_len)
 

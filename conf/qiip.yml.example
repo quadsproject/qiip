@@ -162,7 +162,8 @@ provisioning:
   vllm_verify_timeout: 30.0
   vllm_inference_probe_timeout: 120.0
   vllm_inference_probe_max_tokens: 1
-  # Slack when comparing process age (ps etimes) to this launch duration.
+  # Tolerance when comparing process age (ps etimes) to this launch duration;
+  # covers etimes rounding and a backward gateway clock step.
   vllm_process_start_slack: 30.0
   # Total deadline for one vLLM setup run (dependency resolution and venv sync).
   vllm_setup_timeout: 3600.0
