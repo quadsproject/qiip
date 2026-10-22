@@ -931,8 +931,9 @@ Four settings bound the gate under
 
 - `VLLM_VERIFY_TIMEOUT` (default 30 seconds) is the total deadline for each
   `/version` and `/v1/models` identity request.
-- `VLLM_INFERENCE_PROBE_TIMEOUT` (default 120 seconds) is the total deadline for
-  the bounded inference probe.
+- `VLLM_INFERENCE_PROBE_TIMEOUT` (default 120 seconds) is the per-request
+  deadline for the bounded inference probe. A rejected chat probe gets a fresh
+  budget for the completion fallback.
 - `VLLM_INFERENCE_PROBE_MAX_TOKENS` (default 1) is the token budget for that
   probe.
 - `VLLM_PROCESS_START_SLACK` (default 30 seconds) is the tolerance when

@@ -1457,7 +1457,7 @@ controlled source fallback for the attached NVIDIA GPUs. Gateway settings:
 | `INFERENCE_PROXY_PROVISIONING__STAGE_RETRY_JITTER` | `0.25` | Fractional jitter applied to each retry delay (`0`-.`1`) |
 | `INFERENCE_PROXY_PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS` | `4` | Total automatic-mode vLLM launch attempts, including the first; `1` disables memory-failure retries |
 | `INFERENCE_PROXY_PROVISIONING__VLLM_VERIFY_TIMEOUT` | `30` | Total deadline for each `/version` and `/v1/models` identity request after `/health` (seconds) |
-| `INFERENCE_PROXY_PROVISIONING__VLLM_INFERENCE_PROBE_TIMEOUT` | `120` | Total deadline for the bounded chat or completion probe after identity checks (seconds) |
+| `INFERENCE_PROXY_PROVISIONING__VLLM_INFERENCE_PROBE_TIMEOUT` | `120` | Per-request deadline for the bounded chat or completion probe after identity checks (seconds) |
 | `INFERENCE_PROXY_PROVISIONING__VLLM_INFERENCE_PROBE_MAX_TOKENS` | `1` | Maximum tokens requested by the managed-vLLM inference probe |
 | `INFERENCE_PROXY_PROVISIONING__VLLM_PROCESS_START_SLACK` | `30` | Tolerance when comparing process age to the launch duration; covers `etimes` rounding and a backward gateway clock step (seconds) |
 

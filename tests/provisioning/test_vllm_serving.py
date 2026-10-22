@@ -1259,8 +1259,10 @@ async def test_serving_verification_labels_an_unreadable_generation(
         )
 
     assert evidence.generation_id is None
-    assert any("generation=unavailable" in call.args[2] for call in log.call_args_list)
-    store.append.assert_not_called()
+    assert [
+        (call.args[1], "generation=unavailable" in call.args[2])
+        for call in log.call_args_list
+    ] == [("info", True)]
 
 
 @pytest.mark.asyncio
