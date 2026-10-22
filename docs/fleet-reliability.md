@@ -97,12 +97,13 @@ unknown environment dimensions because diagnostics are collected on failure.
 
 ## Baseline and canary record
 
-**Status: historical snapshot and matched L4 pilot complete; pilot targets
-accepted.** On 2026-09-21 the operator supplied a
-development gateway, the existing workload configuration, and no maintenance
-constraints. The initially selected T4 hostname returned authoritative
-`NXDOMAIN`; the operator replaced it with a reachable, managed L4 node. The
-pilot preserves that node's existing model artifact and catalog runtime profile.
+**Status: implementation complete; matched L4 pilot complete with accepted
+targets; fleet-wide validation continues in #277.** On 2026-09-21 the operator
+supplied a development gateway, the existing workload configuration, and no
+maintenance constraints. The initially selected T4 hostname returned
+authoritative `NXDOMAIN`; the operator replaced it with a reachable, managed L4
+node. The pilot preserves that node's existing model artifact and catalog
+runtime profile.
 
 A consistent SQLite backup captured 14 retained attempts across five hosts:
 10 provisioning attempts and four excluded teardowns. The closed reporting
@@ -215,8 +216,8 @@ For additional cohorts, follow this procedure:
    targets. Close and export the canary window before retention expires.
    Compare bundle/version groups and raw failure evidence. Separate reproduced
    software failures from causes confirmed on real nodes.
-5. Fill in the record below and link both exports and diagnostic bundles before
-   closing the fleet-validation criteria of issue #124.
+5. Fill in the record below and link both exports and diagnostic bundles in
+   #277 before closing the remaining fleet-validation criteria.
 
 | Observation | Matched baseline | Canary | Accepted pilot target |
 | --- | --- | --- | --- |
@@ -233,6 +234,64 @@ For additional cohorts, follow this procedure:
 | Full recovery cycle, including placement delays | 626.648662 s | 636.394442 s | Record separately |
 | Inference smoke check | HTTP 200; `READY` | HTTP 200; `READY` | Complete the same request |
 | Rollout / rollback decision | Original checkout preserved | Candidate active; six nodes healthy; report survived restart | Preserve all six healthy nodes |
+
+## Acceptance criteria status (#121)
+
+Status of the seven acceptance criteria in #121. The implementation is shipped;
+criteria that need fleet-wide measurement point to #277.
+
+1. **Baseline from representative failed and successful nodes (GPU, OS/kernel,
+   runtime, stage, error).** A consistent SQLite backup captured 14 retained
+   attempts across five hosts: 10 provisioning attempts (six succeeded, four
+   failed) and four excluded teardowns, exported as `baseline-report.json`. The
+   four failure bundles were downloaded with their export footers verified, and
+   the recurring CUDA probe failures are grouped as `v1:cuda_probe_compile`.
+   *Limitation:* the historical records have no known series origins and no
+   complete environment dimensions, only one attempt used vLLM, and the matched
+   baseline below covers a single L4 node.
+2. **Per-attempt remote logs across disconnects and gateway restarts, with
+   searchable history, failure summaries, and downloadable bundles.** Durable
+   attempt records and the remote recorder back the history, filters, summaries,
+   and JSON/bundle downloads on `/admin/provisioning/reliability`. The report's
+   identity, counts, denominators, and evidence gaps were unchanged after the
+   gateway restart at `2026-09-21T22:16:31.452682+00:00`. Boundary tests cover
+   the recorder and log lifecycle in `tests/provisioning/test_attempt_logs.py`
+   and `test_log_review_regressions.py`. *Met.*
+3. **Validation across supported hardware and runtime profiles, including
+   existing and fresh installations.** Runtime-profile and OS/ABI gates select
+   only registered profiles, and the transactional bundle publishes gateway and
+   node artifacts together. *Limitation:* no real-node canary yet on vLLM, on a
+   GPU family other than `consumer-ada`, or on a fresh install. Tracked in #277.
+4. **Failure recovery for interrupted installation, SSH loss, gateway restart,
+   unavailable storage, resource exhaustion, and duplicate attempts.** Stage
+   resume and retry cover interrupted installs
+   (`tests/provisioning/test_resume_retry.py`), lease-based reconciliation
+   resends a lost launch over SSH loss (`test_reconcile.py`), restart survival
+   was verified on the pilot gateway, storage and profile gates run before
+   startup, and vLLM sizing recovers from recognized OOM conditions.
+   *Limitation:* resource exhaustion and storage unavailability are exercised
+   with controlled probes rather than induced on a real node.
+5. **Before/after first-attempt success, retry recovery, and setup duration on
+   representative fleet canaries.** The matched L4 cycle measured 74.554863 s
+   for the baseline and 72.521237 s for the canary, both `READY` to a bounded
+   inference request, with targets accepted on 2026-09-22. *Limitation:* one
+   node, one attempt per cycle, and retry recovery is unmeasured because no real
+   failed series was retried, so representativeness is not established. Moved to
+   #277.
+6. **Documented automatic settings, compatibility limits, operator actions, and
+   preserved explicit model/configuration choices.** `docs/user-guide.md`,
+   `UPGRADING.md`, `docs/transactional-provisioning.md`, and this document cover
+   automatic settings, limits, and operator actions. Explicit model and profile
+   choices are preserved by the picker and reported as requested. *Met.*
+7. **Completed sub-issues and recorded rollout results.** All thirteen
+   sub-issues (#122-#134) are closed and shipped. The pilot rollout record
+   covers candidate activation, six previously healthy nodes, restart survival,
+   and the preserved rollback. *Limitation:* rollout results are limited to the
+   pilot cohort; further cohorts belong to #277.
+
+Closing #121 records the shipped implementation and the accepted single-node
+pilot. It does not claim a measured fleet-wide success rate, and no fleet-wide
+improvement figure should be quoted from this document.
 
 ## Local verification
 
