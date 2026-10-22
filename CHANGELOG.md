@@ -2,6 +2,37 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.27 (2026-10-22)
+
+### Bug Fixes
+
+- **provisioning**: Close vLLM review nits
+  ([`87f9f22`](https://github.com/quadsproject/qiip/commit/87f9f22d43255275219d7c31e475be05a807793e))
+
+- **provisioning**: Tighten vLLM serving gate evidence
+  ([`4aca3c0`](https://github.com/quadsproject/qiip/commit/4aca3c0fc950b166b72675d6b27d3b7bf7d4cf23))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`f2fddbd`](https://github.com/quadsproject/qiip/commit/f2fddbd43a64aba22626a864a6e0f05b16a211a3))
+
+### Documentation
+
+- **provisioning**: Clarify vLLM probe timeout scope
+  ([`adb94d1`](https://github.com/quadsproject/qiip/commit/adb94d160ad740c257bcf001ed97e2bfd659d9d8))
+
+### Features
+
+- **provisioning**: Verify vLLM identity and inference before routing
+  ([`23a7d49`](https://github.com/quadsproject/qiip/commit/23a7d497be97382c0a7b8a36c4b35da8f02c09e6))
+
+### Testing
+
+- **provisioning**: Keep failed-store guard meaningful
+  ([`a758701`](https://github.com/quadsproject/qiip/commit/a75870105ad6ab007fafcbee6dd5eca4fee42cdd))
+
+
 ## v0.2.0-dev.26 (2026-10-20)
 
 ### Bug Fixes
