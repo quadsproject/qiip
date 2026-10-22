@@ -1241,9 +1241,12 @@ async def test_serving_verification_labels_an_unreadable_generation(
 ) -> None:
     provisioner, _ssh, _stop = _provisioner()
     store = MagicMock()
+    store.create.return_value = "attempt-1"
     store.get.side_effect = OSError("database is locked")
     provisioner._log_buffer.store = store
-    provisioner._log_buffer.attempts["host1"] = "attempt-1"
+    # Create the host log so any write through _log_buffer.append would reach
+    # the store; that makes the store.append guard below meaningful.
+    provisioner._log_buffer.create("host1")
     httpx_mock.add_response(url="http://host1:8000/version", json=_version_payload())
     httpx_mock.add_response(url="http://host1:8000/v1/models", json=_models_payload())
     httpx_mock.add_response(
@@ -1263,6 +1266,7 @@ async def test_serving_verification_labels_an_unreadable_generation(
         (call.args[1], "generation=unavailable" in call.args[2])
         for call in log.call_args_list
     ] == [("info", True)]
+    store.append.assert_not_called()
 
 
 @pytest.mark.asyncio
