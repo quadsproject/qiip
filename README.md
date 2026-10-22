@@ -114,6 +114,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Type check](#type-check)
 - [User guide (for gateway users)](docs/user-guide.md)
 - [Releases (stable and development trains)](docs/releases.md)
+- [Maintainer release cycle](docs/maintainer-release-cycle.md)
 - [Durable provisioning evidence](#durable-provisioning-evidence)
 - [Troubleshooting](#troubleshooting)
   - [Reading provisioning logs offline](#reading-provisioning-logs-offline)
