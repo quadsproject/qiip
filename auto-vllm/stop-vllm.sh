@@ -1,6 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
+# Resolve the generation once, before sourcing any scripts or choosing tools.
+if [ "${QIIP_GENERATION_PINNED:-0}" != "1" ] \
+    && [ -L "${QIIP_GENERATION_ROOT:-/opt/qiip/vllm}/current" ]; then
+    _qiip_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    exec python3 "${_qiip_script_dir}/../common/generations.py" exec \
+        "${QIIP_GENERATION_ROOT:-/opt/qiip/vllm}" "$_qiip_script_dir" stop-vllm.sh "$@"
+fi
+
 PID_FILE="${AUTOVLLM_PID_FILE:-/var/run/vllm.pid}"
 PROC_ROOT="${AUTOVLLM_PROC_ROOT:-/proc}"
 STOP_TIMEOUT="${AUTOVLLM_STOP_TIMEOUT:-30}"

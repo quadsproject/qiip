@@ -25,6 +25,7 @@ def _versioned_path(path: str) -> str:
                 "css/dashboard.css",
                 "js/config_download.js",
                 "js/setup_selection.js",
+                "js/format_usd.js",
                 "js/dashboard.js",
             ),
         ),
@@ -52,6 +53,9 @@ def _versioned_path(path: str) -> str:
             "/profile",
             (
                 "css/dashboard.css",
+                "js/table_sort.js",
+                "js/clipboard.js",
+                "js/format_usd.js",
                 "js/profile.js",
             ),
         ),
@@ -60,6 +64,8 @@ def _versioned_path(path: str) -> str:
             (
                 "css/dashboard.css",
                 "js/confirm_dialog.js",
+                "js/table_sort.js",
+                "js/format_usd.js",
                 "js/admin_tokens.js",
             ),
         ),
@@ -68,6 +74,8 @@ def _versioned_path(path: str) -> str:
             (
                 "css/dashboard.css",
                 "js/confirm_dialog.js",
+                "js/table_sort.js",
+                "js/format_usd.js",
                 "js/admin_user_detail.js",
             ),
         ),

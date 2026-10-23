@@ -469,6 +469,117 @@ function renderLlamaCppRuntime(node, observation) {
   });
 }
 
+function renderVllmRuntime(node) {
+  var panel = document.getElementById("vllm-runtime-panel");
+  if (!panel) return;
+  if (!node || node.engine !== "vllm") {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  var status = document.getElementById("vllm-runtime-status");
+  var values = document.getElementById("vllm-runtime-values");
+  var runtime = node.vllm_runtime;
+  if (!runtime) {
+    status.hidden = false;
+    status.textContent = node.state === "healthy"
+      ? "No memory-aware launch record; this node was started without a gateway plan."
+      : "vLLM runtime configuration is unavailable until the next successful managed setup.";
+    values.hidden = true;
+    return;
+  }
+  status.hidden = true;
+  values.hidden = false;
+
+  var requested = runtime.requested || {};
+  var effective = runtime.effective || {};
+  var estimate = runtime.estimate || {};
+  var serving = runtime.serving;
+  var automatic = effective.model_selection === "automatic";
+
+  document.getElementById("vllm-runtime-selection").textContent =
+    automatic ? "Automatic (policy sized from available memory)" : "Explicit (operator selection preserved)";
+  document.getElementById("vllm-runtime-model-reason").textContent =
+    effective.model_reason || "—";
+  document.getElementById("vllm-runtime-model").textContent = effective.model || "—";
+  document.getElementById("vllm-runtime-requested-model").textContent =
+    requested.model || "auto";
+  document.getElementById("vllm-runtime-tp").textContent =
+    formatRuntimeCount(effective.tensor_parallel_size) + " GPU(s)";
+  document.getElementById("vllm-runtime-context").textContent =
+    formatRuntimeCount(effective.max_model_len) + " tokens";
+  document.getElementById("vllm-runtime-batched").textContent =
+    formatRuntimeCount(effective.max_num_batched_tokens) + " tokens";
+  document.getElementById("vllm-runtime-util").textContent =
+    (effective.gpu_memory_utilization * 100).toFixed(0) + "%";
+  document.getElementById("vllm-runtime-dtype").textContent =
+    effective.dtype || "auto";
+  document.getElementById("vllm-runtime-backend").textContent =
+    effective.attention_backend || "vLLM default";
+  document.getElementById("vllm-runtime-weights").textContent =
+    formatRuntimeCount(estimate.weights_per_gpu_mib) + " MiB";
+  document.getElementById("vllm-runtime-approximate").textContent =
+    runtime.approximate ? "Approximate (no local checkpoint; sized from the model name)" : "Measured from the local checkpoint";
+  document.getElementById("vllm-runtime-kv").textContent =
+    formatRuntimeCount(estimate.kv_cache_mib) + " MiB";
+  document.getElementById("vllm-runtime-overhead").textContent =
+    formatRuntimeCount(estimate.runtime_overhead_mib) + " MiB";
+  document.getElementById("vllm-runtime-reserve").textContent =
+    formatRuntimeCount(estimate.reserve_mib) + " MiB";
+  document.getElementById("vllm-runtime-budget").textContent =
+    formatRuntimeCount(estimate.usable_budget_mib) + " MiB per GPU";
+  document.getElementById("vllm-runtime-free").textContent =
+    formatRuntimeCount(estimate.free_per_gpu_mib) + " MiB per GPU";
+  document.getElementById("vllm-runtime-attempt").textContent =
+    String((runtime.attempt || 0) + 1);
+  document.getElementById("vllm-runtime-served-model").textContent =
+    serving && serving.served_model ? serving.served_model : "Not recorded";
+  document.getElementById("vllm-runtime-version").textContent =
+    serving && serving.runtime_version ? serving.runtime_version : "Not recorded";
+  document.getElementById("vllm-runtime-revision").textContent =
+    serving && serving.model_revision ? serving.model_revision : "Unknown";
+  document.getElementById("vllm-runtime-generation").textContent =
+    serving && serving.generation_id ? serving.generation_id : "Not recorded";
+  document.getElementById("vllm-runtime-pid").textContent =
+    serving && serving.process_id !== null && serving.process_id !== undefined
+      ? String(serving.process_id)
+      : "Not recorded";
+  document.getElementById("vllm-runtime-reason").textContent =
+    runtime.reason || "—";
+
+  var adjustments = document.getElementById("vllm-runtime-adjustments");
+  adjustments.textContent = "";
+  var entries = runtime.adjustments || [];
+  if (entries.length === 0) {
+    var none = document.createElement("li");
+    none.textContent = automatic
+      ? "None: the initial plan fit without adjustment."
+      : "None: no automatic field required adjustment.";
+    adjustments.appendChild(none);
+  } else {
+    entries.forEach(function (adjustment) {
+      var item = document.createElement("li");
+      item.textContent = adjustment.field + ": " +
+        (adjustment.previous || "auto") + " → " + adjustment.value +
+        " (" + adjustment.reason + ")";
+      adjustments.appendChild(item);
+    });
+  }
+
+  var gpuList = document.getElementById("vllm-runtime-gpus");
+  gpuList.textContent = "";
+  (runtime.gpus || []).forEach(function (gpu) {
+    var item = document.createElement("li");
+    item.textContent = "GPU " + gpu.index + ": " +
+      formatRuntimeCount(gpu.used_mib) + " MiB used, " +
+      formatRuntimeCount(gpu.free_mib) + " MiB free of " +
+      formatRuntimeCount(gpu.total_mib) + " MiB";
+    gpuList.appendChild(item);
+  });
+  document.getElementById("vllm-runtime-observed").textContent =
+    "Post-load snapshot at " + formatRuntimeTimestamp(runtime.observed_at);
+}
+
 async function submitLlamaCppRelaunch() {
   if (!llamaCppRelaunch || !currentDetailNode) return;
   if (llamaCppRelaunch.isBusy()) return;
@@ -547,18 +658,9 @@ async function refreshDetail() {
   var lastUpdatedEl = document.getElementById("last-updated");
 
   try {
-    // Read-only viewers load exactly what their fleet view allows: the
-    // single node, its tasks, and (separately) the log stream -- never the
-    // admin node/metrics endpoints.
-    var nodeResponse = READ_ONLY
-      ? fetch("/fleet/nodes/" + encodeURIComponent(NODE_ID))
-      : fetch("/admin/nodes");
-    var metricsResponse = READ_ONLY
-      ? Promise.resolve(null)
-      : fetch("/admin/metrics");
-    var tasksResponse = READ_ONLY
-      ? fetch("/fleet/nodes/" + encodeURIComponent(NODE_ID) + "/tasks")
-      : fetch("/admin/provisioning/tasks");
+    var nodeResponse = fetch("/admin/nodes");
+    var metricsResponse = fetch("/admin/metrics");
+    var tasksResponse = fetch("/admin/provisioning/tasks");
     var [nodesResp, metricsResp, tasksResp] = await Promise.all([
       nodeResponse,
       metricsResponse,
@@ -595,32 +697,25 @@ async function refreshDetail() {
       missingTag.textContent = "";
       missingTag.hidden = true;
       renderLlamaCppRuntime(null, currentRelaunchObservation);
+      renderVllmRuntime(null);
     } else {
       stateEl.textContent = node.state;
-      if (!READ_ONLY) {
-        setupSelection.setPreferredNode(node);
-        renderLlamaCppRuntime(node, currentRelaunchObservation);
-      }
+      setupSelection.setPreferredNode(node);
+      renderLlamaCppRuntime(node, currentRelaunchObservation);
       renderOriginTag(node);
+      renderVllmRuntime(node);
       document.getElementById("setup-config-panel").style.display =
-        READ_ONLY || node.self_setup ? "none" : "";
+        node.self_setup ? "none" : "";
 
       // Self-setup nodes are externally owned: QIIP must not send BMC power
       // actions or install software on them, and the server rejects those
-      // operations outright. Hide the matching controls here (read-only
-      // viewers already had every operational panel hidden).
-      if (READ_ONLY) {
-        document.getElementById("power-state").style.display = "none";
-        document.getElementById("power-actions").style.display = "none";
-        document.getElementById("recommendations-panel").style.display = "none";
-      } else {
-        document.getElementById("power-state").style.display =
-          node.self_setup ? "none" : "";
-        document.getElementById("power-actions").style.display =
-          node.self_setup ? "none" : "";
-        document.getElementById("recommendations-panel").style.display =
-          node.self_setup ? "none" : "";
-      }
+      // operations outright. Hide the matching controls here too.
+      document.getElementById("power-state").style.display =
+        node.self_setup ? "none" : "";
+      document.getElementById("power-actions").style.display =
+        node.self_setup ? "none" : "";
+      document.getElementById("recommendations-panel").style.display =
+        node.self_setup ? "none" : "";
 
       infoBody.textContent = "";
       var tr = document.createElement("tr");
@@ -645,22 +740,20 @@ async function refreshDetail() {
 
       var tdRq = document.createElement("td"); tdRq.className = "num"; tdRq.textContent = node.state === "available" ? "—" : (perNode[node.node_id] || 0); tr.appendChild(tdRq);
 
-      if (!READ_ONLY) {
-        var enabledActions = node.actions || [];
-        if (!setupSelection.isValid()) {
-          enabledActions = enabledActions.filter(function (a) { return a !== "setup"; });
-        }
-        var nodeActionsContainer = document.getElementById("node-actions");
-        nodeActionsContainer.textContent = "";
-        nodeActionsContainer.appendChild(createActionsDropdown(node.node_id, enabledActions, node));
+      var enabledActions = node.actions || [];
+      if (!setupSelection.isValid()) {
+        enabledActions = enabledActions.filter(function (a) { return a !== "setup"; });
       }
+      var nodeActionsContainer = document.getElementById("node-actions");
+      nodeActionsContainer.textContent = "";
+      nodeActionsContainer.appendChild(createActionsDropdown(node.node_id, enabledActions, node));
 
       infoBody.appendChild(tr);
 
       var cfgPanel = document.getElementById("config-download-panel");
       var cfgHint = document.getElementById("config-download-hint");
       var cfgButtons = document.getElementById("config-download-buttons");
-      if (!READ_ONLY && node.state === "healthy" && node.model) {
+      if (node.state === "healthy" && node.model) {
         cfgPanel.style.display = "";
         cfgHint.textContent = "Download agent configuration pointing at the inference proxy.";
         cfgButtons.textContent = "";
@@ -695,11 +788,33 @@ async function refreshDetail() {
         } else {
           var pb = document.createElement("span"); pb.className = "badge badge-in-progress"; pb.textContent = "in progress"; tdStatus.appendChild(pb);
         }
+        if (task.resume_state) {
+          var rb = document.createElement("span"); rb.className = "badge badge-failed";
+          rb.textContent = formatSetupResumeState(task.resume_state);
+          tdStatus.appendChild(rb);
+        }
+        if (task.attempt_number && task.attempt_number > 1) {
+          var ab = document.createElement("span"); ab.className = "badge badge-in-progress";
+          ab.textContent = "attempt " + task.attempt_number; tdStatus.appendChild(ab);
+        }
+        if (task.retry_count) {
+          var rtb = document.createElement("span"); rtb.className = "badge badge-in-progress";
+          rtb.textContent = task.retry_count + (task.retry_count === 1 ? " retry" : " retries");
+          tdStatus.appendChild(rtb);
+        }
+        if (task.next_action) {
+          var nb = document.createElement("span"); nb.className = "badge badge-failed";
+          nb.textContent = task.next_action; tdStatus.appendChild(nb);
+        }
         ttr.appendChild(tdStatus);
 
         var tdErr = document.createElement("td");
-        if (task.error) { tdErr.className = "error-text"; tdErr.textContent = task.error; }
-        else { tdErr.textContent = "—"; }
+        var progressNote = task.progress && task.progress.total_stages
+          ? (task.progress.percent != null ? task.progress.percent + "% · " : "") +
+            Number(task.progress.completed_count || 0) + " stages verified"
+          : "";
+        if (task.error) { tdErr.className = "error-text"; tdErr.textContent = task.error + (progressNote ? " · " + progressNote : ""); }
+        else { tdErr.textContent = progressNote || "—"; }
         ttr.appendChild(tdErr);
 
         var tdStart = document.createElement("td"); tdStart.textContent = new Date(task.started_at).toLocaleString(); ttr.appendChild(tdStart);
@@ -837,10 +952,8 @@ function connectLogStream() {
   status.textContent = "connecting";
   status.className = "badge badge-in-progress";
 
-  var logUrl = READ_ONLY
-    ? "/fleet/nodes/" + encodeURIComponent(NODE_ID) + "/logs"
-    : "/admin/provisioning/" + encodeURIComponent(NODE_ID) + "/logs";
-  if (!READ_ONLY && logResumeCursor) {
+  var logUrl = "/admin/provisioning/" + encodeURIComponent(NODE_ID) + "/logs";
+  if (logResumeCursor) {
     logUrl += "?attempt_id=" + encodeURIComponent(logResumeCursor.attempt) + "&after=" + logResumeCursor.after;
   }
   var es = new EventSource(logUrl);
@@ -1384,25 +1497,7 @@ async function fetchCatalog() {
   }
 }
 
-function hideOperationalPanels() {
-  ["power-state", "power-actions", "node-actions", "setup-config-panel",
-    "config-download-panel", "recommendations-panel", "llamacpp-runtime-panel",
-  ].forEach(function (id) {
-    var el = document.getElementById(id);
-    if (el) el.style.display = "none";
-  });
-}
-
 document.addEventListener("DOMContentLoaded", function () {
-  // Read-only viewers get no operational surface: the interactive panels are
-  // hidden and their admin-only fetches never run (node info, provisioning
-  // tasks, and the installation log still load from /fleet/nodes/*).
-  if (READ_ONLY) {
-    hideOperationalPanels();
-    refreshDetail();
-    setInterval(refreshDetail, POLL_INTERVAL_MS);
-    return;
-  }
   var relaunchForm = document.getElementById("llamacpp-relaunch-form");
   if (relaunchForm && llamaCppRelaunch) {
     relaunchForm.addEventListener("submit", function (event) {

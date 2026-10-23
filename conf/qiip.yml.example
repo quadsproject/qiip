@@ -84,9 +84,9 @@ pricing:
   # Premium-equivalent rates for token budget estimates; USD per million
   # tokens. The estimate is what the recorded usage would have cost at this
   # rate, not a cash ledger.
-  input_rate_per_mtok: 5.0
-  output_rate_per_mtok: 25.0
-  model_label: claude-opus-4.8
+  input_rate_per_mtok: 2.0
+  output_rate_per_mtok: 10.0
+  model_label: claude-sonnet-5
 
 ssh:
   # Node provisioning access; all hosts use the same key and username.
@@ -104,6 +104,8 @@ provisioning:
   min_disk_gb: 20
   drain_timeout: 30
   scripts_dir: auto-vllm
+  # Complete script/runtime/configuration generations on each managed node.
+  generation_root: /opt/qiip
   boot_wait_timeout: 300
   boot_wait_interval: 10
   max_concurrent_provisions: 32
@@ -143,8 +145,35 @@ provisioning:
   llamacpp_version: v0.4.1
   llamacpp_sha256: ef3d5b1907a391500ae11b5e61a8e2022e0deaac9790899cad9c4e02f03bfb9a
   llamacpp_source_url: https://github.com/ggml-org/llama.cpp/archive/refs/tags/{version}.tar.gz
+  # Configure both values to reuse verified builds from a shared HTTP(S) catalog.
+  llamacpp_artifact_catalog_url: ""
+  llamacpp_artifact_catalog_sha256: ""
+  llamacpp_allow_source_build: true
+  # 0 selects from available RAM/CPU; a positive value adds a job ceiling.
+  llamacpp_build_jobs: 0
   llamacpp_setup_timeout: 7200.0
   llamacpp_fit_target_mib: 512
+  # Bounded number of automatic vLLM launches per setup, including the initial
+  # memory-aware plan (N allows N-1 recognized-OOM retries); 1-5.
+  vllm_memory_retry_max_attempts: 4
+  # A node is only routable after the started server proves its model and
+  # runtime identity and answers one bounded inference request. These bounds
+  # apply after /health, so they are short.
+  vllm_verify_timeout: 30.0
+  vllm_inference_probe_timeout: 120.0
+  vllm_inference_probe_max_tokens: 1
+  # Tolerance when comparing process age (ps etimes) to this launch duration;
+  # covers etimes rounding and a backward gateway clock step.
+  vllm_process_start_slack: 30.0
+  # Total deadline for one vLLM setup run (dependency resolution and venv sync).
+  vllm_setup_timeout: 3600.0
+  # Bounded automatic retry of transient download/repository/SSH failures. Only
+  # recognized transient failures retry; configuration, unsupported-hardware,
+  # and maintenance failures stop immediately.
+  stage_retry_max_attempts: 3
+  stage_retry_base_delay: 5.0
+  stage_retry_max_delay: 120.0
+  stage_retry_jitter: 0.25
 
 quads:
   # Set base_url to enable the QUADS integration; server_timezone is then
@@ -152,10 +181,19 @@ quads:
   base_url: null
   server_timezone: null
   timeout: 10.0
+  # Must be at least 1; the poller sleeps this long after each poll finishes.
   poll_interval: 300
   verify_ssl: true
+  # Must be at least 1; the schedule enforcer sleeps this long after each check.
   schedule_check_interval: 300
+  # Must be at least 1; placement, manual setup and the schedule enforcer
+  # need a host free for the whole window.
   schedule_lookahead_hours: 24
+  # Automatic placement makes no decision from an inventory snapshot older
+  # than this (the poller keeps its last good data through a QUADS outage).
+  # Must be at least 60; where placement runs it must also be at least twice
+  # poll_interval, checked at startup.
+  stale_after_seconds: 900
 
 placement:
   # Automatic placement of catalog llama.cpp profiles on free single-GPU
@@ -200,6 +238,25 @@ redfish:
   power_poll_interval: 5.0
   # Always False for self-signed BMC certs.
   verify_ssl: false
+  # Per-lab and per-host BMC credential overrides. A hostname is matched to a
+  # lab identifier (a dotted FQDN segment) as a dot-bounded substring; the
+  # longest identifier wins, equal lengths resolve lexicographically. A full
+  # node FQDN under `hosts` (the hostname placement passes to auth_for, not the
+  # BMC name that bmc_host_template renders, e.g. mgmt-...) is an exact
+  # override and beats any lab. Anything matching nothing falls back to
+  # bmc_username/bmc_password above, which must be set to use overrides. Keys
+  # are lowercased and surrounding whitespace is stripped; a key that is
+  # empty, has a leading dot, ends with a dot on a `labs` entry (a trailing
+  # dot on a `hosts` entry is stripped), or duplicates another after
+  # normalization is rejected at startup. For example:
+  #   labs:
+  #     rdu2.scalelab: { username: root, password: mypass1 }
+  #     rdu3.labs.perfscale: { username: root, password: mypass2 }
+  #   hosts:
+  #     a20-h10-000-r670.rdu2.scalelab.example.com: { username: root, password: mypass3 }
+  bmc_credentials:
+    labs: {}
+    hosts: {}
 
 llmfit:
   # Model recommendation via SSH; version and sha256 are one upgrade unit.

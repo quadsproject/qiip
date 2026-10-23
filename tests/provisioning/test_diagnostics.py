@@ -42,8 +42,8 @@ def _prepare(
 ) -> None:
     setup = ssh.root / "auto-vllm/setup.sh"
     text, count = re.subn(
-        r"(?m)^    step system_update run_system_update$",
-        """    run_system_update() { :; }
+        r"(?m)^    prepare_runtime vllm$",
+        """    install_runtime_prerequisites() { :; }
     install_nvidia_driver() { :; }
     install_cuda_toolkit() { :; }
     ensure_fabric_manager() { :; }
@@ -52,7 +52,12 @@ def _prepare(
     mount_nfs_cache() { :; }
     configure_firewall() { :; }
     install_llmfit() { :; }
-    step system_update run_system_update""",
+    activate_engine_generation() { :; }
+    check_driver_resume() { :; }
+    install_missing_packages() { :; }
+    installed_driver_compatible() { :; }
+    verify_cuda_execution() { :; }
+    prepare_runtime vllm""",
         setup.read_text(),
     )
     assert count == 1, "Refuse to run real installation functions"
@@ -334,17 +339,22 @@ def test_source_deadlines_truncation_signals_and_missing_tools() -> None:
         diagnostics.capture(["/nonexistent-diagnostic-tool"], 1, 512)["status"]
         == "unavailable"
     )
+    # The child pays CI's coverage bootstrap (subprocess patching) before it
+    # can print: measured 0.26-0.39s against 0.04s bare, so the budget has to
+    # clear that with room to spare.
     hung = diagnostics.capture(
         [
             sys.executable,
             "-c",
             "import time; print('before timeout', flush=True); time.sleep(30)",
         ],
-        0.1,
+        2.0,
         512,
     )
     assert hung["status"] == "timed_out"
-    assert hung["duration_seconds"] < 1
+    # A liveness bound, not a deadline assertion: it only proves the child was
+    # killed instead of running its 30s sleep, with room for a loaded runner.
+    assert hung["duration_seconds"] < 5
     assert "before timeout" in hung["output"]
     killed = diagnostics.capture(["bash", "-c", "kill -KILL $$"], 2, 512)
     assert killed["signal"] == 9
@@ -357,8 +367,11 @@ def test_node_deadline_and_independent_collector_failure(tmp_path: Path) -> None
         attempt_id=attempt,
         engine="vllm",
         mount_point="/tmp",
-        diagnostics_timeout=0.1,
-        diagnostics_source_timeout=0.04,
+        # The store work before the first source is charged to this deadline,
+        # so keep an order-of-magnitude margin: load must not decide which
+        # side of it an assertion lands on.
+        diagnostics_timeout=1.0,
+        diagnostics_source_timeout=0.4,
         diagnostics_source_max_bytes=512,
         failure=dict(
             started_at=store.get(attempt)["started_at"],
@@ -372,7 +385,7 @@ def test_node_deadline_and_independent_collector_failure(tmp_path: Path) -> None
         calls += 1
         if calls == 1:
             raise ValueError("collector failure")
-        time.sleep(0.04)
+        time.sleep(0.4)
         return dict(status="collected", output="evidence")
 
     with patch.object(diagnostics, "capture", side_effect=broken):
@@ -382,6 +395,9 @@ def test_node_deadline_and_independent_collector_failure(tmp_path: Path) -> None
     assert "ValueError" in sources["nvidia_services"]["reason"]
     assert sources["kernel_gpu_oom"]["status"] == "collected"
     assert sources["mounts"]["status"] == "timed_out"
+    # Source budget pass-through is pinned in
+    # test_source_budget_reaches_capture_without_deadline_clamping, where the
+    # deadline is too open to clamp it.
 
 
 def test_failure_signal_and_command_secrets(
@@ -483,6 +499,61 @@ def _config(attempt_id: str) -> dict[str, Any]:
             failed_at="1970-01-01T00:00:02+00:00",
         ),
     )
+
+
+def test_source_budget_reaches_capture_without_deadline_clamping(
+    tmp_path: Path,
+) -> None:
+    store = AttemptLogStore(tmp_path / "node.sqlite3")
+    attempt = store.create("host1")
+    config = {
+        **_config(attempt),
+        # 30s of overall deadline against a 0.25s source cap: the store work
+        # charged before each source cannot reach the clamp, unlike the tight
+        # budget in test_node_deadline_and_independent_collector_failure.
+        "diagnostics_timeout": 30.0,
+        "diagnostics_source_timeout": 0.25,
+    }
+    seen: list[float] = []
+
+    def stub(
+        command: list[str], timeout: float, max_bytes: int, **kwargs: Any
+    ) -> dict[str, Any]:
+        seen.append(timeout)
+        return dict(status="collected", output="")
+
+    with patch.object(diagnostics, "capture", side_effect=stub):
+        diagnostics.collect(config, store)
+    assert set(seen) == {0.25}
+
+
+def test_diagnostics_without_selected_generation_report_absent_runtime(
+    tmp_path: Path,
+) -> None:
+    store = AttemptLogStore(tmp_path / "node.sqlite3")
+    attempt = store.create("host1", engine="vllm")
+    config = _config(attempt)
+    store.update(
+        attempt,
+        diagnostics=dict(
+            sources={
+                name: dict(
+                    status="collected",
+                    window_until=diagnostics.journal_until(config["failure"]),
+                )
+                for name in diagnostics.SOURCE_NAMES
+                if name != "runtime"
+            }
+        ),
+    )
+    assert diagnostics.source_commands(config)["runtime"] == []
+    with patch.object(diagnostics, "capture") as capture:
+        diagnostics.collect(config, store)
+    capture.assert_not_called()
+    runtime = store.get(attempt)["diagnostics"]["sources"]["runtime"]
+    assert runtime["status"] == "unavailable"
+    assert runtime["reason"] == "No generation was selected for this attempt"
+    assert runtime["deferred"] is False
 
 
 @pytest.mark.skipif(

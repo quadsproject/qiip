@@ -152,7 +152,7 @@ def _real_redfish_client(http_client: httpx.AsyncClient) -> RedfishClient:
         "mgmt-{hostname}",
         "1",
         hostname_policy=policy,
-        auth=auth,
+        auth_for=lambda _hostname: auth,
     )
 
 
@@ -205,6 +205,7 @@ class TestAdminNodesPopulated:
             "engine",
             "artifact_id",
             "llamacpp_runtime",
+            "vllm_runtime",
             "state",
             "actions",
             "gpu_vendor",
@@ -215,8 +216,14 @@ class TestAdminNodesPopulated:
             "admin_only",
             "failed_step",
             "error",
+            "resume_state",
             "placement_blocker",
             "owner",
+            "attempt_number",
+            "retry_count",
+            "progress",
+            "failure_class",
+            "next_action",
         }
         assert set(node.keys()) == expected
         assert "last_heartbeat" not in node
@@ -324,6 +331,7 @@ class TestAdminNodesPopulated:
                 "engine": "vllm",
                 "artifact_id": None,
                 "llamacpp_runtime": None,
+                "vllm_runtime": None,
                 "state": "failed",
                 "owner": "",
                 "actions": ["setup", "teardown"],
@@ -336,7 +344,13 @@ class TestAdminNodesPopulated:
                 "name": "",
                 "failed_step": None,
                 "error": None,
+                "resume_state": None,
                 "placement_blocker": None,
+                "attempt_number": None,
+                "retry_count": 0,
+                "progress": None,
+                "failure_class": None,
+                "next_action": None,
             }
         ]
         assert any(
@@ -1145,6 +1159,60 @@ class TestLlamaCppRelaunchEndpoint:
 
 class TestTasksEndpoint:
     """GET /admin/provisioning/tasks returns task status from etcd."""
+
+    @pytest.mark.parametrize(
+        "resume_state", ["maintenance_required", "reboot_required"]
+    )
+    def test_resume_state_survives_task_response(
+        self, client: TestClient, mock_provisioner: MagicMock, resume_state: str
+    ) -> None:
+        task_data = {
+            "hostname": "gpu01",
+            "current_step": "failed",
+            "started_at": "2026-07-07T12:00:00Z",
+            "updated_at": "2026-07-07T12:05:00Z",
+            "failed_step": "nvidia_driver",
+            "error": "Resolve driver maintenance, then retry setup",
+            "resume_state": resume_state,
+        }
+        mock_provisioner.list_tasks_raw.return_value = [
+            (json.dumps(task_data).encode(), {"key": b"/provisioning/gpu01"}),
+        ]
+        response = client.get("/admin/provisioning/tasks")
+        assert response.status_code == 200
+        assert response.json()[0]["resume_state"] == resume_state
+
+    def test_recovery_visibility_survives_task_response(
+        self, client: TestClient, mock_provisioner: MagicMock
+    ) -> None:
+        task_data = {
+            "hostname": "gpu01",
+            "current_step": "setup",
+            "started_at": "2026-07-07T12:00:00Z",
+            "updated_at": "2026-07-07T12:05:00Z",
+            "attempt_number": 2,
+            "retry_count": 1,
+            "progress": {
+                "completed_count": 3,
+                "stages_passed": 6,
+                "total_stages": 13,
+                "percent": 46.2,
+            },
+            "failure_class": "transient",
+            "next_action": "Retry setup; verified stages resume automatically",
+        }
+        mock_provisioner.list_tasks_raw.return_value = [
+            (json.dumps(task_data).encode(), {"key": b"/provisioning/gpu01"}),
+        ]
+        response = client.get("/admin/provisioning/tasks")
+        assert response.status_code == 200
+        body = response.json()[0]
+        assert body["attempt_number"] == 2
+        assert body["retry_count"] == 1
+        assert body["failure_class"] == "transient"
+        assert body["next_action"].startswith("Retry setup")
+        assert body["progress"]["completed_count"] == 3
+        assert body["progress"]["percent"] == 46.2
 
     def test_returns_tasks_from_etcd(
         self,
@@ -2293,10 +2361,98 @@ class TestSetupQuadsRevalidation:
     ) -> None:
         mock_quads = AsyncMock()
         mock_quads.get_available.return_value = ["gpu01"]
+        mock_quads.get_pending_moves.return_value = set()
         app.dependency_overrides[get_quads_client] = lambda: mock_quads
 
         response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
         assert response.status_code == 202
+
+    def test_returns_409_while_quads_has_a_pending_move_for_the_host(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        """Free by schedule, but QUADS still has a pending move for the host."""
+        mock_quads = AsyncMock()
+        mock_quads.get_available.return_value = ["gpu01"]
+        mock_quads.get_pending_moves.return_value = {"gpu01"}
+        app.dependency_overrides[get_quads_client] = lambda: mock_quads
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 409
+        assert "pending move" in response.json()["detail"]
+        mock_provisioner.fire_background.assert_not_called()
+        mock_provisioner.provision.assert_not_awaited()
+
+        # A retry once the move has cleared goes through.
+        mock_quads.get_pending_moves.return_value = set()
+        retry = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+        assert retry.status_code == 202
+
+    @pytest.mark.parametrize("outcome", ["pending", "unknown"])
+    def test_a_refused_retry_keeps_the_failed_node_record(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+        outcome: str,
+    ) -> None:
+        """The record a retry inherits owner and engine from must survive a 409."""
+        test_registry.add(
+            _make_node(node_id="gpu01", status=NodeStatus.FAILED, owner="alice")
+        )
+        mock_quads = AsyncMock()
+        mock_quads.get_available.return_value = ["gpu01"]
+        if outcome == "pending":
+            mock_quads.get_pending_moves.return_value = {"gpu01"}
+        else:
+            mock_quads.get_pending_moves.side_effect = QUADSConnectionError("down")
+        app.dependency_overrides[get_quads_client] = lambda: mock_quads
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == (409 if outcome == "pending" else 503)
+        mock_provisioner.cleanup_stale_node.assert_not_awaited()
+        mock_provisioner.fire_background.assert_not_called()
+        kept = test_registry.get("gpu01")
+        assert kept is not None and kept.owner == "alice"
+        assert kept.status is NodeStatus.FAILED
+
+    def test_returns_503_when_pending_moves_are_unknown(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_quads = AsyncMock()
+        mock_quads.get_available.return_value = ["gpu01"]
+        mock_quads.get_pending_moves.side_effect = QUADSConnectionError("timeout")
+        app.dependency_overrides[get_quads_client] = lambda: mock_quads
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 503
+        mock_provisioner.fire_background.assert_not_called()
+
+    def test_unmanaged_setup_skips_the_release_check(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        mock_quads = AsyncMock()
+        mock_quads.get_pending_moves.return_value = {"gpu01"}
+        app.dependency_overrides[get_quads_client] = lambda: mock_quads
+
+        response = client.post(
+            "/admin/nodes/setup", json={"hostname": "gpu01", "managed": False}
+        )
+
+        assert response.status_code == 202
+        mock_quads.get_pending_moves.assert_not_awaited()
 
     def test_works_without_quads_configured(
         self,

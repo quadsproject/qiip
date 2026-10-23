@@ -32,8 +32,7 @@ LLMFIT_URL="${LLMFIT_URL:-https://github.com/AlexsJones/llmfit/releases/download
 LLMFIT_BIN="${AUTOVLLM_LLMFIT_BIN:-/usr/local/bin/llmfit}"
 INSTALL_TMP_DIR="${AUTOVLLM_TMP_DIR:-/tmp}"
 
-# llama.cpp-specific. GitHub does not publish a Linux CUDA archive for this
-# release, so managed nodes compile the verified source for their attached GPU.
+# llama.cpp-specific. A pinned artifact catalog can avoid on-node compilation.
 DEFAULT_LLAMACPP_VERSION="v0.4.1"
 DEFAULT_LLAMACPP_SHA256="ef3d5b1907a391500ae11b5e61a8e2022e0deaac9790899cad9c4e02f03bfb9a"
 LLAMACPP_VERSION="${AUTOLLAMACPP_VERSION-$DEFAULT_LLAMACPP_VERSION}"
@@ -46,13 +45,17 @@ else
 fi
 LLAMACPP_SOURCE_URL="${AUTOLLAMACPP_SOURCE_URL:-https://github.com/ggml-org/llama.cpp/archive/refs/tags/${LLAMACPP_VERSION}.tar.gz}"
 LLAMACPP_INSTALL_ROOT="${AUTOLLAMACPP_INSTALL_ROOT:-/opt/llama.cpp}"
+QIIP_GENERATION_ROOT="${QIIP_GENERATION_ROOT:-/opt/qiip/llama_cpp}"
 LLAMACPP_LINK_DIR="${AUTOLLAMACPP_LINK_DIR:-/usr/local/bin}"
 LLAMACPP_CUDA_ARCHITECTURES="${AUTOLLAMACPP_CUDA_ARCHITECTURES:-native}"
-LLAMACPP_BUILD_PROFILE="cuda-portable-cpu-v2-fit-concurrency"
+LLAMACPP_BUILD_PROFILE="cuda-native-cpu-v4-artifact"
 LLAMACPP_FIT_PATCH_FROM=').set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));'
 LLAMACPP_FIT_PATCH_TO=').set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL, LLAMA_EXAMPLE_FIT_PARAMS}));'
 LLAMACPP_FIT_PATCH_SHA256="58917efc78ca760a2a1dd162d84e6cf1930c5b62a8dd9710bb4579ca4f2d69dc"
 CUDA_NVCC="${AUTOLLAMACPP_NVCC:-/usr/local/cuda/bin/nvcc}"
+LLAMACPP_ARTIFACT_CATALOG_URL="${AUTOLLAMACPP_ARTIFACT_CATALOG_URL:-}"
+LLAMACPP_ARTIFACT_CATALOG_SHA256="${AUTOLLAMACPP_ARTIFACT_CATALOG_SHA256:-}"
+LLAMACPP_ALLOW_SOURCE_BUILD="${AUTOLLAMACPP_ALLOW_SOURCE_BUILD:-1}"
 
 unset AUTOVLLM_NFS_EXPORT AUTOVLLM_NFS_MOUNT_POINT
 unset AUTOVLLM_NVIDIA_DRIVER_VERSION AUTOVLLM_NVIDIA_DRIVER_SHA256 AUTOVLLM_API_PORT
@@ -61,6 +64,8 @@ unset AUTOVLLM_LLMFIT_BIN AUTOVLLM_TMP_DIR AUTOLLAMACPP_SCRIPT_DIR
 unset AUTOLLAMACPP_VERSION AUTOLLAMACPP_SHA256 AUTOLLAMACPP_SOURCE_URL
 unset AUTOLLAMACPP_INSTALL_ROOT AUTOLLAMACPP_LINK_DIR
 unset AUTOLLAMACPP_CUDA_ARCHITECTURES AUTOLLAMACPP_NVCC
+unset AUTOLLAMACPP_ARTIFACT_CATALOG_URL AUTOLLAMACPP_ARTIFACT_CATALOG_SHA256
+unset AUTOLLAMACPP_ALLOW_SOURCE_BUILD
 
 # Source shared setup functions
 # shellcheck disable=SC1091 source=../common/setup-base.sh
@@ -82,9 +87,12 @@ installed_llamacpp_version() {
 }
 
 cuda_compute_capabilities() {
-    local capabilities
+    local capabilities devices
+    devices=$(profile_gpu_devices)
+    local -a selection=()
+    [ -z "$devices" ] || selection=(-i "$devices")
     if ! capabilities=$(
-        nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null \
+        nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits "${selection[@]}" 2>/dev/null \
             | sed '/^[[:space:]]*$/d' \
             | sort -Vu
     ); then
@@ -197,6 +205,123 @@ verify_managed_server_cli() {
     fi
 }
 
+llamacpp_artifact_tool() {
+    python3 "${SCRIPT_DIR}/../common/llamacpp_artifacts.py" "$@"
+}
+
+llamacpp_host_identity() {
+    [ -n "${OS_ID:-}" ] || detect_profile_os
+    local capabilities nvcc cpu installed_toolkit=""
+    capabilities=$(cuda_compute_capabilities)
+    cpu=$(llamacpp_artifact_tool cpu "${AUTOLLAMACPP_CPUINFO:-/proc/cpuinfo}")
+    nvcc=$(find_nvcc) || nvcc=""
+    if [ -n "$nvcc" ]; then
+        installed_toolkit=$("$nvcc" --version | sed -n 's/.*V\([0-9][0-9.]*\).*/\1/p') || installed_toolkit=""
+    fi
+    python3 -c 'import json,sys; print(json.dumps({**dict(zip(sys.argv[2::2], sys.argv[3::2])), **json.loads(sys.argv[1])}))' "$cpu" \
+        version "$LLAMACPP_VERSION" source_sha256 "${LLAMACPP_SHA256,,}" \
+        build_profile "$LLAMACPP_BUILD_PROFILE" fit_cli_patch_sha256 "$LLAMACPP_FIT_PATCH_SHA256" \
+        compute_capabilities "${capabilities//$'\n'/,}" \
+        cmake_cuda_architectures "$LLAMACPP_CUDA_ARCHITECTURES" \
+        cuda_toolkit "$PROFILE_CUDA_TOOLKIT_VERSION" profile "${PROFILE_NAME:-unselected}" \
+        os_id "$OS_ID" os_major "${OS_VERSION_ID%%.*}" arch "$OS_ARCH" glibc "$GLIBC_VERSION" \
+        installed_cuda_toolkit "$installed_toolkit"
+}
+
+verify_llamacpp_binaries() {
+    local runtime="$1" binary quantize_help quantize_status=0
+    export LD_LIBRARY_PATH="${runtime}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    for binary in llama-server llama-fit-params; do
+        if [ "$(installed_llamacpp_version "${runtime}/bin/${binary}")" != "$LLAMACPP_VERSION" ]; then
+            echo "FATAL: built ${binary} did not report ${LLAMACPP_VERSION}" >&2
+            return 1
+        fi
+    done
+    # These are explicit so a caller that suppresses errexit (for example the
+    # resume verifier's ``cmd >/dev/null 2>&1 || return 1``) still propagates a
+    # failure instead of silently continuing.
+    verify_managed_server_cli "${runtime}/bin/llama-server" || return 1
+    verify_fit_params_cli "${runtime}/bin/llama-fit-params" || return 1
+    # The pinned quantizer has no --version and returns 1 for --help.
+    quantize_help=$("${runtime}/bin/llama-quantize" --help 2>&1) || quantize_status=$?
+    if [ "$quantize_status" -gt 1 ] || ! grep -q '^usage:' <<< "$quantize_help"; then
+        echo "FATAL: llama-quantize did not report its CLI usage" >&2
+        return 1
+    fi
+}
+
+verify_llamacpp_cuda() {
+    local runtime="$1" devices listed
+    devices=$(profile_gpu_devices)
+    local -a probe_env=("LD_LIBRARY_PATH=${runtime}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}")
+    [ -z "$devices" ] || probe_env+=("CUDA_VISIBLE_DEVICES=$devices")
+    echo "[STEP:cuda_proof:START]"
+    if ! listed=$(env "${probe_env[@]}" "${runtime}/bin/llama-server" --list-devices 2>&1) \
+        || ! grep -Eq 'CUDA[0-9]+' <<< "$listed"; then
+        echo "FATAL: llama-server does not expose the required CUDA backend: ${listed}" >&2
+        return 10
+    fi
+    if ! env "${probe_env[@]}" "${runtime}/bin/cuda-probe"; then
+        echo "[STEP:cuda_proof:FAIL]"
+        echo "FATAL: artifact CUDA execution failed; inspect driver/device/fabric health" >&2
+        return 10
+    fi
+    echo "[STEP:cuda_proof:OK]"
+}
+
+reuse_llamacpp_artifact() (
+    set -e
+    local host="$1" runtime work_dir entry marker identity url archive_bytes unpacked_bytes
+    # A local completed package needs no catalog download or toolchain.
+    if runtime=$(llamacpp_artifact_tool local "$LLAMACPP_INSTALL_ROOT" "$host"); then
+        verify_llamacpp_binaries "$runtime"
+        verify_llamacpp_cuda "$runtime"
+        select_llamacpp_runtime "$runtime"
+        echo "[ARTIFACT:hit:local] ${runtime}"
+        echo "llama-server ${LLAMACPP_VERSION} already installed for CUDA capabilities $(cuda_compute_capabilities | paste -sd, -), skipping"
+        exit 0
+    fi
+    if [ -z "$LLAMACPP_ARTIFACT_CATALOG_URL" ]; then
+        echo "[ARTIFACT:miss:catalog_not_configured]"
+        exit 4
+    fi
+    require_sha256 "llama.cpp artifact catalog" "$LLAMACPP_ARTIFACT_CATALOG_SHA256" AUTOLLAMACPP_ARTIFACT_CATALOG_SHA256
+    work_dir=$(mktemp -d "${INSTALL_TMP_DIR%/}/llamacpp-artifact.XXXXXX")
+    trap 'rm -rf "$work_dir"' EXIT
+    if ! wget -q --timeout=30 --tries=2 "$LLAMACPP_ARTIFACT_CATALOG_URL" -O "${work_dir}/catalog.json"; then
+        echo "[ARTIFACT:download:FAIL:catalog]" >&2
+        exit 6
+    fi
+    verify_sha256 "${work_dir}/catalog.json" "$LLAMACPP_ARTIFACT_CATALOG_SHA256" "llama.cpp artifact catalog"
+    if entry=$(llamacpp_artifact_tool select "${work_dir}/catalog.json" "$host"); then :; else
+        local status=$?
+        echo "[ARTIFACT:miss:catalog_selection_failed:${status}]"
+        exit "$status"
+    fi
+    marker=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["identity"])' "$entry")
+    url=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["url"])' "$entry")
+    archive_bytes=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["archive_bytes"])' "$entry")
+    unpacked_bytes=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["unpacked_bytes"])' "$entry")
+    identity=$(printf '%s' "$marker" | sha256sum | cut -c1-16)
+    runtime="${LLAMACPP_INSTALL_ROOT%/}/${LLAMACPP_VERSION}-${identity}"
+    qiip_require_inactive_runtime "$runtime" "$QIIP_GENERATION_ROOT" "$LLAMACPP_INSTALL_ROOT"
+    llamacpp_artifact_tool capacity "$work_dir" "$((archive_bytes + unpacked_bytes))" \
+        "$LLAMACPP_INSTALL_ROOT" "$unpacked_bytes"
+    echo "[ARTIFACT:download:START] ${url}"
+    if ! wget -q --timeout=30 --tries=2 "$url" -O "${work_dir}/runtime.tar.gz"; then
+        echo "[ARTIFACT:download:FAIL:archive]" >&2
+        exit 6
+    fi
+    llamacpp_artifact_tool unpack "${work_dir}/runtime.tar.gz" "${work_dir}/runtime" "$entry"
+    verify_llamacpp_binaries "${work_dir}/runtime"
+    verify_llamacpp_cuda "${work_dir}/runtime" || exit 5
+    sudo python3 "${SCRIPT_DIR}/../common/llamacpp_artifacts.py" install "${work_dir}/runtime" "$runtime"
+    verify_llamacpp_binaries "$runtime"
+    verify_llamacpp_cuda "$runtime" || exit 5
+    select_llamacpp_runtime "$runtime"
+    echo "[ARTIFACT:hit:catalog] ${runtime}"
+)
+
 install_llamacpp() {
     require_sha256 "llama.cpp ${LLAMACPP_VERSION}" "$LLAMACPP_SHA256" \
         "AUTOLLAMACPP_SHA256"
@@ -208,6 +333,63 @@ install_llamacpp() {
         echo "FATAL: AUTOLLAMACPP_SOURCE_URL must be an HTTP(S) URL" >&2
         return 2
     fi
+    if [[ ! "$LLAMACPP_ALLOW_SOURCE_BUILD" =~ ^[01]$ ]]; then
+        echo "FATAL: AUTOLLAMACPP_ALLOW_SOURCE_BUILD must be 0 or 1" >&2
+        return 2
+    fi
+    if [ -n "$LLAMACPP_ARTIFACT_CATALOG_URL" ]; then
+        if [[ ! "$LLAMACPP_ARTIFACT_CATALOG_URL" =~ ^https?:// ]]; then
+            echo "FATAL: AUTOLLAMACPP_ARTIFACT_CATALOG_URL must be an HTTP(S) URL" >&2
+            return 2
+        fi
+        require_sha256 "llama.cpp artifact catalog" "$LLAMACPP_ARTIFACT_CATALOG_SHA256" AUTOLLAMACPP_ARTIFACT_CATALOG_SHA256
+    elif [ -n "$LLAMACPP_ARTIFACT_CATALOG_SHA256" ]; then
+        echo "FATAL: artifact catalog digest requires AUTOLLAMACPP_ARTIFACT_CATALOG_URL" >&2
+        return 2
+    fi
+    verify_fit_params_patch_identity
+    local started="$SECONDS" host fallback_reason
+    [ -n "${OS_ID:-}" ] || detect_profile_os
+    host=$(llamacpp_host_identity)
+    echo "[ARTIFACT:lookup:START] ${host}"
+    run_with_errexit reuse_llamacpp_artifact "$host"
+    echo "[TIMING:llamacpp:lookup_seconds=$((SECONDS - started))]"
+    if [ "$STEP_STATUS" -eq 0 ]; then
+        echo "[TIMING:llamacpp:artifact_seconds=$((SECONDS - started))]"
+        return 0
+    fi
+    # A previously verified local runtime failing execution indicates a stack
+    # failure. A downloaded probe/backend can instead be incompatible.
+    if [ "$STEP_STATUS" -eq 10 ]; then return 10; fi
+    case "$STEP_STATUS" in
+        4) fallback_reason="no_compatible_artifact" ;;
+        5) fallback_reason="artifact_cuda_proof_failed" ;;
+        6) fallback_reason="artifact_download_failed" ;;
+        *) fallback_reason="artifact_verification_failed" ;;
+    esac
+    echo "[ARTIFACT:miss:${fallback_reason}]"
+    if [ "$LLAMACPP_ALLOW_SOURCE_BUILD" = "0" ]; then
+        echo "FATAL: llama.cpp artifact unavailable (${fallback_reason}); source fallback is disabled" >&2
+        return 1
+    fi
+    echo "[BUILD:fallback:${fallback_reason}]"
+    local plan jobs build_tmp target_plan compile_architectures compiled_architectures cpu_flags
+    cpu_flags=$(python3 -c 'import json,sys; h=json.loads(sys.argv[1]); h["cpu_flags"] == h["build_cpu_flags"] or sys.exit("FATAL: native source builds require uniform CPU flags; use a compatible artifact for mixed CPUs"); print(h["build_cpu_flags"])' "$host") || return
+    target_plan=$(llamacpp_artifact_tool targets "$LLAMACPP_CUDA_ARCHITECTURES" "$(cuda_compute_capabilities | paste -sd, -)")
+    compile_architectures=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["cmake_cuda_architectures"])' "$target_plan")
+    compiled_architectures=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["compiled_cuda_architectures"])' "$target_plan")
+    plan=$(llamacpp_artifact_tool resources "$INSTALL_TMP_DIR" "$LLAMACPP_INSTALL_ROOT")
+    jobs=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["jobs"])' "$plan")
+    build_tmp=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["temporary"])' "$plan")
+    echo "[BUILD:resources] ${plan}"
+    step llamacpp_toolchain install_runtime_prerequisites llamacpp
+    step cuda_toolkit install_cuda_toolkit
+    # Installing the toolkit can consume RAM/disk on these same filesystems.
+    # Refresh the plan before any source download or compiler work begins.
+    plan=$(llamacpp_artifact_tool resources "$INSTALL_TMP_DIR" "$LLAMACPP_INSTALL_ROOT")
+    jobs=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["jobs"])' "$plan")
+    build_tmp=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["temporary"])' "$plan")
+    echo "[BUILD:resources:after_toolchain] ${plan}"
     if ! command -v cmake >/dev/null || ! command -v make >/dev/null; then
         echo "FATAL: cmake and make are required to build llama.cpp" >&2
         return 1
@@ -224,7 +406,7 @@ install_llamacpp() {
 
     verify_fit_params_patch_identity
 
-    local compute_capabilities build_identity install_dir marker cuda_toolkit nvcc_version
+    local compute_capabilities build_identity install_dir marker cuda_toolkit nvcc_version compiler
     if ! nvcc_version=$("$CUDA_NVCC" --version); then
         echo "FATAL: could not determine CUDA toolkit version from ${CUDA_NVCC}" >&2
         return 1
@@ -235,37 +417,38 @@ install_llamacpp() {
         return 1
     fi
     compute_capabilities=$(cuda_compute_capabilities) || return
-    marker=$(printf 'version=%s\nsource_sha256=%s\nbuild_profile=%s\nfit_cli_patch_sha256=%s\ncompute_capabilities=%s\ncmake_cuda_architectures=%s\ncuda_toolkit=%s\n' \
+    compiler=$(g++ -dumpfullversion -dumpversion)
+    marker=$(printf 'publication_schema=4\nversion=%s\nsource_sha256=%s\nbuild_profile=%s\nfit_cli_patch_sha256=%s\ncompute_capabilities=%s\ncompiled_cuda_architectures=%s\ncmake_cuda_architectures=%s\ncuda_toolkit=%s\nprofile=%s\ncompiler=GNU-%s\ncpu_flags=%s\nos_id=%s\nos_major=%s\narch=%s\nglibc=%s\n' \
         "$LLAMACPP_VERSION" \
-        "$LLAMACPP_SHA256" \
+        "${LLAMACPP_SHA256,,}" \
         "$LLAMACPP_BUILD_PROFILE" \
         "$LLAMACPP_FIT_PATCH_SHA256" \
         "${compute_capabilities//$'\n'/,}" \
-        "$LLAMACPP_CUDA_ARCHITECTURES" \
-        "$cuda_toolkit")
+        "$compiled_architectures" "$compile_architectures" \
+        "$cuda_toolkit" "${PROFILE_NAME:-unselected}" "$compiler" "$cpu_flags" \
+        "$OS_ID" "${OS_VERSION_ID%%.*}" "$OS_ARCH" "$GLIBC_VERSION")
     build_identity=$(printf '%s' "$marker" | sha256sum | cut -c1-16)
     install_dir="${LLAMACPP_INSTALL_ROOT%/}/${LLAMACPP_VERSION}-${build_identity}"
 
-    if [ -x "${install_dir}/bin/llama-server" ] \
-        && [ -x "${install_dir}/bin/llama-fit-params" ] \
-        && [ -f "${install_dir}/BUILD-INFO" ] \
-        && [ "$(<"${install_dir}/BUILD-INFO")" = "$marker" ] \
-        && [ "$(installed_llamacpp_version "${install_dir}/bin/llama-server")" = "$LLAMACPP_VERSION" ]; then
-        sudo mkdir -p "$LLAMACPP_LINK_DIR"
-        atomic_link "${install_dir}/bin/llama-server" "${LLAMACPP_LINK_DIR%/}/llama-server"
-        atomic_link "${install_dir}/bin/llama-fit-params" "${LLAMACPP_LINK_DIR%/}/llama-fit-params"
-        atomic_link "${install_dir}/bin/llama-quantize" "${LLAMACPP_LINK_DIR%/}/llama-quantize"
+    if [ -f "${install_dir}/RUNTIME.json" ] \
+        && llamacpp_artifact_tool verify "$install_dir" "$marker"; then
+        verify_llamacpp_binaries "$install_dir"
+        verify_llamacpp_cuda "$install_dir"
+        select_llamacpp_runtime "$install_dir"
         echo "llama-server ${LLAMACPP_VERSION} already installed for CUDA capabilities ${compute_capabilities//$'\n'/,}, skipping"
         return 0
     fi
+
+    qiip_require_inactive_runtime "$install_dir" "$QIIP_GENERATION_ROOT" "$LLAMACPP_INSTALL_ROOT"
 
     # run_with_errexit invokes steps inside its own set -e subshell, where a
     # function RETURN trap is not reliable. Keep the entire build and publish
     # sequence in a dedicated subshell whose EXIT trap owns all cleanup.
     (
         set -e
+        INSTALL_TMP_DIR="$build_tmp"
         local work_dir archive source_dir build_dir server_bin fit_bin quantize_bin build_status
-        work_dir=$(mktemp -d "${INSTALL_TMP_DIR%/}/auto-llamacpp.XXXXXX")
+        work_dir=$(mktemp -d "${build_tmp%/}/auto-llamacpp.XXXXXX")
         # shellcheck disable=SC2317,SC2329  # Invoked indirectly by the EXIT trap.
         cleanup_llamacpp_build() {
             build_status=$?
@@ -277,7 +460,13 @@ install_llamacpp() {
         archive="${work_dir}/llamacpp.tar.gz"
         source_dir="${work_dir}/source"
         build_dir="${work_dir}/build"
-        mkdir -p "$source_dir"
+        local staged="${work_dir}/runtime" devices
+        mkdir -p "$source_dir" "${staged}/bin"
+        # Prove the prepared driver before downloading or compiling the engine,
+        # and retain that same probe in the completed package.
+        devices=$(profile_gpu_devices)
+        [ -z "$devices" ] || export CUDA_VISIBLE_DEVICES="$devices"
+        verify_cuda_execution "${staged}/bin/cuda-probe" "$compile_architectures"
 
         wget -q "$LLAMACPP_SOURCE_URL" -O "$archive"
         verify_sha256 "$archive" "$LLAMACPP_SHA256" \
@@ -299,13 +488,23 @@ install_llamacpp() {
         else
             version_flags=(-DLLAMA_BUILD_NUMBER="${LLAMACPP_VERSION#b}")
         fi
+        echo "[BUILD:configure:START]"
+        # DT_RPATH also resolves children of bundled CUDA libraries that have
+        # no RPATH of their own. Never retain absolute producer toolkit paths.
         cmake -S "$source_dir" -B "$build_dir" -G "Unix Makefiles" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$(command -v gcc)" \
+            -DCMAKE_CXX_COMPILER="$(command -v g++)" \
+            -DCMAKE_CUDA_HOST_COMPILER="$(command -v g++)" \
             -DCMAKE_CUDA_COMPILER="$CUDA_NVCC" \
-            -DCMAKE_CUDA_ARCHITECTURES="$LLAMACPP_CUDA_ARCHITECTURES" \
+            -DCMAKE_CUDA_ARCHITECTURES="$compile_architectures" \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            "-DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib" \
+            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_CUDA=ON \
-            -DGGML_NATIVE=OFF \
+            -DGGML_NATIVE=ON \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TOOLS=ON \
@@ -316,8 +515,10 @@ install_llamacpp() {
             -DLLAMA_OPENSSL=OFF \
             "${version_flags[@]}" \
             -DLLAMA_BUILD_COMMIT="$LLAMACPP_VERSION"
+        echo "[BUILD:compile:START:jobs=${jobs}]"
         cmake --build "$build_dir" --target llama-server llama-fit-params llama-quantize \
-            --parallel "$(nproc)"
+            --parallel "$jobs"
+        echo "[BUILD:compile:OK:elapsed_seconds=$((SECONDS - started))]"
 
         server_bin="${build_dir}/bin/llama-server"
         fit_bin="${build_dir}/bin/llama-fit-params"
@@ -326,23 +527,101 @@ install_llamacpp() {
             echo "FATAL: llama.cpp build did not produce the required binaries" >&2
             exit 1
         fi
-        if [ "$(installed_llamacpp_version "$server_bin")" != "$LLAMACPP_VERSION" ]; then
-            echo "FATAL: built llama-server did not report ${LLAMACPP_VERSION}" >&2
-            exit 1
-        fi
-        verify_managed_server_cli "$server_bin"
-        verify_fit_params_cli "$fit_bin"
-
-        printf '%s\n' "$marker" > "${work_dir}/BUILD-INFO"
-        sudo mkdir -p "${install_dir}/bin" "$LLAMACPP_LINK_DIR"
-        sudo install -m 755 "$server_bin" "${install_dir}/bin/llama-server"
-        sudo install -m 755 "$fit_bin" "${install_dir}/bin/llama-fit-params"
-        sudo install -m 755 "$quantize_bin" "${install_dir}/bin/llama-quantize"
-        sudo install -m 644 "${work_dir}/BUILD-INFO" "${install_dir}/BUILD-INFO"
-        atomic_link "${install_dir}/bin/llama-server" "${LLAMACPP_LINK_DIR%/}/llama-server"
-        atomic_link "${install_dir}/bin/llama-fit-params" "${LLAMACPP_LINK_DIR%/}/llama-fit-params"
-        atomic_link "${install_dir}/bin/llama-quantize" "${LLAMACPP_LINK_DIR%/}/llama-quantize"
+        install -m 755 "$server_bin" "$fit_bin" "$quantize_bin" "${staged}/bin/"
+        # Dependency discovery uses the producer toolkit only; installed tools
+        # resolve their bundled closure through the embedded relative RPATH.
+        local toolkit_root
+        toolkit_root=$(dirname "$(dirname "$(readlink -f "$CUDA_NVCC")")")
+        LD_LIBRARY_PATH="${toolkit_root}/lib64:${toolkit_root}/targets/x86_64-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+            llamacpp_artifact_tool libraries "${staged}/bin" "${staged}/lib"
+        printf '%s\n' "$marker" > "${staged}/BUILD-INFO"
+        verify_llamacpp_binaries "$staged"
+        verify_llamacpp_cuda "$staged"
+        llamacpp_artifact_tool seal "$staged" "$marker"
+        echo "[BUILD:publish:START]"
+        sudo python3 "${SCRIPT_DIR}/../common/llamacpp_artifacts.py" install "$staged" "$install_dir"
+        # Validate the installed copies too; failed copying or disk exhaustion
+        # must never produce a completion manifest or switch the active set.
+        verify_llamacpp_binaries "$install_dir"
+        verify_llamacpp_cuda "$install_dir"
+        select_llamacpp_runtime "$install_dir"
+        echo "[TIMING:llamacpp:source_seconds=$((SECONDS - started))]"
     )
+}
+
+select_llamacpp_runtime() {
+    local install_dir="$1" binary
+    if [ -n "${QIIP_RUNTIME_SELECTION:-}" ]; then
+        printf '%s\n' "$install_dir" > "$QIIP_RUNTIME_SELECTION"
+    else
+        # Standalone install_llamacpp callers use one pointer for all tools.
+        # Stable compatibility links are installed once, before the commit.
+        sudo mkdir -p "$LLAMACPP_LINK_DIR"
+        if [ ! -L "${LLAMACPP_INSTALL_ROOT%/}/current" ] \
+            && [ -L "${LLAMACPP_LINK_DIR%/}/llama-server" ] \
+            && [ -e "${LLAMACPP_LINK_DIR%/}/llama-server" ]; then
+            local old_binary
+            old_binary=$(readlink -f "${LLAMACPP_LINK_DIR%/}/llama-server")
+            atomic_link "$(dirname "$(dirname "$old_binary")")" \
+                "${LLAMACPP_INSTALL_ROOT%/}/current"
+        fi
+        for binary in llama-server llama-fit-params llama-quantize; do
+            atomic_link "${LLAMACPP_INSTALL_ROOT%/}/current/bin/${binary}" \
+                "${LLAMACPP_LINK_DIR%/}/${binary}"
+        done
+        if [ -L "${LLAMACPP_INSTALL_ROOT%/}/current" ] \
+            && [ "$(readlink -f "${LLAMACPP_INSTALL_ROOT%/}/current")" != "$install_dir" ]; then
+            atomic_link "$(readlink -f "${LLAMACPP_INSTALL_ROOT%/}/current")" \
+                "${LLAMACPP_INSTALL_ROOT%/}/previous"
+        fi
+        atomic_link "$install_dir" "${LLAMACPP_INSTALL_ROOT%/}/current"
+    fi
+}
+
+# Resume support: re-derive the installed runtime the same way
+# install_llamacpp does and republish the runtime selection, so skipping an
+# expensive source build does not leave generation_activate without a runtime.
+qiip_verify_llamacpp_install() {
+    local runtime
+    runtime=$(llamacpp_artifact_tool local "$LLAMACPP_INSTALL_ROOT" "$(llamacpp_host_identity)") \
+        || return 1
+    [ -n "$runtime" ] || return 1
+    verify_llamacpp_binaries "$runtime" >/dev/null 2>&1 || return 1
+    # llama.cpp defers the common cuda_proof to this installer, so a resumed
+    # install must re-prove CUDA execution too. A failure reruns the stage,
+    # which reports status 10 and reaches the reboot handling.
+    verify_llamacpp_cuda "$runtime" >/dev/null 2>&1 || return 1
+    select_llamacpp_runtime "$runtime" >/dev/null 2>&1 || return 1
+    [ -n "$QIIP_RUNTIME_SELECTION" ] || return 1
+}
+
+install_llamacpp_driver_checked() {
+    local name="llamacpp_install"
+    checkpoint_plan_sync
+    if checkpoint_stage_verified "$name"; then
+        echo "[STEP:${name}:SKIP]"
+        return 0
+    fi
+    echo "[STEP:${name}:START]"
+    run_with_errexit install_llamacpp
+    local status="$STEP_STATUS"
+    if [ "$status" -ne 0 ]; then
+        echo "[STEP:${name}:FAIL]"
+        if [ "$status" -eq 10 ]; then
+            if [ "${QIIP_DRIVER_REPAIRED:-0}" -eq 1 ]; then
+                require_driver_reboot "CUDA execution failed after driver repair"
+                return 20
+            fi
+            resume_required maintenance_required "CUDA execution failed despite a compatible driver version; inspect device/fabric/runtime health, then retry setup"
+            return 21
+        fi
+        return "$status"
+    fi
+    if [ -f "${DRIVER_STATE_DIR}/driver-reboot" ]; then
+        sudo rm -f "${DRIVER_STATE_DIR}/driver-reboot"
+    fi
+    record_checkpoint "$name"
+    echo "[STEP:${name}:OK]"
 }
 
 # --- Main ---
@@ -351,23 +630,17 @@ main() {
         echo "FATAL: AUTOVLLM_NFS_EXPORT is required for node provisioning" >&2
         return 2
     fi
-    require_sha256 "NVIDIA driver ${DRIVER_VERSION}" "$DRIVER_SHA256" \
-        "AUTOVLLM_NVIDIA_DRIVER_SHA256"
     require_sha256 "llmfit ${LLMFIT_RELEASE}" "$LLMFIT_SHA256" \
         "AUTOVLLM_LLMFIT_SHA256"
     require_sha256 "llama.cpp ${LLAMACPP_VERSION}" "$LLAMACPP_SHA256" \
         "AUTOLLAMACPP_SHA256"
-    step system_update run_system_update
-    step nvidia_driver install_nvidia_driver
-    select_runtime_profile llamacpp || exit $?
-    step check_install_capacity check_install_capacity_or_warn
-    step cuda_toolkit install_cuda_toolkit
-    step fabric_manager ensure_fabric_manager
-    step cuda_proof verify_cuda_execution
-    step llamacpp_install install_llamacpp
+    begin_engine_generation
+    prepare_runtime llamacpp 1
+    install_llamacpp_driver_checked
     step nfs_mount mount_nfs_cache
     step firewall configure_firewall
     soft_step llmfit_install install_llmfit
+    step generation_activate activate_engine_generation llama_cpp
 
     echo "Setup complete"
 }

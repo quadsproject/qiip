@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shlex
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,10 @@ from inference_proxy.config.settings import (
     DEFAULT_LLMFIT_VERSION,
     DEFAULT_NVIDIA_DRIVER_SHA256,
     DEFAULT_NVIDIA_DRIVER_VERSION,
+)
+from inference_proxy.provisioning.log_store import (
+    SETUP_ENGINE_STAGES,
+    SETUP_STAGE_ORDER,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -321,6 +327,7 @@ def test_vllm_environment_syncs_with_frozen_uv_lock(tmp_path: Path) -> None:
     venv = tmp_path / "venv"
     bin_dir = venv / "bin"
     bin_dir.mkdir(parents=True)
+    _write_executable(bin_dir / "sudo", '#!/bin/bash\nexec "$@"\n')
     operation_log = tmp_path / "operations.log"
     uv_bin = tmp_path / "uv"
 
@@ -339,6 +346,14 @@ if [[ "$1" == '--version' ]]; then
 fi
 echo "env:$UV_PROJECT_ENVIRONMENT" >> "$AUTOVLLM_TEST_LOG"
 echo "$*" >> "$AUTOVLLM_TEST_LOG"
+mkdir -p "$UV_PROJECT_ENVIRONMENT/bin"
+cp "$AUTOVLLM_TEST_PYTHON" "$UV_PROJECT_ENVIRONMENT/bin/python"
+printf '#!/bin/bash\necho 1.13\n' > "$UV_PROJECT_ENVIRONMENT/bin/ninja"
+cat > "$UV_PROJECT_ENVIRONMENT/bin/vllm" <<'EOF'
+#!/bin/bash
+echo '--host --port --tensor-parallel-size --gpu-memory-utilization --max-model-len --max-num-batched-tokens --enable-auto-tool-choice --tool-call-parser --reasoning-parser --dtype --enforce-eager'
+EOF
+chmod +x "$UV_PROJECT_ENVIRONMENT/bin/"*
 """,
     )
     env = os.environ.copy()
@@ -347,6 +362,9 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
             "AUTOVLLM_VENV": str(venv),
             "AUTOVLLM_UV_BIN": str(uv_bin),
             "AUTOVLLM_TEST_LOG": str(operation_log),
+            "AUTOVLLM_TEST_PYTHON": str(bin_dir / "python"),
+            "AUTOVLLM_BOOTSTRAP_PYTHON": sys.executable,
+            "PATH": f"{bin_dir}:{env['PATH']}",
         }
     )
 
@@ -359,10 +377,13 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
     )
 
     assert result.returncode == 0, result.stderr
+    runtime = next((tmp_path / "venv-generations").iterdir())
+    assert (runtime / "RUNTIME.json").is_file()
+    assert venv.is_dir() and not venv.is_symlink()
     assert operation_log.read_text().splitlines() == [
-        f"env:{venv}",
+        f"env:{runtime}",
         f"sync --project {SCRIPT_ROOT / 'auto-vllm'} --frozen --no-dev "
-        "--no-install-project --no-build --python /usr/bin/python3.12 "
+        f"--no-install-project --no-build --python {sys.executable} "
         "--python-platform x86_64-manylinux_2_34",
     ]
 
@@ -371,10 +392,11 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
     ("installed_version", "expected_returncode", "expected_marker"),
     [
         ("580.126.09", 0, "[STEP:nvidia_driver:OK]"),
+        ("580.95.05", 0, "[STEP:nvidia_driver:OK]"),
         ("570.172.08", 1, "[STEP:nvidia_driver:FAIL]"),
     ],
 )
-def test_existing_nvidia_driver_version_matrix(
+def test_existing_nvidia_driver_compatibility_matrix(
     tmp_path: Path,
     installed_version: str,
     expected_returncode: int,
@@ -413,15 +435,14 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
     )
 
     result = _run_shell(
-        _source_and("step nvidia_driver install_nvidia_driver"), env=env
+        _source_and("step nvidia_driver installed_driver_compatible"), env=env
     )
 
     assert result.returncode == expected_returncode
     assert expected_marker in result.stdout
-    if installed_version != "580.126.09":
-        assert "does not match requested" in result.stdout
-        operations = operation_log.read_text().splitlines()
-        assert any("remove" in op and "nvidia" in op for op in operations)
+    assert not operation_log.exists()
+    if expected_returncode == 0:
+        assert "minimum=580.65.06" in result.stdout
 
 
 @pytest.mark.parametrize("valid_checksum", [True, False])
@@ -460,6 +481,7 @@ echo sha256sum >> "$AUTOVLLM_TEST_LOG"
 exec /usr/bin/sha256sum "$@"
 """,
     )
+    _write_executable(fake_bin / "rpm", "#!/bin/bash\nexit 0\n")
     _write_executable(
         fake_bin / "sudo",
         """#!/bin/bash
@@ -471,18 +493,27 @@ exit 0
         **{k: v for k, v in os.environ.items() if k != "BASH_ENV"},
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "AUTOVLLM_TMP_DIR": str(tmp_path),
+        "AUTOVLLM_DRIVER_STATE_DIR": str(tmp_path / "state"),
         "AUTOVLLM_NVIDIA_DRIVER_SHA256": digest,
         "AUTOVLLM_TEST_LOG": str(operation_log),
         "AUTOVLLM_TEST_ARCHIVE_CONTENT": archive_content,
     }
 
-    result = _run_shell(_source_and("install_nvidia_driver"), env=env)
+    result = _run_shell(
+        _source_and(
+            f"GPU_DEVICE_ROOT={shlex.quote(str(tmp_path / 'devices'))}\n"
+            f"GPU_MODULE_ROOT={shlex.quote(str(tmp_path / 'modules'))}\n"
+            "install_nvidia_driver"
+        ),
+        env=env,
+    )
     operations = operation_log.read_text().splitlines()
 
     if valid_checksum:
-        assert result.returncode == 0, result.stderr
+        assert result.returncode == 20, result.stderr
         assert operations[:2] == ["wget", "sha256sum"]
-        assert operations[-1].startswith("sudo:sh ")
+        assert any(op.startswith("sudo:sh ") for op in operations)
+        assert "[RESUME:reboot_required:" in result.stdout
     else:
         assert result.returncode != 0
         assert "SHA-256 verification failed" in result.stderr
@@ -708,7 +739,10 @@ def test_runtime_flashinfer_index_override_fails_before_setup_work(
     assert not attempted_work.exists()
 
 
-def test_system_update_pins_running_kernel_and_build_packages(tmp_path: Path) -> None:
+@pytest.mark.parametrize("engine", ["vllm", "llamacpp"])
+def test_prerequisites_are_engine_specific_and_never_update_os(
+    tmp_path: Path, engine: str
+) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     operation_log = tmp_path / "operations.log"
@@ -718,6 +752,7 @@ def test_system_update_pins_running_kernel_and_build_packages(tmp_path: Path) ->
 [[ "$1" == '-r' ]] && echo '5.14.0-test'
 """,
     )
+    _write_executable(bin_dir / "rpm", "#!/bin/bash\nexit 1\n")
     _write_executable(
         bin_dir / "sudo",
         """#!/bin/bash
@@ -733,20 +768,28 @@ echo "$*" >> "$AUTOVLLM_TEST_LOG"
         }
     )
 
-    result = _run_shell(_source_and("run_system_update\ninstall_cuda_toolkit"), env=env)
+    result = _run_shell(
+        _source_and(
+            f"install_runtime_prerequisites {engine}\ninstall_kernel_build_dependencies\ninstall_cuda_toolkit"
+        ),
+        env=env,
+    )
 
     assert result.returncode == 0, result.stderr
     operations = operation_log.read_text().splitlines()
-    assert operations[0] == (
-        "dnf -y install kernel-devel-5.14.0-test kernel-headers-5.14.0-test"
-    )
+    assert operations[0] == "dnf -y install wget nfs-utils pciutils gcc-c++"
     assert operations[1] == (
-        "dnf -y install cmake gcc gcc-c++ make wget nfs-utils elfutils-libelf-devel "
-        "python3.12 python3.12-devel"
+        "dnf -y install python3.12 python3.12-devel"
+        if engine == "vllm"
+        else "dnf -y install cmake make gcc"
     )
-    assert operations[2] == "dnf -y update --exclude=kernel*"
+    assert operations[2] == (
+        "dnf -y install kernel-devel-5.14.0-test kernel-headers-5.14.0-test "
+        "gcc make elfutils-libelf-devel"
+    )
+    assert "dnf -y update" not in "\n".join(operations)
+    assert ("python3.12-devel" in "\n".join(operations)) is (engine == "vllm")
     assert operations[3] == "dnf -y install dnf-plugins-core"
-    assert "ninja" not in "\n".join(operations)
 
 
 @pytest.mark.parametrize("backend", ["firewalld", "iptables", "none"])
@@ -1399,3 +1442,228 @@ exit 1
     result = _run_shell(_source_and("nfs_server_reachable"), env=env)
     assert result.returncode == 0, result.stderr
     assert "reachable at [2001:db8::1]:2049" in result.stdout
+
+
+class TestStageCheckpoints:
+    """Stage checkpoints persist, resume, and invalidate (issue #133)."""
+
+    def _checkpoint_file(self, tmp_path: Path) -> Path:
+        return tmp_path / "checkpoints"
+
+    def test_compatible_stage_is_skipped_without_rerunning(
+        self, tmp_path: Path
+    ) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=firewall\n"
+            "checkpoint_plan_sync\n"
+            "record_checkpoint firewall\n"
+            # A non-zero command proves the stage body is not executed on resume.
+            "step firewall false\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:SKIP]" in result.stdout
+        assert "[STEP:firewall:FAIL]" not in result.stdout
+
+    def test_unwritable_state_dir_degrades_to_rerun(self, tmp_path: Path) -> None:
+        # A non-root SSH user may not own the state directory. Checkpoints are
+        # an optimization, so setup must re-run rather than abort.
+        readonly = tmp_path / "readonly"
+        readonly.mkdir()
+        readonly.chmod(0o555)
+        checkpoint = readonly / "nested" / "checkpoints"
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=firewall\n"
+            "step firewall true\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:OK]" in result.stdout
+        assert not checkpoint.exists()
+
+    def test_completed_stage_is_recorded_for_compatible_plan(
+        self, tmp_path: Path
+    ) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "step firewall true\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:START]" in result.stdout
+        assert "[STEP:firewall:OK]" in result.stdout
+        assert "plan:sha256:plan-a" in checkpoint.read_text()
+        assert "stage:firewall" in checkpoint.read_text()
+
+    def test_soft_step_resumes_as_skip(self, tmp_path: Path) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=fabric_manager\n"
+            "checkpoint_plan_sync\n"
+            "record_checkpoint fabric_manager\n"
+            "soft_step fabric_manager false\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:fabric_manager:SKIP]" in result.stdout
+        assert "[STEP:fabric_manager:WARN]" not in result.stdout
+
+    def test_changed_plan_invalidates_previous_checkpoints(
+        self, tmp_path: Path
+    ) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        checkpoint.write_text("plan:sha256:old\nstage:firewall\n")
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:new\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=firewall\n"
+            # The gateway still lists the stage, but the plan id changed, so the
+            # node must invalidate and re-run it.
+            "step firewall true\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "Setup plan changed" in result.stdout
+        assert "[STEP:firewall:SKIP]" not in result.stdout
+        assert "[STEP:firewall:OK]" in result.stdout
+        text = checkpoint.read_text()
+        assert "plan:sha256:new" in text
+        assert "plan:sha256:old" not in text
+
+    def test_stage_not_listed_by_gateway_is_rerun(self, tmp_path: Path) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        checkpoint.write_text("plan:sha256:plan-a\nstage:firewall\n")
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=nvidia_driver\n"
+            "step firewall true\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:SKIP]" not in result.stdout
+        assert "[STEP:firewall:OK]" in result.stdout
+
+    def test_without_plan_id_no_checkpoint_side_effects(self, tmp_path: Path) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        cmd = (
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "step firewall true\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:OK]" in result.stdout
+        assert not checkpoint.exists()
+
+    def test_verifier_failure_reruns_the_stage(self, tmp_path: Path) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=firewall\n"
+            "checkpoint_plan_sync\n"
+            "record_checkpoint firewall\n"
+            # The stage-specific verifier rejects the recorded evidence.
+            "qiip_verify_firewall() { return 1; }\n"
+            "step firewall true\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:SKIP]" not in result.stdout
+        assert "[STEP:firewall:OK]" in result.stdout
+
+    def test_passing_verifier_allows_skip(self, tmp_path: Path) -> None:
+        checkpoint = self._checkpoint_file(tmp_path)
+        cmd = (
+            f"export QIIP_PLAN_ID=sha256:plan-a\n"
+            f"export QIIP_CHECKPOINT_FILE={shlex.quote(str(checkpoint))}\n"
+            "export QIIP_RESUME_STAGES=firewall\n"
+            "checkpoint_plan_sync\n"
+            "record_checkpoint firewall\n"
+            "qiip_verify_firewall() { return 0; }\n"
+            "step firewall false\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert "[STEP:firewall:SKIP]" in result.stdout
+
+
+class TestStageOrderMatchesScripts:
+    """The canonical stage order cannot drift from the scripts.
+
+    Progress, resume state, and operator messaging all key off
+    ``SETUP_STAGE_ORDER``. If a script renames or adds a ``[STEP:...]`` stage
+    without updating the tuple, percent and the resume set silently lie.
+    """
+
+    _STEP_CALL = re.compile(
+        r"^[ \t]*(?:soft_)?step[ \t]+([a-z][a-z0-9_]*)", re.MULTILINE
+    )
+    _LITERAL_MARKER = re.compile(r"\[STEP:([a-z][a-z0-9_]*):")
+    _NAME_ASSIGN = re.compile(r'local\s+name="([a-z][a-z0-9_]*)"')
+
+    def _emitted(self) -> set[str]:
+        emitted: set[str] = set()
+        for relative in (
+            "common/setup-base.sh",
+            "auto-vllm/setup.sh",
+            "auto-llamacpp/setup.sh",
+        ):
+            text = (REPO_ROOT / relative).read_text()
+            emitted.update(self._STEP_CALL.findall(text))
+            emitted.update(self._LITERAL_MARKER.findall(text))
+            emitted.update(self._NAME_ASSIGN.findall(text))
+        return emitted
+
+    def test_union_matches_emitted_markers(self) -> None:
+        assert self._emitted() == set(SETUP_STAGE_ORDER)
+
+    def test_union_is_the_two_engine_orders(self) -> None:
+        union = set(SETUP_ENGINE_STAGES["vllm"]) | set(SETUP_ENGINE_STAGES["llama_cpp"])
+        assert union == set(SETUP_STAGE_ORDER)
+
+    def test_engine_orders_are_known_stages(self) -> None:
+        for stages in SETUP_ENGINE_STAGES.values():
+            assert set(stages) <= set(SETUP_STAGE_ORDER)
+
+
+class TestVllmInstallVerifier:
+    """Resuming ``vllm_install`` must republish the runtime selection."""
+
+    def test_verifier_republishes_runtime_selection(self, tmp_path: Path) -> None:
+        runtime = tmp_path / "runtime"
+        (runtime / "bin").mkdir(parents=True)
+        (runtime / "RUNTIME.json").write_text("{}")
+        _write_executable(runtime / "bin" / "vllm", "#!/bin/bash\nexit 0\n")
+        selection = tmp_path / "selection"
+        cmd = (
+            f"export QIIP_RUNTIME_SELECTION={shlex.quote(str(selection))}\n"
+            f"vllm_runtime_path() {{ printf '%s\\n' {shlex.quote(str(runtime))}; }}\n"
+            "vllm_runtime_marker() { printf 'marker\\n'; }\n"
+            "qiip_generation_tool() { return 0; }\n"
+            "qiip_verify_vllm_install\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode == 0, result.stderr
+        assert selection.read_text().strip() == str(runtime)
+
+    def test_verifier_rejects_missing_runtime(self, tmp_path: Path) -> None:
+        selection = tmp_path / "selection"
+        cmd = (
+            f"export QIIP_RUNTIME_SELECTION={shlex.quote(str(selection))}\n"
+            f"vllm_runtime_path() {{ printf '%s\\n' {shlex.quote(str(tmp_path / 'absent'))}; }}\n"
+            "vllm_runtime_marker() { printf 'marker\\n'; }\n"
+            "qiip_verify_vllm_install\n"
+        )
+        result = _run_shell(_source_and(cmd))
+        assert result.returncode != 0
+        assert not selection.exists()

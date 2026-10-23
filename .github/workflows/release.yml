@@ -269,7 +269,10 @@ jobs:
       needs.semantic.outputs.released == 'true' &&
       needs.semantic.outputs.finalized == 'true' &&
       github.repository == 'quadsproject/qiip'
+    outputs:
+      nvr: ${{ steps.submit.outputs.nvr }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     container: fedora:43
     permissions:
       contents: read
@@ -293,28 +296,76 @@ jobs:
           mkdir -p "$HOME/.config"
           echo "$API_TOKEN_CONTENT" > "$HOME/.config/copr"
 
+      # A package stays listed in the project while its RPMs can be missing
+      # from the repository, which is how a dependency publish that Copr
+      # pruned left every qiip-dev build failing on an unsatisfiable floor.
+      # Check every chroot the project builds, since each serves its own
+      # metadata.
       - name: Check dependency RPMs are published
         run: |
-          python3 - <<'EOF'
-          import json, sys, urllib.request
-          url = ("https://copr.fedorainfracloud.org/api_3/package/list"
-                 "?ownername=quadsdev&projectname=qiip")
-          names = {p["name"] for p in json.load(urllib.request.urlopen(url))["items"]}
-          need = {"python3-click", "python3-etcd3gw", "python3-fastapi",
-                  "python3-huggingface-hub", "python3-structlog", "python3-uvicorn"}
-          missing = sorted(need - names)
-          if missing:
-              print("COPR dependency RPMs not published yet:", ", ".join(missing))
-              print("Publish copr-deps once (COPR dependencies workflow or "
-                    "copr-deps/README.md) before the first qiip/qiip-dev build.")
-              sys.exit(1)
-          print("dependency RPMs present in quadsdev/qiip")
-          EOF
+          script="$GITHUB_WORKSPACE/.github/scripts/copr_nvr_state.py"
+          status=0
+          chroots="$(python3 "$script" chroots)" || status=$?
+          if [[ "$status" != 0 ]]; then
+            echo "could not read quadsdev/qiip from the Copr API (exit $status)." >&2
+            echo "::error title=Copr API unreadable::could not read quadsdev/qiip from the Copr API (exit $status), re-run the failed jobs when it answers"
+            exit 1
+          fi
+          if [[ -z "$chroots" ]]; then
+            echo "no chroots reported for quadsdev/qiip" >&2
+            exit 1
+          fi
+          failed=0
+          missing_deps=0
+          for chroot in $chroots; do
+            if missing="$(python3 "$script" names "$chroot" \
+                python3-click python3-etcd3gw python3-fastapi \
+                python3-huggingface-hub python3-structlog python3-uvicorn)"; then
+              echo "dependency RPMs present in $chroot"
+              continue
+            else
+              status=$?
+            fi
+            if [[ "$status" == 1 && -n "$missing" ]]; then
+              echo "COPR dependency RPMs missing from $chroot: $missing" >&2
+              echo "::error title=COPR dependency RPMs missing::$chroot: $missing"
+              missing_deps=1
+              failed=1
+              continue
+            fi
+            if [[ "$status" == 2 ]]; then
+              echo "could not read $chroot from the repository (exit 2)." >&2
+              echo "That is an upstream Copr or packages.redhat.com problem, not a missing" >&2
+              echo "build: Copr's builders read the same endpoint, so a build would fail too." >&2
+              echo "::error title=Copr repository unreadable::could not read $chroot from quadsdev/qiip (exit 2), retry later"
+              failed=1
+              continue
+            fi
+            echo "the dependency lookup for $chroot failed (exit $status)." >&2
+            echo "::error title=Dependency preflight lookup failed::the dependency lookup for $chroot failed (exit $status), inspect the step log"
+            failed=1
+          done
+          if [[ "$failed" == 1 ]]; then
+            if [[ "$missing_deps" == 1 ]]; then
+              echo "Publish copr-deps once (COPR dependencies workflow or " >&2
+              echo "copr-deps/README.md) before the first qiip/qiip-dev build." >&2
+            fi
+            exit 1
+          fi
 
+      # Copr keeps one build per package version and every build of an NVR
+      # shares one NVRA-named file, so removing any build of that NVR,
+      # including one of two builds of the same version, deletes the RPM and
+      # SRPM and takes the package out of the repository. Submit only when
+      # nothing is published for the NVR, and verify that it landed.
       - name: Build SRPM and submit to COPR
+        id: submit
         env:
           PROJECT: ${{ github.ref_name == 'main' && 'qiip' || 'qiip-dev' }}
         run: |
+          set -euo pipefail
+          script="$GITHUB_WORKSPACE/.github/scripts/copr_nvr_state.py"
+          python3 "$script" --self-test
           cd rpm
           make srpm NAME="$PROJECT"
           srpm_file="$(find . -name '*.src.rpm' -type f | head -n 1)"
@@ -322,5 +373,134 @@ jobs:
             echo "No .src.rpm found after 'make srpm'" >&2
             exit 1
           fi
+          nvr="$(basename "${srpm_file%.src.rpm}")"
+          echo "nvr=$nvr" >> "$GITHUB_OUTPUT"
+          status="$(python3 "$script" state "$PROJECT" "$nvr")"
+          if [[ "$status" == published ]]; then
+            echo "$nvr is already published in quadsdev/qiip, not resubmitting"
+            echo "Resubmitting an NVR that already has a build makes Copr delete"
+            echo "one of the two builds and the RPM file they share."
+            exit 0
+          fi
+          if [[ "$status" == stale ]]; then
+            echo "$nvr has a Copr build but no RPM in the repository." >&2
+            echo "::error title=$nvr is not installable::$nvr has a Copr build but no RPM in the repository"
+            echo "Wait for that build to finish, then delete it only if it ended" >&2
+            echo "without publishing. Re-run this job with 'Re-run failed jobs'; a" >&2
+            echo "new push on the same commit releases nothing." >&2
+            exit 1
+          fi
           echo "Submitting $srpm_file to quadsdev/qiip"
           copr build quadsdev/qiip "$srpm_file"
+          status=""
+          for _ in 1 2 3 4 5 6; do
+            if ! status="$(python3 "$script" state "$PROJECT" "$nvr")"; then
+              echo "::error title=Copr repository state unreadable::could not read the state of $nvr"
+              exit 1
+            fi
+            if [[ "$status" == published ]]; then
+              break
+            fi
+            sleep 30
+          done
+          if [[ "$status" != published ]]; then
+            echo "$nvr is not in the repository although the build succeeded." >&2
+            echo "::error title=$nvr is not visible yet::$nvr is not in the repository although the build succeeded"
+            echo "Re-run this job; do not resubmit the SRPM." >&2
+            exit 1
+          fi
+          echo "$nvr published in quadsdev/qiip"
+
+  release_packages:
+    name: Link packages in release notes
+    needs:
+      - semantic
+      - copr_build
+    if: >-
+      needs.semantic.outputs.released == 'true' &&
+      needs.semantic.outputs.finalized == 'true' &&
+      needs.copr_build.outputs.nvr != '' &&
+      github.repository == 'quadsproject/qiip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.semantic.outputs.tag }}
+
+      # The URLs come from the repository metadata of every chroot, and they
+      # are checked against the project prefix before they are written into
+      # the notes: the notes render as markdown, so a location of an
+      # unexpected shape is refused rather than echoed. The step runs only
+      # after the publish guard verified the artifacts, so a link implies a
+      # file that exists.
+      - name: Append package links to the release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.semantic.outputs.tag }}
+          PROJECT: ${{ github.ref_name == 'main' && 'qiip' || 'qiip-dev' }}
+          NVR: ${{ needs.copr_build.outputs.nvr }}
+        run: |
+          set -euo pipefail
+          script=".github/scripts/copr_nvr_state.py"
+          if [[ ! -f "$script" ]]; then
+            echo "release tag $TAG predates the publish guard; no package links"
+            exit 0
+          fi
+          python3 "$script" --self-test
+          gh release view "$TAG" --json body -q .body > body.md
+          if grep -q '^## Packages$' body.md; then
+            echo "$TAG already lists its packages"
+            exit 0
+          fi
+          artifacts_out=""
+          error_out=""
+          for attempt in 1 2 3; do
+            if artifacts_out="$(python3 "$script" urls "$PROJECT" "$NVR" 2>&1)"; then
+              break
+            fi
+            error_out="${artifacts_out%%$'\n'*}"
+            artifacts_out=""
+            echo "attempt $attempt for $NVR: $error_out" >&2
+            sleep 30
+          done
+          if [[ -z "$artifacts_out" ]]; then
+            echo "$NVR has no verified artifact, last error: $error_out" >&2
+            echo "::error title=$NVR is not published::$error_out"
+            echo "Re-run this job once the repository answers; do not resubmit the SRPM." >&2
+            exit 1
+          fi
+          mapfile -t artifacts <<< "$artifacts_out"
+          prefix="https://download.copr.fedorainfracloud.org/results/quadsdev/qiip/"
+          for artifact in "${artifacts[@]}"; do
+            if [[ "$artifact" != "$prefix"* ]]; then
+              echo "unexpected artifact URL for $NVR: $artifact" >&2
+              exit 1
+            fi
+          done
+          {
+            echo
+            echo "## Packages"
+            echo
+            echo "Enable the repository and install:"
+            echo
+            echo '```'
+            echo "sudo dnf copr enable quadsdev/qiip"
+            echo "sudo dnf install $PROJECT"
+            echo '```'
+            echo
+            echo "Artifacts:"
+            echo
+            for artifact in "${artifacts[@]}"; do
+              echo "- <$artifact>"
+            done
+          } >> body.md
+          prerelease=(--prerelease=false)
+          if [[ "$TAG" == *-dev.* ]]; then
+            prerelease=(--prerelease)
+          fi
+          gh release edit "$TAG" --notes-file body.md "${prerelease[@]}"
+          echo "linked ${#artifacts[@]} artifacts in $TAG"

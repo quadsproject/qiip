@@ -7,18 +7,41 @@
 
   const ERROR_MESSAGES = {
     login_failed: "Sign-in was not completed. Please try again.",
-    no_profile: "Google did not return a profile. Please try again.",
+    no_profile: "The provider did not return a profile. Please try again.",
     unverified_email:
-      "This Google account has an unverified email address and cannot sign in.",
+      "This account has an unverified email address and cannot sign in.",
     domain_not_allowed:
-      "This Google account is not in the allowed domains for this gateway.",
+      "This account is not in the allowed domains for this gateway.",
     not_whitelisted: "This account is not on the gateway whitelist.",
     allowlist_unavailable:
       "The whitelist service is unavailable. Please try again later.",
+    account_conflict:
+      "This email is already linked to another account.",
   };
 
   const $ = (id) => document.getElementById(id);
   let pendingToken = "";
+
+  // ------------------------------------------------------------------
+  // Column sorting (shared js/table_sort.js)
+  // ------------------------------------------------------------------
+
+  const SORTABLE_TABLES = [
+    { head: "tokens-head", body: "tokens-table-body" },
+    { head: "usage-head", body: "usage-table-body" },
+  ];
+
+  function enableTableSort() {
+    SORTABLE_TABLES.forEach((table) => {
+      window.tableSort.enable($(table.head), $(table.body));
+    });
+  }
+
+  function reapplyTableSort() {
+    SORTABLE_TABLES.forEach((table) => {
+      window.tableSort.reapply($(table.head), $(table.body));
+    });
+  }
 
   function clearChildren(el) {
     while (el.firstChild) el.removeChild(el.firstChild);
@@ -109,14 +132,22 @@
       td.className = "muted-status";
       row.appendChild(td);
       body.appendChild(row);
+      reapplyTableSort();
       return;
     }
     for (const token of tokens) {
       const row = document.createElement("tr");
       row.appendChild(tdCell(token.name));
       row.appendChild(tdCell(token.prefix));
-      row.appendChild(tdCell(token.revoked ? "-" : formatDate(token.created_at)));
-      row.appendChild(tdCell(token.last_used_at ? formatDate(token.last_used_at) : "never"));
+      row.appendChild(
+        tdCell(token.revoked ? "-" : formatDate(token.created_at), token.revoked ? "" : token.created_at)
+      );
+      row.appendChild(
+        tdCell(
+          token.last_used_at ? formatDate(token.last_used_at) : "never",
+          token.last_used_at || ""
+        )
+      );
       row.appendChild(tdCell(token.revoked ? "revoked" : "active"));
       row.appendChild(
         tdCell(
@@ -134,11 +165,13 @@
       row.appendChild(actions);
       body.appendChild(row);
     }
+    reapplyTableSort();
   }
 
-  function tdCell(text) {
+  function tdCell(text, sortValue) {
     const td = document.createElement("td");
     td.textContent = text;
+    if (sortValue !== undefined) td.dataset.sortValue = String(sortValue);
     return td;
   }
 
@@ -295,32 +328,11 @@
     });
     $("token-copy-btn").addEventListener("click", () => {
       if (!pendingToken) return;
-      const done = () => {
-        showToast("Token copied to clipboard.", "success");
-      };
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(pendingToken).then(done, () => fallbackCopy(done));
-      } else {
-        fallbackCopy(done);
-      }
+      qiipCopyToClipboard(pendingToken).then((copied) => {
+        if (copied) showToast("Token copied to clipboard.", "success");
+        else showToast("Couldn't copy. Select the token and press Ctrl+C.", "warning");
+      });
     });
-  }
-
-  function fallbackCopy(done) {
-    const area = document.createElement("textarea");
-    area.value = pendingToken;
-    area.setAttribute("readonly", "");
-    area.style.position = "absolute";
-    area.style.left = "-9999px";
-    document.body.appendChild(area);
-    area.select();
-    try {
-      document.execCommand("copy");
-    } catch (_err) {
-      /* clipboard unavailable */
-    }
-    area.remove();
-    done();
   }
 
   // ------------------------------------------------------------------
@@ -349,11 +361,8 @@
     const savings = $("usage-savings");
     if (data.estimated_premium_cost_usd !== undefined) {
       savings.textContent =
-        "Estimated premium-equivalent cost (token budget saved): $" +
-        Number(data.estimated_premium_cost_usd).toLocaleString(undefined, {
-          minimumFractionDigits: 2,
-          maximumFractionDigits: 2,
-        }) +
+        "Estimated premium-equivalent cost (token budget saved): " +
+        qiipFormatUsd(data.estimated_premium_cost_usd) +
         " \u00b7 model: " + (data.model_label || "n/a");
       savings.hidden = false;
     } else {
@@ -369,6 +378,7 @@
       td.className = "muted-status";
       row.appendChild(td);
       body.appendChild(row);
+      reapplyTableSort();
       return;
     }
     for (const row of data.rows) {
@@ -384,6 +394,7 @@
         ]),
       );
     }
+    reapplyTableSort();
   }
 
   // ------------------------------------------------------------------
@@ -393,13 +404,14 @@
   function showSignInRequired() {
     showToast("Your session expired \u2014 sign in again.", "warning");
     setGate(
-      "Sign in with your Google account to create API tokens for the inference API.",
+      "Sign in with a provider account to create API tokens for the inference API.",
       true,
     );
   }
 
   async function init() {
     parseErrorParam();
+    enableTableSort();
     wireTokenForm();
     wireEndpointPicker();
 
@@ -417,12 +429,12 @@
       return;
     }
     if (resp.status === 503) {
-      setGate("Google sign-in is not configured on this gateway.", false);
+      setGate("Sign-in is not configured on this gateway.", false);
       return;
     }
     if (resp.status === 401) {
       setGate(
-        "Sign in with your Google account to create API tokens for the inference API.",
+        "Sign in with a provider account to create API tokens for the inference API.",
         true,
       );
       return;

@@ -35,7 +35,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **OpenAI-compatible API** -- drop-in replacement for `/v1/chat/completions`, `/v1/completions`, and `/v1/models`
 - **Claude Code and Codex** -- the Anthropic Messages API (`/v1/messages`) and the OpenAI Responses API (`/v1/responses`) are forwarded to vLLM and llama.cpp nodes, which implement them natively, with the same token auth, routing, failover, and usage tracking as chat completions
 - **Streaming support** -- Server-Sent Events (SSE) for real-time token generation
-- **Chat playground** -- browser-based chat UI at `/chat` with markdown rendering and model selection
+- **Chat playground** -- browser-based chat UI at `/chat` for signed-in users, with markdown rendering, model selection, and usage recorded against a normal user's own token
 - **Service discovery** -- watches etcd for node registration/deregistration in real time
 - **Least-connections load balancing** -- routes to the node with the fewest in-flight requests
 - **Automatic failover** -- retries transport, timeout, and 5xx failures on alternate healthy nodes before a response begins (configurable, default 3 attempts)
@@ -46,7 +46,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Operations dashboard** -- interactive web UI at `/dashboard` with real-time node and engine identity, catalog-backed setup controls, detail pages, and provisioning status
 - **QUADS integration** -- background polling of QUADS inventory and availability; unified view merging QUADS hosts with etcd-registered nodes
 - **QUADS schedule enforcement** -- automated teardown of managed nodes when QUADS reports an upcoming scheduling conflict
-- **End-to-end node provisioning** -- SSH-based pipeline: BMC power-on, NVIDIA GPU verification, driver and CUDA toolkit install, inference engine setup (vLLM or llama.cpp), NFS mount, firewall, health poll, and etcd registration
+- **End-to-end node provisioning** -- SSH-based pipeline: BMC power-on, NVIDIA GPU verification, driver and CUDA toolkit install, inference engine setup (vLLM or llama.cpp), NFS mount, firewall, health poll, model/runtime identity plus a bounded inference probe, and etcd registration
 - **Node teardown** -- graceful shutdown with connection draining, force teardown option, and provisioning task cancellation
 - **Provisioning log streaming** -- live SSE stream of provisioning and inference engine logs viewable in the dashboard
 - **BMC power management (Redfish)** -- query and control node power state; supports On, ForceOff, GracefulRestart, and ForceRestart
@@ -55,11 +55,13 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Hardware-aware model recommendations** -- runs llmfit via SSH on a target host to produce ranked, runtime-normalized recommendations with fit levels, throughput, memory estimates, and typed GGUF sources; auto-installs the binary on first use
 - **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
 - **Admin authentication** -- HTTP Basic credentials or a signed-in admin-role session (local-admin form or Google OAuth) on all `/admin/*` endpoints; browser pages gate with a sign-in page instead of 401ing
-- **Fleet sign-in gate** -- anonymous visitors to the fleet dashboard get a sign-in page with two choices: **Local Admin** (a collapsible option that expands to an in-page username/password form establishing a signed session cookie — no browser Basic challenge popup; HTTP Basic still works for scripts and SSE) and **Google Auth** (same flow as the profile page)
+- **Fleet sign-in gate** -- anonymous visitors to the fleet dashboard get a sign-in page with two choices: **Local Admin** (a collapsible option that expands to an in-page username/password form establishing a signed session cookie — no browser Basic challenge popup; HTTP Basic still works for scripts and SSE) and **Google Auth** (same flow as the profile page). When the opt-in local OIDC provider is enabled (see [Local OIDC provider](#local-oidc-provider-opt-in)) the **Local Admin** option becomes **Local Login**: the same form, but non-admin usernames are checked against the provider's user list
 - **Admin roles** -- the HTTP Basic admin user (bootstrap authority) can grant or revoke the admin role to Google-authenticated users on the token dashboard (`/dashboard/tokens`); role admins then reach the admin surface through their session and see admin-only servers
 - **Admin-only inference servers** -- admin-defined adopted OpenAI-compatible servers (URL-based, self-setup semantics, no provisioning steps). At `/v1` they are routable only to bearer tokens of admin-role users or the full-access trust list (HTTP Basic covers UI surfaces only; `/v1` is Bearer-only), never listed on the non-admin fleet page or public `/v1/models`, and appear bold with an `admin_only` badge in the admin fleet view. Token usage from admin-only servers is tracked on the token summary pages exactly like any other node
 - **Google OAuth (SSO)** -- open `/profile` to sign in with a Google account (optional hosted-domain allowlist); sessions ride a signed cookie
-- **Self-service onboarding** -- signed-in normal users land on `/start`: one question per screen (name a token, pick a coding tool, pick models) ending in a short-lived `curl ... | bash` line that writes the tool's config; returning users see their single token and its models. See [Self-service onboarding](#self-service-onboarding-start)
+- **Local OAuth (opt-in)** -- a vendored toy OpenID Connect provider (`oidc-provider/`, test-only) plus the `auth.internal_oidc` plugin let a small install maintain a local user list instead of Google. Off by default; enabling it turns the sign-in page's **Local Admin** option into **Local Login** (no separate provider button; the OIDC flow stays reachable by direct link). User rows are keyed by (provider issuer, subject) so Google and local accounts coexist. See [Local OIDC provider](#local-oidc-provider-opt-in)
+- **Self-service onboarding** -- signed-in normal users land on `/start`: one question per screen (name a token, pick a coding tool, pick models) ending in a short-lived `curl ... | bash` line that writes the tool's config; returning users see their single token, its models, and a clipboard icon that copies the token. See [Self-service onboarding](#self-service-onboarding-start)
+- **Usage leaderboard** -- signed-in users get a simple dashboard at `/leaderboard`: every non-admin user ranked by token usage with an estimated premium-equivalent cost at the configured pricing model (admin rows are excluded by default; an admin viewer can opt in with the **Include admin users** checkbox, RFE #271). Normal users also get their own token manager there (copy the token with the clipboard icon next to its prefix, create replaces, delete revokes) and a per-harness config download with optional model and harness pickers; admins see the same ranking and manage their tokens on `/profile` (RFE #156, #247); every table on the token pages sorts by column
 - **Per-token model scope** -- a token minted by the onboarding flow may only request the models chosen for it; other models are refused on `/v1` with `403 model_not_permitted`, and `/v1/models` lists only the token's models
 - **User API tokens** -- admin-role users can mint `qiip_...` bearer tokens on their profile page to call the `/v1` inference API; normal users own exactly one token, managed on `/start`. Tokens are stored as SHA-256 digests and can be revoked at any time
 - **Stable agent-config token** -- one derived per-user key (`agent-config`) is shared by every config download across servers and browsers; its raw value is derived from `auth.session_secret` + user + generation and never stored, so revoking it rotates the key embedded in already-downloaded configs (configuration downloads for admin-only servers require the Google session that can mint it)
@@ -92,6 +94,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Server launch](#server-launch)
   - [Admin authentication](#admin-authentication)
   - [User authentication (Google OAuth)](#user-authentication-google-oauth)
+  - [Local OIDC provider (opt-in)](#local-oidc-provider-opt-in)
   - [Self-service onboarding (`/start`)](#self-service-onboarding-start)
   - [etcd](#etcd)
   - [Routing](#routing)
@@ -109,7 +112,9 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
   - [Run tests](#run-tests)
   - [Lint and format](#lint-and-format)
   - [Type check](#type-check)
+- [User guide (for gateway users)](docs/user-guide.md)
 - [Releases (stable and development trains)](docs/releases.md)
+- [Maintainer release cycle](docs/maintainer-release-cycle.md)
 - [Durable provisioning evidence](#durable-provisioning-evidence)
 - [Troubleshooting](#troubleshooting)
   - [Reading provisioning logs offline](#reading-provisioning-logs-offline)
@@ -265,7 +270,23 @@ the quick-start port with the shipped unit behind nginx gets 502s.
 
 ### Chat playground
 
-The `/chat` playground saves its optional System Prompt in browser local
+The `/chat` playground is for signed-in viewers; an anonymous visitor gets the
+sign-in page. Admins (admin role, the full-access trust list, or the local
+admin) have no personal token to reveal, so the page does not ask for one and
+they chat anonymously like any other API client. Every other signed-in user
+chats with their own token: the page reveals it through
+`POST /onboarding/token/reveal` (the endpoint the token Copy action uses)
+before every turn, so a token replaced in another `/start` tab is followed,
+and sends it on every `/v1` call with `X-Qiip-Require-Token: 1`, so a
+credential that no longer resolves is refused instead of billed as an
+anonymous request. Turns ask for streamed usage
+(`stream_options.include_usage`), and each one is recorded against the
+revealed token (AUTH-04) and limited to the models that token may use. A
+reveal that fails (no token yet, a pre-onboarding token, or an error)
+disables the playground with the server's message and a pointer to `/start`,
+instead of falling back to unattributed anonymous calls.
+
+The playground saves its optional System Prompt in browser local
 storage and sends it to the backend as an OpenAI `system` message. Some model
 chat templates enforce strict user/assistant alternation and reject that role.
 If such a model reports that conversation roles must alternate, clear the
@@ -386,12 +407,13 @@ Public endpoints:
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting |
 | `POST` | `/v1/responses` | OpenAI Responses API (Codex) |
 | `GET` | `/v1/models` | List models available across healthy nodes |
-| `GET` | `/chat` | Browser chat playground |
+| `GET` | `/chat` | Browser chat playground (signed-in viewers; anonymous visitors get the sign-in page, a signed-in normal user chats with their own token) |
 | `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage (signed-in normal users are redirected to `/start`) |
-| `GET` | `/start` | Onboarding wizard and token home for signed-in normal users; anonymous visitors get the sign-in page, admins are redirected to `/dashboard` |
+| `GET` | `/start` | Onboarding wizard and token home for signed-in normal users (clipboard icon next to the token prefix copies the token); anonymous visitors get the sign-in page, admins are redirected to `/dashboard` |
+| `GET` | `/leaderboard` | Leaderboard and token dashboard for signed-in viewers (the HTTP Basic admin is redirected to `/dashboard`): the non-admin usage ranking for everyone, with an **Include admin users** checkbox for admin viewers (RFE #271); the viewer's own token (copy/create/delete) and a per-harness config download for normal users, since admins manage tokens on `/profile` |
 | `GET` | `/s/{id}` | Setup script for a live onboarding link. The id is the credential: 15 minute life, not logged. A dead link returns a script that explains and exits 1 |
-| `GET` | `/auth/login` | Start Google OAuth sign-in (302 to Google) |
-| `GET` | `/auth/callback` | Google redirect target; signs the session cookie |
+| `GET` | `/auth/login` | Start provider OAuth sign-in (302 to the provider; `?provider=google` or `?provider=internal_oidc` selects it, default is the first configured provider) |
+| `GET` | `/auth/callback` | Provider redirect target; signs the session cookie |
 | `GET` | `/auth/local-admin` | Local admin login page entry (302 to `/dashboard`; the sign-in form POSTs here) |
 | `POST` | `/auth/local-admin` | Sign in as the local admin via the form; sets the session cookie and 302s to `/dashboard` |
 | `POST` | `/auth/logout` | Clear the session cookie |
@@ -401,7 +423,7 @@ Fleet (any signed-in user, or HTTP Basic local admin):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/fleet/nodes` | Fleet JSON for non-admin viewers: registered nodes without admin-only servers or operational actions (no page renders it for them any more; normal users live on `/start`) |
+| `GET` | `/fleet/nodes` | Fleet JSON for non-admin viewers: registered nodes without admin-only servers or operational actions (no page renders it for them any more; normal users live on `/start` and `/leaderboard`) |
 
 User-session-protected profile endpoints (require `auth.session_secret` and a
 signed-in session):
@@ -415,14 +437,17 @@ signed-in session):
 | `GET` | `/profile/usage` | Aggregated usage per token/model plus headline totals |
 | `GET` | `/profile/endpoints` | Registered nodes the user may pin (unowned nodes plus nodes they own) |
 
-Onboarding endpoints (signed-in normal users only; admin-role sessions get 403):
+Onboarding endpoints (signed-in normal users only; admin-role sessions get 403, except the shared usage ranking below):
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/onboarding/state` | Identity, the user's current token (never the raw secret), models online right now, and the supported coding tools |
-| `POST` | `/onboarding/token` | Mint the user's single token with a name and a model list; revokes every other token the user has |
+| `POST` | `/onboarding/token` | Mint the user's single token; name and model list are optional (no name defaults to `default`, no models means every model online right now). Revokes every other token the user has |
+| `POST` | `/onboarding/token/reveal` | Return the caller's own raw token, re-derived server-side, for the Copy action (404 without a token, 409 for a token minted before this flow or one that can no longer be derived; `no-store`) |
 | `PUT` | `/onboarding/token/models` | Replace the token's model list (409 for tokens minted before this flow) |
 | `POST` | `/onboarding/setup-link` | Create a `/s/{id}` link for one coding tool; returns the ready-to-paste command and its expiry |
+| `POST` | `/onboarding/config` | Download the config file for one coding tool with the user's own token embedded; models outside the token's scope are added to it first |
+| `GET` | `/onboarding/leaderboard` | Non-admin users ranked by usage, each row carrying `estimated_cost_usd` at the configured pricing rates; admin rows are excluded by default but an admin viewer may opt in with `include_admins=1` (non-admin viewers cannot widen the set for themselves). Every authenticated viewer may read it, admin-role sessions, the local-admin session and HTTP Basic included |
 
 Admin-authenticated endpoints (HTTP Basic or admin-role session):
 
@@ -448,8 +473,8 @@ Admin-authenticated endpoints (HTTP Basic or admin-role session):
 | `GET` | `/admin/nodes/{hostname}/power` | Read Redfish power state |
 | `POST` | `/admin/nodes/{hostname}/power` | Execute an allowed Redfish power action |
 | `GET` | `/admin/nodes/{hostname}/recommendations` | Run hardware-aware model recommendations |
-| `GET` | `/dashboard` | Authenticated operations dashboard; anonymous visitors get the sign-in page |
-| `GET` | `/dashboard/nodes/{node_id}` | Authenticated node detail page |
+| `GET` | `/dashboard` | Admin-only operations dashboard (HTTP Basic admin or admin-role session); anonymous visitors get the sign-in page |
+| `GET` | `/dashboard/nodes/{node_id}` | Admin-only node detail page |
 | `GET` | `/dashboard/admin` | Admin page: manage admin-only inference servers (admin-role management lives on `/dashboard/tokens`) |
 
 ### Claude Code and Codex
@@ -521,9 +546,10 @@ env_key = "QIIP_API_KEY"
 All `/admin/*` API endpoints and `/dashboard` admin pages accept either the
 shared HTTP Basic credentials configured below or a signed-in Google user
 carrying the **admin role** (granted by the HTTP Basic admin user on the
-token dashboard at `/dashboard/tokens`). The inference API, chat page, profile page,
+token dashboard at `/dashboard/tokens`). The inference API, profile page,
 and health endpoint are public; the inference API may additionally require a
-user API token (see [User authentication (Google OAuth)](#user-authentication-google-oauth)).
+user API token, and the chat playground requires a signed-in viewer (see
+[User authentication (Google OAuth)](#user-authentication-google-oauth)).
 For example:
 
 ```bash
@@ -531,8 +557,9 @@ curl -u "$INFERENCE_PROXY_ADMIN__USERNAME:$INFERENCE_PROXY_ADMIN__PASSWORD" \
   http://gateway.example.com/admin/nodes
 ```
 
-The fleet page (`/dashboard`) is available to every authenticated viewer:
-anonymous visitors receive a sign-in page with **Local Admin**
+The fleet page (`/dashboard`) is admin-only (the HTTP Basic local admin or
+an admin-role session). Anonymous visitors receive a sign-in page with
+**Local Admin**
 (a collapsible choice that expands to an in-page username/password form
 creating a signed admin session; the browser native Basic prompt is no longer
 used, though HTTP Basic requests and SSE still pass through unchanged) and
@@ -599,6 +626,16 @@ telemetry. Automatic policy records contain `sizing` and `fit_target_mib`.
 Gateway-authorized custom records additionally contain exact
 `context_per_slot`, `slots`, and `cache_type` values.
 
+Successful managed vLLM setup reports `vllm_runtime`, containing the requested
+overrides, the effective context, batching, tensor parallelism, dtype, and
+attention backend, the device-indexed memory estimate and reserve, the list of
+automatic adjustments with the reason for each, which model was selected and
+why, and an ISO-8601 UTC observation time. `requested` records only the values
+the operator or gateway supplied, so the difference from `effective` is the
+automatic sizing. Other nodes and older records report `vllm_runtime: null`,
+and `approximate` marks a plan sized from the model name because no local
+checkpoint was available.
+
 A host present only in QUADS has not been provisioned and therefore reports
 both `engine: null` and `artifact_id: null`. Do not interpret a null engine as
 vLLM. It means QIIP has no registered serving identity for that host.
@@ -639,6 +676,12 @@ Requirements and limits:
 - **Breaker recovery**: opening the breaker recovers by probing the registered
   model on `/v1/completions`, so the server must expose an OpenAI-compatible
   completions endpoint.
+- **Model auto-rediscovery**: every health cycle re-reads `/v1/models` for a
+  self-setup node; when the server now reports a different primary model, the
+  in-memory registry (the breaker's source of truth) is patched first and the
+  etcd record then follows through a revision CAS, without a manual
+  re-adoption. A failed or unparseable response keeps the last known model;
+  while etcd is degraded the record lags until the next cycle re-converges it.
 
 A custom `port` is rejected for a plain pool registration (without
 `self_setup`), because that node is provisioned later on the configured default
@@ -682,6 +725,22 @@ select arbitrary downloaded models.
   inventory is released, not retried.
 - **QUADS.** A host is placed only while QUADS shows it free for the whole
   `quads.schedule_lookahead_hours` window, the same rule manual setup applies.
+  Free by schedule is not yet free in fact: when an assignment ends, QUADS
+  lists the host as available at once but moves it back to its default cloud
+  minutes later, and that move powers the host off. Placement therefore also
+  asks QUADS for its pending moves (`/api/v3/moves`) and leaves a host with a
+  pending move alone before any probe, for fresh candidates and for retries
+  alike; a host that only starts moving after the pass planned is refused at
+  the launch, which asks QUADS again under the lifecycle lease. Such a host is
+  listed under skipped hosts as "QUADS has a pending move for the host", keeps
+  its claim, error and attempt budget untouched, and is reconsidered on the
+  next pass. Manual managed setup answers `409` for the same host. This keeps
+  placement off a host with an observed pending move; it is not a reservation
+  in QUADS, so an assignment that ends in the seconds between the launch-time
+  read and the first command still relies on the powered-off recovery
+  described under Durability. A pass also makes no decision from an inventory
+  snapshot older than `quads.stale_after_seconds`, and a launch checks the
+  bound again.
 - **Durability.** Each placement is a persistent etcd claim at
   `/placement/claims/<host>`, written with compare-and-swap and refreshed by a
   heartbeat, so a gateway restart or an expired node lease does not hand a host
@@ -697,6 +756,9 @@ select arbitrary downloaded models.
   starts the count again, so a healthy node that later loses its record is
   rebuilt rather than exhausted. QIIP is a single-gateway service: the claim's compare-and-swap is a
   safeguard against an accidental second gateway, not support for running two.
+  With Redfish configured, a free host the BMC reports off is not blocked by
+  the failed probe: placement launches it and provisioning powers it on. To
+  keep a free host off, list it in `placement.exclude_hosts`.
 - **Files.** Profiles reference exact Hugging Face revisions. Download them with
   the existing `POST /admin/models/download`. A missing file is reported and
   only blocks its own profile; it never stops the gateway from starting.
@@ -933,8 +995,9 @@ Enablement and guardrails:
   are validated all-or-none. `auth.session_secret` is then required, and
   `auth.enforce_api_tokens` is only allowed while OAuth is enabled (users need a
   way to mint tokens).
-- Google user accounts are keyed by their stable `sub` claim, so a renamed email
-  still resolves to the same account.
+- User accounts are keyed by (provider issuer, OIDC `sub`) claim, so a renamed
+  email still resolves to the same account and a local provider can issue the
+  same opaque `sub` as Google without colliding.
 - `/v1` behavior (AUTH-03): a valid `qiip_...` bearer token is always
   accepted and attributes usage. What happens without a usable token is set
   by `auth.enforce_api_tokens`. With it `false` (the default), an absent,
@@ -944,9 +1007,21 @@ Enablement and guardrails:
   preserve fully public `/v1` deployments; set
   `INFERENCE_PROXY_AUTH__ENFORCE_API_TOKENS=true` once you want to require a
   token.
-- `/v1/models`, `/health`, and the chat playground stay public in both modes;
-  `/v1/models` lists only models served by unowned nodes (owner-private models
-  are never enumerated).
+- A request may require strict authentication for itself with
+  `X-Qiip-Require-Token: 1`, independent of `auth.enforce_api_tokens`: an
+  absent or unresolvable credential is then refused with `401` instead of
+  being served as an anonymous request, in the route's own error shape
+  (`invalid_api_key`). It applies to the token-authenticated inference routes
+  (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`,
+  `/v1/messages/count_tokens`, `/v1/responses`), never to the public
+  `/v1/models` or `/health`. The chat playground sends it with every attributed
+  call, so a token revoked in another `/start` tab cannot silently turn a turn
+  into an anonymous, unrecorded request.
+- `/v1/models` and `/health` stay public in both modes; the chat playground
+  requires a signed-in viewer, and a signed-in normal user's playground calls
+  carry that user's token, so they follow enforcement like any other client.
+  `/v1/models` lists only models served by unowned, non-admin-only nodes
+  (owner-private and admin-only models are never enumerated).
 - Anonymously reached `/v1` requests are proxied but not attributed; only
   token-authenticated calls record per-token usage (AUTH-04).
 
@@ -1001,6 +1076,98 @@ SSO whitelist (per-domain user filtering):
   `enforce_api_tokens` is `false`, `/v1` still accepts requests without a
   token. Combine both flags to fully gate inference.
 
+### Local OIDC provider (opt-in)
+
+For developer testing and small installations, qiip ships a toy OpenID
+Connect provider (`oidc-provider/`, vendored) and the `auth.internal_oidc`
+plugin. It replaces `accounts.google.com` with a network-local provider whose
+users live in a plaintext `username:password` file. Test-only: in-memory
+codes/tokens, no refresh tokens or PKCE.
+
+Enabling it turns the sign-in page's **Local Admin** form into a **Local
+Login** form — the same username/password form, with non-admin usernames
+checked against the provider's user list instead of just the admin
+account (there is no separate provider button; the external
+`/auth/login?provider=internal_oidc` flow stays reachable by direct
+link). With it disabled (the default) the page is unchanged. Both
+providers can be enabled at once — user rows are keyed by (issuer, sub)
+so accounts never collide.
+
+1. Configure the plugin (default disabled) — `conf/plugins.yml`:
+
+   ```yaml
+   plugins:
+     config:
+       auth.internal_oidc:
+         enabled: true
+         server_metadata_url: https://<host>/oidc/.well-known/openid-configuration
+         users_file: /etc/qiip/oidc-users.txt   # Local Login user list
+         # bare-username suffix comes from the provider's discovery document
+   ```
+
+   The `INFERENCE_PROXY_OAUTH__CLIENT_ID` / `CLIENT_SECRET` / `REDIRECT_URI`
+   triple (same as Google) supplies the OAuth client credentials.
+   `users_file` must point at the SAME file the provider serves: the RPM
+   layout uses `/etc/qiip/oidc-users.txt`, a git checkout with the packaged
+   `systemd/qiip-oidc.service` uses `/opt/inference-proxy/oidc-provider/users.txt`
+   (the provider unit sets `OIDC_USERS_FILE` there) — otherwise the local
+   form and the OIDC flow check different lists.
+   The email suffix for bare usernames comes from the provider's discovery
+   document (`user_email_domain`, published from `OIDC_DOMAIN`, see step 2),
+   so both paths mint identical emails for the same username.
+2. Start the provider and point nginx at `/oidc/` (git checkout:
+   `cp oidc-provider/users.txt.example oidc-provider/users.txt`, edit it,
+   then `systemctl enable --now qiip-oidc`; the included nginx template
+   already proxies `/oidc/` when nginx runs on the provider host. The
+   containerized nginx method (nginx.md Method 2) cannot reach the
+   loopback-bound provider, so the local OIDC provider needs Method 1.
+   Set `OIDC_DOMAIN` to your site domain (e.g. `somelab.example.com`) so
+   bare usernames sign in as
+   `user1@somelab.example.com`; full emails in `users.txt` are used
+   as-is (`OIDC_DOMAIN` goes in `/opt/inference-proxy/.env` for the git
+   checkout unit, `/etc/qiip/oidc.env` for the RPM unit; restart
+   `qiip-oidc` after editing). Set `OIDC_BASE_URL` there too, to the
+   public issuer URL: the external flow needs it and it is the issuer the
+   local form keys accounts by. Keep
+   `INFERENCE_PROXY_OAUTH__ALLOWED_DOMAINS` (or leave it empty) in sync
+   with that domain.
+   The gateway fetches `server_metadata_url` and the token endpoint
+   server-side, so it must trust the nginx certificate: with the
+   self-signed pair from `gen-cert.sh`, put
+   `SSL_CERT_FILE=/etc/pki/tls/certs/<fqdn>.pem` in the gateway's
+   environment file (`/opt/inference-proxy/.env` for the checkout unit,
+   `/etc/qiip/qiip.env` for the RPM unit) and restart
+   `inference-proxy`; with an internal CA, install the CA into the
+   system trust store instead. Note that a global `SSL_CERT_FILE`
+   *replaces* the trust store for every server-side fetch, so a
+   deployment that also enables Google OAuth must use the internal-CA
+   route (or verify Google's endpoints manually); the local provider
+   paths alone work fine with `SSL_CERT_FILE`.
+3. Sign in: with the provider enabled the sign-in page's local form is
+   labelled **Local Login** (it replaces the Local Admin form; there is no
+   separate Local Auth button — the external flow is reachable only by
+   direct link):
+   - the configured admin username/password is checked first and always
+     wins — a same-named entry in `users_file` is ignored;
+   - any other username/password is checked against `users_file` (the same
+     plaintext list the toy provider serves) and signs the matching local
+     user in;
+   - the external OAuth link (`/auth/login?provider=internal_oidc` →
+     provider password form → callback) still works for direct links, and
+     `oauth.allowed_domains` (when set) must match the provider domain.
+
+RPM install layout: provider at `/usr/share/qiip/oidc-provider/`, the user
+list at `/etc/qiip/oidc-users.txt` (0600, `%config(noreplace)`, installed
+comment-only so an unedited copy enables nothing; add users with `sudo vi
+/etc/qiip/oidc-users.txt && sudo systemctl restart qiip-oidc`, the sample
+list is `/usr/share/qiip/oidc-provider/users.txt.example`), `OIDC_*`
+overrides in `/etc/qiip/oidc.env`, and the RSA signing key
+under `/var/lib/qiip/oidc/`. The `qiip-oidc.service` unit is installed but
+not enabled by default. The packaged nginx template already proxies
+`/oidc/`; upgrades never clobber an edited `/etc/nginx/nginx.conf`, so an
+existing install must add that `location /oidc/` block (copied from
+`/usr/share/qiip/nginx/nginx.conf`) once.
+
 Endpoint scoping (per-token pins and owner isolation):
 
 - A token may be pinned at creation to one or more endpoint hostnames
@@ -1053,6 +1220,21 @@ Token management dashboards (admin and per-user):
   revocation, and adds the same premium-equivalent cost estimate next to the
   usage totals. The admin dashboard front page shows the grand total
   "token budget saved" for all token-attributed requests.
+- The `/leaderboard` ranking adds the same premium-equivalent cost per user as
+  `Est. premium cost @ <model_label>`; the figure uses the configured pricing
+  rates and is a linear transform of the prompt/completion totals already in
+  the row.
+- Every token and usage table on `/leaderboard`, `/profile`,
+  `/dashboard/tokens`, and `/dashboard/users/{id}` sorts by column: click a
+  header label (or reach it with Tab and press Enter) to sort ascending,
+  activate it again for descending. `aria-sort` marks the active column, the
+  chosen sort survives the page poll refresh, and rows carrying a formatted
+  value (dates, `$USD`, `active / total` counts) sort by the underlying
+  number. Columns without a sort header stay fixed: the Action columns, and
+  the leaderboard `Rank` column, which keeps each user's total-token standing
+  and travels with the user when another column drives the order. The server
+  ranking is the initial order until a header is activated (the leaderboard
+  `Total tokens` header carries it as `aria-sort`), and a reload restores it.
 - The estimate is `prompt_tokens/1M * input_rate + completion_tokens/1M *
   output_rate`: what the recorded mix would have cost at the configured
   premium frontier-model rate. It is an equivalence figure for self-hosted
@@ -1064,19 +1246,25 @@ Token management dashboards (admin and per-user):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `INFERENCE_PROXY_PRICING__INPUT_RATE_PER_MTOK` | `5.0` | USD per million input (prompt) tokens |
-| `INFERENCE_PROXY_PRICING__OUTPUT_RATE_PER_MTOK` | `25.0` | USD per million output (completion) tokens |
-| `INFERENCE_PROXY_PRICING__MODEL_LABEL` | `claude-opus-4.8` | Reference model shown next to the estimate |
+| `INFERENCE_PROXY_PRICING__INPUT_RATE_PER_MTOK` | `2.0` | USD per million input (prompt) tokens |
+| `INFERENCE_PROXY_PRICING__OUTPUT_RATE_PER_MTOK` | `10.0` | USD per million output (completion) tokens |
+| `INFERENCE_PROXY_PRICING__MODEL_LABEL` | `claude-sonnet-5` | Reference model shown next to the estimate |
 
-The defaults track published Claude Opus-class 1M-context pricing; override
-them when the reference model or your accounting changes.
+The defaults track the published [Claude Sonnet MSRP](https://platform.claude.com/docs/en/about-claude/pricing)
+(Sonnet 5: $2/$10 per MTok, 1M context at standard pricing); override them
+when the reference model or your accounting changes.
 
 ### Self-service onboarding (`/start`)
 
+New here? The [user guide](docs/user-guide.md) is written for gateway
+users; this section is the operator-facing description of the same flow.
+
 Normal (non-admin) users get one page. After Google sign-in they land on
 `/start`, and every operations page (`/dashboard`, node detail, `/models`,
-`/chat`, `/profile`, the token and admin pages) redirects them back to it.
-Admins are unaffected and are redirected away from `/start`.
+`/profile`, the token and admin pages) redirects them back to it. The `/chat`
+playground stays open to them, and it runs on the token they set up here, so
+playground usage is recorded with the rest of their usage. Admins are
+unaffected and are redirected away from `/start`.
 
 A user without a token walks through one question per screen:
 
@@ -1097,7 +1285,16 @@ instead of replacing them, and leaves the file readable only by the user. It
 needs `bash`; `python3` is used for JSON merges when present.
 
 A user who already has a token sees only that token, the models it may use
-(tap to change), and buttons to set up another tool or replace the token.
+(tap to change), a clipboard icon next to the prefix that copies the token,
+and buttons to set up another tool or replace the token.
+
+The header also links to the usage leaderboard (`/leaderboard`): every
+non-admin user ranked by token usage (admin rows are excluded by default;
+an admin viewer can opt in with the **Include admin users** checkbox), plus
+the viewer's own token manager. From there a normal user can
+copy the token, delete it, create a new one by picking an optional model
+(nothing picked means every model online right now), and optionally pick an
+agent harness to download that harness's config file with the token embedded.
 
 | Coding tool | Config written | Models | Needs |
 |-------------|----------------|--------|-------|
@@ -1199,7 +1396,14 @@ the service user's privileges. They can never share a registered name with a
 built-in plugin, so to make an external plugin the active implementation of a
 category, give it a distinct name (e.g. `auth.okta`) and disable the built-in
 (`INFERENCE_PROXY_PLUGINS__DISABLED=["auth.google"]`); the built-in keeps its
-name and wins on any collision.
+name and wins on any collision. The sign-in page only offers a provider whose
+plugin is loaded and configured, and only with the OAuth integration
+configured as well (the credential triple: `/auth/login` cannot start a flow
+without `redirect_uri`), so disabling a built-in also removes its button
+instead of leaving one that answers 404. A replacement registered
+under a different name has no button of its own: its flow stays reachable
+through the provider-less `/auth/login` link (the first loaded provider),
+the same direct-link convention as the local OIDC provider.
 
 ### SSH and provisioning commands
 
@@ -1233,19 +1437,35 @@ Provisioning resource and retention controls:
 | `INFERENCE_PROXY_PROVISIONING__LOG_RECONNECT_ATTEMPTS` | `3` | Consecutive automatic retrieval retries after SSH errors |
 | `INFERENCE_PROXY_PROVISIONING__LOG_POLL_INTERVAL` | `1` | Seconds between node log retrieval requests |
 
-Managed llama.cpp provisioning builds a verified source tag with CUDA enabled
-for the NVIDIA GPU attached to the node. It has five gateway settings:
+Managed llama.cpp provisioning reuses compatible verified CUDA builds, with a
+controlled source fallback for the attached NVIDIA GPUs. Gateway settings:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_VERSION` | `v0.4.1` | Pinned llama.cpp release tag (`v<major>.<minor>.<patch>`, or a nightly `b<number>` build tag) |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SHA256` | committed digest | SHA-256 of the source archive selected by the version |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SOURCE_URL` | GitHub tag archive | Validated HTTP(S) URL template containing exactly one `{version}` placeholder |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_ARTIFACT_CATALOG_URL` | empty | HTTP(S) catalog of verified CUDA builds; configure its SHA-256 together with the URL |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_ARTIFACT_CATALOG_SHA256` | empty | SHA-256 of the complete artifact catalog; archive digests are pinned inside it |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_ALLOW_SOURCE_BUILD` | `true` | Permit verified source compilation when no usable artifact exists; `false` requires a compatible sealed build |
+| `INFERENCE_PROXY_PROVISIONING__LLAMACPP_BUILD_JOBS` | `0` | Compiler-job ceiling; automatic sizing (`0`) and explicit ceilings both respect available CPU and RAM |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT` | `7200` | Total wall-clock deadline for the llama.cpp setup command, including the CUDA source build (seconds) |
 | `INFERENCE_PROXY_PROVISIONING__LLAMACPP_FIT_TARGET_MIB` | `512` | Free VRAM margin per GPU enforced by the llama.cpp capacity planner (MiB) |
+| `INFERENCE_PROXY_PROVISIONING__VLLM_SETUP_TIMEOUT` | `3600` | Total wall-clock deadline for the vLLM setup command, including the wheel/project sync (seconds) |
+| `INFERENCE_PROXY_PROVISIONING__STAGE_RETRY_MAX_ATTEMPTS` | `3` | Total setup attempts for a recognized transient failure, including the first |
+| `INFERENCE_PROXY_PROVISIONING__STAGE_RETRY_BASE_DELAY` | `5.0` | Base delay before the first jittered retry delay (seconds) |
+| `INFERENCE_PROXY_PROVISIONING__STAGE_RETRY_MAX_DELAY` | `120.0` | Upper bound on a single retry delay (seconds) |
+| `INFERENCE_PROXY_PROVISIONING__STAGE_RETRY_JITTER` | `0.25` | Fractional jitter applied to each retry delay (`0`-.`1`) |
+| `INFERENCE_PROXY_PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS` | `4` | Total automatic-mode vLLM launch attempts, including the first; `1` disables memory-failure retries |
+| `INFERENCE_PROXY_PROVISIONING__VLLM_VERIFY_TIMEOUT` | `30` | Total deadline for each `/version` and `/v1/models` identity request after `/health` (seconds) |
+| `INFERENCE_PROXY_PROVISIONING__VLLM_INFERENCE_PROBE_TIMEOUT` | `120` | Per-request deadline for the bounded chat or completion probe after identity checks (seconds) |
+| `INFERENCE_PROXY_PROVISIONING__VLLM_INFERENCE_PROBE_MAX_TOKENS` | `1` | Maximum tokens requested by the managed-vLLM inference probe |
+| `INFERENCE_PROXY_PROVISIONING__VLLM_PROCESS_START_SLACK` | `30` | Tolerance when comparing process age to the launch duration; covers `etimes` rounding and a backward gateway clock step (seconds) |
 
 Changing `LLAMACPP_VERSION` requires an explicitly configured matching digest.
-The node verifies the archive before extracting it, builds `llama-server`,
+Artifact production, compatibility rules, source resource budgets, and rollout
+are described in [the llama.cpp setup guide](auto-llamacpp/README.md#verified-build-artifacts).
+The source fallback verifies the archive before extracting it, builds `llama-server`,
 `llama-fit-params`, and `llama-quantize`, and atomically publishes a versioned
 installation under `/opt/llama.cpp`. CUDA kernels target the attached GPU; the
 supporting CPU backend uses a portable non-native profile so host assembler
@@ -1284,6 +1504,34 @@ dashboard. See
 [auto-llamacpp](auto-llamacpp/README.md) for the direct script contract and
 build details.
 
+Managed vLLM setup is sized the same way, but on the gateway. The planner reads
+per-device total and free VRAM, the model's weights and quantization, the KV
+cache, and a per-profile runtime overhead, records the estimate and reserve,
+and chooses context, batching, tensor parallelism, and a supported dtype and
+attention backend consistent with the selected profile. When the free VRAM
+cannot satisfy the estimated `gpu_memory_utilization`, the planner caps the
+utilization to what is actually available instead of sending vLLM past its own
+free-memory gate. It never rewrites a value the operator set explicitly: an
+explicit context, tensor-parallel size, or utilization that does not fit stops
+provisioning with a reason rather than being silently changed. When no model is
+requested, `select_vllm_model` picks the largest catalog model the budget
+supports and records the policy that chose it. Recognized memory failures during
+an automatic launch are retried under a bounded policy
+(`INFERENCE_PROXY_PROVISIONING__VLLM_MEMORY_RETRY_MAX_ATTEMPTS`, total attempts,
+default 4): the failed engine is stopped, the plan is recomputed from live
+memory, and each adjustment is logged with its reason and persisted as the
+effective configuration. After `/health` succeeds, the managed server must also
+prove which process owns the configured port, report a runtime version
+through `/version` and the expected model through `/v1/models`, and answer one
+bounded chat or completion request before the node is registered. A failure at
+that gate stops the engine and is terminal; it is not retried by the memory
+policy. Planned hosts persist the verified serving evidence under
+`vllm_runtime.serving` and show it on the node-detail dashboard, while hosts
+without a memory plan keep the legacy runtime shape and record the evidence in
+the attempt log. See
+[auto-vllm](auto-vllm/README.md) for the direct script contract and the plan
+record.
+
 LLMFit has one version setting: `INFERENCE_PROXY_LLMFIT__VERSION`.
 
 The default NVIDIA driver and LLMFit versions each ship with a verified
@@ -1316,6 +1564,38 @@ Node-side launch tuning uses the `AUTOVLLM_*` namespace. The retired
 `start-vllm.sh`. All seven reserved legacy inputs, including `VLLM_MODEL` and
 `VLLM_PORT`, are removed from the child environment so script inputs cannot
 leak into the namespace reserved by vLLM itself.
+
+### Setup resume and transient retries
+
+Setup persists the plan inputs, per-stage checkpoints, attempt relationships,
+and retry history in the durable attempt database. Each attempt derives a plan
+id from a canonical digest of the inputs that change what setup does: the
+engine, model and artifact, NFS export, the content digest of the uploaded
+script bundle, and the API port. A later attempt only resumes stages whose
+recorded checkpoint has the same plan id and whose stage-specific verifier
+still passes on the node; any input change invalidates every checkpoint so the
+stage runs again. `generation_activate`, the cheap step that makes a freshly
+separated engine upload live, is always re-run and never resumed.
+
+Only recognized transient download, repository, and SSH transport failures are
+retried automatically. Retries use bounded exponential backoff with jitter
+(`STAGE_RETRY_MAX_ATTEMPTS`, `STAGE_RETRY_BASE_DELAY`, `STAGE_RETRY_MAX_DELAY`,
+`STAGE_RETRY_JITTER`), and the gateway reconciles remote ownership and stops a
+failed engine before re-running. Invalid configuration (a bad credential,
+missing artifact, or untrusted certificate), unsupported hardware, and
+explicit maintenance boundaries are never retried automatically. The
+`LLAMACPP_SETUP_TIMEOUT` and `VLLM_SETUP_TIMEOUT` deadlines bound each engine's
+run; a run that exhausts its own deadline is terminal and is not retried.
+
+The attempt list shows the attempt number, retry count, current stage, percent
+of the ordered pipeline passed, and the next operator action. The CUDA
+probe (`cuda_proof`) deliberately re-runs every attempt because it must reflect
+the current driver and device state before a reboot decision. For llama.cpp the
+proof is deferred to the installer, so the `llamacpp_install` verifier re-runs
+it (and re-derives the sealed runtime) before the stage can be skipped, and a
+proof failure re-runs the stage so status 10 still reaches the reboot handling.
+Every other expensive stage (package installation, vLLM sync, the llama.cpp
+source build) is resumed when its checkpoint and verifier still hold.
 
 ### HuggingFace model downloads
 
@@ -1416,6 +1696,18 @@ fragment.
 self-signed certificates. Credentials are attached per request only after the
 node hostname passes the allowlist and the validated template resolves the BMC
 destination.
+
+Per-lab and per-host credential overrides live in `redfish.bmc_credentials`
+(JSON via `INFERENCE_PROXY_REDFISH__BMC_CREDENTIALS`, or natively in
+`conf/qiip.yml`). `hosts` maps a full node FQDN to an exact override that wins
+over any lab; `labs` maps a dotted FQDN segment such as `rdu2.scalelab`,
+matched as a dot-bounded substring with the longest identifier first and equal
+lengths resolved lexicographically. A hostname matching neither falls back to
+`bmc_username`/`bmc_password`, which must be set when overrides are used. Keys
+are lowercased and surrounding whitespace is stripped; a key that is empty,
+has a leading dot, ends with a dot on a `labs` entry (a trailing dot on a
+`hosts` entry is stripped), or duplicates another after normalization is
+rejected at startup.
 
 ## Architecture
 
@@ -1519,13 +1811,18 @@ uv run --frozen pytest
 
 # With branch coverage (the same gate used by CI)
 uv run --frozen coverage run -m pytest
+uv run --frozen coverage combine
 uv run --frozen coverage report
 
 # Specific module
 uv run --frozen pytest tests/api/test_routes.py -v
 ```
 
-Coverage is measured over `inference_proxy` with branch tracking enabled. CI
+Coverage is measured over `inference_proxy`, `common/generations.py`, and
+`common/llamacpp_artifacts.py`, with branch tracking and subprocess collection
+enabled. The existing recorder (`common/provision-logs.py`) is excluded from
+this floor; its copied-bundle workers need separate coverage instrumentation.
+Combine the per-process data before reporting. CI
 enforces a 93% combined statement-and-branch floor, raised from 92% once the
 measured total stayed near 94%. The total may move as
 code is added or removed. The floor prevents new untested code from materially

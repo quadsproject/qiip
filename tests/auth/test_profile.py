@@ -200,8 +200,8 @@ class TestUsageSummary:
 
         data = profile_client.get("/profile/usage").json()
 
-        assert data["estimated_premium_cost_usd"] == pytest.approx(17.5)
-        assert data["model_label"] == "claude-opus-4.8"
+        assert data["estimated_premium_cost_usd"] == pytest.approx(7.0)
+        assert data["model_label"] == "claude-sonnet-5"
 
 
 class TestTokenMintWhitelist:

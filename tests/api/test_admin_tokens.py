@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, TypedDict
 
 import pytest
@@ -74,8 +75,8 @@ class TestAdminUsers:
         assert user["active_token_count"] == 1
         assert user["request_count"] == 1
         assert user["total_tokens"] == 1_500_000
-        # 1M prompt * $5 + 500k completion * $25 = $17.50 (defaults).
-        assert user["estimated_cost_usd"] == pytest.approx(17.5)
+        # 1M prompt * $2 + 500k completion * $10 = $7.00 (defaults).
+        assert user["estimated_cost_usd"] == pytest.approx(7.0)
 
     def test_list_users_empty(self, client: TestClient) -> None:
         response = client.get("/admin/users")
@@ -139,8 +140,8 @@ class TestAdminUserDetail:
         assert detail["usage"][0]["endpoint"] == "/v1/chat/completions"
         assert detail["totals"]["total_tokens"] == 1_500_000
         assert detail["timeline"][0]["total_tokens"] == 1_500_000
-        assert detail["estimated_cost_usd"] == pytest.approx(17.5)
-        assert detail["model_label"] == "claude-opus-4.8"
+        assert detail["estimated_cost_usd"] == pytest.approx(7.0)
+        assert detail["model_label"] == "claude-sonnet-5"
 
     def test_user_detail_unknown_404(self, client: TestClient) -> None:
         response = client.get("/admin/users/999")
@@ -160,8 +161,8 @@ class TestAdminBilling:
         billing: dict[str, Any] = response.json()
         assert billing["totals"]["total_tokens"] == 1_500_000
         assert billing["totals"]["request_count"] == 1
-        assert billing["estimated_cost_usd"] == pytest.approx(17.5)
-        assert billing["model_label"] == "claude-opus-4.8"
+        assert billing["estimated_cost_usd"] == pytest.approx(7.0)
+        assert billing["model_label"] == "claude-sonnet-5"
 
     def test_billing_empty(self, client: TestClient) -> None:
         response = client.get("/admin/billing")
@@ -201,3 +202,29 @@ class TestAdminTokenPages:
         assert response.status_code == 200
         assert "QIIP - User Tokens" in response.text
         assert "timeline-table-body" in response.text
+
+
+@pytest.mark.parametrize(
+    ("route", "labels"),
+    [
+        ("/profile", ("API Tokens", "Usage")),
+        ("/dashboard/tokens", ("Users", "All tokens")),
+        ("/dashboard/users/1", ("Tokens", "Usage", "Daily timeline")),
+    ],
+)
+def test_token_pages_declare_sortable_columns(
+    client: TestClient, route: str, labels: tuple[str, ...]
+) -> None:
+    """Each token page loads the shared sorter and labels its sortable columns."""
+    html = client.get(route).text
+
+    assert "js/table_sort.js" in html
+    kinds = re.findall(r'data-sort="([^"]*)"', html)
+    assert kinds
+    assert set(kinds) <= {"text", "number", "date"}
+    headers = re.findall(r'<th[^>]*data-sort="[^"]*"[^>]*>(.*?)</th>', html)
+    assert len(headers) == len(kinds)
+    for header in headers:
+        assert 'type="button"' in header
+    for label in labels:
+        assert f'aria-label="{label}"' in html

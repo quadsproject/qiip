@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>QIIP - Leaderboard</title>
+    <meta name="description" content="Token usage leaderboard and your own tokens for the QIIP inference proxy.">
+    <link rel="icon" type="image/svg+xml" href="{{ static_asset_url(request, 'img/qiip.svg') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ static_asset_url(request, 'css/dashboard.css') }}">
+    <script>var __t=localStorage.getItem('theme')||'dark';document.documentElement.dataset.theme=__t;</script>
+</head>
+<body>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    {% include "partials/navbar.html" %}
+
+    <div class="dashboard">
+        <header class="dashboard-header">
+            <div>
+                <h1>Leaderboard</h1>
+                <p id="board-note" role="status" aria-live="polite">Loading...</p>
+                {% if viewer_role == "admin" %}
+                <label class="muted-status board-toggle" for="include-admins">
+                    <input type="checkbox" id="include-admins" name="include_admins">
+                    Include admin users
+                </label>
+                {% endif %}
+            </div>
+            <div class="header-right">
+                <p id="last-updated"></p>
+                <p id="poll-warning"></p>
+            </div>
+        </header>
+
+        <main id="main-content">
+            <div id="error-banner" class="profile-error" hidden></div>
+
+            <section class="card">
+                <h2 class="card-title">Usage leaderboard</h2>
+                <div class="table-wrap">
+                    <table aria-label="Usage leaderboard">
+                        <thead id="leaderboard-head">
+                            <tr>
+                                <th scope="col">Rank</th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">User</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Tokens</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Requests</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Prompt tokens</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Completion tokens</button></th>
+                                {# The server sends the ranking by total tokens DESC (#}
+                                {# store.list_leaderboard), so the column carries its state. #}
+                                <th scope="col" data-sort="number" aria-sort="descending"><button type="button" class="th-sort">Total tokens</button></th>
+                                <th scope="col" data-sort="number"><button type="button" class="th-sort">Est. premium cost @ {{ model_label }}</button></th>
+                            </tr>
+                        </thead>
+                        <tbody id="leaderboard-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            {% if viewer_role == "admin" %}
+            <section class="card">
+                <h2 class="card-title">Your tokens</h2>
+                <p class="muted-status">Admins manage tokens on the <a href="/profile">profile page</a> after a provider sign-in.</p>
+            </section>
+            {% else %}
+            <section class="card">
+                <h2 class="card-title">Your tokens</h2>
+                <p class="muted-status" id="token-legacy-note" hidden>
+                    This token was made before the new setup flow, so it can't be
+                    copied or exported. Create a new token below.
+                </p>
+                <div class="table-wrap">
+                    <table aria-label="Your tokens">
+                        <thead id="tokens-head">
+                            <tr>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Name</button></th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Prefix</button></th>
+                                <th scope="col" data-sort="date"><button type="button" class="th-sort">Created</button></th>
+                                <th scope="col" data-sort="date"><button type="button" class="th-sort">Last used</button></th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Status</button></th>
+                                <th scope="col" data-sort="text"><button type="button" class="th-sort">Models</button></th>
+                                <th scope="col">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tokens-table-body">
+                            <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section class="card">
+                <h2 class="card-title">Create a token</h2>
+                <form id="token-form" class="setup-form">
+                    <div class="token-field">
+                        <label for="token-model">Model</label>
+                        <select id="token-model" class="setup-select" aria-label="Model (optional)">
+                            <option value="">All models (optional)</option>
+                        </select>
+                    </div>
+                    <div class="token-field">
+                        <label for="token-harness">Agent harness</label>
+                        <select id="token-harness" class="setup-select" aria-label="Agent harness (optional)">
+                            <option value="">None (skip config)</option>
+                        </select>
+                    </div>
+                    <div class="token-actions">
+                        <button type="submit" id="token-create-btn" class="btn btn-primary">Create</button>
+                        <button type="button" id="config-download-btn" class="btn btn-neutral" disabled>Download config</button>
+                    </div>
+                </form>
+            </section>
+            {% endif %}
+        </main>
+    </div>
+
+    <div id="toast-container" role="status"></div>
+
+    <footer>
+        <p>QIIP Inference Proxy</p>
+    </footer>
+
+    <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/table_sort.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/clipboard.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/format_usd.js') }}"></script>
+    <script src="{{ static_asset_url(request, 'js/leaderboard.js') }}"></script>
+</body>
+</html>

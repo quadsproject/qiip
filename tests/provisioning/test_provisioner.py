@@ -59,11 +59,13 @@ from inference_proxy.provisioning.provisioner import (
     ProvisioningError,
     ProvisioningIdentity,
     SelfSetupError,
+    SetupResumeRequiredError,
     _parse_llamacpp_runtime_fit,
     served_model_id,
 )
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
+    SSHClient,
     SSHConnectionError,
 )
 from inference_proxy.redfish.errors import RedfishError
@@ -72,6 +74,7 @@ from inference_proxy.resilience.health_checker import (
     _ConsecutiveFailures,
     _probe_all_nodes,
 )
+from tests.provisioning.test_driver_reuse import _host, _setup
 
 _TEST_ENDPOINT_POLICY = EndpointPolicy.from_values(
     allowed_hosts=["host1"],
@@ -229,7 +232,7 @@ def _llamacpp_fit_log(
 
 def _make_provisioner(
     *,
-    ssh_client: MagicMock | None = None,
+    ssh_client: SSHClient | MagicMock | None = None,
     etcd_client: MagicMock | None = None,
     settings: ProvisioningSettings | None = None,
     llmfit_settings: LLMFitSettings | None = None,
@@ -241,10 +244,14 @@ def _make_provisioner(
     nfs_export: str | None = "nfs.example:/exports/huggingface",
     hf_token: str | None = None,
     artifact_index: GGUFArtifactIndex | None = None,
+    hf_cache_dir: str | None = None,
 ) -> NodeProvisioner:
     """Build a NodeProvisioner with mock dependencies."""
+    ssh_client = ssh_client or MagicMock()
+    if isinstance(ssh_client, MagicMock) and not isinstance(ssh_client.run, AsyncMock):
+        ssh_client.run = AsyncMock(return_value=("", "", 0))
     return NodeProvisioner(
-        ssh_client=ssh_client or MagicMock(),
+        ssh_client=ssh_client,
         etcd_client=etcd_client or MagicMock(),
         settings=settings
         or ProvisioningSettings(health_poll_timeout=2, health_poll_interval=0),
@@ -257,6 +264,7 @@ def _make_provisioner(
         hf_token=hf_token,
         nfs_export=nfs_export,
         artifact_index=artifact_index,
+        hf_cache_dir=hf_cache_dir,
     )
 
 
@@ -330,6 +338,7 @@ def test_script_env_prefix_exact() -> None:
     )
 
     assert provisioner._setup_script_env() == {
+        "QIIP_GENERATION_ROOT": "/opt/qiip/vllm",
         "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
         "AUTOVLLM_NVIDIA_DRIVER_VERSION": "999.1",
@@ -394,6 +403,7 @@ def test_script_env_prefix_exact() -> None:
     }
     llama_setup = provisioner._setup_script_env(InferenceEngine.LLAMA_CPP)
     assert llama_setup == {
+        "QIIP_GENERATION_ROOT": "/opt/qiip/llama_cpp",
         "AUTOVLLM_NFS_EXPORT": "nfs.example:/exports/hf cache",
         "AUTOVLLM_NFS_MOUNT_POINT": "/srv/hf cache",
         "AUTOVLLM_NVIDIA_DRIVER_VERSION": "999.1",
@@ -409,6 +419,9 @@ def test_script_env_prefix_exact() -> None:
         "AUTOLLAMACPP_SOURCE_URL": (
             "https://github.com/ggml-org/llama.cpp/archive/refs/tags/v0.4.1.tar.gz"
         ),
+        "AUTOLLAMACPP_ARTIFACT_CATALOG_URL": "",
+        "AUTOLLAMACPP_ARTIFACT_CATALOG_SHA256": "",
+        "AUTOLLAMACPP_ALLOW_SOURCE_BUILD": "1",
     }
     artifact = _artifact()
     assert provisioner._start_script_env(None, InferenceEngine.LLAMA_CPP, artifact) == {
@@ -457,6 +470,7 @@ def test_script_env_prefix_exact() -> None:
     assert shlex.split(
         provisioner._script_command("setup.sh", env=provisioner._setup_script_env())
     ) == [
+        "QIIP_GENERATION_ROOT=/opt/qiip/vllm",
         "AUTOVLLM_NFS_EXPORT=nfs.example:/exports/hf cache",
         "AUTOVLLM_NFS_MOUNT_POINT=/srv/hf cache",
         "AUTOVLLM_NVIDIA_DRIVER_VERSION=999.1",
@@ -691,10 +705,11 @@ async def test_llamacpp_bundle_uses_configured_sibling_root(tmp_path: Path) -> N
 
     await provisioner._upload_scripts("host1", InferenceEngine.LLAMA_CPP)
 
-    assert [item.args for item in ssh.upload.await_args_list] == [
-        ("host1", llama_dir),
-        ("host1", common_dir),
-    ]
+    assert ssh.upload.await_count == 1
+    assert ssh.upload.await_args.args[2] == ".qiip/bundles/"
+    assert provisioner._remote_bundles["host1", InferenceEngine.LLAMA_CPP].startswith(
+        ".qiip/bundles/"
+    )
 
 
 @pytest.mark.asyncio
@@ -731,6 +746,8 @@ async def test_llamacpp_setup_uses_its_extended_total_timeout() -> None:
 
 async def _async_iter(
     items: list[tuple[str, str]],
+    *,
+    total_timeout: float | None = None,
 ) -> AsyncIterator[tuple[str, str]]:
     """Helper: async generator yielding items."""
     for item in items:
@@ -788,6 +805,8 @@ class TestProvisionSequence:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             if "setup.sh" in command:
                 call_order.append("setup")
@@ -1023,6 +1042,8 @@ class TestScriptUpload:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             if "setup.sh" in command:
                 call_order.append("setup")
@@ -1095,6 +1116,8 @@ class TestStepMarkerParsing:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             for item in [
                 ("stdout", "[STEP:system_update:START]"),
@@ -1128,6 +1151,8 @@ class TestModelExtraction:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             for item in [
                 ("stdout", "Starting container..."),
@@ -1149,6 +1174,8 @@ class TestModelExtraction:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             for item in [("stdout", "no model line here")]:
                 yield item
@@ -1166,6 +1193,8 @@ class TestModelExtraction:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("stdout", "# Model:              wrong/model")
 
@@ -1188,6 +1217,8 @@ class TestModelExtraction:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             captured_commands.append(command)
             for item in [("stdout", "# Model:              org/model")]:
@@ -1211,6 +1242,8 @@ class TestModelExtraction:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             captured_commands.append(command)
             for item in [("stdout", "# Model:              auto-detected")]:
@@ -1231,6 +1264,8 @@ class TestModelExtraction:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             captured_commands.append(command)
             for item in [("stdout", "# Model:              safe")]:
@@ -1704,6 +1739,8 @@ class TestSetupFailure:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("stdout", "[STEP:system_update:START]")
             raise RemoteCommandError("host1", "bash setup.sh", 1)
@@ -1731,6 +1768,8 @@ class TestSetupFailure:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             raise SSHConnectionError("host1", "connection refused")
             # Make it an async generator
@@ -1752,6 +1791,114 @@ class TestSetupFailure:
 
 class TestProvisioningFailureAccuracy:
     """P3/P7/P8/E14: failures are terminal, accurate, and diagnosable."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("host_settings", "resume_state"),
+        [
+            ({"HEADERS_RC": "1"}, None),
+            (
+                {"INSTALLED_DRIVER": "570.172.08", "GPU_BUSY": "1"},
+                "maintenance_required",
+            ),
+            (
+                {"INSTALLED_DRIVER": "570.172.08", "NEEDS_REBOOT": "1"},
+                "reboot_required",
+            ),
+            ({"PROBE_RC": "1"}, "maintenance_required"),
+        ],
+    )
+    async def test_real_setup_result_controls_gateway_launch(
+        self, tmp_path: Path, host_settings: dict[str, str], resume_state: str | None
+    ) -> None:
+        result = _setup(_host(tmp_path, **host_settings))
+        etcd, _values, state_payloads = _recording_etcd()
+        ssh = MagicMock()
+        ssh.upload = AsyncMock()
+
+        async def setup_output(
+            host: str,
+            command: str,
+            *,
+            total_timeout: float | None = None,
+        ) -> AsyncIterator[tuple[str, str]]:
+            assert "setup.sh" in command
+            for line in result.stdout.splitlines():
+                yield "stdout", line
+            for line in result.stderr.splitlines():
+                yield "stderr", line
+            if result.returncode:
+                raise RemoteCommandError(host, command, result.returncode)
+
+        ssh.run_streaming = setup_output
+        provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
+        with (
+            patch.object(provisioner, "preflight", new_callable=AsyncMock),
+            patch.object(provisioner, "_verify_gpu", new_callable=AsyncMock),
+            patch.object(
+                provisioner,
+                "_read_gpu_inventory",
+                new_callable=AsyncMock,
+                return_value=(),
+            ),
+            patch.object(
+                provisioner,
+                "_run_start_vllm",
+                new_callable=AsyncMock,
+                return_value="org/model",
+            ) as launch,
+            patch.object(provisioner, "_poll_health", new_callable=AsyncMock),
+            patch.object(provisioner, "_register_node", new_callable=AsyncMock),
+        ):
+            if resume_state:
+                with pytest.raises(SetupResumeRequiredError):
+                    await provisioner.provision("host1")
+                launch.assert_not_awaited()
+                assert state_payloads[-1]["resume_state"] == resume_state
+            else:
+                await provisioner.provision("host1")
+                launch.assert_awaited_once()
+                assert state_payloads[-1]["current_step"] == "complete"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "resume_state", ["maintenance_required", "reboot_required"]
+    )
+    @pytest.mark.parametrize("ssh_fails", [True, False])
+    async def test_setup_resume_marker_is_persisted_and_blocks_launch(
+        self, resume_state: str, ssh_fails: bool
+    ) -> None:
+        etcd, values, state_payloads = _recording_etcd()
+        ssh = MagicMock()
+        ssh.upload = AsyncMock()
+
+        async def setup_resume(
+            host: str,
+            command: str,
+            *,
+            total_timeout: float | None = None,
+        ) -> AsyncIterator[tuple[str, str]]:
+            assert "setup.sh" in command
+            yield "stdout", "[STEP:nvidia_driver:START]"
+            yield (
+                "stdout",
+                f"[RESUME:{resume_state}:Drain/reboot the node, then retry setup]",
+            )
+            yield "stdout", "[STEP:nvidia_driver:FAIL]"
+            if ssh_fails:
+                raise RemoteCommandError(host, command, 1)
+
+        ssh.run_streaming = setup_resume
+        provisioner = _make_provisioner(ssh_client=ssh, etcd_client=etcd)
+        with patch.object(provisioner, "preflight", new_callable=AsyncMock):
+            with pytest.raises(SetupResumeRequiredError, match="then retry setup"):
+                await provisioner.provision("host1")
+
+        assert state_payloads[-1]["current_step"] == "failed"
+        assert state_payloads[-1]["failed_step"] == "nvidia_driver"
+        assert state_payloads[-1]["resume_state"] == resume_state
+        assert "then retry setup" in str(state_payloads[-1]["error"])
+        assert json.loads(values["/nodes/host1"])["status"] == "failed"
 
     @pytest.mark.asyncio
     async def test_initial_registration_failure_aborts_before_ssh(self) -> None:
@@ -1852,6 +1999,8 @@ class TestProvisioningFailureAccuracy:
         async def setup_failure(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             assert host == "host1"
             assert "setup.sh" in command
@@ -1876,6 +2025,8 @@ class TestProvisioningFailureAccuracy:
         async def setup_failure(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("stdout", "[STEP:system_update:START]")
             raise RuntimeError("setup interrupted")
@@ -1902,6 +2053,8 @@ class TestProvisioningFailureAccuracy:
         async def setup_warning(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             yield ("stdout", "[STEP:llmfit_install:WARN]")
             raise RuntimeError("later setup failure")
@@ -1945,6 +2098,8 @@ class TestProvisioningFailureAccuracy:
         async def stopped(
             _host: str,
             _command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             if False:  # pragma: no cover - defines an empty async generator
                 yield ("stdout", "")
@@ -1987,6 +2142,8 @@ class TestProvisioningFailureAccuracy:
         async def stopped(
             _host: str,
             _command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             if False:  # pragma: no cover - defines an empty async generator
                 yield ("stdout", "")
@@ -2737,10 +2894,13 @@ class TestVerifyGpu:
 def _make_full_provisioner(etcd: MagicMock) -> tuple[NodeProvisioner, MagicMock]:
     """Build a provisioner with mocks suitable for full provision() tests."""
     ssh = MagicMock()
+    ssh.run = AsyncMock(return_value=("", "", 0))
 
     async def mock_streaming(
         host: str,
         command: str,
+        *,
+        total_timeout: float | None = None,
     ) -> AsyncIterator[tuple[str, str]]:
         if "setup.sh" in command:
             for item in [
@@ -2819,10 +2979,13 @@ class TestStateTracking:
         """On failure, last state write has current_step=failed with details."""
         etcd = MagicMock()
         ssh = MagicMock()
+        ssh.run = AsyncMock(return_value=("", "", 0))
 
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             if "setup.sh" in command:
                 raise RemoteCommandError("host1", "bash setup.sh", 1)
@@ -3069,6 +3232,8 @@ def _make_teardown_provisioner(
     async def mock_streaming(
         host: str,
         command: str,
+        *,
+        total_timeout: float | None = None,
     ) -> AsyncIterator[tuple[str, str]]:
         for item in [("stdout", "ok")]:
             yield item
@@ -3209,17 +3374,18 @@ class TestTeardownGraceful:
         commands: list[str] = []
         operation_order: list[str] = []
 
-        async def mock_upload(host: str, local_path: Path) -> None:
+        async def mock_upload(host: str, local_path: Path, remote_path: str) -> None:
             assert host == "host1"
-            assert local_path in {
-                provisioner._settings.scripts_dir,
-                provisioner._settings.scripts_dir.parent / "common",
-            }
+            assert remote_path == ".qiip/bundles/"
+            assert (local_path / "BUNDLE.json").is_file()
+            assert (local_path / "auto-vllm/stop-vllm.sh").is_file()
             operation_order.append("upload")
 
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             commands.append(command)
             operation_order.append("stop")
@@ -3236,8 +3402,10 @@ class TestTeardownGraceful:
             mock_tt.return_value = True
             await provisioner.teardown("host1")
 
-        assert commands == ["bash auto-vllm/stop-vllm.sh"]
-        assert operation_order == ["upload", "upload", "stop"]
+        assert len(commands) == 1
+        assert shlex.split(commands[0])[-1] == "stop-vllm.sh"
+        assert "generations.py exec" in commands[0]
+        assert operation_order == ["upload", "stop"]
 
     @pytest.mark.asyncio
     async def test_scripts_dir_respected_in_commands(self, tmp_path: Path) -> None:
@@ -3255,6 +3423,8 @@ class TestTeardownGraceful:
         async def capture_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             assert host == "host1"
             commands.append(command)
@@ -3273,23 +3443,18 @@ class TestTeardownGraceful:
         )
         await provisioner._run_start_vllm("host1", model="org/model")
 
-        assert [item.args for item in ssh.upload.await_args_list[:2]] == [
-            ("host1", scripts_dir),
-            ("host1", common_dir),
-        ]
-        assert [shlex.split(command)[-1] for command in commands[:2]] == [
-            "provision scripts -- vllm/setup.sh",
-            "provision scripts -- vllm/start-vllm.sh",
+        assert ssh.upload.await_count == 1
+        bundle = provisioner._remote_bundles["host1", InferenceEngine.VLLM]
+        assert shlex.split(commands[0])[-1] == f"{bundle}/{scripts_dir.name}/setup.sh"
+        assert shlex.split(commands[1])[-2:] == [
+            f"{bundle}/{scripts_dir.name}",
+            "start-vllm.sh",
         ]
         assert all("auto-vllm/" not in command for command in commands)
 
         await asyncio.wait_for(provisioner.teardown("host1", force=True), timeout=1)
 
-        assert shlex.split(commands[2]) == [
-            "bash",
-            "provision scripts -- vllm/stop-vllm.sh",
-            "--force",
-        ]
+        assert shlex.split(commands[2])[-2:] == ["stop-vllm.sh", "--force"]
         assert all("auto-vllm/" not in command for command in commands)
 
     @pytest.mark.asyncio
@@ -3328,6 +3493,8 @@ class TestTeardownGraceful:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             assert host == "host1"
             commands.append(command)
@@ -3389,6 +3556,8 @@ class TestTeardownForce:
         async def mock_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             commands.append(command)
             for item in [("stdout", "ok")]:
@@ -3403,7 +3572,8 @@ class TestTeardownForce:
             mock_tt.return_value = True
             await provisioner.teardown("host1", force=True)
 
-        assert commands == ["bash auto-vllm/stop-vllm.sh --force"]
+        assert len(commands) == 1
+        assert shlex.split(commands[0])[-2:] == ["stop-vllm.sh", "--force"]
 
 
 class TestDrainTimeout:
@@ -3503,6 +3673,8 @@ class TestTeardownSSHFailure:
         async def failing_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
             raise SSHConnectionError("host1", "connection refused")
             yield  # pragma: no cover
@@ -3535,8 +3707,10 @@ class TestTeardownSSHFailure:
         async def failing_streaming(
             host: str,
             command: str,
+            *,
+            total_timeout: float | None = None,
         ) -> AsyncIterator[tuple[str, str]]:
-            assert command == "bash auto-vllm/stop-vllm.sh --force"
+            assert shlex.split(command)[-2:] == ["stop-vllm.sh", "--force"]
             raise RemoteCommandError(host, command, 1, "process survived")
             yield  # pragma: no cover
 
@@ -3547,6 +3721,23 @@ class TestTeardownSSHFailure:
 
         etcd.delete.assert_not_called()
         registry.remove.assert_not_called()
+
+
+class TestPowerState:
+    """Placement reads BMC power through the provisioner before its SSH probe."""
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_redfish_not_configured(self) -> None:
+        provisioner = _make_provisioner()
+        assert await provisioner.power_state("host1") is None
+
+    @pytest.mark.asyncio
+    async def test_delegates_to_redfish_client(self) -> None:
+        redfish = MagicMock()
+        redfish.get_power_state = AsyncMock(return_value="Off")
+        provisioner = _make_provisioner(redfish_client=redfish)
+        assert await provisioner.power_state("host1") == "Off"
+        redfish.get_power_state.assert_awaited_once_with("host1")
 
 
 class TestPowerOnIfNeeded:

@@ -7,7 +7,8 @@ bare-metal NVIDIA GPU nodes.
 
 - RHEL 9-compatible Linux on x86_64
 - An NVIDIA GPU and access to the configured NVIDIA package repositories;
-  setup installs or validates the driver and CUDA toolkit
+  setup installs or validates the driver. A compatible artifact supplies its
+  CUDA runtime libraries; source fallback installs the profile toolkit
 - Reachable NFS export containing the native Hugging Face Hub cache and its
   GGUF snapshots
 
@@ -16,26 +17,130 @@ GPU verification fails. The start script retains a standalone CPU branch for
 direct development use, but CPU-only nodes are not a supported QIIP-managed
 deployment target.
 
-## Verified source build
+## Verified build artifacts
+
+Setup first checks sealed local installations, then an optional checksum-pinned
+HTTP(S) artifact catalog. A matching build includes `llama-server`,
+`llama-fit-params`, `llama-quantize`, a compiled CUDA execution probe, and the
+CUDA/compiler shared libraries needed by those executables. The node-owned
+NVIDIA driver, libc, and dynamic loader are never bundled. Each executable embeds
+`$ORIGIN/../lib` as its RPATH, so direct invocations, diagnostics, and compatibility
+symlinks resolve the bundled library closure without `LD_LIBRARY_PATH` or a toolkit.
+
+The package identity records the source tag/digest, fit-CLI transformation
+digest, build profile, compiler version, full CUDA toolkit version, measured GPU
+architectures, resolved engine/probe compile targets, runtime profile, OS major
+version, machine architecture, producer CPU feature flags, and glibc version.
+A consumer requires the same source, transformation, build/runtime profile,
+OS major and machine architecture, a matching CUDA toolkit series, compiled
+coverage for every selected GPU architecture, and glibc at least as new as the
+producer's. Every consumer CPU must support all recorded producer CPU features.
+Explicit CMake architecture overrides
+must match. Selected-profile installations can be reused across local compiler
+and toolkit patch updates. Missing or unreadable CPU features fail compatibility
+checks before executing an artifact.
+
+Both the catalog and archive must pass SHA-256 verification. Extraction rejects
+links, special files, traversal, duplicate paths, and unexpected files. Setup
+checks the sealed binaries and libraries, server/fit version, managed CLI
+options, quantizer help, CUDA backend discovery, and actual probe-kernel
+execution before installation and activation. A cache hit requires no CMake,
+Make, host compiler, or CUDA toolkit installation. Driver repair can still
+require its own kernel build dependencies. A downloaded artifact's CUDA-proof
+failure is a cache miss. When source fallback is allowed, a freshly compiled probe checks
+driver/device/fabric health before downloading or compiling the engine. Failure
+of that fresh proof stops setup with the existing maintenance/reboot handling.
+A previously verified local runtime failing execution also stops setup for
+driver/device/fabric inspection.
+
+### Produce and distribute a catalog
+
+On a representative producer for each supported runtime profile, run managed
+setup with the pinned source pair and no artifact catalog, then validate a real
+inference request. Publish that selected runtime from the same script bundle:
+
+```bash
+bundle=$(dirname "$(readlink -f /opt/qiip/llama_cpp/current/common)")
+runtime=$(readlink -f /opt/qiip/llama_cpp/current/runtime)
+python3 "$bundle/common/llamacpp_artifacts.py" publish \
+  "$runtime" /srv/llamacpp-artifacts https://artifacts.example/llamacpp
+```
+
+The publisher reruns the binary/CLI/CUDA checks, flushes a content-addressed
+archive with mode `0644`, and atomically updates `catalog.json` under a publication
+lock. Its last output line contains the catalog SHA-256 and archive metadata.
+Repeating publication retains other profile entries. Serve the archives and catalog at
+the chosen base URL, and configure the gateway with the catalog URL and digest:
+
+```dotenv
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_ARTIFACT_CATALOG_URL=https://artifacts.example/llamacpp/catalog.json
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_ARTIFACT_CATALOG_SHA256=<catalog-sha256>
+INFERENCE_PROXY_PROVISIONING__LLAMACPP_ALLOW_SOURCE_BUILD=false
+```
+
+Update the pinned catalog digest whenever its contents change. Publish archives
+before making a new catalog available. No production catalog or fleet GPU
+validation is claimed by the controlled regression fixtures. Runtime-profile
+validation status remains in `common/PROFILES.md`; the
+`cuda-native-cpu-v4-artifact` build profile still requires producer and consumer
+validation on each representative fleet GPU configuration, including mixed GPU
+selections and any explicit architecture overrides, before publishing catalogs.
+
+### Resource-aware source fallback
 
 Linux CUDA archives are not published for the pinned `v0.4.1` release.
-`setup.sh` therefore downloads the pinned GitHub tag source archive, verifies
+With source fallback allowed (the default), a cache miss downloads the pinned
+GitHub tag source archive, verifies
 its committed SHA-256 before extraction, applies one digest-pinned CLI
 allowlist transformation, and compiles `llama-server`, `llama-fit-params`, and
-`llama-quantize` with `GGML_CUDA=ON` and the attached GPUs' native CUDA
-architecture. The supporting CPU backend uses `GGML_NATIVE=OFF`: managed
-inference is CUDA-only, and the portable CPU profile avoids coupling builds to
-host-specific compiler and assembler feature support.
+`llama-quantize` with `GGML_CUDA=ON`. The default `native` selection resolves to
+explicit numeric CMake targets for every selected GPU. The same targets compile
+the packaged CUDA probe and are recorded in its schema-4 identity. An override
+via `AUTOLLAMACPP_CUDA_ARCHITECTURES` must use explicit numeric CMake targets
+(for example `80;90`, optionally suffixed `-real` or `-virtual`); unbounded
+`all`/`all-major` selections are rejected. The supporting CPU backend uses
+`GGML_NATIVE=ON`, allowing ggml to detect native instruction support without
+explicit SIMD overrides. Setup records the sorted `/proc/cpuinfo` flags of the
+producer, including AVX512, VNNI, or AMX when present. Source builds require
+uniform feature flags across producer CPUs; mixed CPU hosts can consume artifacts
+whose required features are present on every CPU. Earlier artifact schemas and
+build profiles need rebuilding before they can enter a new catalog.
 The build uses CMake's explicit Unix Makefiles generator with parallel jobs, so
 it depends only on the `make` package available from the standard RHEL
 repositories and does not require CodeReady Builder or `ninja-build`.
+Jobs are bounded by `nproc` and available RAM: by default setup reserves
+2 GiB and budgets 4 GiB per compiler job. Less than 6 GiB available fails before
+toolchain installation or source download. `LLAMACPP_BUILD_JOBS` is an optional
+gateway ceiling (`0` means automatic); it cannot increase the memory limit.
+The fallback requires 12 GiB of build space and 4 GiB of installation space,
+adding the requirements when both paths share a filesystem. It checks the
+nearest existing installation ancestor, including on a fresh node. Setup tries
+the configured temporary directory, `/var/tmp`, then `/tmp` for available space.
+Both the CUDA probe and the engine build use the selected scratch directory.
+Artifact downloads check the archive's recorded compressed/unpacked sizes
+against both staging and installation capacity.
+
+Standalone producers can tune `AUTOLLAMACPP_BUILD_RESERVE_MIB`,
+`AUTOLLAMACPP_BUILD_JOB_MIB`, `AUTOLLAMACPP_BUILD_FREE_MIB`, and
+`AUTOLLAMACPP_INSTALL_FREE_MIB` (all positive integers), set a job ceiling with
+`AUTOLLAMACPP_BUILD_JOBS` (`0` or unset means automatic), or require a specific build directory with
+`AUTOLLAMACPP_BUILD_TMP_DIR`. A missing/unwritable directory or unmeasurable
+capacity fails before compilation. Resource budgets are conservative policy
+values, not measurements of peak compiler memory on every fleet profile.
+
+Attempt logs record `[ARTIFACT:hit|miss:...]`, the fallback reason, resource
+selection, configure/compile/publication progress, and lookup/setup timings.
 
 Installations are immutable and build-identified under
-`/opt/llama.cpp/<version>-<identity>`. The three public binaries in
-`/usr/local/bin` are replaced with same-directory atomic symlink renames only
-after the new build reports the configured version. Repeating setup with the
-same source digest, transformation digest, build profile, and GPU capabilities
-reuses that installation.
+`/opt/llama.cpp/<version>-<identity>`. Setup verifies all three installed tools,
+their manifest, the source/build/profile identity, and managed CLI compatibility
+before publication. Managed setup selects the runtime and the complete script
+bundle together through `/opt/qiip/llama_cpp/current`, retaining the previous
+generation. Repeating setup with the same identity validates and reuses that
+installation. Standalone `install_llamacpp` callers expose the three tools
+through one `/opt/llama.cpp/current` pointer and stable compatibility links.
+See [transactional provisioning](../docs/transactional-provisioning.md) for
+interruption recovery and rollback.
 
 The full llama.cpp setup command has a separate two-hour default deadline
 (`INFERENCE_PROXY_PROVISIONING__LLAMACPP_SETUP_TIMEOUT`) because it includes
@@ -77,12 +182,14 @@ mount, firewall, llmfit) live in `common/setup-base.sh`. Both
 `auto-vllm/setup.sh` and `auto-llamacpp/setup.sh` source this file. Do not
 duplicate shared logic in engine-specific scripts.
 
-Both engines select a measured runtime profile (`common/profiles.sh`), install
-the profile's exact CUDA toolkit, verify real CUDA execution, and prepare
+Both engines select a measured runtime profile (`common/profiles.sh`), verify
+real CUDA execution, and prepare
 Fabric Manager on NVSwitch hosts (`ensure_fabric_manager` plus a readiness
 gate at start). Unsupported combinations are rejected with
 `[REJECT:unsupported_hardware:...]` and exit code 3. See
 `common/PROFILES.md` for the compatibility matrix and its validation status.
+vLLM and llama.cpp source fallback install the profile's exact CUDA toolkit;
+llama.cpp artifact hits use their bundled CUDA runtime and compiled probe.
 
 ## Setup
 
@@ -95,6 +202,18 @@ AUTOVLLM_NFS_EXPORT=storage.example.com:/exports/huggingface ./setup.sh
 
 Shared environment variables use the `AUTOVLLM_` prefix for backward
 compatibility with existing provisioning infrastructure.
+
+Setup reuses compatible drivers after a real CUDA execution probe and installs
+only missing prerequisites. A working stack does not need kernel headers or
+an OS update. `AUTOVLLM_NVIDIA_DRIVER_VERSION` selects the fallback installer;
+replacement requires checksum verification, node idleness, and matching
+running-kernel build dependencies. Compatible RPM and runfile/DKMS installs can
+rebuild a missing module before replacement. Until hardware can be measured,
+bootstrap drivers must satisfy the Volta recovery limits (575.57.08 through R580).
+Maintenance and reboot requirements stop
+setup with a `[RESUME:...]` marker; resolve the reason and retry setup to
+revalidate the stack before the source build. See the
+[driver maintenance runbook](../UPGRADING.md#13-prepare-for-strict-driver-and-cache-checks).
 
 ## Run
 
@@ -268,7 +387,7 @@ request), and `aggregate_context` (the unified pool).
 
 The pinned estimator already implements unified-KV memory accounting but
 does not expose that option in the `llama-fit-params` CLI allowlist. The
-versioned `cuda-portable-cpu-v2-fit-concurrency` build profile exposes the
+versioned `cuda-native-cpu-v4-artifact` build profile exposes the
 existing option so estimation and serving use the same KV mode. Its exact
 transformation digest is part of `BUILD-INFO` and the installation identity,
 and setup exercises every planner option against the built helper before

@@ -61,9 +61,11 @@ class Rig:
         self.registry = registry or NodeRegistry()
         self.provisioner = provisioner or FakeProvisioner(self.registry)
         self.quads = FakeQuads([host.hostname for host in hosts])
-        self.poller = FakePoller(hosts)
-        self.index = FakeArtifactIndex(catalog_artifacts())
         self.clock = clock or FakeClock()
+        # The snapshot is as fresh as the clock: tests that advance time by
+        # hours are about retries and takeovers, not about a QUADS outage.
+        self.poller = FakePoller(hosts, self.clock)
+        self.index = FakeArtifactIndex(catalog_artifacts())
         values: dict[str, object] = {"max_concurrent": 32}
         self.settings = PlacementSettings.model_validate(
             {**values, **settings, **(extra_settings or {})}
@@ -1102,6 +1104,132 @@ async def test_a_first_launch_is_blocked_and_its_share_goes_to_another_host(
 
 
 @pytest.mark.asyncio
+async def test_a_powered_off_host_is_not_blocked_when_the_ssh_probe_fails() -> None:
+    """Off means no earlier setup can run: the failed probe does not block.
+
+    The probe runs first (power is read only on a failed probe), then the BMC
+    read shows Off and the launch proceeds.
+    """
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.power_states["l4-00"] = "Off"
+    rig.provisioner.remote_check_errors["l4-00"] = TimeoutError("ssh probe timed out")
+    rig.provisioner.remote_processes["l4-00"] = list(_SETUP_RUNNING)
+    await rig.run()
+    assert "l4-00" in _placed(rig)
+    assert "l4-00" not in _skips(rig)
+    # The probe runs for the readiness pass and again under the launch lease;
+    # power is read only on those failed probes.
+    assert rig.provisioner.remote_checks == ["l4-00", "l4-00"]
+    assert rig.provisioner.power_state_checks == ["l4-00", "l4-00"]
+
+
+@pytest.mark.asyncio
+async def test_a_powered_on_host_still_runs_the_ssh_probe() -> None:
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.power_states["l4-00"] = "On"
+    rig.provisioner.remote_processes["l4-00"] = list(_SETUP_RUNNING)
+    await rig.run()
+    assert rig.provisioner.calls == []
+    assert "l4-00" in rig.provisioner.remote_checks
+    assert rig.provisioner.power_state_checks == [], "a reachable host is not read"
+    assert _skips(rig)["l4-00"] == (
+        "blocked: an earlier provisioning command is still running on the host"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_reachable_host_is_never_asked_about_power() -> None:
+    """SSH succeeds: the BMC is not touched for the launch decision."""
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.power_state_error = ConnectionError("bmc unreachable")
+    rig.provisioner.remote_processes["l4-00"] = list(_SETUP_RUNNING)
+    await rig.run()
+    assert rig.provisioner.power_state_checks == []
+    assert _skips(rig)["l4-00"] == (
+        "blocked: an earlier provisioning command is still running on the host"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_power_state_falls_back_to_the_ssh_probe() -> None:
+    """Unknown is never read as off: a failed BMC read keeps the SSH error."""
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.remote_check_errors["l4-00"] = TimeoutError("ssh probe timed out")
+    rig.provisioner.power_state_error = ConnectionError("bmc unreachable")
+    await rig.run()
+    assert rig.provisioner.power_state_checks == ["l4-00"]
+    assert _skips(rig)["l4-00"].startswith("blocked: ")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["PoweringOn", "PoweringOff"])
+async def test_a_transitional_power_state_keeps_the_probe_error(state: str) -> None:
+    """Transitional is not off: the failed probe still blocks the launch."""
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.remote_check_errors["l4-00"] = TimeoutError("ssh probe timed out")
+    rig.provisioner.power_states["l4-00"] = state
+    await rig.run()
+    assert "l4-00" in rig.provisioner.remote_checks
+    assert _skips(rig)["l4-00"].startswith("blocked: ")
+
+
+@pytest.mark.asyncio
+async def test_a_power_read_past_the_deadline_keeps_the_probe_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A BMC read that hangs past the probe deadline is not read as off."""
+    monkeypatch.setattr(
+        "inference_proxy.placement.reconciler._REMOTE_PROBE_TIMEOUT_SECONDS", 0.01
+    )
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    rig.provisioner.remote_check_errors["l4-00"] = TimeoutError("ssh probe timed out")
+    rig.provisioner.power_states["l4-00"] = "Off"  # would be off if the read landed
+    rig.provisioner.power_state_delay = 0.2
+    await rig.run()
+    assert _skips(rig)["l4-00"].startswith("blocked: ")
+    assert "l4-00" in rig.provisioner.remote_checks
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_failed_claim_launches_a_host_the_bmc_reports_off() -> None:
+    """Prod case from #224: a failed claim blocked by an SSH TimeoutError.
+
+    The BMC reports Off, so the failed probe does not block the retry: the
+    launch gate starts one more attempt and the blocked error is replaced.
+    """
+    rig = Rig(_l4s(1), retry_backoff_seconds=60)
+    now = rig.clock()
+    await ClaimStore(rig.etcd).create(
+        PlacementClaim(
+            claim_id="a" * 32,
+            hostname="l4-00",
+            profile_id="qwen3.8-27b-24g",
+            profile_version=1,
+            gpu_class="l4",
+            state=ClaimState.FAILED,
+            attempts=1,
+            holder="a" * 32,
+            created_at=now,
+            updated_at=now,
+            heartbeat_at=now,
+            retry_at=now - timedelta(seconds=1),
+            last_error=(
+                "blocked: could not verify that no earlier provisioning is "
+                "running: TimeoutError"
+            ),
+        )
+    )
+    rig.provisioner.power_states["l4-00"] = "Off"
+    rig.provisioner.remote_check_errors["l4-00"] = TimeoutError("ssh probe timed out")
+    rig.provisioner.failures["l4-00"] = ["retry failed"]
+    await rig.run()
+    retried = (await rig.claims())["l4-00"]
+    assert (retried.state, retried.attempts) == (ClaimState.FAILED, 2)
+    assert retried.last_error == "retry failed"
+    assert len(rig.provisioner.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_a_deferred_host_that_leaves_the_inventory_is_forgotten() -> None:
     rig = Rig(_l4s(1), retry_backoff_seconds=60)
     rig.provisioner.remote_processes["l4-00"] = list(_SETUP_RUNNING)
@@ -1581,3 +1709,186 @@ async def test_a_card_sharing_the_l4_chip_code_is_not_an_l4() -> None:
     await rig.run()
 
     assert set(_placed(rig)) == {"l4-00", "a30-00"}
+
+
+# -- QUADS release readiness: free by schedule is not yet free in fact --
+
+
+@pytest.mark.asyncio
+async def test_a_host_quads_is_still_releasing_is_not_placed_or_probed() -> None:
+    """The Oct 11 pattern: the schedule ended, the move has not run yet."""
+    rig = Rig(_l4s(4))
+    rig.quads.pending_moves = {"l4-01"}
+
+    await rig.run()
+
+    assert "l4-01" not in _placed(rig)
+    assert set(_placed(rig)) == {"l4-00", "l4-02", "l4-03"}
+    assert _skips(rig)["l4-01"].startswith("QUADS has a pending move")
+    assert "l4-01" not in rig.provisioner.remote_checks, "a doomed host was probed"
+    assert "l4-01" not in rig.provisioner.power_state_checks
+    assert "l4-01" not in await rig.claims()
+    # Its share went to a host that can actually take it.
+    assert sorted(_placed(rig).values()) == sorted(
+        ["qwen3.8-27b-24g", "qwen3.6-35b-a3b-24g", "muse-glimmer-30b-24g"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_released_host_is_placed_on_the_next_pass_without_a_backoff() -> None:
+    rig = Rig(_l4s(2))
+    rig.quads.pending_moves = {"l4-01"}
+
+    await rig.run()
+
+    assert "l4-01" not in _placed(rig)
+
+    rig.quads.pending_moves = set()
+    rig.clock.advance(rig.settings.interval_seconds)
+    await rig.run()
+
+    assert "l4-01" in _placed(rig)
+    assert (await rig.claims())["l4-01"].state is ClaimState.ACTIVE
+    assert "l4-01" not in _skips(rig)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_claim_waits_out_the_release_without_spending_anything() -> None:
+    rig = await _failed_once()
+    before = (await rig.claims())["l4-00"]
+    probes_before = len(rig.provisioner.remote_checks)
+    rig.quads.pending_moves = {"l4-00"}
+
+    await rig.run()
+
+    after = (await rig.claims())["l4-00"]
+    assert after == before, "the claim was rewritten while waiting"
+    assert after.last_error == "boom", "the real failure was overwritten"
+    assert len(rig.provisioner.calls) == 1
+    assert len(rig.provisioner.remote_checks) == probes_before, (
+        "a doomed host was probed"
+    )
+    assert _skips(rig)["l4-00"].startswith("QUADS has a pending move")
+
+    rig.quads.pending_moves = set()
+    await rig.run()
+    assert (await rig.claims())["l4-00"].state is ClaimState.ACTIVE
+    assert len(rig.provisioner.calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry", [False, True])
+async def test_a_release_that_starts_after_planning_is_caught_at_launch(
+    retry: bool,
+) -> None:
+    """The pass planned from one reading; the launch asks QUADS again."""
+    rig = await _failed_once() if retry else Rig(_l4s(1))
+    calls_before = len(rig.provisioner.calls)
+    reads_before = rig.quads.move_reads
+    claim_before = (await rig.claims()).get("l4-00")
+
+    def release_on_launch(read: int) -> None:
+        # The pass-level read says free; the launch-time read says releasing.
+        rig.quads.pending_moves = {"l4-00"} if read >= reads_before + 2 else set()
+
+    rig.quads.on_moves_read = release_on_launch
+
+    await rig.run()
+
+    assert len(rig.provisioner.calls) == calls_before, (
+        "setup started on a releasing host"
+    )
+    # Refused at launch, not at planning: the pass still says why.
+    assert _skips(rig)["l4-00"].startswith("QUADS has a pending move")
+    if retry:
+        assert (await rig.claims())["l4-00"] == claim_before
+    else:
+        assert await rig.claims() == {}
+        assert rig.reconciler.launch_blockers["l4-00"].startswith(
+            "QUADS has a pending move"
+        )
+        # Sits out briefly, not for the remote-work backoff.
+        rig.quads.on_moves_read = None
+        rig.quads.pending_moves = set()
+        rig.clock.advance(61)
+        await rig.run()
+        assert "l4-00" in _placed(rig)
+    assert not rig.provisioner.lifecycle.is_busy("l4-00")
+
+
+@pytest.mark.asyncio
+async def test_an_unanswered_release_check_at_launch_reads_as_pending() -> None:
+    rig = Rig(_l4s(1))
+
+    def fail_second_read(read: int) -> None:
+        rig.quads.moves_fail = read >= 2
+
+    rig.quads.on_moves_read = fail_second_read
+
+    await rig.run()
+
+    assert rig.provisioner.calls == []
+    assert await rig.claims() == {}
+    # An unknown answer is reported as such, not dressed up as a pending move.
+    assert _skips(rig)["l4-00"].startswith("QUADS pending moves could not be read")
+    assert "QUADS is down" in _skips(rig)["l4-00"]
+
+
+@pytest.mark.asyncio
+async def test_unknown_pending_moves_place_nothing_and_are_reported() -> None:
+    rig = Rig(_l4s(3))
+    rig.quads.moves_fail = True
+
+    await rig.run()
+
+    assert _placed(rig) == {}
+    assert "pending moves" in rig.reconciler.status.error
+
+
+@pytest.mark.asyncio
+async def test_a_stale_quads_snapshot_places_nothing_and_is_reported() -> None:
+    rig = Rig(_l4s(3))
+    rig.poller.last_sync = rig.clock() - timedelta(seconds=901)
+
+    await rig.run()
+
+    assert _placed(rig) == {}
+    assert "stale" in rig.reconciler.status.error
+    # Fail closed before touching QUADS: a stale pass reads no pending moves,
+    # so a QUADS moves outage cannot turn one doomed request per stale pass.
+    assert rig.quads.move_reads == 0
+
+    rig.poller.last_sync = rig.clock() - timedelta(seconds=900)
+    await rig.run()
+    assert len(_placed(rig)) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry", [False, True])
+async def test_a_snapshot_that_goes_stale_during_the_pass_stops_the_launch(
+    retry: bool,
+) -> None:
+    """The bound holds at the moment of the launch, not only at pass entry."""
+    rig = await _failed_once() if retry else Rig(_l4s(1))
+    calls_before = len(rig.provisioner.calls)
+    claim_before = (await rig.claims()).get("l4-00")
+    rig.poller.last_sync = rig.clock() - timedelta(seconds=895)
+    reads_before = rig.quads.move_reads
+
+    def age_during_probes(read: int) -> None:
+        # Time passes between planning and the launch-time re-check.
+        if read == reads_before + 1:
+            rig.clock.advance(10)
+
+    rig.quads.on_moves_read = age_during_probes
+
+    await rig.run()
+
+    assert len(rig.provisioner.calls) == calls_before, "launched on a stale snapshot"
+    assert rig.reconciler.status.error == "", "the pass itself was fresh enough"
+    assert _skips(rig)["l4-00"].startswith("QUADS inventory is stale (905s old")
+    if retry:
+        assert (await rig.claims())["l4-00"] == claim_before
+    else:
+        assert await rig.claims() == {}
+    assert not rig.provisioner.lifecycle.is_busy("l4-00")

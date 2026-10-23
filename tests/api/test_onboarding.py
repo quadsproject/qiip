@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from datetime import timedelta
 from pathlib import Path
@@ -17,7 +18,8 @@ from pydantic import SecretStr
 from inference_proxy.auth import store as store_module
 from inference_proxy.auth.dependencies import get_auth_plugin
 from inference_proxy.auth.store import AuthStore
-from inference_proxy.config.settings import OAuthSettings, Settings
+from inference_proxy.config.dependencies import get_settings
+from inference_proxy.config.settings import OAuthSettings, PricingSettings, Settings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.node import InferenceEngine, Node, NodeStatus
 from inference_proxy.onboarding.harness import HARNESSES, get_harness
@@ -223,6 +225,7 @@ class TestStartPage:
             "css/start.css",
             "js/start.js",
             "js/model_info.js",
+            "js/clipboard.js",
             "img/qiip.svg",
         ],
     )
@@ -296,7 +299,7 @@ class TestSingleToken:
         ("payload", "status"),
         [
             ({"name": "x", "models": ["org/unknown"]}, 400),
-            ({"name": "x", "models": []}, 422),
+            ({"name": "x", "models": []}, 201),
             ({"name": "   ", "models": [MODEL_A]}, 422),
             ({"name": "", "models": [MODEL_A]}, 422),
         ],
@@ -1051,3 +1054,476 @@ def test_existing_setup_script_refuses_unconfigured_origin(
     )
     assert result.returncode != 0
     assert not (tmp_path / ".claude/settings.json").exists()
+
+
+class TestLeaderboard:
+    def test_ranks_non_admins_by_usage_and_excludes_admins(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        me = auth_store.list_users_with_stats()[0]
+        bob = auth_store.upsert_google_user(
+            google_sub="sub-bob", email="bob@example.com", name="Bob", picture=""
+        )
+        carol = auth_store.upsert_google_user(
+            google_sub="sub-carol", email="carol@example.com", name="Carol", picture=""
+        )
+        admin = auth_store.upsert_google_user(
+            google_sub="sub-admin", email="admin@example.com", name="Admin", picture=""
+        )
+        auth_store.set_user_admin(admin.id, True)
+        bob_token = auth_store.create_token(bob.id, "bob-ci")
+        carol_token = auth_store.create_token(carol.id, "carol-ci")
+        admin_token = auth_store.create_token(admin.id, "admin-ci")
+        auth_store.record_usage(
+            user_id=bob.id,
+            token_id=bob_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            total_tokens=2000,
+        )
+        auth_store.record_usage(
+            user_id=carol.id,
+            token_id=carol_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            total_tokens=1000,
+        )
+        auth_store.record_usage(
+            user_id=admin.id,
+            token_id=admin_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            total_tokens=999_000,
+        )
+
+        rows = user_client.get("/onboarding/leaderboard").json()
+
+        assert [row["id"] for row in rows] == [bob.id, carol.id, me.id]
+        assert "admin@example.com" not in {row["email"] for row in rows}
+        assert rows[0]["total_tokens"] == 2000
+        assert rows[1]["total_tokens"] == 1000
+        assert rows[2]["total_tokens"] == 0
+        assert rows[2]["estimated_cost_usd"] == 0.0
+
+        # A non-admin client asking for admins gets the same ranking: the
+        # widen flag only honors admin viewers (RFE #271).
+        wide = user_client.get("/onboarding/leaderboard?include_admins=1").json()
+        assert [row["id"] for row in wide] == [bob.id, carol.id, me.id]
+        assert "admin@example.com" not in {row["email"] for row in wide}
+
+    def test_rows_include_estimated_premium_cost(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        me = auth_store.list_users_with_stats()[0]
+        bob = auth_store.upsert_google_user(
+            google_sub="sub-bob", email="bob@example.com", name="Bob", picture=""
+        )
+        bob_token = auth_store.create_token(bob.id, "bob-ci")
+        auth_store.record_usage(
+            user_id=bob.id,
+            token_id=bob_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            prompt_tokens=1_000_000,
+            completion_tokens=500_000,
+            total_tokens=1_500_000,
+        )
+
+        rows = user_client.get("/onboarding/leaderboard").json()
+
+        by_id = {row["id"]: row for row in rows}
+        assert by_id[bob.id]["estimated_cost_usd"] == pytest.approx(7.0)
+        assert by_id[me.id]["estimated_cost_usd"] == 0.0
+
+    def test_rows_use_configured_pricing(
+        self,
+        app: FastAPI,
+        user_client: TestClient,
+        auth_store: AuthStore,
+        test_settings: Settings,
+    ) -> None:
+        configured = test_settings.model_copy(
+            update={
+                "pricing": PricingSettings(
+                    input_rate_per_mtok=8.5,
+                    output_rate_per_mtok=42.0,
+                    model_label="gpt-neo-test",
+                )
+            }
+        )
+        app.dependency_overrides[get_settings] = lambda: configured
+        bob = auth_store.upsert_google_user(
+            google_sub="sub-bob", email="bob@example.com", name="Bob", picture=""
+        )
+        bob_token = auth_store.create_token(bob.id, "bob-ci")
+        auth_store.record_usage(
+            user_id=bob.id,
+            token_id=bob_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            prompt_tokens=1_000_000,
+            completion_tokens=500_000,
+            total_tokens=1_500_000,
+        )
+
+        rows = user_client.get("/onboarding/leaderboard").json()
+        by_id = {row["id"]: row for row in rows}
+        assert by_id[bob.id]["estimated_cost_usd"] == pytest.approx(29.5)
+        assert (
+            "Est. premium cost @ gpt-neo-test" in user_client.get("/leaderboard").text
+        )
+
+    def test_page_renders_for_signed_in_user(self, user_client: TestClient) -> None:
+        html = user_client.get("/leaderboard").text
+        assert "clipboard.js" in html
+        assert "leaderboard.js" in html
+        assert "Usage leaderboard" in html
+        assert 'id="token-legacy-note"' in html
+        # The Include admin users toggle is admin-view only (RFE #271).
+        assert 'id="include-admins"' not in html
+
+    def test_page_declares_sortable_columns(self, user_client: TestClient) -> None:
+        html = user_client.get("/leaderboard").text
+
+        assert "js/table_sort.js" in html
+        for asset in (
+            "js/table_sort.js",
+            "js/format_usd.js",
+            "js/leaderboard.js",
+            "js/confirm_dialog.js",
+        ):
+            assert re.search(rf"/static/{re.escape(asset)}\?v=[0-9a-f]{{12}}", html)
+        kinds = re.findall(r'data-sort="([^"]*)"', html)
+        assert kinds
+        assert set(kinds) <= {"text", "number", "date"}
+        headers = re.findall(r'<th[^>]*data-sort="[^"]*"[^>]*>(.*?)</th>', html)
+        assert len(headers) == len(kinds)
+        for header in headers:
+            assert 'type="button"' in header
+        # The rank is a fixed standing, not a row position: no sort control.
+        assert re.search(r"<th[^>]*>Rank</th>", html)
+        for label in ("Usage leaderboard", "Your tokens"):
+            assert f'aria-label="{label}"' in html
+        # The server sends the ranking by total tokens DESC; the header says so.
+        assert html.count('aria-sort="descending"') == 1
+        assert re.search(
+            r'aria-sort="descending"[^>]*>\s*<button[^>]*>Total tokens', html
+        )
+        assert "Est. premium cost @ claude-sonnet-5" in html
+
+    def test_anonymous_gets_signin(self, app: FastAPI) -> None:
+        response = TestClient(app).get("/leaderboard")
+        assert response.status_code == 200
+        assert "Google Auth" in response.text or "Local Admin" in response.text
+
+    def test_admin_sees_the_ranking_without_the_token_manager(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        user_id = auth_store.list_users_with_stats()[0].id
+        auth_store.set_user_admin(user_id, True)
+
+        page = user_client.get("/leaderboard", follow_redirects=False)
+
+        assert page.status_code == 200
+        assert "Usage leaderboard" in page.text
+        assert "Est. premium cost" in page.text
+        # The server still sends its ranking state on the Total tokens column.
+        assert page.text.count('aria-sort="descending"') == 1
+        # The normal-user token manager is not on the admin view; admins
+        # manage tokens on their profile page instead. This id set is the
+        # contract the JS harness models (tests/frontend/
+        # test_leaderboard_javascript.py, ABSENT_IDS).
+        for element_id in (
+            "token-form",
+            "token-model",
+            "token-harness",
+            "token-create-btn",
+            "config-download-btn",
+            "token-legacy-note",
+            "tokens-head",
+            "tokens-table-body",
+        ):
+            assert f'id="{element_id}"' not in page.text, element_id
+        assert "Admins manage tokens on the" in page.text
+        assert 'href="/profile"' in page.text
+        # The admin view offers the Include admin users toggle (RFE #271).
+        assert 'id="include-admins"' in page.text
+        # The admin reads the same ranking, which never lists admins: the
+        # only user here is the promoted admin, so the board is empty.
+        assert user_client.get("/onboarding/leaderboard").json() == []
+
+    def test_admin_viewer_may_include_admins(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        """An admin viewer opting in sees admin rows ranked alongside
+        non-admin users by total tokens, with their token counts (RFE #271)."""
+        me = auth_store.list_users_with_stats()[0]
+        auth_store.set_user_admin(me.id, True)
+        admin_token = auth_store.create_token(me.id, "admin-ci")
+        auth_store.record_usage(
+            user_id=me.id,
+            token_id=admin_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            total_tokens=999_000,
+        )
+        bob = auth_store.upsert_google_user(
+            google_sub="sub-bob-include",
+            email="bob@example.com",
+            name="Bob",
+            picture="",
+        )
+        bob_token = auth_store.create_token(bob.id, "bob-ci")
+        auth_store.record_usage(
+            user_id=bob.id,
+            token_id=bob_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            total_tokens=1_000,
+        )
+
+        default_rows = user_client.get("/onboarding/leaderboard").json()
+        wide_rows = user_client.get("/onboarding/leaderboard?include_admins=1").json()
+
+        assert [row["email"] for row in default_rows] == ["bob@example.com"]
+        assert [row["email"] for row in wide_rows] == [
+            "alice@example.com",
+            "bob@example.com",
+        ]
+        assert wide_rows[0]["total_tokens"] == 999_000
+        assert wide_rows[0]["token_count"] == 1
+        assert wide_rows[0]["active_token_count"] == 1
+        assert wide_rows[1]["total_tokens"] == 1_000
+
+    def test_local_admin_session_gets_the_leaderboard(
+        self, app: FastAPI, auth_store: AuthStore
+    ) -> None:
+        client = TestClient(app)
+        client.post(
+            "/auth/local-admin",
+            json={"username": "test-admin", "password": "test-password"},
+        )
+        response = client.get("/leaderboard", follow_redirects=False)
+        assert response.status_code == 200
+        assert "Usage leaderboard" in response.text
+        assert 'id="token-form"' not in response.text
+        # The local-admin session is an admin viewer: it gets the Include
+        # admin users toggle and may widen the ranking (RFE #271).
+        assert 'id="include-admins"' in response.text
+        other_admin = auth_store.upsert_google_user(
+            google_sub="sub-local-admin-widen",
+            email="local-admin-widen@example.com",
+            name="Widen Admin",
+            picture="",
+        )
+        auth_store.set_user_admin(other_admin.id, True)
+        other_token = auth_store.create_token(other_admin.id, "local-admin-widen-ci")
+        auth_store.record_usage(
+            user_id=other_admin.id,
+            token_id=other_token.id,
+            model=MODEL_A,
+            endpoint="/v1/chat/completions",
+            total_tokens=5_000,
+        )
+        default_rows = client.get("/onboarding/leaderboard").json()
+        wide_rows = client.get("/onboarding/leaderboard?include_admins=1").json()
+        assert "local-admin-widen@example.com" not in {
+            row["email"] for row in default_rows
+        }
+        assert "local-admin-widen@example.com" in {row["email"] for row in wide_rows}
+
+    def test_basic_admin_is_redirected_to_dashboard(self, client: TestClient) -> None:
+        # HTTP Basic carries no cookie for the page's own requests, so the
+        # session-less admin keeps the dashboard redirect.
+        response = client.get("/leaderboard", follow_redirects=False)
+        assert response.status_code == 302
+        assert response.headers["location"] == "/dashboard"
+
+    def test_every_authenticated_viewer_may_read_the_ranking(
+        self, app: FastAPI, client: TestClient
+    ) -> None:
+        # The admin viewers read the same ranking the normal-user page shows;
+        # anonymous callers stay locked out.
+        assert client.get("/onboarding/leaderboard").status_code == 200
+        local = TestClient(app)
+        local.post(
+            "/auth/local-admin",
+            json={"username": "test-admin", "password": "test-password"},
+        )
+        assert local.get("/onboarding/leaderboard").status_code == 200
+        assert TestClient(app).get("/onboarding/leaderboard").status_code == 401
+
+
+class TestConfigDownload:
+    def test_download_renders_harness_config_with_token(
+        self, user_client: TestClient
+    ) -> None:
+        _mint(user_client, [MODEL_A])
+        response = user_client.post(
+            "/onboarding/config", json={"harness": "opencode", "models": [MODEL_A]}
+        )
+        assert response.status_code == 200
+        assert response.headers["content-disposition"] == (
+            'attachment; filename="opencode.json"'
+        )
+        config = json.loads(response.text)
+        provider = config["provider"]["qiip"]
+        assert provider["options"]["baseURL"] == "http://testserver/v1"
+        assert provider["options"]["apiKey"].startswith("qiip_")
+        assert provider["models"][MODEL_A]["name"] == "model-a"
+
+    def test_download_requires_a_token(self, user_client: TestClient) -> None:
+        assert (
+            user_client.post(
+                "/onboarding/config",
+                json={"harness": "opencode", "models": [MODEL_A]},
+            ).status_code
+            == 404
+        )
+
+    def test_download_widens_token_scope(self, user_client: TestClient) -> None:
+        _mint(user_client, [MODEL_A])
+        response = user_client.post(
+            "/onboarding/config", json={"harness": "pi", "models": [MODEL_B]}
+        )
+        assert response.status_code == 200
+        state = user_client.get("/onboarding/state").json()
+        assert set(state["token"]["models"]) == {MODEL_A, MODEL_B}
+
+    def test_single_model_harness_rejects_two_models(
+        self, user_client: TestClient
+    ) -> None:
+        _mint(user_client, [MODEL_A])
+        assert (
+            user_client.post(
+                "/onboarding/config",
+                json={"harness": "claude", "models": [MODEL_A, MODEL_B]},
+            ).status_code
+            == 400
+        )
+
+    def test_unknown_model_is_refused(self, user_client: TestClient) -> None:
+        _mint(user_client, [MODEL_A])
+        assert (
+            user_client.post(
+                "/onboarding/config",
+                json={"harness": "opencode", "models": ["org/unknown"]},
+            ).status_code
+            == 400
+        )
+
+
+class TestTokenReveal:
+    """The page Copy action: the raw token is re-derived on click only."""
+
+    def test_state_marks_a_minted_token_exportable(
+        self, user_client: TestClient
+    ) -> None:
+        _mint(user_client, [MODEL_A])
+        state = user_client.get("/onboarding/state").json()
+        assert state["token"]["exportable"] is True
+
+    def test_reveal_returns_the_token_the_setup_script_embeds(
+        self, user_client: TestClient
+    ) -> None:
+        _mint(user_client, [MODEL_A])
+        url = _link(user_client, "pi", [MODEL_A])["url"].replace(
+            "http://testserver", ""
+        )
+        from_script = _script_token(user_client.get(url).text)
+
+        response = user_client.post("/onboarding/token/reveal")
+
+        assert response.status_code == 200
+        assert response.json() == {"token": from_script}
+        assert response.headers["cache-control"] == "no-store"
+
+    def test_revealed_token_matches_the_config_download(
+        self, user_client: TestClient
+    ) -> None:
+        _mint(user_client, [MODEL_A])
+        download = user_client.post(
+            "/onboarding/config", json={"harness": "opencode", "models": [MODEL_A]}
+        )
+        api_key = json.loads(download.text)["provider"]["qiip"]["options"]["apiKey"]
+        assert user_client.post("/onboarding/token/reveal").json()["token"] == api_key
+
+    def test_revealed_token_authenticates_v1(self, user_client: TestClient) -> None:
+        _mint(user_client, [MODEL_A])
+        raw = user_client.post("/onboarding/token/reveal").json()["token"]
+        listed = TestClient(user_client.app).get(
+            "/v1/models", headers={"Authorization": f"Bearer {raw}"}
+        )
+        assert listed.status_code == 200
+        assert [m["id"] for m in listed.json()["data"]] == [MODEL_A]
+
+    def test_reveal_without_a_token_is_404(self, user_client: TestClient) -> None:
+        assert user_client.post("/onboarding/token/reveal").status_code == 404
+
+    def test_revoked_token_is_404(self, user_client: TestClient) -> None:
+        token = _mint(user_client, [MODEL_A])
+        assert user_client.post("/onboarding/token/reveal").status_code == 200
+        revoked = user_client.delete(f"/profile/tokens/{token['id']}")
+        assert revoked.status_code == 200
+        assert user_client.post("/onboarding/token/reveal").status_code == 404
+
+    def test_legacy_token_cannot_be_revealed(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        _legacy_token(auth_store)
+        response = user_client.post("/onboarding/token/reveal")
+        assert response.status_code == 409
+        assert "old way" in response.json()["detail"]
+
+    def test_rotated_session_secret_cannot_be_revealed(
+        self, user_client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _mint(user_client, [MODEL_A])
+        monkeypatch.setattr(
+            "inference_proxy.api.onboarding._session_secret",
+            lambda settings: "rotated-secret",
+        )
+        response = user_client.post("/onboarding/token/reveal")
+        assert response.status_code == 409
+        assert "no longer be exported" in response.json()["detail"]
+
+    def test_reveal_requires_a_session(self, app: FastAPI) -> None:
+        assert TestClient(app).post("/onboarding/token/reveal").status_code == 401
+
+    def test_reveal_needs_no_configured_origin(
+        self, user_client: TestClient, test_settings: Settings
+    ) -> None:
+        """Copy keeps working where setup links cannot be built."""
+        _mint(user_client, [MODEL_A])
+        test_settings.oauth = OAuthSettings()
+        assert user_client.post("/onboarding/token/reveal").status_code == 200
+        blocked = user_client.post(
+            "/onboarding/config", json={"harness": "opencode", "models": [MODEL_A]}
+        )
+        assert blocked.status_code == 503
+        assert "oauth.redirect_uri" in blocked.json()["detail"]
+
+    def test_reveal_is_post_only(self, user_client: TestClient) -> None:
+        """A GET would put the request in a URL and a cache; only POST exists."""
+        assert user_client.get("/onboarding/token/reveal").status_code == 405
+
+    def test_reveal_returns_only_the_callers_own_token(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        other = auth_store.upsert_google_user(
+            google_sub="sub-other", email="other@example.com", name="Other", picture=""
+        )
+        theirs = auth_store.create_personal_token(other.id, "theirs", [MODEL_A], SECRET)
+        _mint(user_client, [MODEL_A])
+        mine = user_client.post("/onboarding/token/reveal").json()["token"]
+        assert mine != theirs.token
+        assert user_client.post("/onboarding/token/reveal").json()["token"] == mine
+
+    def test_admin_is_refused(
+        self, user_client: TestClient, auth_store: AuthStore
+    ) -> None:
+        admin = auth_store.list_users_with_stats()[0]
+        auth_store.set_user_admin(admin.id, True)
+        response = user_client.post("/onboarding/token/reveal")
+        assert response.status_code == 403
+        assert "profile page" in response.json()["detail"]

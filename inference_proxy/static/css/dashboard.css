@@ -230,7 +230,7 @@ main { padding: 0; }
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 0.8125rem;
-  color: var(--text-muted);
+  color: var(--text-light);
 }
 
 .nav-logout-form {
@@ -347,6 +347,14 @@ h1 {
   color: var(--text-light);
   font-size: 0.875rem;
 }
+
+.board-toggle {
+  display: block;
+  margin-top: 0.25rem;
+  cursor: pointer;
+}
+
+.board-toggle input { margin-right: 0.375rem; }
 
 #recs-hw-summary { margin-bottom: 0.75rem; font-size: 0.875rem; }
 #config-download-buttons { display: flex; gap: 0.5rem; margin-top: 0.5rem; }
@@ -640,6 +648,27 @@ h1 {
   margin-bottom: 1rem;
 }
 
+/* One label + select pair in the leaderboard token form. The pair wraps
+   as a unit so the select drops below its label in a narrow card. */
+.token-field {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  white-space: nowrap;
+  flex-wrap: wrap;
+}
+
+.token-field .setup-select {
+  min-width: 0;
+}
+
+/* The Create + Download config buttons, spaced like every other action row. */
+.token-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .token-pin-group {
   display: flex;
   align-items: center;
@@ -819,6 +848,34 @@ tbody tr:last-child td { border-bottom: none; }
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
 }
+
+/* --- Sortable table headers (js/table_sort.js) --- */
+th[data-sort] .th-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+th[data-sort] { cursor: pointer; }
+
+th[data-sort] .th-sort:hover { color: var(--text); }
+
+.th-sort-arrow {
+  margin-left: 0.25rem;
+  font-size: 0.625rem;
+  color: var(--text-light);
+}
+
+th[aria-sort="ascending"] .th-sort-arrow::after { content: "\2191"; }
+th[aria-sort="descending"] .th-sort-arrow::after { content: "\2193"; }
 
 /* --- Skeleton loaders --- */
 @keyframes skeleton-sweep {
@@ -1066,6 +1123,31 @@ tbody tr:last-child td { border-bottom: none; }
 .btn-neutral { background: transparent; color: var(--text-light); border-color: var(--border-strong); }
 .btn-neutral:hover:not(:disabled) { border-color: var(--text); color: var(--text); background: var(--bg); }
 
+/* Clipboard icon shown beside an abbreviated token (leaderboard token row). */
+.token-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 0.4rem;
+  padding: 0.25rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-light);
+  cursor: pointer;
+  vertical-align: middle;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.token-copy:hover:not(:disabled) {
+  border-color: var(--text);
+  color: var(--text);
+  background: var(--bg);
+}
+
+.token-copy:disabled { opacity: 0.4; cursor: not-allowed; }
+.token-copy svg { width: 0.85rem; height: 0.85rem; }
+
 .btn-trigger { gap: 0.5rem; }
 .btn-trigger::after {
   content: "";
@@ -1283,6 +1365,7 @@ footer p { margin: 0; }
   html { scroll-behavior: auto; }
   .toast { transition: none; }
   .btn { transition: none; }
+  .token-copy { transition: none; }
   .nav-link { transition: none; }
   .theme-toggle { transition: none; }
   .setup-form input[type="text"] { transition: none; }

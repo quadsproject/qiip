@@ -14,18 +14,21 @@ from inference_proxy.models.admin import _HOSTNAME_RE
 
 
 class User(BaseModel):
-    """A Google-authenticated user row.
+    """An SSO-authenticated user row.
 
-    ``google_sub`` is the OIDC subject claim: the stable, per-account
-    identifier that never changes even when the user's email does.
-    ``is_admin`` is the admin-role designation granted by an existing
-    admin (HTTP Basic holder) through the admin page.
+    ``google_sub`` is the OIDC subject claim (stable per account, never
+    reissued); ``issuer`` is the provider that issued it. Together they form
+    the row's unique identity key, so Google and a local OIDC provider can
+    issue the same opaque ``sub`` without colliding. ``is_admin`` is the
+    admin-role designation granted by an existing admin (HTTP Basic holder)
+    through the admin page.
     """
 
     model_config = ConfigDict(frozen=True)
 
     id: int
     google_sub: str
+    issuer: str
     email: str
     name: str
     picture: str
@@ -79,7 +82,10 @@ class CreatedToken(ApiToken):
 
     The full ``token`` value is returned exactly once, at creation -- except
     for the derived ``agent-config`` key, which is returned by every
-    ``get_or_create_config_token`` call (see :mod:`inference_proxy.auth.store`).
+    ``get_or_create_config_token`` call, and for a ``personal`` onboarding
+    token, whose value is re-derived on demand by the setup script, the
+    config download and ``/onboarding/token/reveal`` (see
+    :mod:`inference_proxy.auth.store`).
     """
 
     token: str
@@ -173,6 +179,25 @@ class UsageTotals(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+
+
+class LeaderboardEntry(BaseModel):
+    """Per-user aggregate counts for the non-admin leaderboard (RFE #156)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: int
+    email: str
+    name: str
+    token_count: int
+    active_token_count: int
+    request_count: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    # Store rows carry usage only; the leaderboard endpoint always fills this
+    # in from settings.pricing before returning it.
+    estimated_cost_usd: float = 0.0
 
 
 class AdminUserStats(BaseModel):

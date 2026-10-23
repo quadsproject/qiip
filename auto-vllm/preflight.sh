@@ -18,8 +18,8 @@ ATTENTION_BACKEND_OVERRIDE="${AUTOVLLM_ATTENTION_BACKEND:-}"
 NFS_EXPORT="${AUTOVLLM_NFS_EXPORT:-}"
 
 # Shared storage primitives (source/fstype/option verification, capacity).
-# Resolved from the node bundle layout first, then the installed location used
-# by systemd's ExecStartPre (setup.sh installs qiip-setup-base.sh).
+# Resolved from the selected bundle first. The installed fallback supports
+# nodes whose service unit predates generation dispatch.
 # shellcheck disable=SC1091 source=../common/setup-base.sh
 _COMMON_SH=""
 if [ -f "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/common/setup-base.sh" ]; then
@@ -637,6 +637,53 @@ check_persistence_mode() {
     fi
 }
 
+# ── Gateway memory plan ─────────────────────────
+
+# The gateway plans vLLM from the free VRAM of the devices the launch actually
+# allocates and passes that per-device budget. If another tenant takes the
+# memory between the plan and the launch, vLLM would OOM while loading weights;
+# fail closed here so the gateway's bounded retry can re-plan instead of
+# crashing mid-load. This only catches post-plan degradation, not a device that
+# was already busy when the plan was made.
+check_vllm_memory() {
+    local budget="${AUTOVLLM_FIT_BUDGET_MIB:-}"
+    if [ -z "$budget" ]; then
+        _mark PASS "No gateway memory plan; node-side sizing applies"
+        return 0
+    fi
+    if ! [[ "$budget" =~ ^[0-9]+$ ]]; then
+        _bail "AUTOVLLM_FIT_BUDGET_MIB '${budget}' is not an integer count of MiB"
+    fi
+
+    local plan_device_list=""
+    if [ -n "$GPU_DEVICES_OVERRIDE" ]; then
+        plan_device_list="$GPU_DEVICES_OVERRIDE"
+    else
+        local i
+        for (( i=0; i<GPU_COUNT; i++ )); do
+            plan_device_list+="${plan_device_list:+,}$i"
+        done
+    fi
+
+    local -a fit_devices=()
+    IFS=',' read -r -a fit_devices <<< "$plan_device_list"
+    local index free_mib
+    for index in "${fit_devices[@]}"; do
+        free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$index" | xargs) || free_mib=""
+        # Fail closed: a blank or non-numeric answer proves nothing, so treat it
+        # as a device that cannot satisfy the plan rather than skipping the
+        # check (``[ -lt ]`` on garbage is an error that would otherwise kill
+        # the script under set -e without a [FAIL] line).
+        if [[ ! "$free_mib" =~ ^[0-9]+$ ]]; then
+            _bail "GPU ${index} did not report a usable free-memory value (${free_mib:-empty}); cannot verify the ${budget} MiB memory plan"
+        fi
+        if [ "$free_mib" -lt "$budget" ]; then
+            _bail "GPU ${index} has ${free_mib} MiB free but the memory plan reserved ${budget} MiB; another process is using the device"
+        fi
+    done
+    _mark PASS "Memory plan fits: each of ${#fit_devices[@]} selected device(s) has at least the planned ${budget} MiB free"
+}
+
 # ── Orchestrator ────────────────────────────────────────────────────────
 
 run_preflight() {
@@ -657,6 +704,7 @@ run_preflight() {
     check_fabric
     check_cuda_devices
     check_cuda_execution
+    check_vllm_memory
     check_model
     check_model_topology
     check_nfs_mounts

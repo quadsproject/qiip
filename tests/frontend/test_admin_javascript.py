@@ -65,7 +65,7 @@ function byId(id) {{
 
 const sandbox = {{
   console,
-  NODE_ID: "gpu01", READ_ONLY: false,
+  NODE_ID: "gpu01",
   POLL_INTERVAL_MS: 10000,
   document: {{
     getElementById: byId,
@@ -134,7 +134,7 @@ function byId(id) {
   return elements.get(id);
 }
 const sandbox = {
-  console, NODE_ID: "gpu01", READ_ONLY: false, POLL_INTERVAL_MS: 10000,
+  console, NODE_ID: "gpu01", POLL_INTERVAL_MS: 10000,
   document: {
     getElementById: byId, addEventListener() {}, querySelectorAll() { return []; },
     querySelector() { return element(); }, createElement() { return element(); },
@@ -338,7 +338,7 @@ class FakeDate extends Date {
 
 const sandbox = {
   console,
-  NODE_ID: "gpu01", READ_ONLY: false,
+  NODE_ID: "gpu01",
   POLL_INTERVAL_MS: 10000,
   Date: FakeDate,
   document: {
@@ -382,7 +382,7 @@ function runNextTimer() {
   return timer.delay;
 }
 
-function installDetailFetch(tasks, tasksOk, engine, runtime, nodeState) {
+function installDetailFetch(tasks, tasksOk, engine, runtime, nodeState, vllmRuntime) {
   sandbox.fetch = async function (url) {
     if (url === "/admin/nodes") {
       return {
@@ -390,11 +390,12 @@ function installDetailFetch(tasks, tasksOk, engine, runtime, nodeState) {
         headers: { get() { return null; } },
         json: async function () { return [{
           node_id: "gpu01",
-          state: nodeState || (runtime ? "healthy" : "provisioning"),
-          model: "org/model", managed: runtime ? true : false,
+          state: nodeState || (runtime || vllmRuntime ? "healthy" : "provisioning"),
+          model: "org/model", managed: (runtime || vllmRuntime) ? true : false,
           engine: engine || null,
           artifact_id: runtime ? "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" : null,
           llamacpp_runtime: runtime || null,
+          vllm_runtime: vllmRuntime || null,
           endpoint: "gpu01:8000", active_connections: 0,
           circuit_breaker_state: "closed", actions: [],
         }]; },
@@ -439,6 +440,44 @@ def _run_node_detail_scenario(scenario: str) -> dict[str, Any]:
         _NODE_DETAIL_JS,
         _NODE_DETAIL_HARNESS.replace("__SCENARIO__", scenario),
     )
+
+
+def _run_vllm_serving_scenario(serving: object) -> dict[str, Any]:
+    runtime = {
+        "requested": {
+            "model": "Qwen/Qwen2.5-32B-Instruct",
+            "params": {"max_model_len": 8192},
+        },
+        "effective": {
+            "model": "Qwen/Qwen2.5-32B-Instruct",
+            "model_selection": "automatic",
+            "tensor_parallel_size": 1,
+            "max_model_len": 8192,
+            "max_num_batched_tokens": 8192,
+            "gpu_memory_utilization": 0.9,
+        },
+        "estimate": {},
+        "adjustments": [],
+        "attempt": 0,
+        "reason": "Automatic plan fitted",
+        "approximate": False,
+        "serving": serving,
+        "gpus": [
+            {"index": 0, "total_mib": 81920, "used_mib": 66000, "free_mib": 15920}
+        ],
+        "observed_at": "2026-08-05T21:55:24Z",
+    }
+    scenario = """
+installDetailFetch([], true, "vllm", null, undefined, __RUNTIME__);
+(async function () {
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    servedModel: byId("vllm-runtime-served-model").textContent,
+    generation: byId("vllm-runtime-generation").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+""".replace("__RUNTIME__", json.dumps(runtime))
+    return _run_node_detail_scenario(scenario)
 
 
 def test_node_detail_self_setup_hides_setup_and_shows_tag() -> None:
@@ -562,6 +601,7 @@ console.log(JSON.stringify({
     assert result["lines"] == 1500
     assert result["retained"] == 0
     assert result["cursor"] == {"attempt": "attempt", "after": 1500}
+    assert result["url"].startswith("/admin/provisioning/gpu01/logs")
     assert result["url"].endswith("?attempt_id=attempt&after=1500")
 
 
@@ -1418,6 +1458,186 @@ installDetailFetch([], true, "vllm", null);
     assert result == {"panelHidden": True}
 
 
+def test_node_detail_renders_verified_vllm_runtime_snapshot() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([], true, "vllm", null, undefined, {
+  requested: {
+    model: "Qwen/Qwen2.5-32B-Instruct",
+    params: { max_model_len: 32768 },
+  },
+  effective: {
+    model: "Qwen/Qwen2.5-32B-Instruct",
+    model_selection: "automatic",
+    model_reason: "Largest catalog model that fits 80 GB per device",
+    tensor_parallel_size: 1,
+    max_model_len: 8192,
+    max_num_batched_tokens: 8192,
+    gpu_memory_utilization: 0.9,
+    dtype: "bfloat16",
+    attention_backend: "FLASHINFER",
+  },
+  estimate: {
+    weights_mib: 64000, weights_per_gpu_mib: 64000, kv_cache_mib: 2048,
+    runtime_overhead_mib: 6144, reserve_mib: 1475,
+    usable_budget_mib: 73728, free_per_gpu_mib: 80000,
+  },
+  adjustments: [{
+    field: "max_model_len", previous: "32768", value: "8192",
+    reason: "context reduced to fit the KV cache",
+  }],
+  attempt: 1,
+  reason: "Automatic plan fitted after one bounded adjustment",
+  approximate: false,
+  serving: {
+    served_model: "Qwen/Qwen2.5-32B-Instruct",
+    runtime_version: "0.26.0",
+    model_revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    generation_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    process_id: 4321,
+  },
+  gpus: [{ index: 0, total_mib: 81920, used_mib: 66000, free_mib: 15920 }],
+  observed_at: "2026-08-05T21:55:24Z",
+});
+(async function () {
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    panelHidden: byId("vllm-runtime-panel").hidden,
+    statusHidden: byId("vllm-runtime-status").hidden,
+    valuesHidden: byId("vllm-runtime-values").hidden,
+    selection: byId("vllm-runtime-selection").textContent,
+    modelReason: byId("vllm-runtime-model-reason").textContent,
+    model: byId("vllm-runtime-model").textContent,
+    requestedModel: byId("vllm-runtime-requested-model").textContent,
+    tp: byId("vllm-runtime-tp").textContent,
+    context: byId("vllm-runtime-context").textContent,
+    batched: byId("vllm-runtime-batched").textContent,
+    util: byId("vllm-runtime-util").textContent,
+    dtype: byId("vllm-runtime-dtype").textContent,
+    backend: byId("vllm-runtime-backend").textContent,
+    weights: byId("vllm-runtime-weights").textContent,
+    approximate: byId("vllm-runtime-approximate").textContent,
+    kv: byId("vllm-runtime-kv").textContent,
+    overhead: byId("vllm-runtime-overhead").textContent,
+    reserve: byId("vllm-runtime-reserve").textContent,
+    budget: byId("vllm-runtime-budget").textContent,
+    free: byId("vllm-runtime-free").textContent,
+    attempt: byId("vllm-runtime-attempt").textContent,
+    servedModel: byId("vllm-runtime-served-model").textContent,
+    version: byId("vllm-runtime-version").textContent,
+    revision: byId("vllm-runtime-revision").textContent,
+    generation: byId("vllm-runtime-generation").textContent,
+    pid: byId("vllm-runtime-pid").textContent,
+    reason: byId("vllm-runtime-reason").textContent,
+    adjustment: byId("vllm-runtime-adjustments").children[0].textContent,
+    adjustmentCount: byId("vllm-runtime-adjustments").children.length,
+    gpu: byId("vllm-runtime-gpus").children[0].textContent,
+    gpuCount: byId("vllm-runtime-gpus").children.length,
+    observed: byId("vllm-runtime-observed").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "panelHidden": False,
+        "statusHidden": True,
+        "valuesHidden": False,
+        "selection": "Automatic (policy sized from available memory)",
+        "modelReason": "Largest catalog model that fits 80 GB per device",
+        "model": "Qwen/Qwen2.5-32B-Instruct",
+        "requestedModel": "Qwen/Qwen2.5-32B-Instruct",
+        "tp": "1 GPU(s)",
+        "context": "8,192 tokens",
+        "batched": "8,192 tokens",
+        "util": "90%",
+        "dtype": "bfloat16",
+        "backend": "FLASHINFER",
+        "weights": "64,000 MiB",
+        "approximate": "Measured from the local checkpoint",
+        "kv": "2,048 MiB",
+        "overhead": "6,144 MiB",
+        "reserve": "1,475 MiB",
+        "budget": "73,728 MiB per GPU",
+        "free": "80,000 MiB per GPU",
+        "attempt": "2",
+        "servedModel": "Qwen/Qwen2.5-32B-Instruct",
+        "version": "0.26.0",
+        "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "generation": "b" * 64,
+        "pid": "4321",
+        "reason": "Automatic plan fitted after one bounded adjustment",
+        "adjustment": (
+            "max_model_len: 32768 → 8192 (context reduced to fit the KV cache)"
+        ),
+        "adjustmentCount": 1,
+        "gpu": "GPU 0: 66,000 MiB used, 15,920 MiB free of 81,920 MiB",
+        "gpuCount": 1,
+        "observed": result["observed"],
+    }
+    assert result["observed"].startswith("Post-load snapshot at ")
+    assert result["observed"] != "Post-load snapshot at —"
+
+
+def test_node_detail_marks_an_unrecorded_vllm_generation_as_not_recorded() -> None:
+    absent = _run_vllm_serving_scenario(None)
+    unreadable = _run_vllm_serving_scenario(
+        {
+            "served_model": "Qwen/Qwen2.5-32B-Instruct",
+            "runtime_version": "0.26.0",
+            "model_revision": "a" * 40,
+            "generation_id": None,
+            "process_id": 4321,
+        }
+    )
+
+    assert absent == {"servedModel": "Not recorded", "generation": "Not recorded"}
+    assert unreadable["generation"] == "Not recorded"
+
+
+def test_node_detail_explains_missing_vllm_runtime_state() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([], true, "vllm", null, "healthy");
+(async function () {
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    panelHidden: byId("vllm-runtime-panel").hidden,
+    statusHidden: byId("vllm-runtime-status").hidden,
+    valuesHidden: byId("vllm-runtime-values").hidden,
+    status: byId("vllm-runtime-status").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "panelHidden": False,
+        "statusHidden": False,
+        "valuesHidden": True,
+        "status": (
+            "No memory-aware launch record; this node was started without a "
+            "gateway plan."
+        ),
+    }
+
+
+def test_node_detail_hides_vllm_runtime_card_for_llamacpp() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([], true, "llama_cpp", null);
+(async function () {
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    panelHidden: byId("vllm-runtime-panel").hidden,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {"panelHidden": True}
+
+
 def _power_controls_result(status_code: int) -> object:
     return _run_node_detail_scenario(
         f"""
@@ -1693,6 +1913,73 @@ sandbox.fetch = async function (url) {
     )
 
     assert result == {"display": "table-row"}
+
+
+@pytest.mark.parametrize(
+    ("resume_state", "label"),
+    [
+        ("maintenance_required", "Maintenance required"),
+        ("reboot_required", "Reboot required"),
+        ("future_resume_state", "Setup paused"),
+    ],
+)
+def test_dashboard_displays_required_setup_resume_action(
+    resume_state: str, label: str
+) -> None:
+    result = _run_dashboard_scenario(
+        r"""
+const failed = node("gpu01", "failed", ["setup", "teardown"]);
+failed.resume_state = "__RESUME_STATE__";
+sandbox.fetch = async function (url) {
+  if (url === "/admin/nodes") return response([failed]);
+  if (url === "/admin/metrics") return response({ per_node: {} });
+  if (url === "/admin/quads/status") return response({ status: "connected" });
+  throw new Error("unexpected request " + url);
+};
+(async function () {
+  await sandbox.refreshDashboard();
+  process.stdout.write(JSON.stringify({ labels: allElements.filter(function (el) {
+    return el.className === "badge badge-failed";
+  }).map(function (el) { return el.textContent; }) }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+""".replace("__RESUME_STATE__", resume_state)
+    )
+    assert isinstance(result, dict)
+    labels = result["labels"]
+    assert isinstance(labels, list)
+    assert label in labels
+
+
+@pytest.mark.parametrize(
+    ("resume_state", "label"),
+    [
+        ("maintenance_required", "Maintenance required"),
+        ("reboot_required", "Reboot required"),
+        ("future_resume_state", "Setup paused"),
+    ],
+)
+def test_node_detail_displays_required_setup_resume_action(
+    resume_state: str, label: str
+) -> None:
+    result = _run_node_detail_scenario(
+        r"""
+installDetailFetch([{
+  hostname: "gpu01", current_step: "failed", failed_step: "nvidia_driver",
+  started_at: "2026-07-31T12:00:00Z", updated_at: "2026-07-31T12:01:00Z",
+  resume_state: "__RESUME_STATE__", error: "Resolve maintenance, then retry setup",
+}], true, "vllm", null, "failed");
+(async function () {
+  await sandbox.refreshDetail();
+  console.log(JSON.stringify({ labels: byId("tasks-table-body").children[0].children[1].children.map(function (el) {
+    return el.textContent;
+  }) }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+""".replace("__RESUME_STATE__", resume_state)
+    )
+    assert isinstance(result, dict)
+    labels = result["labels"]
+    assert isinstance(labels, list)
+    assert label in labels
 
 
 def test_dashboard_preserves_open_action_menu_across_refresh() -> None:

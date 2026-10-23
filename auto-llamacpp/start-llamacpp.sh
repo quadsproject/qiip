@@ -1,6 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
+# Resolve the generation once, before sourcing any scripts or choosing tools.
+if [ "${QIIP_GENERATION_PINNED:-0}" != "1" ] \
+    && [ -L "${QIIP_GENERATION_ROOT:-/opt/qiip/llama_cpp}/current" ]; then
+    _qiip_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    exec python3 "${_qiip_script_dir}/../common/generations.py" exec \
+        "${QIIP_GENERATION_ROOT:-/opt/qiip/llama_cpp}" "$_qiip_script_dir" start-llamacpp.sh "$@"
+fi
+
 API_PORT="${AUTOLLAMACPP_PORT:-8000}"
 NFS_MOUNT_POINT="${AUTOLLAMACPP_NFS_MOUNT_POINT:-/srv/hf-cache}"
 # Shared name (setup.sh and the gateway use AUTOVLLM_NFS_EXPORT for both engines).
@@ -39,6 +47,13 @@ SCRIPT_DIR="${AUTOLLAMACPP_SCRIPT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}"
 LLAMACPP_BIN="${AUTOLLAMACPP_BIN:-/usr/local/bin/llama-server}"
 LLAMACPP_FIT_BIN="${AUTOLLAMACPP_FIT_BIN:-/usr/local/bin/llama-fit-params}"
 LLAMACPP_INSTALL_ROOT="${AUTOLLAMACPP_INSTALL_ROOT:-/opt/llama.cpp}"
+# Published CUDA/compiler libraries travel with the selected executable.
+_qiip_runtime_bin=$(readlink -f -- "$LLAMACPP_BIN" 2>/dev/null || true)
+if [ -n "$_qiip_runtime_bin" ] && [ -d "$(dirname "$(dirname "$_qiip_runtime_bin")")/lib" ]; then
+    LD_LIBRARY_PATH="$(dirname "$(dirname "$_qiip_runtime_bin")")/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH
+fi
+unset _qiip_runtime_bin
 PID_FILE="${AUTOLLAMACPP_PID_FILE:-/var/run/llamacpp.pid}"
 LLAMACPP_LOG_FILE="${AUTOLLAMACPP_LOG_FILE:-/var/log/llamacpp-serve.log}"
 PROC_ROOT="${AUTOLLAMACPP_PROC_ROOT:-/proc}"

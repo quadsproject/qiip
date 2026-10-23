@@ -628,9 +628,12 @@ async def test_failed_provision_does_not_resurrect_after_teardown(
     )
     release_failure.set()
 
+    # A loaded CI runner can take well over a second to schedule the mocked
+    # etcd writes through the loop's default executor; this is a liveness
+    # guard, not a deadline assertion.
     results = await asyncio.wait_for(
         asyncio.gather(provision_task, teardown_task, return_exceptions=True),
-        timeout=1,
+        timeout=10,
     )
 
     assert "Command 'upload'" in str(results[0])

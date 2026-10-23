@@ -13,6 +13,8 @@ Regression coverage for:
 from __future__ import annotations
 
 import json
+import re
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -168,6 +170,27 @@ class TestAdminOnlyRoutingScope:
 
         # Never routed: an error body and no backend call for the admin-only model.
         assert response.status_code != 200
+        assert len(httpx_mock.get_requests()) == 0
+
+    def test_anonymous_request_never_selects_admin_only_node(
+        self,
+        app: FastAPI,
+        test_registry: NodeRegistry,
+        httpx_mock: HTTPXMock,
+    ) -> None:
+        """End-to-end: a request carrying no token (the admin playground, or
+        any anonymous API client) resolves to anonymous scope, so naming an
+        admin-only node's model by id is still refused."""
+        test_registry.add(_make_node("admin_only1", admin_only=True, model="secret"))
+        test_registry.add(_make_node("pub1", model="public"))
+
+        response = TestClient(app).post(
+            "/v1/chat/completions",
+            json={"model": "secret", "messages": [{"role": "user", "content": "Hi"}]},
+        )
+
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "model_not_found"
         assert len(httpx_mock.get_requests()) == 0
 
     def test_admin_role_token_selects_admin_only_node(
@@ -515,9 +538,10 @@ class TestDashboardRoles:
         app: FastAPI,
         test_settings: Settings,
     ) -> None:
-        # With the OAuth integration configured both sign-in options render;
-        # with OAuth off the Google button is hidden (see the Basic-only
-        # regression in test_admin_auth.py).
+        # With the OAuth integration configured and the google provider
+        # loaded both sign-in options render; with OAuth off or the provider
+        # disabled the Google button is hidden (see the Basic-only and
+        # provider-gating regressions in test_admin_auth.py).
         enabled = test_settings.model_copy(
             deep=True,
             update={
@@ -531,6 +555,12 @@ class TestDashboardRoles:
             },
         )
         app.dependency_overrides[get_settings] = lambda: enabled
+        google = FakeAuthPlugin()
+        google.name = "google"
+        app.state.plugin_manager = SimpleNamespace(
+            get_plugin=lambda name: google if name == "auth.google" else None,
+            get_plugins_by_type=lambda _plugin_type: [google],
+        )
 
         response = TestClient(app).get("/dashboard")
 
@@ -547,11 +577,10 @@ class TestDashboardRoles:
             "/dashboard/admin",
             "/dashboard/users/1",
             "/models",
-            "/chat",
             "/profile",
         ],
     )
-    def test_normal_user_is_sent_to_start_from_every_page(
+    def test_normal_user_is_sent_to_start_from_operations_pages(
         self,
         app: FastAPI,
         auth_store: AuthStore,
@@ -583,7 +612,8 @@ class TestDashboardRoles:
         # (restored: role management lives here AND on the token dashboard).
         assert 'id="admin-user-body"' in admin_page.text
         assert '<th scope="col">Admin</th>' in admin_page.text
-        assert '<th scope="col">Admin</th>' in tokens.text
+        # Headers now carry a sort button; the Admin column must still be there.
+        assert re.search(r"<th[^>]*>(?:<button[^>]*>)?Admin", tokens.text)
 
     def test_logout_visible_for_local_admin_session(
         self,
@@ -872,7 +902,9 @@ class TestNodeDetailReadOnly:
         response = client.get("/dashboard/nodes/gpu01")
 
         assert response.status_code == 200
-        assert "READ_ONLY = false" in response.text
+        # The operational panels and their script are rendered.
+        assert 'id="attempt-history-panel"' in response.text
+        assert "js/provisioning_history.js" in response.text
 
     def test_anonymous_gets_signin_page(
         self,

@@ -9,10 +9,11 @@ Per D-15: Concrete class, no protocol/interface.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import shlex
+import tempfile
+import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass
@@ -20,7 +21,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from ipaddress import ip_address
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import structlog
@@ -55,7 +56,20 @@ from inference_proxy.models.node import (
     NodeGPU,
     NodePlacement,
     NodeStatus,
+    VllmAdjustment,
+    VllmGPUState,
+    VllmMemoryEstimate,
+    VllmModelSelection,
     VllmParams,
+    VllmRuntimeEffective,
+    VllmRuntimeRequest,
+    VllmRuntimeState,
+    VllmServingVerification,
+)
+from inference_proxy.provisioning.bundles import (
+    bundle_files,
+    bundle_manifest,
+    write_bundle,
 )
 from inference_proxy.provisioning.host_lifecycle import (
     HostLifecycleCoordinator,
@@ -69,13 +83,41 @@ from inference_proxy.provisioning.llamacpp_profile import (
     split_profile_sections,
 )
 from inference_proxy.provisioning.log_buffer import ProvisioningLogBuffer
+from inference_proxy.provisioning.recovery import (
+    FailureClass,
+    RetryPolicy,
+    classify_failure,
+    next_action,
+    setup_plan_id,
+)
 from inference_proxy.provisioning.remote_logs import RemoteLogCollector
 from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
     SSHClient,
     SSHConnectionError,
 )
-from inference_proxy.provisioning.state import ProvisioningState, ProvisioningStep
+from inference_proxy.provisioning.state import (
+    ProvisioningResumeState,
+    ProvisioningState,
+    ProvisioningStep,
+)
+from inference_proxy.provisioning.vllm_fit import (
+    VllmDeviceMemory,
+    VllmFitPlan,
+    VllmRequested,
+    is_memory_failure,
+    plan_vllm_launch,
+    vllm_profile_bucket,
+)
+from inference_proxy.provisioning.vllm_serving import (
+    VllmServingError,
+    fetch_server_identity,
+    parse_vllm_processes,
+    probe_inference,
+    revision_from_root,
+    select_model,
+    select_process,
+)
 from inference_proxy.redfish.client import RedfishClient
 from inference_proxy.redfish.errors import RedfishError
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
@@ -92,7 +134,10 @@ _SELF_SETUP_PROBE_TIMEOUT = 5.0
 # unhealthy response (e.g. 503) is authoritative and refuses adoption.
 _OPTIONAL_HEALTH_STATUSES = frozenset({404, 405, 501})
 
-STEP_PATTERN = re.compile(r"\[STEP:(\w+):(START|OK|FAIL|WARN)\]")
+STEP_PATTERN = re.compile(r"\[STEP:(\w+):(START|OK|SKIP|FAIL|WARN)\]")
+RESUME_PATTERN = re.compile(
+    r"\[RESUME:(maintenance_required|reboot_required):([^\]\r\n]+)\]"
+)
 MODEL_PATTERN = re.compile(r"#\s*Model:\s+(.+)")
 LLAMACPP_CONTEXT_PATTERN = re.compile(
     r"initializing, n_slots = (?P<slots>\d+), "
@@ -149,6 +194,8 @@ _ENGINE_BUNDLE_FILES = {
         "uv.lock",
         "uv-x86_64-unknown-linux-gnu.tar.gz.sha256",
         "vllm-process.sh",
+        "preflight.sh",
+        "wait-fabric.sh",
     },
     InferenceEngine.LLAMA_CPP: {
         "llamacpp-process.sh",
@@ -161,6 +208,23 @@ _ENGINE_BUNDLE_FILES = {
 
 class ProvisioningError(Exception):
     """Raised when any stage of provisioning fails."""
+
+
+class SetupResumeRequiredError(ProvisioningError):
+    """Setup stopped at a maintenance boundary; retry after operator action."""
+
+    def __init__(self, state: ProvisioningResumeState, reason: str) -> None:
+        super().__init__(reason)
+        self.resume_state = state
+
+
+class SetupDeadlineError(ProvisioningError):
+    """One setup attempt exceeded its stage-specific total deadline.
+
+    Deliberately not a ``TimeoutError``: a download socket timeout is
+    transient, but the run's own deadline expiring is terminal. Retrying it
+    automatically would only repeat the exhausted wait.
+    """
 
 
 class SelfSetupError(Exception):
@@ -456,6 +520,7 @@ class NodeProvisioner:
         hf_token: str | None = None,
         nfs_export: str | None = None,
         artifact_index: GGUFArtifactIndex | None = None,
+        hf_cache_dir: str | None = None,
     ) -> None:
         self._ssh_client = ssh_client
         self._etcd_client = etcd_client
@@ -484,14 +549,28 @@ class NodeProvisioner:
         self._hf_token = hf_token
         self._nfs_export = nfs_export
         self._artifact_index = artifact_index
+        self._hf_cache_dir = hf_cache_dir
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._owner_updates: set[asyncio.Task[Node]] = set()
         self._provisioning_tasks: dict[str, ProvisioningTask] = {}
         self._explicit_cancel_tasks: set[asyncio.Task[None]] = set()
+        self._remote_bundles: dict[tuple[str, InferenceEngine], str] = {}
 
     @property
     def log_buffer(self) -> ProvisioningLogBuffer:
         return self._log_buffer
+
+    def _bundle_version(self, engine: InferenceEngine) -> str:
+        """Return the content digest of the scripts uploaded for *engine*.
+
+        The bundle identity is part of the setup plan: a re-uploaded script
+        that changes an install or build must invalidate completed stages even
+        when every configured setting is unchanged.
+        """
+        identity, _manifest = bundle_manifest(
+            bundle_files(self._engine_scripts_dir(engine), self._common_scripts_dir())
+        )
+        return "sha256:" + identity
 
     def _begin_log(
         self,
@@ -500,25 +579,25 @@ class NodeProvisioner:
         *,
         model: str | None = None,
         operation: str = "provision",
+        plan_id: str | None = None,
+        setup_inputs: dict[str, Any] | None = None,
     ) -> None:
-        digest = hashlib.sha256()
-        files = [
-            *self._engine_scripts_dir(engine).glob("*"),
-            *self._common_scripts_dir().glob("*"),
-            Path(__file__).with_name("log_store.py"),
-            Path(__file__).with_name("diagnostics.py"),
-        ]
-        for path in sorted(files):
-            if path.is_file():
-                digest.update(path.name.encode())
-                digest.update(path.read_bytes())
+        bundle_version = self._bundle_version(engine)
         self._log_buffer.create(
             hostname,
             engine=engine.value,
             model=model,
             operation=operation,
-            bundle_version="sha256:" + digest.hexdigest(),
+            bundle_version=bundle_version,
+            plan_id=plan_id or bundle_version,
+            setup_inputs=setup_inputs,
         )
+        if self._log_buffer.store is not None and self._remote_logs is not None:
+            recorder = self._remote_logs.recorders.get(hostname)
+            if recorder:
+                self._log_buffer.store.update(
+                    self._log_buffer.attempts[hostname], recorder_path=recorder
+                )
 
     async def collect_logs(self, hostname: str, attempt_id: str) -> dict[str, object]:
         store = self._log_buffer.store
@@ -549,6 +628,25 @@ class NodeProvisioner:
                 attempt_id, "Remote log retrieval deadline exceeded", source="remote"
             )
             raise
+
+    def _record_failure_classification(
+        self, hostname: str, error: BaseException
+    ) -> None:
+        """Persist the retry class and operator action on the attempt.
+
+        The original error stays in the retained failure/diagnostics records;
+        this only adds the recovery decision so the UI can show what to do next.
+        """
+        store = self._log_buffer.store
+        attempt_id = self._log_buffer.attempts.get(hostname)
+        if store is None or attempt_id is None:
+            return
+        with suppress(KeyError):
+            store.update(
+                attempt_id,
+                failure_class=str(classify_failure(error)),
+                next_action=next_action(error),
+            )
 
     async def _capture_failure(
         self, hostname: str, stage: str, error: BaseException
@@ -724,7 +822,10 @@ class NodeProvisioner:
             *(engine_dir / name for name in _ENGINE_BUNDLE_FILES[engine]),
             common_dir / "setup-base.sh",
             common_dir / "profiles.sh",
+            common_dir / "generations.py",
         }
+        if engine == InferenceEngine.LLAMA_CPP:
+            required.add(common_dir / "llamacpp_artifacts.py")
         if self._remote_logs is not None:
             required.add(common_dir / "provision-logs.py")
         missing = sorted(str(path) for path in required if not path.is_file())
@@ -735,11 +836,73 @@ class NodeProvisioner:
             )
         return engine_dir, common_dir
 
+    def _setup_plan_inputs(
+        self,
+        engine: InferenceEngine = InferenceEngine.VLLM,
+        *,
+        artifact: ResolvedGGUFArtifact | None = None,
+        llamacpp_request: LlamaCppRuntimeRequest | None = None,
+        vllm_params: VllmParams | None = None,
+    ) -> dict[str, Any]:
+        """Return the inputs whose change invalidates a completed stage.
+
+        The identity must cover everything a setup stage installs, builds, or
+        mounts. The caller passes the resulting mapping to ``_begin_log`` so a
+        retry with different inputs cannot resume stale checkpoints.
+        """
+        inputs: dict[str, Any] = {
+            "engine": engine.value,
+            "bundle_version": self._bundle_version(engine),
+            # AUTOVLLM_API_PORT / AUTOLLAMACPP_PORT feed configure_firewall,
+            # the systemd unit, and the generation config, so a port change
+            # must invalidate those completed stages too.
+            "api_port": self._settings.vllm_port,
+            "nfs_export": self._required_nfs_export(),
+            "nfs_mount_point": self._settings.nfs_mount_point,
+            "nvidia_driver_version": self._settings.nvidia_driver_version,
+            "nvidia_driver_sha256": self._settings.nvidia_driver_sha256,
+            "llmfit_version": self._llmfit_version,
+            "llmfit_sha256": self._llmfit_sha256,
+            "min_disk_gb": self._settings.min_disk_gb,
+            "generation_root": str(self._settings.generation_root / engine.value),
+        }
+        if engine == InferenceEngine.LLAMA_CPP:
+            inputs.update(
+                llamacpp_version=self._settings.llamacpp_version,
+                llamacpp_sha256=self._settings.llamacpp_sha256,
+                llamacpp_source_url=self._settings.llamacpp_source_download_url(),
+                llamacpp_artifact_catalog_url=(
+                    self._settings.llamacpp_artifact_catalog_url
+                ),
+                llamacpp_artifact_catalog_sha256=(
+                    self._settings.llamacpp_artifact_catalog_sha256
+                ),
+                llamacpp_allow_source_build=self._settings.llamacpp_allow_source_build,
+                llamacpp_build_jobs=self._settings.llamacpp_build_jobs,
+                artifact_id=artifact.artifact_id if artifact is not None else None,
+                runtime_request=(
+                    llamacpp_request.model_dump(mode="json")
+                    if llamacpp_request is not None
+                    else None
+                ),
+            )
+        else:
+            inputs.update(
+                model=artifact.model_alias if artifact is not None else None,
+                vllm_params=(
+                    vllm_params.model_dump(mode="json")
+                    if vllm_params is not None
+                    else None
+                ),
+            )
+        return inputs
+
     def _setup_script_env(
         self, engine: InferenceEngine = InferenceEngine.VLLM
     ) -> dict[str, str]:
         """Return the exact environment accepted by setup.sh."""
         env = {
+            "QIIP_GENERATION_ROOT": str(self._settings.generation_root / engine.value),
             "AUTOVLLM_NFS_EXPORT": self._required_nfs_export(),
             "AUTOVLLM_NFS_MOUNT_POINT": self._settings.nfs_mount_point,
             "AUTOVLLM_NVIDIA_DRIVER_VERSION": self._settings.nvidia_driver_version,
@@ -755,6 +918,17 @@ class NodeProvisioner:
             env["AUTOLLAMACPP_SOURCE_URL"] = (
                 self._settings.llamacpp_source_download_url()
             )
+            env["AUTOLLAMACPP_ARTIFACT_CATALOG_URL"] = (
+                self._settings.llamacpp_artifact_catalog_url
+            )
+            env["AUTOLLAMACPP_ARTIFACT_CATALOG_SHA256"] = (
+                self._settings.llamacpp_artifact_catalog_sha256
+            )
+            env["AUTOLLAMACPP_ALLOW_SOURCE_BUILD"] = (
+                "1" if self._settings.llamacpp_allow_source_build else "0"
+            )
+            if self._settings.llamacpp_build_jobs:
+                env["AUTOLLAMACPP_BUILD_JOBS"] = str(self._settings.llamacpp_build_jobs)
         return env
 
     def _start_script_env(
@@ -765,6 +939,7 @@ class NodeProvisioner:
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
         vllm_params: VllmParams | None = None,
         draft_artifact: ResolvedGGUFArtifact | None = None,
+        vllm_plan: VllmFitPlan | None = None,
     ) -> dict[str, str]:
         """Return the exact environment accepted by the engine start script."""
         if engine == InferenceEngine.LLAMA_CPP:
@@ -837,6 +1012,18 @@ class NodeProvisioner:
                     env["AUTOVLLM_GPU_DEVICES"] = ",".join(
                         str(device) for device in vllm_params.gpu_devices
                     )
+            if vllm_plan is not None:
+                if vllm_plan.effective.attention_backend is not None:
+                    env["AUTOVLLM_ATTENTION_BACKEND"] = (
+                        vllm_plan.effective.attention_backend
+                    )
+                env["AUTOVLLM_FIT_BUDGET_MIB"] = str(
+                    vllm_plan.estimate.usable_budget_mib
+                )
+                env["AUTOVLLM_FIT_RESERVE_MIB"] = str(vllm_plan.estimate.reserve_mib)
+                env["AUTOVLLM_FIT_OVERHEAD_MIB"] = str(
+                    vllm_plan.estimate.runtime_overhead_mib
+                )
         if self._hf_token:
             env["HF_TOKEN"] = self._hf_token
         return env
@@ -922,6 +1109,59 @@ class NodeProvisioner:
         )
         return f"{assignments} {command}"
 
+    def _remote_script_command(
+        self,
+        hostname: str,
+        engine: InferenceEngine,
+        script: str,
+        *,
+        env: dict[str, str] | None = None,
+        args: tuple[str, ...] = (),
+    ) -> str:
+        bundle = self._remote_bundles.get((hostname, engine))
+        directory = self._engine_scripts_dir(engine).name
+        if bundle is None:
+            return self._script_command(
+                script, scripts_dir=directory, env=env, args=args
+            )
+        if script == "setup.sh":
+            return self._script_command(
+                script, scripts_dir=f"{bundle}/{directory}", env=env, args=args
+            )
+        command = shlex.join(
+            (
+                "python3",
+                f"{bundle}/common/generations.py",
+                "exec",
+                str(self._settings.generation_root / engine.value),
+                f"{bundle}/{directory}",
+                script,
+                *args,
+            )
+        )
+        assignments = " ".join(
+            f"{key}={shlex.quote(value)}" for key, value in (env or {}).items()
+        )
+        return f"{assignments} {command}" if assignments else command
+
+    def _record_generation(self, hostname: str, line: str) -> None:
+        if not line.startswith("[GENERATION:") or not line.endswith("]"):
+            return
+        try:
+            selected = json.loads(line[len("[GENERATION:") : -1])
+            if not isinstance(selected, dict) or not isinstance(
+                selected.get("runtime_path"), str
+            ):
+                raise ValueError("expected generation metadata")
+        except ValueError:
+            logger.warning("invalid_generation_marker", hostname=hostname)
+            return
+        if self._log_buffer.store is not None:
+            self._log_buffer.store.update(
+                self._log_buffer.attempts[hostname],
+                selected_generation=selected,
+            )
+
     def _log(
         self,
         hostname: str,
@@ -945,6 +1185,7 @@ class NodeProvisioner:
         *,
         failed_step: str | None = None,
         error: str | None = None,
+        resume_state: ProvisioningResumeState | None = None,
         started_at: datetime | None = None,
         history: bool = True,
     ) -> None:
@@ -979,6 +1220,19 @@ class NodeProvisioner:
                     ),
                 )
             store.update(attempt_id, **fields)
+        attempt_number: int | None = None
+        retry_count = 0
+        progress: dict[str, object] | None = None
+        failure_class: str | None = None
+        required_action: str | None = None
+        if store is not None and attempt_id is not None:
+            with suppress(KeyError):
+                manifest = store.get(attempt_id)
+                attempt_number = manifest.get("attempt_number")
+                retry_count = int(manifest.get("transient_retries") or 0)
+                progress = manifest.get("progress")
+                failure_class = manifest.get("failure_class")
+                required_action = manifest.get("next_action")
         state = ProvisioningState(
             hostname=hostname,
             attempt_id=attempt_id,
@@ -987,6 +1241,12 @@ class NodeProvisioner:
             updated_at=now,
             failed_step=failed_step,
             error=error,
+            resume_state=resume_state,
+            attempt_number=attempt_number,
+            retry_count=retry_count,
+            progress=progress,
+            failure_class=failure_class,
+            next_action=required_action,
         )
         key = f"/provisioning/{hostname}"
         value = json.dumps(state.model_dump(mode="json")).encode("utf-8")
@@ -1143,6 +1403,17 @@ class NodeProvisioner:
             finally:
                 lease.release()
             logger.info("startup_reconcile_finished", hostname=hostname)
+
+    async def power_state(self, hostname: str) -> str | None:
+        """Current BMC power state, or ``None`` when Redfish is not configured.
+
+        Placement reads this when its SSH probe fails: a host the BMC reports
+        ``Off`` runs no earlier setup, so the failed probe does not block and
+        provisioning powers it on. ``None`` keeps today's probe-first behavior.
+        """
+        if self._redfish_client is None:
+            return None
+        return await self._redfish_client.get_power_state(hostname)
 
     async def _power_on_if_needed(self, hostname: str) -> None:
         """Power on the host via Redfish if configured (D-01, D-06, D-07).
@@ -1479,9 +1750,10 @@ class NodeProvisioner:
 
     async def _stop_llamacpp(self, hostname: str) -> None:
         """Stop llama.cpp through the verified engine-specific script."""
-        command = self._script_command(
+        command = self._remote_script_command(
+            hostname,
+            InferenceEngine.LLAMA_CPP,
             "stop-llamacpp.sh",
-            scripts_dir=self._engine_scripts_dir(InferenceEngine.LLAMA_CPP).name,
         )
         await self._ssh_run_command(hostname, command)
 
@@ -2283,8 +2555,19 @@ class NodeProvisioner:
                 "A prior provisioning operation is still active on the node; "
                 "wait for it to finish or tear the host down before retrying"
             )
+        plan_inputs = self._setup_plan_inputs(
+            engine,
+            artifact=artifact,
+            llamacpp_request=llamacpp_request,
+            vllm_params=vllm_params,
+        )
+        plan_id = setup_plan_id(plan_inputs)
         self._begin_log(
-            hostname, engine, model=artifact.model_alias if artifact else model
+            hostname,
+            engine,
+            model=artifact.model_alias if artifact else model,
+            plan_id=plan_id,
+            setup_inputs=plan_inputs,
         )
         record = self._provisioning_tasks.get(hostname)
         if record is not None:
@@ -2350,11 +2633,12 @@ class NodeProvisioner:
                 current_step = step
 
             current_step = "setup"
-            await self._run_setup(
+            await self._run_setup_with_retries(
                 hostname,
                 started_at=provision_started_at,
                 on_step=set_current_step,
                 engine=engine,
+                plan_id=plan_id,
             )
             current_step = "gpu_verify"
             await self._verify_gpu(hostname)
@@ -2375,23 +2659,26 @@ class NodeProvisioner:
                 started_at=provision_started_at,
             )
             self._log(hostname, "info", f"Starting {engine} inference engine")
-            model_name = await self._run_start_vllm(
-                hostname,
-                model=model,
-                engine=engine,
-                artifact=artifact,
-                llamacpp_request=llamacpp_request,
-                vllm_params=vllm_params,
-                draft_artifact=draft_artifact,
-            )
-            current_step = "health_poll"
-            await self._update_state(
-                hostname, ProvisioningStep.HEALTH_POLL, started_at=provision_started_at
-            )
-            self._log(hostname, "info", "Waiting for health endpoint")
-            await self._poll_health(hostname, engine=engine)
             llamacpp_runtime: LlamaCppRuntimeState | None = None
+            vllm_runtime: VllmRuntimeState | None = None
             if engine == InferenceEngine.LLAMA_CPP:
+                model_name = await self._run_start_vllm(
+                    hostname,
+                    model=model,
+                    engine=engine,
+                    artifact=artifact,
+                    llamacpp_request=llamacpp_request,
+                    vllm_params=vllm_params,
+                    draft_artifact=draft_artifact,
+                )
+                current_step = "health_poll"
+                await self._update_state(
+                    hostname,
+                    ProvisioningStep.HEALTH_POLL,
+                    started_at=provision_started_at,
+                )
+                self._log(hostname, "info", "Waiting for health endpoint")
+                await self._poll_health(hostname, engine=engine)
                 current_step = "llamacpp_runtime_verify"
                 llamacpp_runtime = await self._verify_llamacpp_runtime(
                     hostname,
@@ -2400,6 +2687,14 @@ class NodeProvisioner:
                     ),
                     draft_artifact=draft_artifact,
                     gpus=gpus,
+                )
+            else:
+                model_name, vllm_runtime = await self._start_vllm_with_retries(
+                    hostname,
+                    model=model,
+                    vllm_params=vllm_params,
+                    started_at=provision_started_at,
+                    on_step=set_current_step,
                 )
             current_step = "registering"
             await self._update_state(
@@ -2413,6 +2708,7 @@ class NodeProvisioner:
                 engine=engine,
                 artifact_id=artifact_id,
                 llamacpp_runtime=llamacpp_runtime,
+                vllm_runtime=vllm_runtime,
                 owner=owner,
                 gpus=gpus,
                 placement=placement,
@@ -2428,6 +2724,11 @@ class NodeProvisioner:
                 ProvisioningStep.FAILED,
                 failed_step=current_step,
                 error=str(exc),
+                resume_state=(
+                    exc.resume_state
+                    if isinstance(exc, SetupResumeRequiredError)
+                    else None
+                ),
                 started_at=provision_started_at,
             )
             # Update node entry to FAILED so it doesn't stay stuck as PROVISIONING
@@ -2476,26 +2777,232 @@ class NodeProvisioner:
         by an older gateway lack the ``active`` action; uploading first lets
         the reconcile gate distinguish "no evidence" from "unreachable".
         """
-        await self._ssh_client.upload(hostname, self._common_scripts_dir())
+        files = bundle_files(None, self._common_scripts_dir())
+        bundle = await self._publish_bundle(hostname, files)
         if self._remote_logs is not None:
-            await self._ssh_client.upload(
+            self._remote_logs.recorders[hostname] = f"{bundle}/common/provision-logs.py"
+
+    async def _publish_bundle(self, hostname: str, files: dict[str, bytes]) -> str:
+        # Unique upload paths leave partial transfers inactive and harmless.
+        # Snapshot bytes before the first await so a gateway checkout change
+        # cannot silently combine files from different versions.
+        with tempfile.TemporaryDirectory(prefix="qiip-bundle-") as temporary:
+            name = ".upload-" + uuid.uuid4().hex
+            staged = Path(temporary) / name
+            staged.mkdir()
+            identity = write_bundle(staged, files)
+            remote_staged = f".qiip/bundles/{name}"
+            final = f".qiip/bundles/{identity}"
+            await self._ssh_client.run(hostname, "mkdir -p .qiip/bundles")
+            await self._ssh_client.upload(hostname, staged, ".qiip/bundles/")
+            await self._ssh_client.run(
                 hostname,
-                Path(__file__).with_name("log_store.py"),
-                "common/log_store.py",
+                shlex.join(
+                    (
+                        "python3",
+                        f"{remote_staged}/common/generations.py",
+                        "publish-bundle",
+                        remote_staged,
+                        final,
+                        identity,
+                    )
+                ),
             )
-            await self._ssh_client.upload(
-                hostname,
-                Path(__file__).with_name("diagnostics.py"),
-                "common/diagnostics.py",
-            )
+        return final
 
     async def _upload_scripts(
         self, hostname: str, engine: InferenceEngine = InferenceEngine.VLLM
     ) -> None:
         """Copy provisioning scripts to the remote host via SCP."""
-        scripts_dir, _common_dir = self._required_script_bundles(engine)
-        await self._ssh_client.upload(hostname, scripts_dir)
-        await self._ensure_remote_recorder(hostname)
+        scripts_dir, common_dir = self._required_script_bundles(engine)
+        bundle = await self._publish_bundle(
+            hostname, bundle_files(scripts_dir, common_dir)
+        )
+        self._remote_bundles[hostname, engine] = bundle
+        if self._remote_logs is not None:
+            self._remote_logs.recorders[hostname] = f"{bundle}/common/provision-logs.py"
+        if self._log_buffer.store is not None and hostname in self._log_buffer.attempts:
+            self._log_buffer.store.update(
+                self._log_buffer.attempts[hostname],
+                staged_bundle=bundle.rsplit("/", 1)[1],
+                bundle_version="sha256:" + bundle.rsplit("/", 1)[1],
+                recorder_path=f"{bundle}/common/provision-logs.py",
+            )
+
+    def _setup_resume_env(self, hostname: str, plan_id: str | None) -> dict[str, str]:
+        """Return plan identity and verified stages for setup.sh.
+
+        A compatible plan reuses only stages the gateway has evidence for; a
+        changed plan id yields no resume stages, so setup.sh re-verifies and
+        every stale checkpoint is invalidated on the node.
+        """
+        env: dict[str, str] = {}
+        if plan_id:
+            env["QIIP_PLAN_ID"] = plan_id
+        store = self._log_buffer.store
+        if store is not None and plan_id:
+            with suppress(Exception):
+                verified = store.resumable_checkpoints(hostname, plan_id)
+                env["QIIP_RESUME_STAGES"] = ",".join(sorted(verified))
+        return env
+
+    def _record_step_checkpoint(
+        self, hostname: str, step_name: str, status: str, line: str
+    ) -> None:
+        store = self._log_buffer.store
+        attempt_id = self._log_buffer.attempts.get(hostname)
+        if store is None or attempt_id is None:
+            return
+        status_value = {
+            "START": "running",
+            "OK": "completed",
+            "SKIP": "skipped",
+            "FAIL": "failed",
+        }.get(status)
+        if status_value is None:
+            return
+        with suppress(KeyError):
+            store.record_checkpoint(
+                attempt_id, step_name, status_value, evidence=line[:512]
+            )
+
+    async def _run_setup_with_retries(
+        self,
+        hostname: str,
+        *,
+        started_at: datetime,
+        on_step: Callable[[str], None],
+        engine: InferenceEngine = InferenceEngine.VLLM,
+        plan_id: str | None = None,
+    ) -> None:
+        """Run setup.sh, retrying only recognized transient failures.
+
+        Bounded exponential backoff with jitter. Reconcile runs before each
+        retry so a still-live remote phase is never duplicated. Completed
+        stages are checkpointed by :meth:`_run_setup`, so a retry resumes
+        instead of repeating verified package/compile work.
+        """
+        policy = RetryPolicy(
+            max_attempts=self._settings.stage_retry_max_attempts,
+            base_delay_seconds=self._settings.stage_retry_base_delay,
+            max_delay_seconds=self._settings.stage_retry_max_delay,
+            jitter=self._settings.stage_retry_jitter,
+        )
+        store = self._log_buffer.store
+        attempt_id = self._log_buffer.attempts.get(hostname)
+        step_name = "setup"
+        captured_failure = False
+        timeout = self._setup_engine_timeout(engine)
+
+        def track_step(step: str) -> None:
+            nonlocal step_name
+            step_name = step
+            on_step(step)
+
+        for attempt in range(1, policy.max_attempts + 1):
+            try:
+                await self._run_setup_once(
+                    hostname,
+                    started_at=started_at,
+                    on_step=track_step,
+                    engine=engine,
+                    plan_id=plan_id,
+                    timeout=timeout,
+                )
+                # A recovered transient failure is not a failure: drop the
+                # provisional record while keeping the retry history.
+                if captured_failure and store is not None and attempt_id is not None:
+                    with suppress(KeyError):
+                        store.update(
+                            attempt_id,
+                            failure=None,
+                            failure_summary=None,
+                            diagnostics={"sources": {}},
+                            failure_class=None,
+                            next_action=None,
+                        )
+                return
+            except Exception as exc:
+                failure_class = classify_failure(exc)
+                if (
+                    failure_class != FailureClass.TRANSIENT
+                    or attempt >= policy.max_attempts
+                ):
+                    # Terminal for this attempt chain. Record the classification
+                    # and the operator action the *setup* failure implies; a
+                    # later launch/health failure is classified elsewhere.
+                    self._record_failure_classification(hostname, exc)
+                    raise
+                delay = policy.delay(attempt)
+                # Reconcile before retry: never duplicate a live remote phase.
+                if await self._reconcile_host(hostname):
+                    raise
+                if not captured_failure:
+                    # Capture the original error before the retry re-launches
+                    # the recorder and replaces the active phase; otherwise the
+                    # failure points at a phase that never ran and loses its
+                    # command evidence.
+                    await self._capture_failure(hostname, step_name, exc)
+                    captured_failure = True
+                self._record_failure_classification(hostname, exc)
+                if store is not None and attempt_id is not None:
+                    with suppress(KeyError):
+                        retries = store.increment_transient_retry(attempt_id)
+                        store.issue(
+                            attempt_id,
+                            f"Transient setup failure ({failure_class}); "
+                            f"automatic retry {retries} in {delay:.0f}s: {exc}",
+                            source="gateway",
+                        )
+                self._log(
+                    hostname,
+                    "warning",
+                    f"Transient setup failure; retry {attempt}/"
+                    f"{policy.max_retries} in {delay:.0f}s",
+                )
+                await asyncio.sleep(delay)
+
+    async def _run_setup_once(
+        self,
+        hostname: str,
+        *,
+        started_at: datetime,
+        on_step: Callable[[str], None],
+        engine: InferenceEngine,
+        plan_id: str | None,
+        timeout: float,
+    ) -> None:
+        """Run one setup attempt under its stage-specific total deadline.
+
+        ``asyncio.timeout`` raises ``TimeoutError`` on expiry, which is also
+        the type of an ordinary socket timeout. ``Timeout.expired()``
+        distinguishes the two: the run's own deadline is a terminal
+        :class:`SetupDeadlineError`, while a socket timeout stays
+        transient and eligible for the bounded retry.
+        """
+        try:
+            async with asyncio.timeout(timeout) as deadline:
+                await self._run_setup(
+                    hostname,
+                    started_at=started_at,
+                    on_step=on_step,
+                    engine=engine,
+                    plan_id=plan_id,
+                )
+        except TimeoutError:
+            if deadline.expired():
+                raise SetupDeadlineError(
+                    f"setup exceeded its {timeout:.0f}s stage deadline"
+                ) from None
+            raise
+
+    def _setup_engine_timeout(self, engine: InferenceEngine) -> float:
+        """Return the stage-specific total deadline for one setup run."""
+        return (
+            self._settings.llamacpp_setup_timeout
+            if engine == InferenceEngine.LLAMA_CPP
+            else self._settings.vllm_setup_timeout
+        )
 
     async def _run_setup(
         self,
@@ -2504,66 +3011,88 @@ class NodeProvisioner:
         started_at: datetime,
         on_step: Callable[[str], None],
         engine: InferenceEngine = InferenceEngine.VLLM,
+        plan_id: str | None = None,
     ) -> None:
         """Run setup.sh and parse step markers from stdout (D-05, D-06)."""
-        command = self._script_command(
+        env = self._setup_script_env(engine)
+        env.update(self._setup_resume_env(hostname, plan_id))
+        command = self._remote_script_command(
+            hostname,
+            engine,
             "setup.sh",
-            env=self._setup_script_env(engine),
-            scripts_dir=self._engine_scripts_dir(engine).name,
+            env=env,
         )
+        # The node must bound the same run the gateway bounds: pass the
+        # engine's stage deadline on both the durable-recorder and direct-SSH
+        # paths so a stuck command cannot outlive the gateway's wait.
+        timeout = self._setup_engine_timeout(engine)
         output: AsyncIterator[tuple[str, str]]
         if self._remote_logs is not None:
             output = self._remote_logs.run(
                 hostname,
                 command,
                 stage="setup",
-                timeout=self._settings.llamacpp_setup_timeout
-                if engine == InferenceEngine.LLAMA_CPP
-                else None,
+                timeout=timeout,
             )
-        elif engine == InferenceEngine.LLAMA_CPP:
+        else:
             output = self._ssh_client.run_streaming(
                 hostname,
                 command,
-                total_timeout=self._settings.llamacpp_setup_timeout,
+                total_timeout=timeout,
             )
-        else:
-            output = self._ssh_client.run_streaming(hostname, command)
-        async for stream, line in output:
-            if stream == "stdout":
-                match = STEP_PATTERN.search(line)
-                if match:
-                    step_name, status = match.group(1), match.group(2)
-                    on_step(step_name)
-                    if status in {"START", "WARN"}:
-                        with suppress(ValueError):
-                            await self._update_state(
-                                hostname,
-                                ProvisioningStep(step_name),
-                                started_at=started_at,
+        resume: SetupResumeRequiredError | None = None
+        try:
+            async for stream, line in output:
+                resume_match = RESUME_PATTERN.search(line)
+                if resume_match:
+                    resume = SetupResumeRequiredError(
+                        ProvisioningResumeState(resume_match.group(1)),
+                        resume_match.group(2),
+                    )
+                if stream == "stdout":
+                    self._record_generation(hostname, line)
+                    match = STEP_PATTERN.search(line)
+                    if match:
+                        step_name, status = match.group(1), match.group(2)
+                        on_step(step_name)
+                        self._record_step_checkpoint(hostname, step_name, status, line)
+                        if status in {"START", "WARN"}:
+                            with suppress(ValueError):
+                                await self._update_state(
+                                    hostname,
+                                    ProvisioningStep(step_name),
+                                    started_at=started_at,
+                                )
+                        if status == "FAIL":
+                            logger.error(
+                                "step_failed", step=step_name, hostname=hostname
                             )
-                    if status == "FAIL":
-                        logger.error("step_failed", step=step_name, hostname=hostname)
-                        self._log(hostname, "error", f"[STEP:{step_name}:FAIL]")
-                    elif status == "WARN":
-                        logger.warning(
-                            "step_warning", step=step_name, hostname=hostname
-                        )
-                        self._log(hostname, "warning", f"[STEP:{step_name}:WARN]")
+                            self._log(hostname, "error", f"[STEP:{step_name}:FAIL]")
+                        elif status == "WARN":
+                            logger.warning(
+                                "step_warning", step=step_name, hostname=hostname
+                            )
+                            self._log(hostname, "warning", f"[STEP:{step_name}:WARN]")
+                        else:
+                            logger.info(
+                                "step_marker",
+                                step=step_name,
+                                status=status,
+                                hostname=hostname,
+                            )
+                            self._log(hostname, "info", f"[STEP:{step_name}:{status}]")
                     else:
-                        logger.info(
-                            "step_marker",
-                            step=step_name,
-                            status=status,
-                            hostname=hostname,
-                        )
-                        self._log(hostname, "info", f"[STEP:{step_name}:{status}]")
+                        logger.debug("setup_stdout", line=line, hostname=hostname)
+                        self._log(hostname, "debug", line, stream="stdout")
                 else:
-                    logger.debug("setup_stdout", line=line, hostname=hostname)
-                    self._log(hostname, "debug", line, stream="stdout")
-            else:
-                logger.warning("setup_stderr", line=line, hostname=hostname)
-                self._log(hostname, "warning", line, stream="stderr")
+                    logger.warning("setup_stderr", line=line, hostname=hostname)
+                    self._log(hostname, "warning", line, stream="stderr")
+        except Exception as exc:
+            if resume is not None:
+                raise resume from exc
+            raise
+        if resume is not None:
+            raise resume
 
     async def _verify_gpu(self, hostname: str) -> None:
         """Verify GPUs are visible after setup.sh installs the NVIDIA driver."""
@@ -2668,6 +3197,669 @@ class NodeProvisioner:
                 "llama.cpp runtime verification failed and the stop script "
                 f"also failed: {exc}",
             )
+
+    async def _stop_failed_vllm_start(self, hostname: str) -> bool:
+        """Best-effort cleanup after a vLLM start or OOM retry fails.
+
+        Returns ``False`` when the stop command failed, so an OOM retry can
+        refuse to re-plan against a host that still has an engine holding its
+        VRAM. The stop runs through the uploaded bundle/generation path so a
+        freshly provisioned host without the legacy script directory is still
+        stopped.
+        """
+        command = self._remote_script_command(
+            hostname, InferenceEngine.VLLM, "stop-vllm.sh"
+        )
+        try:
+            await self._ssh_run_command(hostname, command)
+        except Exception as exc:
+            logger.warning(
+                "vllm_cleanup_failed",
+                hostname=hostname,
+                error=str(exc),
+                exc_info=True,
+            )
+            self._log(hostname, "warning", f"vLLM stop script failed: {exc}")
+            return False
+        return True
+
+    async def _read_vllm_device_memory(
+        self, hostname: str
+    ) -> tuple[VllmDeviceMemory, ...]:
+        """Read selected-device total/free memory and compute capability.
+
+        Returns an empty tuple, never a partial reading, when the node cannot
+        answer. The caller then falls back to the node-side runtime heuristics
+        rather than inventing memory numbers.
+        """
+        try:
+            output = await self._ssh_run_command(
+                hostname,
+                "nvidia-smi --query-gpu=index,memory.total,memory.free,compute_cap "
+                "--format=csv,noheader,nounits",
+            )
+        except Exception as exc:
+            self._log(hostname, "warning", f"vLLM memory planning skipped: {exc}")
+            return ()
+        devices: list[VllmDeviceMemory] = []
+        try:
+            for line in output.splitlines():
+                if not line.strip():
+                    continue
+                index, total, free, capability = (
+                    part.strip() for part in line.split(",")
+                )
+                devices.append(
+                    VllmDeviceMemory(
+                        index=int(index),
+                        total_mib=int(total),
+                        free_mib=int(free),
+                        compute_capability=capability,
+                    )
+                )
+        except ValueError as exc:
+            self._log(
+                hostname,
+                "warning",
+                f"vLLM memory planning skipped: unreadable GPU memory ({exc})",
+            )
+            return ()
+        if not devices:
+            return ()
+        return tuple(sorted(devices, key=lambda device: device.index))
+
+    def _select_vllm_devices(
+        self, devices: tuple[VllmDeviceMemory, ...], vllm_params: VllmParams | None
+    ) -> tuple[VllmDeviceMemory, ...]:
+        """Honor an explicit device subset and fail on a stale index."""
+        requested = vllm_params.gpu_devices if vllm_params is not None else None
+        if not requested:
+            return devices
+        by_index = {device.index: device for device in devices}
+        missing = [index for index in requested if index not in by_index]
+        if missing:
+            raise ProvisioningError(
+                f"requested GPU devices {missing} are not present on the host"
+            )
+        return tuple(by_index[index] for index in requested)
+
+    @staticmethod
+    def _vllm_requested(model: str | None, params: VllmParams | None) -> VllmRequested:
+        if params is None:
+            return VllmRequested(model=model)
+        return VllmRequested(
+            model=model,
+            tensor_parallel_size=params.tensor_parallel_size,
+            max_model_len=params.max_model_len,
+            max_num_batched_tokens=params.max_num_batched_tokens,
+            gpu_memory_utilization=params.gpu_memory_utilization,
+            dtype=params.dtype,
+            gpu_devices=params.gpu_devices,
+        )
+
+    async def _plan_vllm_launch(
+        self,
+        hostname: str,
+        *,
+        model: str | None,
+        params: VllmParams | None,
+        attempt: int,
+    ) -> tuple[VllmFitPlan, tuple[VllmDeviceMemory, ...]] | None:
+        """Plan one attempt, or return None when the host cannot be measured."""
+        devices = await self._read_vllm_device_memory(hostname)
+        if not devices:
+            return None
+        selected = self._select_vllm_devices(devices, params)
+        first = selected[0]
+        if first.compute_capability is None:
+            self._log(
+                hostname,
+                "warning",
+                "vLLM memory planning skipped: the node reported no compute capability",
+            )
+            return None
+        try:
+            bucket = vllm_profile_bucket(first.compute_capability, first.total_mib)
+        except ValueError as exc:
+            self._log(hostname, "warning", f"vLLM memory planning skipped: {exc}")
+            return None
+        try:
+            plan = await asyncio.to_thread(
+                plan_vllm_launch,
+                profile_bucket=bucket,
+                devices=selected,
+                requested=self._vllm_requested(model, params),
+                cache_dir=self._hf_cache_dir,
+                attempt=attempt,
+            )
+        except (ValueError, OverflowError) as exc:
+            raise ProvisioningError(
+                f"could not plan the vLLM launch for {hostname}: {exc}"
+            ) from exc
+        return plan, selected
+
+    @staticmethod
+    def _require_fitting_plan(hostname: str, plan: VllmFitPlan) -> None:
+        if not plan.fitting:
+            raise ProvisioningError(
+                f"planned vLLM launch does not fit {hostname}: {plan.reason}"
+            )
+
+    @staticmethod
+    def _plan_vllm_effective(
+        vllm_params: VllmParams | None,
+        plan: VllmFitPlan,
+        selected: tuple[VllmDeviceMemory, ...],
+    ) -> VllmParams:
+        """Translate an authorized plan into the env the start script reads."""
+        params = vllm_params or VllmParams()
+        return VllmParams(
+            tensor_parallel_size=plan.effective.tensor_parallel_size,
+            max_model_len=plan.effective.max_model_len,
+            gpu_memory_utilization=plan.effective.gpu_memory_utilization,
+            max_num_batched_tokens=plan.effective.max_num_batched_tokens,
+            tool_call_parser=params.tool_call_parser,
+            reasoning_parser=params.reasoning_parser,
+            dtype=plan.effective.dtype,
+            gpu_devices=tuple(
+                device.index
+                for device in selected[: plan.effective.tensor_parallel_size]
+            ),
+        )
+
+    async def _vllm_oom_in_engine_log(self, hostname: str) -> bool:
+        """Return whether retained output shows a recognized memory failure.
+
+        The engine log holds vLLM's own refusal or CUDA OOM. The node-side
+        preflight bails before vLLM writes anything, so its lines only reach the
+        retained provisioning output, which is checked as a fallback.
+        """
+        try:
+            log_text = await self._ssh_run_command(
+                hostname,
+                "cat -- "
+                + shlex.quote(self._engine_log_path(hostname, InferenceEngine.VLLM)),
+            )
+        except Exception as exc:
+            logger.warning(
+                "vllm_oom_probe_failed",
+                hostname=hostname,
+                error=str(exc),
+            )
+            log_text = ""
+        if log_text and is_memory_failure(log_text):
+            return True
+        return any(
+            is_memory_failure(entry["msg"])
+            for entry in self._log_buffer.get_entries(hostname)
+        )
+
+    async def _vllm_maybe_retry(
+        self,
+        hostname: str,
+        *,
+        model: str | None,
+        params: VllmParams | None,
+        plan: VllmFitPlan | None,
+        attempt: int,
+        max_attempts: int,
+        failure: BaseException | None = None,
+    ) -> tuple[int, VllmFitPlan, tuple[VllmDeviceMemory, ...]] | None:
+        """Decide, stop cleanly, and re-plan the next bounded adjustment.
+
+        Returns ``None`` when the failure is not a recognized memory failure,
+        every adjustable field is explicit, the retry budget is exhausted, or
+        the incumbent engine could not be stopped. The caller must then stop
+        the engine and re-raise.
+        """
+        if plan is None or not plan.retry_available or attempt + 1 >= max_attempts:
+            return None
+        if not self._vllm_failure_is_memory(failure) and not (
+            await self._vllm_oom_in_engine_log(hostname)
+        ):
+            return None
+        self._log(
+            hostname,
+            "warning",
+            "vLLM ran out of memory during attempt "
+            f"{attempt + 1}; stopping it cleanly before the bounded retry",
+        )
+        stopped = await self._stop_failed_vllm_start(hostname)
+        if not stopped:
+            # Re-planning against a host whose retained VRAM the incumbent
+            # still owns would plan from a lie. Surface the original failure.
+            self._log(
+                hostname,
+                "warning",
+                "vLLM retry skipped because the previous engine could not be "
+                "stopped cleanly",
+            )
+            return None
+        planned = await self._plan_vllm_launch(
+            hostname, model=model, params=params, attempt=attempt + 1
+        )
+        if planned is None:
+            return None
+        next_plan, selected = planned
+        if not next_plan.fitting:
+            # The adjustment cannot make the launch fit. Stop rather than
+            # replace the original failure with a misleading "does not fit"
+            # error; the caller re-raises the recognized OOM.
+            self._log(
+                hostname,
+                "warning",
+                "vLLM retry cannot fit the host and will not be attempted: "
+                f"{next_plan.reason}",
+            )
+            return None
+        self._log(hostname, "info", next_plan.plan_line())
+        return attempt + 1, next_plan, selected
+
+    @staticmethod
+    def _vllm_failure_is_memory(failure: BaseException | None) -> bool:
+        """Classify a start failure from the exception before any engine log.
+
+        The node-side preflight memory guard bails before vLLM writes its log,
+        so its refusal only exists in the command's stderr.
+        """
+        if failure is None:
+            return False
+        stderr = getattr(failure, "stderr", "")
+        return is_memory_failure(f"{failure}\n{stderr}")
+
+    def _selected_generation(
+        self, hostname: str
+    ) -> tuple[dict[str, object] | None, bool]:
+        """Return the selected generation and whether the attempt store was read.
+
+        A missing attempt is a legacy launch and returns ``(None, True)``. A
+        missing store or a failed read returns ``(None, False)`` so the caller
+        can distinguish "no generation marker" from "evidence unavailable".
+        """
+        store = self._log_buffer.store
+        attempt_id = self._log_buffer.attempts.get(hostname)
+        if store is None:
+            return None, False
+        if attempt_id is None:
+            return None, True
+        try:
+            selected = store.get(attempt_id).get("selected_generation")
+        except Exception as exc:
+            # Do not write the warning through the attempt store that just
+            # failed; a missing or corrupt row would raise again and abort the
+            # gate instead of letting it report generation=unavailable.
+            logger.warning(
+                "vllm_generation_read_failed",
+                hostname=hostname,
+                error=str(exc),
+                exc_info=True,
+            )
+            return None, False
+        if isinstance(selected, dict):
+            return selected, True
+        return None, True
+
+    async def _read_vllm_model_revision(self, hostname: str, model: str) -> str | None:
+        """Resolve the cached Hugging Face commit when the model card lacks it."""
+        if model.startswith("/") or "/" not in model:
+            return None
+        slug = model.replace("/", "--")
+        path = f"{self._settings.nfs_mount_point}/hub/models--{slug}/refs/main"
+        try:
+            output = await self._ssh_run_command(
+                hostname, f"cat -- {shlex.quote(path)} 2>/dev/null || true"
+            )
+        except Exception:
+            logger.debug(
+                "vllm_model_revision_unavailable",
+                hostname=hostname,
+                model=model,
+                exc_info=True,
+            )
+            return None
+        revision = output.strip()
+        return revision if re.fullmatch(r"[0-9a-f]{40}", revision) else None
+
+    async def _verify_vllm_serving(
+        self,
+        hostname: str,
+        *,
+        expected_model: str,
+        started_at: datetime,
+        expected_max_model_len: int | None = None,
+        revision_fallback: str | None = None,
+    ) -> VllmServingVerification:
+        """Fail closed unless this attempt's server answers real inference.
+
+        The process check proves the listener belongs to this attempt and, when
+        a generation was selected, that it runs the exact published runtime.
+        The server's own ``/version`` and ``/v1/models`` responses then prove
+        the model and version, and one bounded completion proves the model can
+        serve. A failure must never reach registration.
+        """
+        base_url = self.validate_endpoint(hostname)
+        selected, generation_available = self._selected_generation(hostname)
+        selected = selected or {}
+        runtime_path = selected.get("runtime_path")
+        generation_id = selected.get("generation_id")
+        runtime_path = runtime_path if isinstance(runtime_path, str) else None
+        generation_id = generation_id if isinstance(generation_id, str) else None
+        attempt_elapsed = max(0.0, (datetime.now(UTC) - started_at).total_seconds())
+        process_output = await self._ssh_run_command(
+            hostname, "ps -eo pid=,etimes=,args="
+        )
+        try:
+            process = select_process(
+                parse_vllm_processes(process_output),
+                port=self._settings.vllm_port,
+                expected_model=expected_model,
+                runtime_path=runtime_path,
+                attempt_elapsed_seconds=attempt_elapsed,
+                slack_seconds=self._settings.vllm_process_start_slack,
+            )
+            async with httpx.AsyncClient() as client:
+                identity = await fetch_server_identity(
+                    client,
+                    base_url,
+                    timeout=self._settings.vllm_verify_timeout,
+                )
+                card = select_model(identity.models, expected_model)
+                if (
+                    expected_max_model_len is not None
+                    and card.max_model_len is not None
+                    and card.max_model_len != expected_max_model_len
+                ):
+                    raise VllmServingError(
+                        "the server reports max_model_len "
+                        f"{card.max_model_len}, planned {expected_max_model_len}"
+                    )
+                probe = await probe_inference(
+                    client,
+                    base_url,
+                    model=card.model_id,
+                    timeout=self._settings.vllm_inference_probe_timeout,
+                    max_tokens=self._settings.vllm_inference_probe_max_tokens,
+                )
+        except VllmServingError as exc:
+            self._log(hostname, "error", f"vLLM serving verification failed: {exc}")
+            raise ProvisioningError(str(exc)) from exc
+
+        revision = revision_from_root(card.root) or revision_fallback
+        if revision is None:
+            revision = await self._read_vllm_model_revision(hostname, card.model_id)
+        evidence = VllmServingVerification(
+            served_model=card.model_id,
+            runtime_version=identity.version,
+            generation_id=generation_id,
+            runtime_path=runtime_path,
+            model_revision=revision,
+            model_max_model_len=card.max_model_len,
+            process_id=process.pid,
+            process_age_seconds=process.age_seconds,
+            task=probe.task,
+            endpoint=probe.endpoint,
+            latency_ms=round(probe.latency_ms, 2),
+            prompt_tokens=probe.prompt_tokens,
+            completion_tokens=probe.completion_tokens,
+            finish_reason=probe.finish_reason,
+            verified_at=datetime.now(UTC),
+        )
+        generation_label = (
+            evidence.generation_id
+            if evidence.generation_id is not None
+            else ("legacy" if generation_available else "unavailable")
+        )
+        self._log(
+            hostname,
+            "info",
+            "vLLM serving verified: "
+            f"model={evidence.served_model} "
+            f"runtime_version={evidence.runtime_version} "
+            f"revision={evidence.model_revision or 'unknown'} "
+            f"generation={generation_label} "
+            f"pid={evidence.process_id} "
+            f"task={evidence.task} endpoint={evidence.endpoint} "
+            f"latency_ms={evidence.latency_ms:g} "
+            f"completion_tokens={evidence.completion_tokens}",
+        )
+        return evidence
+
+    async def _verify_vllm_runtime(
+        self,
+        hostname: str,
+        *,
+        plan: VllmFitPlan,
+        vllm_params: VllmParams | None,
+        selected: tuple[VllmDeviceMemory, ...],
+        serving: VllmServingVerification | None = None,
+    ) -> VllmRuntimeState:
+        """Persist the authorized plan and observe post-load selected-device memory."""
+        memory_text = await self._ssh_run_command(
+            hostname,
+            "nvidia-smi --query-gpu=index,memory.total,memory.used,memory.free "
+            "--format=csv,noheader,nounits",
+        )
+        selected_indices = {device.index for device in selected}
+        rows: list[VllmGPUState] = []
+        try:
+            for line in memory_text.splitlines():
+                if not line.strip():
+                    continue
+                index_text, total_text, used_text, free_text = line.split(",")
+                index = int(index_text.strip())
+                if index not in selected_indices:
+                    continue
+                rows.append(
+                    VllmGPUState(
+                        index=index,
+                        total_mib=int(total_text.strip()),
+                        used_mib=int(used_text.strip()),
+                        free_mib=int(free_text.strip()),
+                    )
+                )
+        except ValueError as exc:
+            raise ProvisioningError(
+                "could not parse post-load NVIDIA memory telemetry"
+            ) from exc
+        if not rows:
+            raise ProvisioningError(
+                "post-load NVIDIA memory telemetry returned no selected GPUs"
+            )
+        params = vllm_params or VllmParams()
+        request = VllmRuntimeRequest(
+            model=plan.requested.model,
+            params=VllmParams(
+                tensor_parallel_size=plan.requested.tensor_parallel_size,
+                max_model_len=plan.requested.max_model_len,
+                max_num_batched_tokens=plan.requested.max_num_batched_tokens,
+                gpu_memory_utilization=plan.requested.gpu_memory_utilization,
+                tool_call_parser=params.tool_call_parser,
+                reasoning_parser=params.reasoning_parser,
+                dtype=plan.requested.dtype,
+                gpu_devices=plan.requested.gpu_devices,
+            ),
+        )
+        runtime = VllmRuntimeState(
+            requested=request,
+            effective=VllmRuntimeEffective(
+                model=plan.effective.model,
+                model_selection=VllmModelSelection(plan.model_selection),
+                model_reason=plan.model_reason,
+                tensor_parallel_size=plan.effective.tensor_parallel_size,
+                max_model_len=plan.effective.max_model_len,
+                max_num_batched_tokens=plan.effective.max_num_batched_tokens,
+                gpu_memory_utilization=plan.effective.gpu_memory_utilization,
+                dtype=plan.effective.dtype,
+                attention_backend=plan.effective.attention_backend,
+            ),
+            estimate=VllmMemoryEstimate(
+                weights_mib=plan.estimate.weights_mib,
+                weights_per_gpu_mib=plan.estimate.weights_per_gpu_mib,
+                kv_cache_mib=plan.estimate.kv_cache_mib,
+                runtime_overhead_mib=plan.estimate.runtime_overhead_mib,
+                reserve_mib=plan.estimate.reserve_mib,
+                usable_budget_mib=plan.estimate.usable_budget_mib,
+                free_per_gpu_mib=plan.estimate.free_per_gpu_mib,
+            ),
+            adjustments=tuple(
+                VllmAdjustment(
+                    field=item.field,
+                    previous=item.previous,
+                    value=item.value,
+                    reason=item.reason,
+                )
+                for item in plan.adjustments
+            ),
+            attempt=plan.attempt,
+            reason=plan.reason,
+            approximate=plan.approximate,
+            gpus=tuple(sorted(rows, key=lambda row: row.index)),
+            serving=serving,
+            observed_at=datetime.now(UTC),
+        )
+        used = ",".join(str(row.used_mib) for row in runtime.gpus)
+        free = ",".join(str(row.free_mib) for row in runtime.gpus)
+        self._log(
+            hostname,
+            "info",
+            "vLLM fitted: "
+            f"model={runtime.effective.model} "
+            f"selection={runtime.effective.model_selection.value} "
+            f"tp={runtime.effective.tensor_parallel_size} "
+            f"max_model_len={runtime.effective.max_model_len} "
+            f"max_num_batched_tokens={runtime.effective.max_num_batched_tokens} "
+            f"gpu_memory_utilization={runtime.effective.gpu_memory_utilization:g} "
+            f"attempt={runtime.attempt} gpu_used_mib={used} gpu_free_mib={free}",
+        )
+        return runtime
+
+    async def _start_vllm_with_retries(
+        self,
+        hostname: str,
+        *,
+        model: str | None,
+        vllm_params: VllmParams | None,
+        started_at: datetime,
+        on_step: Callable[[str], None] | None = None,
+    ) -> tuple[str, VllmRuntimeState | None]:
+        """Start vLLM, poll health, and retry recognized OOMs within bounds.
+
+        Without a memory plan (a host that cannot be measured) the legacy
+        node-side behavior is preserved: start once, poll health once, and
+        record no runtime state.
+        """
+        plan: VllmFitPlan | None = None
+        selected: tuple[VllmDeviceMemory, ...] = ()
+        # The incumbent server holds VRAM that would otherwise look allocated to
+        # a process the plan does not control, so it must be stopped before the
+        # first measurement. The retry path already stops before re-planning.
+        await self._stop_failed_vllm_start(hostname)
+        planned = await self._plan_vllm_launch(
+            hostname, model=model, params=vllm_params, attempt=0
+        )
+        if planned is not None:
+            plan, selected = planned
+            self._require_fitting_plan(hostname, plan)
+            self._log(hostname, "info", plan.plan_line())
+        max_attempts = self._settings.vllm_memory_retry_max_attempts
+        attempt = 0
+        while True:
+            if on_step is not None:
+                on_step("starting_engine")
+            start_model = plan.effective.model if plan is not None else model
+            effective_params = (
+                self._plan_vllm_effective(vllm_params, plan, selected)
+                if plan is not None
+                else vllm_params
+            )
+            # Verification compares process age to this specific launch, not
+            # the whole attempt, so a survivor from an earlier retry cannot
+            # pass as freshly started.
+            launch_started_at = datetime.now(UTC)
+            try:
+                model_name = await self._run_start_vllm(
+                    hostname,
+                    model=start_model,
+                    vllm_params=effective_params,
+                    vllm_plan=plan,
+                )
+            except Exception as exc:
+                retry = await self._vllm_maybe_retry(
+                    hostname,
+                    model=model,
+                    params=vllm_params,
+                    plan=plan,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    failure=exc,
+                )
+                if retry is None:
+                    await self._stop_failed_vllm_start(hostname)
+                    raise
+                attempt, plan, selected = retry
+                continue
+            # Capture the cache ref now, while it still describes the launch
+            # that just started, rather than after the model has loaded.
+            launch_revision = await self._read_vllm_model_revision(
+                hostname, model or model_name
+            )
+            if on_step is not None:
+                on_step("health_poll")
+            await self._update_state(
+                hostname, ProvisioningStep.HEALTH_POLL, started_at=started_at
+            )
+            self._log(hostname, "info", "Waiting for health endpoint")
+            try:
+                await self._poll_health(hostname, engine=InferenceEngine.VLLM)
+            except Exception as exc:
+                retry = await self._vllm_maybe_retry(
+                    hostname,
+                    model=model,
+                    params=vllm_params,
+                    plan=plan,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    failure=exc,
+                )
+                if retry is None:
+                    await self._stop_failed_vllm_start(hostname)
+                    raise
+                attempt, plan, selected = retry
+                continue
+            if on_step is not None:
+                on_step("vllm_serving_verify")
+            expected_model = (
+                plan.effective.model if plan is not None else (model or model_name)
+            )
+            try:
+                serving = await self._verify_vllm_serving(
+                    hostname,
+                    expected_model=expected_model,
+                    started_at=launch_started_at,
+                    expected_max_model_len=(
+                        plan.effective.max_model_len if plan is not None else None
+                    ),
+                    revision_fallback=launch_revision,
+                )
+                if plan is None:
+                    # A host without a memory plan keeps the legacy return
+                    # shape, but inference is still proven before routing.
+                    return model_name, None
+                if on_step is not None:
+                    on_step("vllm_runtime_verify")
+                runtime = await self._verify_vllm_runtime(
+                    hostname,
+                    plan=plan,
+                    vllm_params=vllm_params,
+                    selected=selected,
+                    serving=serving,
+                )
+            except Exception:
+                # A runtime we cannot verify must not stay running and
+                # registered as healthy.
+                await self._stop_failed_vllm_start(hostname)
+                raise
+            return model_name, runtime
 
     @staticmethod
     def _verify_profile_evidence(
@@ -2908,13 +4100,16 @@ class NodeProvisioner:
         llamacpp_request: LlamaCppRuntimeRequest | None = None,
         vllm_params: VllmParams | None = None,
         draft_artifact: ResolvedGGUFArtifact | None = None,
+        vllm_plan: VllmFitPlan | None = None,
     ) -> str:
         """Run the engine start script and extract model name from stdout."""
         if engine == InferenceEngine.LLAMA_CPP:
             script = "start-llamacpp.sh"
         else:
             script = "start-vllm.sh"
-        command = self._script_command(
+        command = self._remote_script_command(
+            hostname,
+            engine,
             script,
             env=self._start_script_env(
                 model,
@@ -2923,8 +4118,8 @@ class NodeProvisioner:
                 llamacpp_request=llamacpp_request,
                 vllm_params=vllm_params,
                 draft_artifact=draft_artifact,
+                vllm_plan=vllm_plan,
             ),
-            scripts_dir=self._engine_scripts_dir(engine).name,
         )
         output: AsyncIterator[tuple[str, str]]
         if self._remote_logs is not None:
@@ -2947,6 +4142,7 @@ class NodeProvisioner:
             )
             self._log(hostname, "debug", line, stream=stream)
             if stream == "stdout":
+                self._record_generation(hostname, line)
                 match = MODEL_PATTERN.search(line)
                 if match:
                     model_name = match.group(1).strip()
@@ -3038,6 +4234,7 @@ class NodeProvisioner:
         engine: InferenceEngine = InferenceEngine.VLLM,
         artifact_id: str | None = None,
         llamacpp_runtime: LlamaCppRuntimeState | None = None,
+        vllm_runtime: VllmRuntimeState | None = None,
         self_setup: bool = False,
         owner: str = "",
         gpus: tuple[NodeGPU, ...] = (),
@@ -3052,6 +4249,7 @@ class NodeProvisioner:
             engine=engine,
             artifact_id=artifact_id,
             llamacpp_runtime=llamacpp_runtime,
+            vllm_runtime=vllm_runtime,
             last_heartbeat=datetime.now(UTC),
             managed=managed,
             self_setup=self_setup,
@@ -3444,10 +4642,11 @@ class NodeProvisioner:
                 stop_script = "stop-llamacpp.sh"
             else:
                 stop_script = "stop-vllm.sh"
-            stop_command = self._script_command(
+            stop_command = self._remote_script_command(
+                hostname,
+                engine,
                 stop_script,
                 args=("--force",) if force else (),
-                scripts_dir=self._engine_scripts_dir(engine).name,
             )
             await self._ssh_run_command(hostname, stop_command)
 

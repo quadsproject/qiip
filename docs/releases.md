@@ -37,7 +37,8 @@ a `development` -> `main` merge, `development` therefore does not contain the
 stable release commit or its `v<version>` tag. python-semantic-release would
 then keep computing the same prerelease as already released and release
 nothing (the stale `v0.1.0-dev.*` tags from before any history rewrite have
-the same effect). Reset `development` to `main` right after the merge:
+the same effect). Reset `development` to `main` after the stable release is
+finalized and tagged, before new development commits land:
 
 ```bash
 git checkout development
@@ -46,9 +47,11 @@ git push --force-with-lease origin development
 ```
 
 The next development release is then `v0.2.0-dev.1` (the next minor after
-`main`'s version). Do the reset only immediately after the merge, before new
-development commits land, and never rewrite `development` afterwards: the
-dev tags must stay reachable or the prerelease revision stops advancing.
+`main`'s version). Do the reset only after the release tag exists and before
+new development commits land, and never rewrite `development` afterwards: the
+dev tags must stay reachable or the prerelease revision stops advancing. See
+[maintainer-release-cycle.md](maintainer-release-cycle.md) for the full
+sequence.
 
 ## Versioning rules
 
@@ -88,6 +91,27 @@ sudo dnf install qiip-dev
 `qiip-dev` and `qiip` own the same files (`/usr/share/qiip`, the systemd
 unit, `/etc/qiip`), so `qiip-dev` conflicts with `qiip`; use one train per
 host.
+
+For the maintainer procedure that syncs development into main and resets the
+branches after each stable release, see
+[maintainer-release-cycle.md](maintainer-release-cycle.md).
+
+The project stores its results in Copr's Pulp backend, so the per-build
+directories under `download.copr.fedorainfracloud.org` hold logs and build
+metadata only: RPMs and SRPMs are served from `<chroot>/Packages/<letter>/`,
+which is what `dnf repoquery --location` prints and what the "Go to Pulp
+results for this project" link in the Copr footer lists. `wget` follows the
+redirects to that storage by default, `curl` needs `-L`. Deleting a build in
+Copr deletes the RPM and SRPM files for its NVR as well, so only failed
+builds, or builds whose files the repository no longer serves, are safe to
+remove.
+
+Each release also gets a `Packages` section appended to its notes, by the
+`Link packages in release notes` job, but only after the COPR build verified
+that the artifacts are published: it lists the `dnf copr enable` and
+`dnf install` lines and the absolute URL of every RPM and SRPM in every
+chroot the project builds. Re-running the release job leaves the section
+unchanged.
 
 ## Badges
 

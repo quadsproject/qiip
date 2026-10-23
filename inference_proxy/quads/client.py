@@ -1,7 +1,7 @@
 """QUADS REST API client.
 
-Thin async wrapper over httpx for fetching GPU host inventory and
-availability from a QUADS server.  The httpx.AsyncClient is injected
+Thin async wrapper over httpx for fetching GPU host inventory, availability
+and pending moves from a QUADS server.  The httpx.AsyncClient is injected
 via the constructor for testability (DIP).
 
 Per D-11: no connectivity check at construction time.
@@ -160,6 +160,37 @@ class QUADSClient:
                     "available hosts must be a list of strings"
                 )
             return [canonical_hostname(hostname) for hostname in data]
+        except _InvalidQUADSResponseError as exc:
+            raise QUADSConnectionError(
+                f"invalid QUADS response from {path}: {exc}"
+            ) from exc
+
+    async def get_pending_moves(self) -> set[str]:
+        """Hosts QUADS believes have to move between clouds, normalized.
+
+        ``host`` differs from the cloud QUADS derives for it: the assignment
+        cloud of its current schedule, or its default cloud when none is
+        current. A reclaim is therefore listed from the schedule's half-open
+        end until the release job writes the host's cloud back, and that job
+        powers the host off first, so a host that is free by schedule can be
+        listed here and still unsafe to provision. Listing is not time-bounded
+        and is not only about reclaims: a move into an assignment that has just
+        started is listed too, and a move that never runs keeps the host in the
+        set.
+        """
+        path = "/api/v3/moves"
+        data = await self._get(path)
+        try:
+            if not isinstance(data, list):
+                raise _InvalidQUADSResponseError("pending moves must be a list")
+            pending: set[str] = set()
+            for raw in data:
+                if not isinstance(raw, dict) or not isinstance(raw.get("host"), str):
+                    raise _InvalidQUADSResponseError(
+                        "pending move entries must be objects naming a host"
+                    )
+                pending.add(canonical_hostname(raw["host"]))
+            return pending
         except _InvalidQUADSResponseError as exc:
             raise QUADSConnectionError(
                 f"invalid QUADS response from {path}: {exc}"

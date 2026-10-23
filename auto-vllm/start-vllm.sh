@@ -1,6 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
+# Resolve the generation once, before sourcing any scripts or choosing tools.
+if [ "${QIIP_GENERATION_PINNED:-0}" != "1" ] \
+    && [ -L "${QIIP_GENERATION_ROOT:-/opt/qiip/vllm}/current" ]; then
+    _qiip_script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    exec python3 "${_qiip_script_dir}/../common/generations.py" exec \
+        "${QIIP_GENERATION_ROOT:-/opt/qiip/vllm}" "$_qiip_script_dir" start-vllm.sh "$@"
+fi
+
 API_PORT="${AUTOVLLM_API_PORT:-8000}"
 NFS_MOUNT_POINT="${AUTOVLLM_NFS_MOUNT_POINT:-/srv/hf-cache}"
 MODEL_OVERRIDE="${AUTOVLLM_MODEL:-}"
@@ -220,6 +228,7 @@ clear_script_environment() {
     unset AUTOVLLM_NFS_EXPORT
     unset AUTOVLLM_GPU_DEVICES
     unset AUTOVLLM_ENV_FILE
+    unset AUTOVLLM_FIT_BUDGET_MIB AUTOVLLM_FIT_RESERVE_MIB AUTOVLLM_FIT_OVERHEAD_MIB
 }
 
 configure_attention_backend() {
@@ -404,6 +413,12 @@ run_vllm() {
         # aborts this script under set -e rather than registering the wrong model.
         bash "${SCRIPT_DIR}/stop-vllm.sh"
     fi
+    # Capture the gateway memory plan before clearing the environment so the
+    # configuration banner can report the plan the launch actually used. These
+    # values must not leak into the long-lived vLLM process environment.
+    local plan_budget_mib="${AUTOVLLM_FIT_BUDGET_MIB:-}"
+    local plan_reserve_mib="${AUTOVLLM_FIT_RESERVE_MIB:-}"
+    local plan_overhead_mib="${AUTOVLLM_FIT_OVERHEAD_MIB:-}"
     clear_script_environment
 
     # Running the venv binary directly doesn't activate the venv, so tools
@@ -438,6 +453,7 @@ run_vllm() {
 # Memory Util:        ${GPU_MEM_UTIL}
 # Max Context:        $MAX_MODEL_LEN tokens
 # Max Batched Tokens: $MAX_BATCHED_TOKENS tokens
+# Memory Budget:      ${plan_budget_mib:-(none)} MiB/device planned (reserve ${plan_reserve_mib:-(none)} MiB, overhead ${plan_overhead_mib:-(none)} MiB)
 # Tool Call Parser:   $tool_call_parser
 # Reasoning Parser:   ${REASONING_PARSER_OVERRIDE:-(none)}
 # Dtype:              ${EFFECTIVE_DTYPE:-(none)}

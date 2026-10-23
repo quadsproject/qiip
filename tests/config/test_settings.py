@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import warnings
 from pathlib import Path
@@ -32,6 +33,19 @@ from inference_proxy.config.settings import (
     Settings,
     SSHSettings,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_quads_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop exported QUADS and placement settings before each test.
+
+    conftest pins ``INFERENCE_PROXY_CONF_DIR`` for the same reason: a shell
+    or runner with deployment values exported must not decide what these
+    tests construct. Every test that needs a value sets it itself.
+    """
+    for name in list(os.environ):
+        if name.startswith(("INFERENCE_PROXY_QUADS__", "INFERENCE_PROXY_PLACEMENT__")):
+            monkeypatch.delenv(name, raising=False)
 
 
 class TestServerSettings:
@@ -637,6 +651,118 @@ class TestEnvVarOverrideQUADSBaseUrl:
                 server_timezone="Mars/Olympus_Mons",
             )
 
+    def test_stale_bound_under_two_poll_intervals_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com"
+        )
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SERVER_TIMEZONE", "America/New_York")
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "300")
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__STALE_AFTER_SECONDS", "599")
+        # Ambient deployment env must not decide whether the rule applies.
+        monkeypatch.setenv("INFERENCE_PROXY_PLACEMENT__ENABLED", "true")
+
+        with pytest.raises(ValidationError, match="at least twice quads.poll_interval"):
+            Settings(_env_file=None)
+
+    def test_stale_bound_of_exactly_two_poll_intervals_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com"
+        )
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SERVER_TIMEZONE", "America/New_York")
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "300")
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__STALE_AFTER_SECONDS", "600")
+        monkeypatch.setenv("INFERENCE_PROXY_PLACEMENT__ENABLED", "true")
+
+        assert Settings(_env_file=None).quads.stale_after_seconds == 600
+
+    def test_a_longer_poll_interval_needs_a_longer_stale_bound(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Raising the poll interval alone can invalidate the default bound."""
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com"
+        )
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SERVER_TIMEZONE", "America/New_York")
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "600")
+        monkeypatch.setenv("INFERENCE_PROXY_PLACEMENT__ENABLED", "true")
+        with pytest.raises(ValidationError, match="1200s for a 600s poll interval"):
+            Settings(_env_file=None)
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__STALE_AFTER_SECONDS", "1200")
+        assert Settings(_env_file=None).quads.stale_after_seconds == 1200
+
+    def test_a_longer_poll_interval_without_placement_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only placement reads the bound, so an opted-out deployment may tune."""
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com"
+        )
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SERVER_TIMEZONE", "America/New_York")
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "600")
+        monkeypatch.setenv("INFERENCE_PROXY_PLACEMENT__ENABLED", "false")
+
+        settings = Settings(_env_file=None)
+        assert settings.quads.base_url == "http://quads.example.com"
+        assert settings.placement.enabled is False
+        assert settings.quads.poll_interval == 600
+
+    def test_a_longer_poll_interval_without_quads_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No QUADS means no poller and no placement, so the bound is unused."""
+        monkeypatch.delenv("INFERENCE_PROXY_QUADS__BASE_URL", raising=False)
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "600")
+
+        settings = Settings(_env_file=None)
+        assert settings.quads.base_url is None
+        assert settings.quads.poll_interval == 600
+
+    def test_poll_interval_must_be_positive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "0")
+
+        with pytest.raises(ValidationError, match="poll_interval"):
+            Settings(_env_file=None)
+
+    def test_schedule_check_interval_must_be_positive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The enforcer sleeps this long between checks, like the poller."""
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SCHEDULE_CHECK_INTERVAL", "0")
+
+        with pytest.raises(ValidationError, match="schedule_check_interval"):
+            Settings(_env_file=None)
+
+    def test_schedule_lookahead_hours_must_be_positive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Whole hours only: zero is not a window anyone can be free for."""
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SCHEDULE_LOOKAHEAD_HOURS", "0")
+
+        with pytest.raises(ValidationError, match="schedule_lookahead_hours"):
+            Settings(_env_file=None)
+
+    def test_stale_bound_has_an_absolute_floor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Below a minute the bound is not a bound, whatever the poll cadence."""
+        monkeypatch.setenv(
+            "INFERENCE_PROXY_QUADS__BASE_URL", "http://quads.example.com"
+        )
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__SERVER_TIMEZONE", "America/New_York")
+        # A short interval keeps the 2x interlock satisfied, so only the
+        # absolute floor can reject this.
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__POLL_INTERVAL", "10")
+        monkeypatch.setenv("INFERENCE_PROXY_QUADS__STALE_AFTER_SECONDS", "59")
+
+        with pytest.raises(ValidationError, match="greater than or equal to 60"):
+            Settings(_env_file=None)
+
 
 class TestEnvVarOverrideQUADSTimeout:
     def test_env_var_override_quads_timeout(
@@ -753,6 +879,145 @@ def test_redfish_partial_config_rejected(
 ) -> None:
     with pytest.raises(ValidationError, match=missing_field):
         RedfishSettings.model_validate(values)
+
+
+class TestRedfishBmcCredentials:
+    def test_parses_labs_and_hosts(self) -> None:
+        rs = RedfishSettings.model_validate(
+            {
+                "bmc_username": "root",
+                "bmc_password": SecretStr("mypass1"),
+                "bmc_credentials": {
+                    "labs": {
+                        "rdu2.scalelab": {"username": "root", "password": "mypass1"},
+                    },
+                    "hosts": {
+                        "a20-h10-000-r670.rdu2.scalelab.example.com": {
+                            "username": "root",
+                            "password": "mypass3",
+                        },
+                    },
+                },
+            }
+        )
+        lab = rs.bmc_credentials.labs["rdu2.scalelab"]
+        assert lab.username == "root"
+        assert lab.password.get_secret_value() == "mypass1"
+        host = rs.bmc_credentials.hosts["a20-h10-000-r670.rdu2.scalelab.example.com"]
+        assert host.password.get_secret_value() == "mypass3"
+
+    def test_password_is_secret(self) -> None:
+        rs = RedfishSettings.model_validate(
+            {
+                "bmc_username": "root",
+                "bmc_password": SecretStr("default-bmc-secret"),
+                "bmc_credentials": {
+                    "labs": {
+                        "rdu2.scalelab": {
+                            "username": "root",
+                            "password": "lab-override-secret",
+                        }
+                    }
+                },
+            }
+        )
+        rendered = repr(rs)
+        # Guards the nested BmcCredential.password specifically: a distinctive
+        # override value must be masked, so the test fails if it stops being a
+        # SecretStr even though the default password is still masked.
+        assert "lab-override-secret" not in rendered
+        assert "default-bmc-secret" not in rendered
+
+    def test_overrides_require_default_credentials(self) -> None:
+        with pytest.raises(ValidationError, match="bmc_credentials requires"):
+            RedfishSettings.model_validate(
+                {
+                    "bmc_credentials": {
+                        "labs": {"rdu2.scalelab": {"username": "root", "password": "x"}}
+                    }
+                }
+            )
+
+    def test_default_is_empty(self) -> None:
+        rs = RedfishSettings()
+        assert rs.bmc_credentials.labs == {}
+        assert rs.bmc_credentials.hosts == {}
+
+    def test_keys_are_normalized(self) -> None:
+        rs = RedfishSettings.model_validate(
+            {
+                "bmc_username": "root",
+                "bmc_password": SecretStr("mypass1"),
+                "bmc_credentials": {
+                    "labs": {" RDU2.Scalelab ": {"username": "root", "password": "x"}},
+                    "hosts": {
+                        "A20-H10-000-R670.RDU2.SCALELAB.EXAMPLE.COM.": {
+                            "username": "root",
+                            "password": "y",
+                        }
+                    },
+                },
+            }
+        )
+        assert list(rs.bmc_credentials.labs) == ["rdu2.scalelab"]
+        assert list(rs.bmc_credentials.hosts) == [
+            "a20-h10-000-r670.rdu2.scalelab.example.com"
+        ]
+
+    @pytest.mark.parametrize(
+        ("key", "match"),
+        [
+            ("", "must not be empty"),
+            ("  ", "must not be empty"),
+            (".rdu2.scalelab", "starts with a dot"),
+            ("rdu2.scalelab.", "ends with a dot"),
+        ],
+        ids=["empty", "blank", "leading-dot", "trailing-dot"],
+    )
+    def test_lab_key_that_can_never_match_is_rejected(
+        self, key: str, match: str
+    ) -> None:
+        with pytest.raises(ValidationError, match=match):
+            RedfishSettings.model_validate(
+                {
+                    "bmc_username": "root",
+                    "bmc_password": SecretStr("mypass1"),
+                    "bmc_credentials": {
+                        "labs": {key: {"username": "root", "password": "x"}}
+                    },
+                }
+            )
+
+    def test_case_duplicate_keys_are_rejected(self) -> None:
+        with pytest.raises(
+            ValidationError, match="duplicates 'rdu2.scalelab' after normalization"
+        ):
+            RedfishSettings.model_validate(
+                {
+                    "bmc_username": "root",
+                    "bmc_password": SecretStr("mypass1"),
+                    "bmc_credentials": {
+                        "labs": {
+                            "rdu2.scalelab": {"username": "root", "password": "x"},
+                            "RDU2.SCALELAB": {"username": "root", "password": "y"},
+                        }
+                    },
+                }
+            )
+
+    def test_host_key_with_leading_dot_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="starts with a dot"):
+            RedfishSettings.model_validate(
+                {
+                    "bmc_username": "root",
+                    "bmc_password": SecretStr("mypass1"),
+                    "bmc_credentials": {
+                        "hosts": {
+                            ".a20.example.com": {"username": "root", "password": "x"}
+                        }
+                    },
+                }
+            )
 
 
 @pytest.mark.parametrize(
@@ -1235,6 +1500,36 @@ class TestAdminFullAccessSetting:
         assert AuthSettings().admin_only_tokens_full_access == []
 
 
+class TestAdminFullAccessByIssuerSetting:
+    """admin_only_tokens_full_access_by_issuer validation (review #231)."""
+
+    def test_default_is_empty(self) -> None:
+        assert AuthSettings().admin_only_tokens_full_access_by_issuer == {}
+
+    def test_issuer_and_emails_normalized(self) -> None:
+        auth = AuthSettings(
+            admin_only_tokens_full_access_by_issuer={
+                " https://local.oidc/ ": [" Ops@example.com ", "alice@example.com"],
+            }
+        )
+        assert auth.admin_only_tokens_full_access_by_issuer == {
+            "https://local.oidc/": ["ops@example.com", "alice@example.com"],
+        }
+
+    def test_bad_issuer_keys_rejected(self) -> None:
+        for bad in ("", "  ", "not a url", "example.com", "ftp://example.com"):
+            with pytest.raises(ValidationError, match="issuer"):
+                AuthSettings(admin_only_tokens_full_access_by_issuer={bad: ["a@b.com"]})
+
+    def test_bad_emails_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="full_access"):
+            AuthSettings(
+                admin_only_tokens_full_access_by_issuer={
+                    "https://local.oidc/": ["not-an-email"],
+                }
+            )
+
+
 class TestSSOWhitelistDefaultDomain:
     """sso_whitelist_default_domain validation (RFE)."""
 
@@ -1254,16 +1549,16 @@ class TestSSOWhitelistDefaultDomain:
 class TestPricingSettings:
     """Premium rate settings for token budget estimates (RFE #113)."""
 
-    def test_defaults_match_opus_class_rates(self) -> None:
+    def test_defaults_match_sonnet_class_rates(self) -> None:
         pricing = PricingSettings()
-        assert pricing.input_rate_per_mtok == 5.0
-        assert pricing.output_rate_per_mtok == 25.0
-        assert pricing.model_label == "claude-opus-4.8"
+        assert pricing.input_rate_per_mtok == 2.0
+        assert pricing.output_rate_per_mtok == 10.0
+        assert pricing.model_label == "claude-sonnet-5"
 
     def test_registered_on_root_settings(self) -> None:
         settings = Settings(_env_file=None)
-        assert settings.pricing.input_rate_per_mtok == 5.0
-        assert settings.pricing.output_rate_per_mtok == 25.0
+        assert settings.pricing.input_rate_per_mtok == 2.0
+        assert settings.pricing.output_rate_per_mtok == 10.0
 
     def test_env_var_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("INFERENCE_PROXY_PRICING__INPUT_RATE_PER_MTOK", "8.5")

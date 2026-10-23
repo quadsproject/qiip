@@ -20,7 +20,11 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
-from log_store import AttemptLogStore, timestamp
+# Uploaded recorder generations stay immutable, including their imports.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
+from log_store import AttemptLogStore, timestamp  # noqa: E402
 
 
 def open_store(config):
@@ -165,6 +169,21 @@ def worker(config):
             marker = re.search(r"\[STEP:(\w+):(START|OK|WARN|FAIL)\]", message)
             if source == "setup.stdout" and marker:
                 current_stage = marker.group(1)
+            if (
+                source.endswith(".stdout")
+                and message.startswith("[GENERATION:")
+                and message.endswith("]")
+            ):
+                try:
+                    selected = json.loads(message[len("[GENERATION:") : -1])
+                    if not isinstance(selected, dict) or not isinstance(
+                        selected.get("runtime_path"), str
+                    ):
+                        raise ValueError("expected generation metadata")
+                except ValueError:
+                    store.issue(attempt, "Malformed generation marker")
+                else:
+                    store.update(attempt, selected_generation=selected)
             reject = re.search(r"\[REJECT:unsupported_hardware:(.*?)\]", message)
             if reject and source.endswith("stderr"):
                 store.issue(attempt, f"unsupported_hardware: {reject.group(1)}")
