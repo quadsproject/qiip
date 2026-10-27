@@ -553,6 +553,7 @@ class NodeProvisioner:
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._owner_updates: set[asyncio.Task[Node]] = set()
         self._provisioning_tasks: dict[str, ProvisioningTask] = {}
+        self._task_engines: dict[str, InferenceEngine] = {}
         self._explicit_cancel_tasks: set[asyncio.Task[None]] = set()
         self._remote_bundles: dict[tuple[str, InferenceEngine], str] = {}
 
@@ -1188,6 +1189,7 @@ class NodeProvisioner:
         resume_state: ProvisioningResumeState | None = None,
         started_at: datetime | None = None,
         history: bool = True,
+        engine: InferenceEngine | None = None,
     ) -> None:
         """Write provisioning state to etcd (D-05). Best-effort (Pitfall 3).
 
@@ -1236,6 +1238,7 @@ class NodeProvisioner:
         state = ProvisioningState(
             hostname=hostname,
             attempt_id=attempt_id,
+            engine=engine if engine is not None else self._task_engines.get(hostname),
             current_step=step,
             started_at=started_at or now,
             updated_at=now,
@@ -2541,6 +2544,7 @@ class NodeProvisioner:
         Tracks state in etcd at each step (D-05 through D-11).
         """
         provision_started_at = datetime.now(UTC)
+        self._task_engines[hostname] = engine
         logger.info(
             "provisioning_start",
             hostname=hostname,
@@ -4592,6 +4596,7 @@ class NodeProvisioner:
         Force: kill -9 -> deregister.
         """
         teardown_started_at = datetime.now(UTC)
+        self._task_engines[hostname] = engine
         logger.info("teardown_start", hostname=hostname, force=force, engine=engine)
         self._begin_log(hostname, engine, operation="teardown")
         self._log(hostname, "info", f"Teardown started (force={force})")
