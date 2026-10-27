@@ -85,7 +85,12 @@ class UnifiedNodeService:
                 # D-05: etcd status wins
                 result.append(self._from_etcd(etcd_node, host, task_map=task_map))
             elif hostname in available_set and viewer_admin:
-                result.append(self._from_available(host))
+                result.append(
+                    self._from_available(
+                        host,
+                        task=task_map.get(hostname) if task_map else None,
+                    )
+                )
             # else: not available and not in etcd -> skip
 
         # Registry membership is authoritative for operational visibility.
@@ -174,7 +179,20 @@ class UnifiedNodeService:
         )
 
     @staticmethod
-    def _from_available(host: QUADSHost) -> AdminNodeResponse:
+    def _from_available(
+        host: QUADSHost,
+        *,
+        task: TaskStatusResponse | None = None,
+    ) -> AdminNodeResponse:
+        state = "available"
+        actions = list(_STATE_ACTIONS["available"])
+        if task is not None:
+            if task.current_step == "failed" or task.failed_step:
+                state = "failed"
+                actions = list(_STATE_ACTIONS["failed"])
+            elif task.current_step not in {"complete", "teardown_complete"}:
+                state = "provisioning"
+                actions = list(_STATE_ACTIONS["provisioning"])
         return AdminNodeResponse(
             node_id=host.hostname,
             endpoint="",
@@ -182,9 +200,17 @@ class UnifiedNodeService:
             status="",
             active_connections=0,
             circuit_breaker_state="closed",
-            state="available",
-            actions=list(_STATE_ACTIONS["available"]),
+            state=state,
+            actions=actions,
             gpu_vendor=host.gpu_vendor,
             gpu_model=host.gpu_model,
             gpu_count=host.gpu_count,
+            failed_step=task.failed_step if task else None,
+            error=task.error if task else None,
+            resume_state=task.resume_state if task else None,
+            attempt_number=task.attempt_number if task else None,
+            retry_count=task.retry_count if task else 0,
+            progress=task.progress if task else None,
+            failure_class=task.failure_class if task else None,
+            next_action=task.next_action if task else None,
         )
