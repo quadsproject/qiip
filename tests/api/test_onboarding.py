@@ -204,6 +204,13 @@ class TestStartPage:
         assert response.status_code == 302
         assert response.headers["location"] == "/dashboard"
 
+    def test_leaderboard_is_linked_from_the_logo(self, user_client: TestClient) -> None:
+        page = user_client.get("/start").text
+
+        assert '<a class="ob-logo-link" href="/leaderboard"' in page
+        assert '<a class="ob-link" href="/leaderboard"' not in page
+        assert ">Leaderboard</a>" not in page
+
     def test_state_for_new_user(self, user_client: TestClient) -> None:
         assert "start.js" in user_client.get("/start").text
         state = user_client.get("/onboarding/state").json()

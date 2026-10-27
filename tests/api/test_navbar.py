@@ -110,6 +110,29 @@ class TestNavbarRenderedOnEveryPage:
         assert ">Profile</a>" in response.text
 
 
+class TestOnboardLink:
+    """Non-admin users get Onboard instead of a Dashboard link that bounces."""
+
+    def test_normal_user_sees_onboard_not_dashboard(
+        self, user_session_client: TestClient
+    ) -> None:
+        page = user_session_client.get("/leaderboard", follow_redirects=False)
+
+        assert page.status_code == 200
+        assert '<a href="/start" class="nav-link">Onboard</a>' in page.text
+        assert '<a href="/dashboard"' not in page.text
+
+    def test_admin_user_still_sees_dashboard(
+        self, admin_session_client: TestClient
+    ) -> None:
+        page = admin_session_client.get("/leaderboard", follow_redirects=False)
+
+        assert page.status_code == 200
+        assert '<a href="/dashboard"' in page.text
+        assert ">Dashboard</a>" in page.text
+        assert ">Onboard</a>" not in page.text
+
+
 class TestNavbarActiveState:
     """The current page is marked active in the shared navbar."""
 
