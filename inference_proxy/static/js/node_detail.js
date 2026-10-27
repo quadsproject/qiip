@@ -852,6 +852,8 @@ var logReconnectStartedAt = null;
 var logSeenEntries = new Set();
 var logStreamStarted = false;
 var logResumeCursor = null;
+var logObservedTaskIdentity = "";
+var logStreamTaskIdentity = "";
 var LOG_RECONNECT_BASE_MS = 1000;
 var LOG_RECONNECT_MAX_DELAY_MS = 30000;
 var LOG_RECONNECT_MAX_ELAPSED_MS = 5 * 60 * 1000;
@@ -866,6 +868,18 @@ function updateLogTaskState(tasks) {
   logTaskStateKnown = true;
   if (tasks.length > 0) logTaskObserved = true;
   logTaskTerminal = logTaskObserved && (tasks.length === 0 || tasks.every(isTerminalTask));
+  var latest = tasks.length > 0 ? tasks[0] : null;
+  var latestIdentity = latest
+    ? String(latest.attempt_id || latest.started_at || "")
+    : "";
+  if (
+    logStreamStarted &&
+    logStreamTaskIdentity &&
+    latestIdentity &&
+    latestIdentity !== logStreamTaskIdentity
+  ) {
+    resetLogStreamState();
+  }
   if (logTaskTerminal) {
     // Let an active stream deliver its final buffered entries. If it already
     // disconnected, terminal task state cancels the pending reconnect.
@@ -878,9 +892,10 @@ function updateLogTaskState(tasks) {
   // A new active task can appear without an action from this page. Clear a
   // stream that ended for the previous terminal task so refreshDetail can
   // open a fresh EventSource.
-  if (wasTerminal && logStreamDone) {
+  else if (wasTerminal && logStreamDone) {
     resetLogStreamState();
   }
+  logObservedTaskIdentity = latestIdentity;
 
   // A successful task poll proves the operation is still observable. A later
   // task-API outage gets a fresh, bounded reconnect window.
@@ -921,6 +936,8 @@ function resetLogStreamState() {
   logReconnectStartedAt = null;
   logSeenEntries = new Set();
   logResumeCursor = null;
+  logObservedTaskIdentity = "";
+  logStreamTaskIdentity = "";
   logStreamStarted = false;
 }
 
@@ -967,12 +984,15 @@ function connectLogStream() {
   var es = new EventSource(logUrl);
   logSource = es;
   logStreamStarted = true;
+  logStreamTaskIdentity = logObservedTaskIdentity;
 
   es.addEventListener("open", function () {
+    if (logSource !== es) return;
     status.textContent = "streaming";
   });
 
   es.addEventListener("message", function (ev) {
+    if (logSource !== es) return;
     try {
       var entry = JSON.parse(ev.data);
       if (entry.attempt_id && Number.isInteger(entry.seq)) {
@@ -1010,12 +1030,15 @@ function connectLogStream() {
   });
 
   es.addEventListener("complete", function () {
+    if (logSource !== es) return;
     finishLogStream("ended", "badge badge-complete");
   });
   es.addEventListener("unavailable", function () {
+    if (logSource !== es) return;
     finishLogStream("logs evicted by retention", "badge badge-failed");
   });
   es.addEventListener("error", function () {
+    if (logSource !== es) return;
     es.close();
     logSource = null;
     if (logTaskTerminal) {
