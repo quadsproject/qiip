@@ -1179,6 +1179,25 @@ class NodeProvisioner:
         """Return raw provisioning task entries from etcd."""
         return await asyncio.to_thread(self._etcd_client.get_prefix, "/provisioning/")
 
+    def _latest_attempt_engine(self, hostname: str) -> InferenceEngine | None:
+        """Return the engine recorded by the latest attempt for *hostname*."""
+        store = self._log_buffer.store
+        if store is None:
+            return None
+        try:
+            attempts = store.attempts_metadata_by_host(hostname)
+        except Exception:
+            return None
+        if not attempts:
+            return None
+        raw = attempts[0][1].get("engine")
+        if not isinstance(raw, str):
+            return None
+        try:
+            return InferenceEngine(raw)
+        except ValueError:
+            return None
+
     async def _update_state(
         self,
         hostname: str,
@@ -1190,6 +1209,7 @@ class NodeProvisioner:
         started_at: datetime | None = None,
         history: bool = True,
         engine: InferenceEngine | None = None,
+        inherit_task_engine: bool = True,
     ) -> None:
         """Write provisioning state to etcd (D-05). Best-effort (Pitfall 3).
 
@@ -1239,7 +1259,11 @@ class NodeProvisioner:
         state = ProvisioningState(
             hostname=hostname,
             attempt_id=attempt_id,
-            engine=engine if engine is not None else self._task_engines.get(hostname),
+            engine=(
+                engine
+                if engine is not None or not inherit_task_engine
+                else self._task_engines.get(hostname)
+            ),
             current_step=step,
             started_at=started_at or now,
             updated_at=now,
@@ -2570,6 +2594,8 @@ class NodeProvisioner:
                 error=str(error),
                 started_at=provision_started_at,
                 history=False,
+                engine=self._latest_attempt_engine(hostname),
+                inherit_task_engine=False,
             )
             raise error
         plan_inputs = self._setup_plan_inputs(

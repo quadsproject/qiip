@@ -1181,13 +1181,21 @@ async def teardown_node(
                     status_code=503,
                     detail="Could not inspect the provisioning task",
                 ) from exc
-            if (
-                stuck is None
-                or stuck.engine is None
-                or stuck.current_step in {"complete", "teardown_complete"}
-            ):
+            if stuck is None or stuck.current_step in {
+                "complete",
+                "teardown_complete",
+            }:
                 raise HTTPException(
                     status_code=404, detail=f"Node '{node_id}' not found"
+                )
+            if stuck.engine is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Node '{node_id}' has a task without a recorded engine; "
+                        "retry teardown with force=true&recovery_engine=vllm "
+                        "or force=true&recovery_engine=llama_cpp"
+                    ),
                 )
             # The in-memory task is gone but the etcd task still names the
             # engine. Use it so teardown can clean up an unregistered host.
