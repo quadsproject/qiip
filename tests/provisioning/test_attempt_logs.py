@@ -600,6 +600,51 @@ async def test_failed_command_summary_and_unavailable_journal(
 
 
 @pytest.mark.asyncio
+async def test_benign_journal_stderr_is_not_an_issue(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    provisioner, ssh, store = harness
+    args_file = ssh.root / "journal-args"
+    _write_executable(
+        Path(ssh.environment["PATH"].split(":")[0]) / "journalctl",
+        "#!/bin/bash\n"
+        f"printf '%s\\n' \"$@\" > {shlex.quote(str(args_file))}\n"
+        "echo 'Failed to parse timestamp: 2026-10-27T12:00:00+00:00' >&2\n"
+        "exit 1\n",
+    )
+    provisioner._begin_log("host1", InferenceEngine.VLLM)
+    attempt = provisioner.log_buffer.attempts["host1"]
+    collector = provisioner._remote_logs
+    assert collector is not None
+    async for _ in collector.run("host1", "echo done", stage="setup"):
+        pass
+
+    issues = store.get(attempt).get("issues") or []
+    assert not any("Service journal reported an error" in issue for issue in issues)
+    assert not any("Service journal unavailable" in issue for issue in issues)
+    args = args_file.read_text()
+    assert "--since=@" in args
+    assert "+00:00" not in args
+
+
+@pytest.mark.asyncio
+async def test_expected_long_line_split_is_not_an_issue(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    provisioner, _ssh, store = harness
+    provisioner._settings.log_max_entry_bytes = 64
+    provisioner._begin_log("host1", InferenceEngine.VLLM)
+    attempt = provisioner.log_buffer.attempts["host1"]
+    collector = provisioner._remote_logs
+    assert collector is not None
+    async for _ in collector.run("host1", "printf '%200s\\n' x", stage="setup"):
+        pass
+
+    issues = store.get(attempt).get("issues") or []
+    assert not any("Long remote line split" in issue for issue in issues)
+
+
+@pytest.mark.asyncio
 async def test_engine_sink_rotation_bounds_raw_and_durable_output(
     harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
 ) -> None:
