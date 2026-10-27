@@ -600,7 +600,7 @@ async def test_failed_command_summary_and_unavailable_journal(
 
 
 @pytest.mark.asyncio
-async def test_benign_journal_stderr_is_not_an_issue(
+async def test_journal_parse_failure_is_not_benign(
     harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
 ) -> None:
     provisioner, ssh, store = harness
@@ -620,8 +620,8 @@ async def test_benign_journal_stderr_is_not_an_issue(
         pass
 
     issues = store.get(attempt).get("issues") or []
-    assert not any("Service journal reported an error" in issue for issue in issues)
-    assert not any("Service journal unavailable" in issue for issue in issues)
+    assert any("Service journal reported an error" in issue for issue in issues)
+    assert any("Service journal unavailable" in issue for issue in issues)
     args = args_file.read_text()
     assert "--since=@" in args
     assert "+00:00" not in args
