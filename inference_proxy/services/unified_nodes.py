@@ -32,6 +32,10 @@ _STATE_ACTIONS: dict[str, list[str]] = {
     "relaunch_failed": ["teardown"],
 }
 
+_TEARDOWN_STEPS = frozenset(
+    {"draining", "stopping_vllm", "stopping_llamacpp", "deregistering"}
+)
+
 
 class UnifiedNodeService:
     """Merges QUADS hosts with etcd nodes into a unified view (D-01)."""
@@ -190,6 +194,9 @@ class UnifiedNodeService:
             if task.current_step == "failed" or task.failed_step:
                 state = "failed"
                 actions = list(_STATE_ACTIONS["failed"])
+            elif task.current_step in _TEARDOWN_STEPS:
+                state = "draining"
+                actions = list(_STATE_ACTIONS["draining"])
             elif task.current_step not in {"complete", "teardown_complete"}:
                 state = "provisioning"
                 actions = list(_STATE_ACTIONS["provisioning"])
