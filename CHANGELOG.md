@@ -2,6 +2,33 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.30 (2026-10-27)
+
+### Bug Fixes
+
+- Address profile review findings
+  ([`7f7d493`](https://github.com/quadsproject/qiip/commit/7f7d493c4de7e6f3447bb3df099b6fa4111b42fe))
+
+- Avoid dead home link for full-access users
+  ([`6a16da4`](https://github.com/quadsproject/qiip/commit/6a16da4485bf732c41a8e2b5b3e550163d429936))
+
+- Correct onboarding and leaderboard navigation
+  ([`b586d53`](https://github.com/quadsproject/qiip/commit/b586d53cc162f435c57b7b77b979f60e6fc02c13))
+
+- Show non-admin users their profile
+  ([`557d17b`](https://github.com/quadsproject/qiip/commit/557d17b2f96c72c7390b903cc9e233a2cedf8d6b))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`4fd6b06`](https://github.com/quadsproject/qiip/commit/4fd6b064f80d2c6b6a3d026cc4c1156c8673d105))
+
+### Testing
+
+- Cover profile token capability
+  ([`4bf40c9`](https://github.com/quadsproject/qiip/commit/4bf40c9da112754218e31e1f68b36baccea3dcf0))
+
+
 ## v0.2.0-dev.29 (2026-10-27)
 
 ### Bug Fixes
