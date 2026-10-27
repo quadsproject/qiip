@@ -2,6 +2,48 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.28 (2026-10-27)
+
+### Bug Fixes
+
+- Allow teardown of unregistered stuck tasks
+  ([`9f1879e`](https://github.com/quadsproject/qiip/commit/9f1879efcf71cb30a1839089423ee201a1e5ead2))
+
+- Keep provisioning state and teardown labels consistent
+  ([`4637c54`](https://github.com/quadsproject/qiip/commit/4637c54ad8496653450b80f6a5447f47c32497ca))
+
+- Keep teardown engine and recovery guidance honest
+  ([`499d43d`](https://github.com/quadsproject/qiip/commit/499d43d666459ea6aeb83c31861da9bb89adbf87))
+
+- Name the prior provisioning task explicitly
+  ([`ee5addc`](https://github.com/quadsproject/qiip/commit/ee5addc56e7cccbb3708f57128ce9dbe5a46fbb0))
+
+- Require teardown after a failed teardown
+  ([`1f2f344`](https://github.com/quadsproject/qiip/commit/1f2f34437bbc7ac504e665d74901422a5ea6cb0b))
+
+- Surface provisioning task failures and available-host actions
+  ([`080f5c5`](https://github.com/quadsproject/qiip/commit/080f5c577f0abe0fb10c18603e131fc531c1292d))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`98c1476`](https://github.com/quadsproject/qiip/commit/98c147642c13889a4d438039b7665905ea993b64))
+
+### Documentation
+
+- Document the development-to-main release cycle
+  ([`e249d62`](https://github.com/quadsproject/qiip/commit/e249d62e5947d9cfd2efd5b56e00266883dbb777))
+
+- Record #121 acceptance status and split fleet validation (#277)
+  ([#278](https://github.com/quadsproject/qiip/pull/278),
+  [`ffebc31`](https://github.com/quadsproject/qiip/commit/ffebc31f3ccc7b4b843053ce3dc68d456cd8ea12))
+
+### Testing
+
+- Allow slower CI for relaunch transitions
+  ([`ba7ebc1`](https://github.com/quadsproject/qiip/commit/ba7ebc1c191315460c31cd9cb3e2521ed0267f9c))
+
+
 ## v0.2.0-dev.27 (2026-10-22)
 
 ### Bug Fixes
