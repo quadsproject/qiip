@@ -12,7 +12,8 @@ import hashlib
 import json
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -59,6 +60,22 @@ async def _run_in_daemon_thread[T](function: Callable[[], T], *, name: str) -> T
     return values[0]
 
 
+class ActiveDownloadError(RuntimeError):
+    """Raised when a cache deletion races an active download."""
+
+    def __init__(self, repo_id: str) -> None:
+        self.repo_id = repo_id
+        super().__init__(f"A download is in progress for '{repo_id}'")
+
+
+class CacheDeletionInProgressError(RuntimeError):
+    """Raised when a download starts while the same repo is being deleted."""
+
+    def __init__(self, repo_id: str) -> None:
+        self.repo_id = repo_id
+        super().__init__(f"A cache deletion is in progress for '{repo_id}'")
+
+
 @dataclass(frozen=True, slots=True)
 class DownloadTriggerResult:
     """Atomic result of requesting a model download."""
@@ -85,6 +102,7 @@ class DownloadService:
         self._token = token
         self._artifact_index = artifact_index or GGUFArtifactIndex(cache_dir)
         self._statuses: dict[str, DownloadStatusResponse] = {}
+        self._deleting: set[str] = set()
         self._lock = threading.Lock()
         # ponytail: lazy semaphore -- must be created inside a running event loop
         self._semaphore: asyncio.Semaphore | None = None
@@ -146,6 +164,8 @@ class DownloadService:
         with self._lock:
             if self._closed:
                 raise RuntimeError("download service is shutting down")
+            if repo_id in self._deleting:
+                raise CacheDeletionInProgressError(repo_id)
             existing = self._statuses.get(key)
             if existing is not None and existing.status == DownloadState.DOWNLOADING:
                 return DownloadTriggerResult(status=existing, started=False)
@@ -165,6 +185,51 @@ class DownloadService:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return DownloadTriggerResult(status=status, started=True)
+
+    async def run_cache_deletion[T](
+        self,
+        repo_id: str,
+        delete: Callable[[], Awaitable[T]],
+    ) -> T:
+        """Run one cache deletion while fencing downloads for *repo_id*.
+
+        The fence is acquired atomically with the active-download check, so a
+        download cannot start between the check and the filesystem deletion.
+        A successful deletion also forgets the repository's completed or failed
+        status records; a failed deletion preserves them for diagnosis.
+        """
+        with self._lock:
+            if any(
+                status.repo_id == repo_id and status.status == DownloadState.DOWNLOADING
+                for status in self._statuses.values()
+            ):
+                raise ActiveDownloadError(repo_id)
+            if repo_id in self._deleting:
+                raise CacheDeletionInProgressError(repo_id)
+            self._deleting.add(repo_id)
+
+        succeeded = False
+        deletion = asyncio.ensure_future(delete())
+        try:
+            result = await asyncio.shield(deletion)
+            succeeded = True
+            return result
+        except asyncio.CancelledError:
+            # The callback usually offloads filesystem work to a thread, which
+            # cannot be stopped. Hold the fence until that work finishes so a
+            # new download cannot overlap a deletion after request cancellation.
+            with suppress(Exception, asyncio.CancelledError):
+                await deletion
+            raise
+        finally:
+            with self._lock:
+                self._deleting.discard(repo_id)
+                if succeeded:
+                    self._statuses = {
+                        key: status
+                        for key, status in self._statuses.items()
+                        if status.repo_id != repo_id
+                    }
 
     async def _run_download(
         self,
