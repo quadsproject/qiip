@@ -47,6 +47,11 @@ class PublicUser(BaseModel):
     name: str
     picture: str
     is_admin: bool = False
+
+
+class ProfileUser(PublicUser):
+    """Public identity plus the signed-in caller's token-management capability."""
+
     can_create_tokens: bool = False
 
 
