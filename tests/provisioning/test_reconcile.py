@@ -303,6 +303,13 @@ async def test_provision_blocks_when_host_active(
         await provisioner.provision("host1", model="org/model")
     assert provisioner.log_buffer.attempts.get("host1") is None
     assert store.history("host1")["total"] == 0
+    state = json.loads(
+        cast(MagicMock, provisioner._etcd_client).put.call_args_list[-1].args[1]
+    )
+    assert state["current_step"] == "failed"
+    assert state["failed_step"] == "reconcile"
+    assert state["attempt_id"] is None
+    assert "still active on the node" in state["error"]
 
 
 @pytest.mark.asyncio

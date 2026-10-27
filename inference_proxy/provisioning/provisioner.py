@@ -2551,10 +2551,22 @@ class NodeProvisioner:
         # step before the reconcile gate can judge it as unreachable.
         await self._power_on_if_needed(hostname)
         if await self._reconcile_host(hostname):
-            raise ProvisioningError(
+            error = ProvisioningError(
                 "A prior provisioning operation is still active on the node; "
                 "wait for it to finish or tear the host down before retrying"
             )
+            # Record the rejection before raising. This gate runs before
+            # _begin_log, so the background task failure otherwise leaves the
+            # etcd task stuck at powering_on with no error for the UI.
+            await self._update_state(
+                hostname,
+                ProvisioningStep.FAILED,
+                failed_step="reconcile",
+                error=str(error),
+                started_at=provision_started_at,
+                history=False,
+            )
+            raise error
         plan_inputs = self._setup_plan_inputs(
             engine,
             artifact=artifact,

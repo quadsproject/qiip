@@ -71,6 +71,24 @@ def _node(
     )
 
 
+def _task(
+    hostname: str = "gpu01",
+    *,
+    current_step: str = "powering_on",
+    failed_step: str | None = None,
+    error: str | None = None,
+) -> TaskStatusResponse:
+    now = datetime(2026, 10, 27, tzinfo=UTC)
+    return TaskStatusResponse(
+        hostname=hostname,
+        current_step=current_step,
+        started_at=now,
+        updated_at=now,
+        failed_step=failed_step,
+        error=error,
+    )
+
+
 def _runtime_state() -> LlamaCppRuntimeState:
     return LlamaCppRuntimeState(
         requested=LlamaCppRuntimeRequest(
@@ -164,6 +182,40 @@ class TestAvailableOnly:
         assert n.circuit_breaker_state == "closed"
         assert n.engine is None
         assert n.artifact_id is None
+
+    def test_available_host_with_active_task_shows_cancel(self) -> None:
+        poller = _poller(hosts=[_host("gpu01")], available=["gpu01"])
+        svc = _service(poller=poller)
+
+        n = svc.get_unified_nodes(task_map={"gpu01": _task()})[0]
+
+        assert n.state == "provisioning"
+        assert n.actions == ["cancel"]
+
+    def test_available_host_with_failed_task_shows_teardown(self) -> None:
+        poller = _poller(hosts=[_host("gpu01")], available=["gpu01"])
+        svc = _service(poller=poller)
+        task = _task(
+            current_step="failed",
+            failed_step="reconcile",
+            error="A prior provisioning operation is still active",
+        )
+
+        n = svc.get_unified_nodes(task_map={"gpu01": task})[0]
+
+        assert n.state == "failed"
+        assert n.actions == ["setup", "teardown"]
+        assert n.failed_step == "reconcile"
+        assert "prior provisioning" in (n.error or "")
+
+    def test_available_host_with_complete_task_stays_available(self) -> None:
+        poller = _poller(hosts=[_host("gpu01")], available=["gpu01"])
+        svc = _service(poller=poller)
+
+        n = svc.get_unified_nodes(task_map={"gpu01": _task(current_step="complete")})[0]
+
+        assert n.state == "available"
+        assert n.actions == ["setup"]
 
     def test_available_host_gpu_fields(self) -> None:
         poller = _poller(
