@@ -15,6 +15,7 @@ from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.models.admin import AdminNodeResponse, TaskStatusResponse
 from inference_proxy.models.node import Node
 from inference_proxy.models.quads import QUADSHost
+from inference_proxy.provisioning.state import TEARDOWN_FAILED_STEP, TEARDOWN_STEPS
 from inference_proxy.quads.client import canonical_hostname
 from inference_proxy.quads.poller import QUADSPoller
 from inference_proxy.resilience.circuit_breaker import CircuitBreakerRegistry
@@ -31,10 +32,6 @@ _STATE_ACTIONS: dict[str, list[str]] = {
     "relaunching": [],
     "relaunch_failed": ["teardown"],
 }
-
-_TEARDOWN_STEPS = frozenset(
-    {"draining", "stopping_vllm", "stopping_llamacpp", "deregistering"}
-)
 
 
 class UnifiedNodeService:
@@ -149,6 +146,8 @@ class UnifiedNodeService:
         actions = list(_STATE_ACTIONS.get(state, []))
         if node.self_setup:
             actions = ["remove"]
+        elif task is not None and task.failed_step == TEARDOWN_FAILED_STEP:
+            actions = ["teardown"]
         elif state == "available" and not node.managed:
             actions.append("remove")
         return AdminNodeResponse(
@@ -193,8 +192,12 @@ class UnifiedNodeService:
         if task is not None:
             if task.current_step == "failed" or task.failed_step:
                 state = "failed"
-                actions = list(_STATE_ACTIONS["failed"])
-            elif task.current_step in _TEARDOWN_STEPS:
+                actions = (
+                    ["teardown"]
+                    if task.failed_step == TEARDOWN_FAILED_STEP
+                    else list(_STATE_ACTIONS["failed"])
+                )
+            elif task.current_step in TEARDOWN_STEPS:
                 state = "draining"
                 actions = list(_STATE_ACTIONS["draining"])
             elif task.current_step not in {"complete", "teardown_complete"}:

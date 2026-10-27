@@ -221,6 +221,16 @@ class TestAvailableOnly:
         assert n.failed_step == "reconcile"
         assert "prior provisioning" in (n.error or "")
 
+    def test_available_host_with_failed_teardown_only_allows_teardown(self) -> None:
+        poller = _poller(hosts=[_host("gpu01")], available=["gpu01"])
+        svc = _service(poller=poller)
+        task = _task(current_step="failed", failed_step="teardown")
+
+        n = svc.get_unified_nodes(task_map={"gpu01": task})[0]
+
+        assert n.state == "failed"
+        assert n.actions == ["teardown"]
+
     def test_available_host_with_complete_task_stays_available(self) -> None:
         poller = _poller(hosts=[_host("gpu01")], available=["gpu01"])
         svc = _service(poller=poller)
@@ -257,6 +267,17 @@ class TestEtcdNodeStates:
         assert n.actions == ["teardown"]
         assert n.gpu_vendor == "NVIDIA"
         assert n.gpu_model == "A100"
+
+    def test_failed_node_with_failed_teardown_only_allows_teardown(self) -> None:
+        registry = NodeRegistry()
+        registry.add(_node("gpu01", status=NodeStatus.FAILED))
+        svc = _service(registry=registry, poller=_poller())
+        task = _task(current_step="failed", failed_step="teardown")
+
+        n = svc.get_unified_nodes(task_map={"gpu01": task})[0]
+
+        assert n.state == "failed"
+        assert n.actions == ["teardown"]
 
     def test_self_setup_healthy_only_allows_remove(self) -> None:
         registry = NodeRegistry()
