@@ -13,7 +13,11 @@
         <span class="brand-sub">Inference Proxy</span>
     </div>
     <div class="nav-links">
+        {% if viewer_signed_in(request) and not admin_view %}
+        <a href="/start" class="nav-link">Onboard</a>
+        {% else %}
         <a href="/dashboard" class="nav-link{{ ' nav-link-active' if dash_active else '' }}"{% if dash_active %} aria-current="page"{% endif %}>Dashboard</a>
+        {% endif %}
         {% if leaderboard_link_visible(request) %}
         <a href="/leaderboard" class="nav-link{{ ' nav-link-active' if leaderboard_active else '' }}"{% if leaderboard_active %} aria-current="page"{% endif %}>Leaderboard</a>
         {% endif %}
