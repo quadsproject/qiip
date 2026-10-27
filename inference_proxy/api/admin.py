@@ -588,13 +588,13 @@ async def setup_node(
                 )
 
         try:
-            task = await _task_for_host(provisioner, hostname)
+            prior_task = await _task_for_host(provisioner, hostname)
         except Exception as exc:
             logger.exception("provisioning_task_lookup_failed", hostname=hostname)
             raise HTTPException(
                 status_code=503, detail="Could not inspect the provisioning task"
             ) from exc
-        if task is not None and task.current_step in TEARDOWN_STEPS:
+        if prior_task is not None and prior_task.current_step in TEARDOWN_STEPS:
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -602,7 +602,7 @@ async def setup_node(
                     "teardown to finish before starting setup"
                 ),
             )
-        if task is not None and task.failed_step == TEARDOWN_FAILED_STEP:
+        if prior_task is not None and prior_task.failed_step == TEARDOWN_FAILED_STEP:
             raise HTTPException(
                 status_code=409,
                 detail=(
