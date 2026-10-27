@@ -7,11 +7,17 @@ returns the list of cached model repositories.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NamedTuple
 
 import structlog
-from huggingface_hub import CachedRepoInfo, scan_cache_dir, snapshot_download
+from huggingface_hub import (
+    CachedRepoInfo,
+    HFCacheInfo,
+    scan_cache_dir,
+    snapshot_download,
+)
 from huggingface_hub.errors import (
     IncompleteSnapshotError,
     LocalEntryNotFoundError,
@@ -27,6 +33,25 @@ class CatalogEntry(BaseModel):
     """A single cached model repository."""
 
     repo_id: str
+
+
+class ModelNotCachedError(LookupError):
+    """Raised when a requested repository is not deletable from the cache."""
+
+    def __init__(
+        self, repo_id: str, reason: str = "is not present in the cache"
+    ) -> None:
+        self.repo_id = repo_id
+        super().__init__(f"Model '{repo_id}' {reason}")
+
+
+@dataclass(frozen=True, slots=True)
+class DeletedModel:
+    """Summary of an explicit model-cache deletion."""
+
+    repo_id: str
+    revision_count: int
+    freed_bytes: int
 
 
 class ModelCatalogResponse(BaseModel):
@@ -49,10 +74,10 @@ class _SnapshotCheck(NamedTuple):
 
 
 class ModelCatalogService:
-    """Lists model repos found in a HuggingFace cache directory.
+    """Lists and deletes model repos in a HuggingFace cache directory.
 
-    Wraps ``scan_cache_dir`` in ``asyncio.to_thread`` so the blocking
-    filesystem scan does not stall the event loop.
+    Wraps ``scan_cache_dir`` and explicit deletions in ``asyncio.to_thread`` so
+    the blocking filesystem work does not stall the event loop.
     """
 
     def __init__(
@@ -66,6 +91,59 @@ class ModelCatalogService:
     async def list_models(self) -> ModelCatalogResponse:
         """Return complete models and counts for hidden cache entries."""
         return await asyncio.to_thread(self._scan_catalog)
+
+    async def delete_model(self, repo_id: str) -> DeletedModel:
+        """Delete every cached revision of one model repository.
+
+        Only Hugging Face ``model`` repositories are eligible. The returned
+        summary reports the exact revisions removed and the cache's expected
+        freed size. Callers must coordinate with active downloads and reject a
+        deletion while a registered node still serves the repository.
+        """
+        return await asyncio.to_thread(self._delete_model, repo_id)
+
+    def _delete_model(self, repo_id: str) -> DeletedModel:
+        cache_info = scan_cache_dir(self._cache_dir)
+        repo = next(
+            (
+                item
+                for item in cache_info.repos
+                if item.repo_id == repo_id and item.repo_type == "model"
+            ),
+            None,
+        )
+        if repo is None:
+            raise ModelNotCachedError(repo_id)
+        revisions = sorted(repo.revisions, key=lambda item: item.commit_hash)
+        if not revisions:
+            raise ModelNotCachedError(repo_id, "has no cached revisions")
+
+        # Hugging Face resolves revisions by commit hash across the whole
+        # cache, and assumes a hash is unique to one repository. A mirror can
+        # legitimately have the same commit as its source, so restrict the
+        # deletion view to the repository the operator named.
+        target_cache = HFCacheInfo(
+            size_on_disk=repo.size_on_disk,
+            repos=frozenset({repo}),
+            incomplete_files=cache_info.incomplete_files,
+            warnings=cache_info.warnings,
+        )
+        strategy = target_cache.delete_revisions(
+            *(revision.commit_hash for revision in revisions)
+        )
+        freed_bytes = strategy.expected_freed_size
+        strategy.execute()
+        logger.info(
+            "model cache deleted",
+            repo_id=repo_id,
+            revision_count=len(revisions),
+            freed_bytes=freed_bytes,
+        )
+        return DeletedModel(
+            repo_id=repo_id,
+            revision_count=len(revisions),
+            freed_bytes=freed_bytes,
+        )
 
     def _scan_catalog(self) -> ModelCatalogResponse:
         cache_info = scan_cache_dir(self._cache_dir)

@@ -16,7 +16,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from inference_proxy.huggingface.artifacts import GGUFDownloadSpec
-from inference_proxy.huggingface.downloader import DownloadTriggerResult
+from inference_proxy.huggingface.downloader import (
+    CacheDeletionInProgressError,
+    DownloadTriggerResult,
+)
 from inference_proxy.models.admin import DownloadState, DownloadStatusResponse
 from inference_proxy.models.node import InferenceEngine
 
@@ -53,6 +56,21 @@ class TestTriggerDownload:
         data = response.json()
         assert data["repo_id"] == "meta-llama/Llama-3.1-8B"
         assert data["status"] == "downloading"
+
+    def test_cache_deletion_in_progress_returns_409(
+        self,
+        app: FastAPI,
+        client: TestClient,
+    ) -> None:
+        mock_svc: MagicMock = app.state.download_service
+        mock_svc.trigger_download.side_effect = CacheDeletionInProgressError(
+            "org/model"
+        )
+
+        response = client.post("/admin/models/download", json={"repo_id": "org/model"})
+
+        assert response.status_code == 409
+        assert "deletion is in progress" in response.json()["detail"]
 
     def test_requires_repo_id(self, client: TestClient) -> None:
         response = client.post("/admin/models/download", json={})

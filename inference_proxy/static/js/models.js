@@ -60,15 +60,76 @@ function renderCatalog(data) {
   if (total === 0) {
     const empty = tr(["No models in cache"]);
     empty.firstChild.className = "empty-state";
+    empty.firstChild.colSpan = 2;
     tbody.appendChild(empty);
     return;
   }
 
   for (const m of models) {
-    tbody.appendChild(tr([m.repo_id]));
+    tbody.appendChild(tr([m.repo_id, deleteModelButton(m.repo_id)]));
   }
   for (const a of gguf) {
-    tbody.appendChild(tr([a.repo_id + " (" + a.entrypoint + ")"]));
+    tbody.appendChild(
+      tr([a.repo_id + " (" + a.entrypoint + ")", deleteModelButton(a.repo_id)]),
+    );
+  }
+}
+
+function modelCacheUrl(repoId) {
+  // Keep the repository separator in the path; encode only each segment so
+  // reverse proxies do not have to decode an escaped slash.
+  return (
+    "/admin/models/cache/" +
+    repoId.split("/").map(encodeURIComponent).join("/")
+  );
+}
+
+function deleteModelButton(repoId) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "btn btn-danger btn-sm";
+  btn.textContent = "Delete";
+  btn.title = "Delete " + repoId + " from the shared cache";
+  btn.setAttribute("aria-label", "Delete cached model " + repoId);
+  btn.addEventListener("click", function () {
+    deleteModel(repoId, btn);
+  });
+  return btn;
+}
+
+async function deleteModel(repoId, btn) {
+  const confirmed = await confirmDialog({
+    title: "Delete cached model?",
+    message:
+      "Every cached revision of \"" +
+      repoId +
+      "\" will be permanently removed from the shared Hugging Face cache. " +
+      "This cannot be undone.",
+    confirmLabel: "Delete model",
+    danger: true,
+  });
+  if (!confirmed) return;
+
+  btn.disabled = true;
+  btn.textContent = "Deleting...";
+  try {
+    const resp = await fetch(modelCacheUrl(repoId), { method: "DELETE" });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || resp.statusText);
+    }
+    showToast("Deleted " + repoId + " from the cache", "success");
+    const requestSequence = ++modelsRequestSequence;
+    await Promise.all([
+      fetchCatalog(requestSequence),
+      fetchDownloads(requestSequence),
+    ]);
+    updateTimestamp();
+  } catch (err) {
+    showToast("Delete failed: " + err.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Delete";
   }
 }
 

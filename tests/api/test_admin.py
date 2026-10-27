@@ -3456,6 +3456,131 @@ class TestModelCatalog:
         }
 
 
+class TestDeleteCachedModel:
+    """DELETE /admin/models/cache/{repo_id} removes an explicit cache entry."""
+
+    @staticmethod
+    def _allow_deletion(app: FastAPI) -> MagicMock:
+        downloads: MagicMock = app.state.download_service
+
+        async def run(
+            repo_id: str, delete: Callable[[], Coroutine[Any, Any, Any]]
+        ) -> Any:
+            return await delete()
+
+        downloads.run_cache_deletion = AsyncMock(side_effect=run)
+        return downloads
+
+    def test_deletes_all_revisions_through_the_download_fence(
+        self,
+        app: FastAPI,
+        client: TestClient,
+    ) -> None:
+        from inference_proxy.huggingface.catalog import DeletedModel
+
+        mock_catalog = MagicMock()
+        mock_catalog.delete_model = AsyncMock(
+            return_value=DeletedModel(
+                repo_id="meta-llama/Llama-3.1-8B",
+                revision_count=2,
+                freed_bytes=4096,
+            )
+        )
+        app.dependency_overrides[get_catalog_service] = lambda: mock_catalog
+        downloads = self._allow_deletion(app)
+
+        response = client.delete("/admin/models/cache/meta-llama/Llama-3.1-8B")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "repo_id": "meta-llama/Llama-3.1-8B",
+            "revision_count": 2,
+            "freed_bytes": 4096,
+        }
+        mock_catalog.delete_model.assert_awaited_once_with("meta-llama/Llama-3.1-8B")
+        downloads.run_cache_deletion.assert_awaited_once()
+
+    def test_unknown_model_returns_404(
+        self,
+        app: FastAPI,
+        client: TestClient,
+    ) -> None:
+        from inference_proxy.huggingface.catalog import ModelNotCachedError
+
+        mock_catalog = MagicMock()
+        mock_catalog.delete_model = AsyncMock(
+            side_effect=ModelNotCachedError("org/missing")
+        )
+        app.dependency_overrides[get_catalog_service] = lambda: mock_catalog
+        self._allow_deletion(app)
+
+        response = client.delete("/admin/models/cache/org/missing")
+
+        assert response.status_code == 404
+        assert "not present in the cache" in response.json()["detail"]
+
+    def test_active_download_returns_409(
+        self,
+        app: FastAPI,
+        client: TestClient,
+    ) -> None:
+        from inference_proxy.huggingface.downloader import ActiveDownloadError
+
+        downloads = self._allow_deletion(app)
+        downloads.run_cache_deletion = AsyncMock(
+            side_effect=ActiveDownloadError("org/model")
+        )
+
+        response = client.delete("/admin/models/cache/org/model")
+
+        assert response.status_code == 409
+        assert "download is in progress" in response.json()["detail"]
+
+    def test_concurrent_deletion_returns_409(
+        self,
+        app: FastAPI,
+        client: TestClient,
+    ) -> None:
+        from inference_proxy.huggingface.downloader import (
+            CacheDeletionInProgressError,
+        )
+
+        downloads = self._allow_deletion(app)
+        downloads.run_cache_deletion = AsyncMock(
+            side_effect=CacheDeletionInProgressError("org/model")
+        )
+
+        response = client.delete("/admin/models/cache/org/model")
+
+        assert response.status_code == 409
+        assert "deletion is in progress" in response.json()["detail"]
+
+    def test_registered_node_using_model_returns_409(
+        self,
+        app: FastAPI,
+        client: TestClient,
+        test_registry: NodeRegistry,
+    ) -> None:
+        from inference_proxy.huggingface.catalog import DeletedModel
+
+        test_registry.add(_make_node(node_id="gpu01", model="org/model"))
+        mock_catalog = MagicMock()
+        mock_catalog.delete_model = AsyncMock(
+            return_value=DeletedModel(
+                repo_id="org/model", revision_count=1, freed_bytes=1
+            )
+        )
+        app.dependency_overrides[get_catalog_service] = lambda: mock_catalog
+        downloads = self._allow_deletion(app)
+
+        response = client.delete("/admin/models/cache/org/model")
+
+        assert response.status_code == 409
+        assert "gpu01" in response.json()["detail"]
+        mock_catalog.delete_model.assert_not_awaited()
+        downloads.run_cache_deletion.assert_not_awaited()
+
+
 class TestUpdateNodeOwner:
     """PATCH /admin/nodes/{node_id}/owner (RFE #107)."""
 

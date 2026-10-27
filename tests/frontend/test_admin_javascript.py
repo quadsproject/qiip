@@ -2421,6 +2421,7 @@ class Element {
     this.disabled = false;
     this.firstChild = null;
     this._textContent = "";
+    this.attributes = {};
     this.classList = {
       add() {}, remove() {}, contains() { return false; },
     };
@@ -2442,6 +2443,10 @@ class Element {
     this.firstChild = this.children[0] || null;
   }
   addEventListener(name, cb) { this.listeners[name] = cb; }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  getAttribute(name) {
+    return this.attributes[name] === undefined ? null : this.attributes[name];
+  }
   remove() {}
 }
 
@@ -2468,6 +2473,7 @@ const sandbox = {
 vm.createContext(sandbox);
 vm.runInContext(source, sandbox);
 sandbox.showToast = function () {};
+sandbox.confirmDialog = async function () { return true; };
 
 function response(data) {
   return {
@@ -2557,6 +2563,101 @@ sandbox.fetch = async function (url) {
     )
 
     assert result == {"catalogRequests": 2, "rendered": ["new-model"]}
+
+
+def test_models_delete_button_cancels_without_a_request() -> None:
+    """The trash action asks first; cancelling makes no destructive request."""
+    result = _run_models_scenario(
+        r"""
+const requests = [];
+const confirmations = [];
+sandbox.confirmDialog = async function (options) {
+  confirmations.push(options);
+  return false;
+};
+sandbox.fetch = async function (url, options) {
+  requests.push({ url, method: options && options.method });
+  if (url === "/admin/models/catalog") {
+    return response({ models: [{ repo_id: "org/model" }], gguf_artifacts: [] });
+  }
+  if (url === "/admin/models/downloads") return response([]);
+  throw new Error("unexpected URL " + url);
+};
+(async function () {
+  await sandbox.poll();
+  const button = byId("catalog-table-body").children[0].children[1].children[0];
+  const label = button.textContent;
+  await sandbox.deleteModel("org/model", button);
+  process.stdout.write(JSON.stringify({
+    label,
+    className: button.className,
+    ariaLabel: button.getAttribute("aria-label"),
+    confirmations,
+    deleteRequests: requests.filter(function (request) {
+      return request.method === "DELETE";
+    }).length,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result["label"] == "Delete"
+    assert result["className"] == "btn btn-danger btn-sm"
+    assert result["ariaLabel"] == "Delete cached model org/model"
+    assert result["deleteRequests"] == 0
+    assert result["confirmations"][0]["danger"] is True
+    assert result["confirmations"][0]["confirmLabel"] == "Delete model"
+    assert "org/model" in result["confirmations"][0]["message"]
+
+
+def test_models_delete_button_removes_repo_and_refreshes_catalog() -> None:
+    """Confirming a deletion sends the repo in the URL and reloads the table."""
+    result = _run_models_scenario(
+        r"""
+const requests = [];
+const toasts = [];
+let catalogRequests = 0;
+sandbox.confirmDialog = async function () { return true; };
+sandbox.showToast = function (message, type) { toasts.push([message, type]); };
+sandbox.fetch = async function (url, options) {
+  requests.push({ url, method: options && options.method });
+  if (url === "/admin/models/catalog") {
+    catalogRequests += 1;
+    return response(catalogRequests === 1
+      ? { models: [{ repo_id: "org/model" }], gguf_artifacts: [] }
+      : { models: [], gguf_artifacts: [] });
+  }
+  if (url === "/admin/models/cache/org/model" && options.method === "DELETE") {
+    return response({ repo_id: "org/model", revision_count: 1, freed_bytes: 42 });
+  }
+  if (url === "/admin/models/downloads") return response([]);
+  throw new Error("unexpected URL " + url);
+};
+(async function () {
+  await sandbox.poll();
+  const button = byId("catalog-table-body").children[0].children[1].children[0];
+  await sandbox.deleteModel("org/model", button);
+  process.stdout.write(JSON.stringify({
+    requests,
+    toasts,
+    rows: byId("catalog-table-body").children.length,
+    emptyText: byId("catalog-table-body").children[0].children[0].textContent,
+    count: byId("model-count").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    delete_requests = [
+        request for request in result["requests"] if request.get("method") == "DELETE"
+    ]
+    assert delete_requests == [
+        {"url": "/admin/models/cache/org/model", "method": "DELETE"}
+    ]
+    assert result["toasts"] == [["Deleted org/model from the cache", "success"]]
+    assert result["rows"] == 1
+    assert result["emptyText"] == "No models in cache"
+    assert result["count"] == "0 models cached"
 
 
 def test_models_download_form_refreshes_downloads_after_submit() -> None:
