@@ -47,6 +47,7 @@ class PublicUser(BaseModel):
     name: str
     picture: str
     is_admin: bool = False
+    can_create_tokens: bool = False
 
 
 class ApiToken(BaseModel):

@@ -21,6 +21,7 @@
 
   const $ = (id) => document.getElementById(id);
   let pendingToken = "";
+  let canCreateTokens = true;
 
   // ------------------------------------------------------------------
   // Column sorting (shared js/table_sort.js)
@@ -81,6 +82,21 @@
   }
 
   function renderUser(user) {
+    canCreateTokens =
+      user.can_create_tokens !== undefined
+        ? !!user.can_create_tokens
+        : !!user.is_admin;
+    const toggle = $("token-toggle");
+    if (toggle) toggle.hidden = !canCreateTokens;
+    const form = $("token-form");
+    if (form) form.hidden = true;
+    const note = $("token-required-note");
+    if (note && !canCreateTokens) {
+      note.textContent =
+        "Your onboarding token is managed from the Start page. " +
+        "Open Start to create or rotate it.";
+      note.hidden = false;
+    }
     $("user-name").textContent = user.name || user.email;
     $("user-email").textContent = user.email;
     if (user.picture) {
@@ -127,7 +143,9 @@
     if (tokens.length === 0) {
       const row = document.createElement("tr");
       const td = document.createElement("td");
-      td.textContent = "No tokens yet. Create one to start tracking usage.";
+      td.textContent = canCreateTokens
+        ? "No tokens yet. Create one to start tracking usage."
+        : "No tokens yet. Open Start to create your onboarding token.";
       td.colSpan = 7;
       td.className = "muted-status";
       row.appendChild(td);
