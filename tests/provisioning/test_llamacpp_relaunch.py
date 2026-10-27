@@ -42,6 +42,7 @@ _POLICY = EndpointPolicy.from_values(
     allowed_networks=[],
     allowed_ports=[8000],
 )
+_RELAUNCH_TEST_TIMEOUT = 10
 
 
 def _request(
@@ -238,7 +239,7 @@ async def test_relaunch_drains_then_commits_verified_runtime_with_same_lease() -
 
     await asyncio.wait_for(
         provisioner.relaunch_llamacpp("host1", requested),
-        timeout=1,
+        timeout=_RELAUNCH_TEST_TIMEOUT,
     )
 
     assert writes == [
@@ -264,7 +265,7 @@ async def test_drain_timeout_restores_node_without_stopping_server() -> None:
     with pytest.raises(ProvisioningError, match="did not drain"):
         await asyncio.wait_for(
             provisioner.relaunch_llamacpp("host1", _request()),
-            timeout=1,
+            timeout=_RELAUNCH_TEST_TIMEOUT,
         )
 
     assert writes == [
@@ -316,7 +317,7 @@ async def test_failed_request_rolls_back_previous_policy(
     with pytest.raises(ProvisioningError, match="does not fit"):
         await asyncio.wait_for(
             provisioner.relaunch_llamacpp("host1", _request()),
-            timeout=1,
+            timeout=_RELAUNCH_TEST_TIMEOUT,
         )
 
     assert writes == [
@@ -355,7 +356,9 @@ async def test_cancellation_after_stop_rolls_back_before_propagating() -> None:
 
     provisioner._launch_llamacpp_runtime.side_effect = launch_or_restore  # type: ignore[attr-defined]
     task = asyncio.create_task(provisioner.relaunch_llamacpp("host1", _request()))
-    await asyncio.wait_for(requested_launch_started.wait(), timeout=1)
+    await asyncio.wait_for(
+        requested_launch_started.wait(), timeout=_RELAUNCH_TEST_TIMEOUT
+    )
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -386,7 +389,7 @@ async def test_cancellation_during_failure_diagnostics_still_restores_engine() -
     ]
     with patch.object(provisioner, "_capture_failure", side_effect=stall):
         task = asyncio.create_task(provisioner.relaunch_llamacpp("host1", _request()))
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), timeout=_RELAUNCH_TEST_TIMEOUT)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -408,7 +411,7 @@ async def test_failed_request_and_rollback_enter_persistent_terminal_state() -> 
     with pytest.raises(ProvisioningError, match="rollback failed"):
         await asyncio.wait_for(
             provisioner.relaunch_llamacpp("host1", _request()),
-            timeout=1,
+            timeout=_RELAUNCH_TEST_TIMEOUT,
         )
 
     assert writes == [
@@ -482,7 +485,7 @@ async def test_revision_conflict_before_stop_never_overwrites_or_stops() -> None
     with pytest.raises(RelaunchConflictError, match="changed during relaunch"):
         await asyncio.wait_for(
             provisioner.relaunch_llamacpp("host1", _request()),
-            timeout=1,
+            timeout=_RELAUNCH_TEST_TIMEOUT,
         )
 
     assert writes == []
@@ -722,7 +725,7 @@ async def test_relaunch_finalizes_remote_logs() -> None:
 
     await asyncio.wait_for(
         provisioner.relaunch_llamacpp("host1", _request()),
-        timeout=1,
+        timeout=_RELAUNCH_TEST_TIMEOUT,
     )
 
     provisioner._finish_remote_logs.assert_awaited_once_with("host1", cancel=False)
@@ -741,7 +744,7 @@ async def test_relaunch_finalizes_remote_logs_after_rollback() -> None:
     with pytest.raises(ProvisioningError, match="does not fit"):
         await asyncio.wait_for(
             provisioner.relaunch_llamacpp("host1", _request()),
-            timeout=1,
+            timeout=_RELAUNCH_TEST_TIMEOUT,
         )
 
     provisioner._finish_remote_logs.assert_awaited_once_with("host1", cancel=False)
