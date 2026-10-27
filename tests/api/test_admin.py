@@ -1816,6 +1816,28 @@ class TestTeardownEndpoint:
 
         assert response.status_code == 404
 
+    def test_unregistered_host_with_completed_task_returns_404(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        now = datetime(2026, 10, 27, tzinfo=UTC)
+        task = TaskStatusResponse(
+            hostname="gpu01",
+            current_step="complete",
+            engine=InferenceEngine.VLLM,
+            started_at=now,
+            updated_at=now,
+        )
+        mock_provisioner.list_tasks_raw.return_value = [
+            (task.model_dump_json().encode(), None)
+        ]
+
+        response = client.delete("/admin/nodes/gpu01")
+
+        assert response.status_code == 404
+        mock_provisioner.fire_background.assert_not_called()
+
     def test_unknown_node_returns_404(
         self,
         client: TestClient,
@@ -2165,6 +2187,38 @@ class TestSetupEligibility:
             lifecycle_lease=ANY,
             owner="",
         )
+
+    @pytest.mark.parametrize(
+        ("current_step", "failed_step"),
+        [("failed", "teardown"), ("draining", None)],
+    )
+    def test_setup_rejected_while_teardown_is_pending(
+        self,
+        client: TestClient,
+        test_registry: NodeRegistry,
+        mock_provisioner: MagicMock,
+        current_step: str,
+        failed_step: str | None,
+    ) -> None:
+        now = datetime(2026, 10, 27, tzinfo=UTC)
+        task = TaskStatusResponse(
+            hostname="gpu01",
+            current_step=current_step,
+            failed_step=failed_step,
+            engine=InferenceEngine.VLLM,
+            started_at=now,
+            updated_at=now,
+        )
+        mock_provisioner.list_tasks_raw.return_value = [
+            (task.model_dump_json().encode(), None)
+        ]
+
+        response = client.post("/admin/nodes/setup", json={"hostname": "gpu01"})
+
+        assert response.status_code == 409
+        assert "teardown" in response.json()["detail"].lower()
+        mock_provisioner.fire_background.assert_not_called()
+        mock_provisioner.cleanup_stale_node.assert_not_awaited()
 
     def test_draining_node_with_connections_is_rejected_actionably(
         self,
