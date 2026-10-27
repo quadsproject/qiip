@@ -138,6 +138,13 @@ class TestTokenManagement:
 
         assert response.status_code == 404
 
+    def test_normal_user_cannot_create_tokens(
+        self, normal_profile_client: TestClient
+    ) -> None:
+        response = normal_profile_client.post("/profile/tokens", json={"name": "x"})
+
+        assert response.status_code == 403
+
     def test_create_blank_name_rejected(self, profile_client: TestClient) -> None:
         response = profile_client.post("/profile/tokens", json={"name": "  "})
 

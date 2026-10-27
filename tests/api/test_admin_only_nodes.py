@@ -592,19 +592,6 @@ class TestDashboardRoles:
         assert response.status_code == 302
         assert response.headers["location"] == "/start"
 
-    def test_normal_user_can_open_own_profile(
-        self,
-        app: FastAPI,
-        auth_store: AuthStore,
-    ) -> None:
-        client, _user = _signed_in_client(app, auth_store)
-
-        response = client.get("/profile", follow_redirects=False)
-
-        assert response.status_code == 200
-        assert "API Tokens" in response.text
-        assert "Usage" in response.text
-
     def test_admin_role_sees_admin_pages(
         self,
         app: FastAPI,
