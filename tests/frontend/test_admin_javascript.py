@@ -773,6 +773,91 @@ installDetailFetch([terminal], true);
     }
 
 
+def test_reprovision_with_open_log_stream_switches_to_new_task() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+const oldTask = {
+  hostname: "gpu01", current_step: "vllm_install", attempt_id: "old",
+  started_at: "2026-08-05T20:00:00Z", updated_at: "2026-08-05T20:01:00Z",
+  failed_step: null, error: null,
+};
+const newTask = {
+  hostname: "gpu01", current_step: "vllm_install", attempt_id: "new",
+  started_at: "2026-08-05T21:00:00Z", updated_at: "2026-08-05T21:00:01Z",
+  failed_step: null, error: null,
+};
+installDetailFetch([oldTask], true);
+(async function () {
+  await sandbox.refreshDetail();
+  const oldSource = eventSources[0];
+  oldSource.emit("message", { data: JSON.stringify({
+    attempt_id: "old", seq: 1, msg: "old log", ts: "2026-08-05T20:01:00Z",
+  }) });
+  installDetailFetch([newTask], true);
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    sourceCount: eventSources.length,
+    oldClosed: oldSource.closed,
+    done: sandbox.logStreamDone,
+    status: byId("logs-status").textContent,
+    cursor: sandbox.logResumeCursor,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "sourceCount": 2,
+        "oldClosed": True,
+        "done": False,
+        "status": "connecting",
+        "cursor": None,
+    }
+
+
+def test_late_event_from_replaced_log_stream_is_ignored() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+const oldTask = {
+  hostname: "gpu01", current_step: "vllm_install", attempt_id: "old",
+  started_at: "2026-08-05T20:00:00Z", updated_at: "2026-08-05T20:01:00Z",
+  failed_step: null, error: null,
+};
+const newTask = {
+  hostname: "gpu01", current_step: "vllm_install", attempt_id: "new",
+  started_at: "2026-08-05T21:00:00Z", updated_at: "2026-08-05T21:00:01Z",
+  failed_step: null, error: null,
+};
+installDetailFetch([oldTask], true);
+(async function () {
+  await sandbox.refreshDetail();
+  const oldSource = eventSources[0];
+  oldSource.emit("message", { data: JSON.stringify({
+    attempt_id: "old", seq: 1, msg: "old log", ts: "2026-08-05T20:01:00Z",
+  }) });
+  sandbox.resetLogStreamState();
+  installDetailFetch([newTask], true);
+  await sandbox.refreshDetail();
+  const newSource = eventSources[1];
+  oldSource.emit("complete");
+  process.stdout.write(JSON.stringify({
+    sourceCount: eventSources.length,
+    newClosed: newSource.closed,
+    done: sandbox.logStreamDone,
+    status: byId("logs-status").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "sourceCount": 2,
+        "newClosed": False,
+        "done": False,
+        "status": "connecting",
+    }
+
+
 def test_log_reconnect_stops_when_task_status_stays_unavailable() -> None:
     result = _run_node_detail_scenario(
         r"""
