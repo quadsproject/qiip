@@ -20,6 +20,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from inference_proxy.models.node import InferenceEngine
+
 
 class ProvisioningStep(StrEnum):
     """Steps in the node provisioning sequence (D-06)."""
@@ -101,6 +103,7 @@ class ProvisioningState(BaseModel):
 
     hostname: str
     attempt_id: str | None = None
+    engine: InferenceEngine | None = None
     current_step: ProvisioningStep
     started_at: datetime
     updated_at: datetime
