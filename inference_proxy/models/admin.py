@@ -241,6 +241,7 @@ class TaskStatusResponse(BaseModel):
 
     hostname: str
     attempt_id: str | None = None
+    engine: InferenceEngine | None = None
     current_step: str
     started_at: datetime
     updated_at: datetime
