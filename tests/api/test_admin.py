@@ -44,6 +44,7 @@ from inference_proxy.config.settings import LLMFitSettings, Settings
 from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.llmfit.errors import LLMFitParseError, LLMFitTimeoutError
 from inference_proxy.llmfit.runner import LLMFitRunner
+from inference_proxy.models.admin import TaskStatusResponse
 from inference_proxy.models.endpoint import EndpointPolicy, EndpointValidationError
 from inference_proxy.models.llmfit import (
     GGUFSource,
@@ -1764,6 +1765,56 @@ class TestTeardownEndpoint:
         assert "retry teardown" in response.json()["detail"]
         assert call_order == ["cancel", "reserve"]
         mock_provisioner.fire_background.assert_not_called()
+
+    def test_unregistered_host_with_stuck_task_uses_task_engine(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        now = datetime(2026, 10, 27, tzinfo=UTC)
+        task = TaskStatusResponse(
+            hostname="gpu01",
+            current_step="powering_on",
+            started_at=now,
+            updated_at=now,
+            engine=InferenceEngine.VLLM,
+        )
+        mock_provisioner.list_tasks_raw.return_value = [
+            (task.model_dump_json().encode(), None)
+        ]
+
+        response = client.delete("/admin/nodes/gpu01")
+
+        assert response.status_code == 202
+        coro = mock_provisioner.fire_background.call_args.args[0]
+        asyncio.run(asyncio.wait_for(coro, timeout=1))
+        mock_provisioner.teardown.assert_awaited_once_with(
+            "gpu01",
+            force=False,
+            provisioning_identity=ProvisioningIdentity(engine=InferenceEngine.VLLM),
+            recovery_engine=None,
+            lifecycle_lease=ANY,
+        )
+
+    def test_unregistered_host_without_task_engine_returns_404(
+        self,
+        client: TestClient,
+        mock_provisioner: MagicMock,
+    ) -> None:
+        now = datetime(2026, 10, 27, tzinfo=UTC)
+        task = TaskStatusResponse(
+            hostname="gpu01",
+            current_step="powering_on",
+            started_at=now,
+            updated_at=now,
+        )
+        mock_provisioner.list_tasks_raw.return_value = [
+            (task.model_dump_json().encode(), None)
+        ]
+
+        response = client.delete("/admin/nodes/gpu01")
+
+        assert response.status_code == 404
 
     def test_unknown_node_returns_404(
         self,

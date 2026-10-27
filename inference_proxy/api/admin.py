@@ -1071,6 +1071,19 @@ async def stream_provisioning_logs(
     return StreamingResponse(memory(), media_type="text/event-stream")
 
 
+async def _task_for_host(
+    provisioner: NodeProvisioner, hostname: str
+) -> TaskStatusResponse | None:
+    for value_bytes, _metadata in await provisioner.list_tasks_raw():
+        try:
+            task = TaskStatusResponse(**json.loads(value_bytes))
+        except (json.JSONDecodeError, ValidationError):
+            continue
+        if task.hostname == hostname:
+            return task
+    return None
+
+
 @admin_router.delete("/nodes/{node_id}", status_code=202)
 async def teardown_node(
     node_id: str,
@@ -1135,7 +1148,25 @@ async def teardown_node(
     else:
         active = provisioner.active_provision(node_id)
         if existing is None and active is None:
-            raise HTTPException(status_code=404, detail=f"Node '{node_id}' not found")
+            try:
+                stuck = await _task_for_host(provisioner, node_id)
+            except Exception as exc:
+                logger.exception("provisioning_task_lookup_failed", hostname=node_id)
+                raise HTTPException(
+                    status_code=503,
+                    detail="Could not inspect the provisioning task",
+                ) from exc
+            if (
+                stuck is None
+                or stuck.engine is None
+                or stuck.current_step in {"complete", "teardown_complete"}
+            ):
+                raise HTTPException(
+                    status_code=404, detail=f"Node '{node_id}' not found"
+                )
+            # The in-memory task is gone but the etcd task still names the
+            # engine. Use it so teardown can clean up an unregistered host.
+            cancelled_identity = ProvisioningIdentity(engine=stuck.engine)
         if active is not None:
             # This task holds the lifecycle lease. Persist before cancelling it;
             # a store failure must leave active provisioning completely untouched.

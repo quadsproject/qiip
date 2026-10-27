@@ -309,6 +309,7 @@ async def test_provision_blocks_when_host_active(
     assert state["current_step"] == "failed"
     assert state["failed_step"] == "reconcile"
     assert state["attempt_id"] is None
+    assert state["engine"] == "vllm"
     assert "still active on the node" in state["error"]
 
 
