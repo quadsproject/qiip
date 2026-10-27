@@ -20,7 +20,11 @@ from huggingface_hub.errors import (
 )
 
 from inference_proxy.huggingface.artifacts import GGUFDownloadSpec
-from inference_proxy.huggingface.downloader import DownloadService
+from inference_proxy.huggingface.downloader import (
+    ActiveDownloadError,
+    CacheDeletionInProgressError,
+    DownloadService,
+)
 from inference_proxy.models.admin import DownloadState, DownloadStatusResponse
 from inference_proxy.models.node import InferenceEngine
 
@@ -439,3 +443,151 @@ class TestTokenPassing:
         await asyncio.sleep(0.1)
 
         mock_sd.assert_called_once_with("org/model", cache_dir="/tmp/test", token=None)
+
+
+class TestCacheDeletionFence:
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.downloader.snapshot_download")
+    async def test_active_download_blocks_deletion(self, mock_sd: MagicMock) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def block_download(repo_id: str, **_kwargs: object) -> str:
+            started.set()
+            if not release.wait(timeout=2):
+                raise AssertionError("test did not release the download worker")
+            return _snapshot_result(repo_id)
+
+        mock_sd.side_effect = block_download
+        svc = DownloadService(cache_dir="/tmp/test", token=None)
+        await svc.trigger_download("org/model")
+        assert await _wait_for_thread_event(started, 1)
+
+        async def delete() -> str:
+            raise AssertionError("deletion callback must not run")
+
+        try:
+            with pytest.raises(ActiveDownloadError, match="in progress"):
+                await svc.run_cache_deletion("org/model", delete)
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.gather(*tuple(svc._tasks)), timeout=1)
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.downloader.snapshot_download")
+    async def test_deletion_fences_new_downloads(self, mock_sd: MagicMock) -> None:
+        deletion_started = asyncio.Event()
+        release_deletion = asyncio.Event()
+
+        async def delete() -> str:
+            deletion_started.set()
+            await release_deletion.wait()
+            return "deleted"
+
+        svc = DownloadService(cache_dir="/tmp/test", token=None)
+        deletion = asyncio.create_task(svc.run_cache_deletion("org/model", delete))
+        await asyncio.wait_for(deletion_started.wait(), timeout=1)
+
+        with pytest.raises(
+            CacheDeletionInProgressError, match="deletion is in progress"
+        ):
+            await svc.trigger_download("org/model")
+
+        release_deletion.set()
+        assert await deletion == "deleted"
+        mock_sd.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_deletion_is_rejected(self) -> None:
+        deletion_started = asyncio.Event()
+        release_deletion = asyncio.Event()
+
+        async def delete() -> str:
+            deletion_started.set()
+            await release_deletion.wait()
+            return "deleted"
+
+        svc = DownloadService(cache_dir="/tmp/test", token=None)
+        deletion = asyncio.create_task(svc.run_cache_deletion("org/model", delete))
+        await asyncio.wait_for(deletion_started.wait(), timeout=1)
+
+        with pytest.raises(
+            CacheDeletionInProgressError, match="deletion is in progress"
+        ):
+            await svc.run_cache_deletion("org/model", delete)
+
+        release_deletion.set()
+        assert await deletion == "deleted"
+
+    @pytest.mark.asyncio
+    async def test_cancellation_holds_the_fence_until_deletion_finishes(
+        self,
+    ) -> None:
+        deletion_started = asyncio.Event()
+        release_deletion = asyncio.Event()
+
+        async def delete() -> str:
+            deletion_started.set()
+            await release_deletion.wait()
+            return "deleted"
+
+        svc = DownloadService(cache_dir="/tmp/test", token=None)
+        deletion = asyncio.create_task(svc.run_cache_deletion("org/model", delete))
+        await asyncio.wait_for(deletion_started.wait(), timeout=1)
+
+        deletion.cancel()
+        await asyncio.sleep(0)
+        with pytest.raises(
+            CacheDeletionInProgressError, match="deletion is in progress"
+        ):
+            await svc.trigger_download("org/model")
+
+        release_deletion.set()
+        with pytest.raises(asyncio.CancelledError):
+            await deletion
+
+        async def retry() -> str:
+            return "deleted"
+
+        assert await svc.run_cache_deletion("org/model", retry) == "deleted"
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.downloader.snapshot_download")
+    async def test_successful_deletion_forgets_status_history(
+        self, mock_sd: MagicMock
+    ) -> None:
+        mock_sd.return_value = _snapshot_result("org/model")
+        svc = DownloadService(cache_dir="/tmp/test", token=None)
+        await svc.trigger_download("org/model")
+        await asyncio.sleep(0.1)
+        assert _status(svc, "org/model").status == DownloadState.COMPLETE
+
+        async def delete() -> str:
+            return "deleted"
+
+        assert await svc.run_cache_deletion("org/model", delete) == "deleted"
+        assert svc.get_all_statuses() == []
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.downloader.snapshot_download")
+    async def test_failed_deletion_preserves_status_history(
+        self, mock_sd: MagicMock
+    ) -> None:
+        mock_sd.return_value = _snapshot_result("org/model")
+        svc = DownloadService(cache_dir="/tmp/test", token=None)
+        await svc.trigger_download("org/model")
+        await asyncio.sleep(0.1)
+
+        async def delete() -> str:
+            raise OSError("filesystem is read-only")
+
+        with pytest.raises(OSError, match="read-only"):
+            await svc.run_cache_deletion("org/model", delete)
+        assert _status(svc, "org/model").status == DownloadState.COMPLETE
+
+        # The fence is released after a failed deletion, so a retry can start.
+        async def retry() -> str:
+            return "deleted"
+
+        assert await svc.run_cache_deletion("org/model", retry) == "deleted"
+        assert svc.get_all_statuses() == []

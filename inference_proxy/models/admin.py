@@ -336,6 +336,16 @@ class DownloadStatusResponse(BaseModel):
     error: str | None = None
 
 
+class ModelDeleteResponse(BaseModel):
+    """Result of deleting one cached HuggingFace model repository."""
+
+    model_config = ConfigDict(frozen=True)
+
+    repo_id: str
+    revision_count: int
+    freed_bytes: int
+
+
 class RecommendationResponse(BaseModel):
     """Response body for GET /admin/nodes/{hostname}/recommendations."""
 
