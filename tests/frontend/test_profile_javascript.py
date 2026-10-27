@@ -162,7 +162,7 @@ vm.runInContext(source, sandbox);
   // toggle actually opens it (which is what triggers loadEndpoints).
   byId("token-form").hidden = true;
   const toggle = byId("token-toggle");
-  if (toggle && toggle._handlers.click) toggle._handlers.click();
+  if (CAN_CREATE && toggle && toggle._handlers.click) toggle._handlers.click();
   await new Promise(function (r) { setTimeout(r, 20); });
 
   if (CHECK_INDEX >= 0) {
@@ -227,6 +227,9 @@ vm.runInContext(source, sandbox);
       return row.children[5] ? row.children[5].textContent : "";
     }),
     savings: byId("usage-savings").textContent,
+    tokenToggleHidden: byId("token-toggle").hidden,
+    tokenFormHidden: byId("token-form").hidden,
+    tokenNote: byId("token-required-note").textContent,
     usageRows: byId("usage-table-body").children.map(function (row) {
       return row.children[0] ? row.children[0].textContent : "";
     }),
@@ -264,6 +267,7 @@ def _run(
     sort_usage: bool = False,
     created_token: dict[str, Any] | None = None,
     lang: str = "en_US.UTF-8",
+    can_create_tokens: bool = True,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -277,10 +281,18 @@ def _run(
         .replace("REOPEN", "true" if reopen else "false")
         .replace("USAGE_ROWS", json.dumps(usage or []))
         .replace("SORT_USAGE", "true" if sort_usage else "false")
+        .replace("CAN_CREATE", "true" if can_create_tokens else "false")
         .replace(
             "USER",
             json.dumps(
-                {"id": 1, "email": "kambiz@example.com", "name": "K", "picture": None}
+                {
+                    "id": 1,
+                    "email": "kambiz@example.com",
+                    "name": "K",
+                    "picture": None,
+                    "is_admin": can_create_tokens,
+                    "can_create_tokens": can_create_tokens,
+                }
             ),
         )
     )
@@ -435,6 +447,17 @@ def test_unsorted_usage_table_keeps_server_order() -> None:
 
     assert result["usageRows"] == ["laptop", "ci"]
     assert set(result["usageAria"]) == {None}
+
+
+def test_normal_user_sees_read_only_token_profile() -> None:
+    result = _run([], [], can_create_tokens=False)
+
+    assert result["tokenToggleHidden"] is True
+    assert result["tokenFormHidden"] is True
+    assert "Start page" in result["tokenNote"]
+    assert result["rowNames"] == [
+        "No tokens yet. Open Start to create your onboarding token."
+    ]
 
 
 def test_created_token_is_copied_from_the_reveal_box() -> None:

@@ -36,6 +36,7 @@ from inference_proxy.auth.dependencies import (
     require_profile_user,
 )
 from inference_proxy.auth.models import PublicUser, User
+from inference_proxy.auth.scopes import has_admin_access
 from inference_proxy.auth.session import (
     clear_local_admin_session,
     clear_session_user,
@@ -345,7 +346,10 @@ async def oauth_logout(
 
 
 @auth_router.get("/me")
-async def oauth_me(user: Annotated[User, Depends(require_profile_user)]) -> PublicUser:
+async def oauth_me(
+    user: Annotated[User, Depends(require_profile_user)],
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> PublicUser:
     """Return the signed-in user's public identity, or 401 when anonymous."""
     return PublicUser(
         id=user.id,
@@ -353,4 +357,7 @@ async def oauth_me(user: Annotated[User, Depends(require_profile_user)]) -> Publ
         name=user.name,
         picture=user.picture,
         is_admin=user.is_admin,
+        can_create_tokens=has_admin_access(
+            user.email, user.issuer, settings, is_admin=user.is_admin
+        ),
     )

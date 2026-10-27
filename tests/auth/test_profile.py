@@ -27,6 +27,17 @@ class TestProfilePage:
         assert "QIIP - Profile" in response.text
         assert "API Tokens" in response.text
 
+    def test_normal_user_can_open_own_profile(
+        self, normal_profile_client: TestClient
+    ) -> None:
+        page = normal_profile_client.get("/profile", follow_redirects=False)
+
+        assert page.status_code == 200
+        assert "API Tokens" in page.text
+        assert "Usage" in page.text
+        assert normal_profile_client.get("/profile/tokens").status_code == 200
+        assert normal_profile_client.get("/profile/usage").status_code == 200
+
     def test_profile_page_has_token_required_note(self, app: FastAPI) -> None:
         """The no-token guidance callout is present in the page shell."""
         response = TestClient(app).get("/profile")
@@ -50,6 +61,16 @@ class TestProfileMe:
         assert response.status_code == 200
         assert response.json()["email"] == "alice@example.com"
         assert "id" in response.json()
+        assert response.json()["can_create_tokens"] is True
+
+    def test_normal_user_profile_is_read_only(
+        self, normal_profile_client: TestClient
+    ) -> None:
+        response = normal_profile_client.get("/profile/me")
+
+        assert response.status_code == 200
+        assert response.json()["is_admin"] is False
+        assert response.json()["can_create_tokens"] is False
 
 
 class TestTokenManagement:
