@@ -20,9 +20,9 @@ import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
-from inference_proxy.api.templating import templates, user_home_redirect
+from inference_proxy.api.templating import templates
 from inference_proxy.auth.allowlist import (
     AllowlistUnavailableError,
     SSOAllowlist,
@@ -47,12 +47,7 @@ from inference_proxy.auth.scopes import (
     pickable_endpoints,
 )
 from inference_proxy.auth.store import AuthStore
-from inference_proxy.config.dependencies import (
-    get_registry,
-    get_settings,
-    session_user_has_full_access,
-    viewer_role,
-)
+from inference_proxy.config.dependencies import get_registry, get_settings
 from inference_proxy.config.settings import Settings
 from inference_proxy.discovery.registry import NodeRegistry
 
@@ -85,19 +80,12 @@ async def enforce_mint_allowlist(
 
 
 @profile_router.get("", response_class=HTMLResponse, response_model=None)
-async def profile_page(
-    request: Request,
-    settings: Annotated[Settings, Depends(get_settings)],
-) -> HTMLResponse | RedirectResponse:
+async def profile_page(request: Request) -> HTMLResponse:
     """Render the profile HTML shell (client decides signed-in state).
 
-    Signed-in normal users are sent to their own page (``/start``); the
-    profile stays for admins and for anonymous sign-in error display.
+    Every signed-in user sees their own token and usage profile. Anonymous
+    visitors get the sign-in gate, and OAuth errors still render here.
     """
-    if viewer_role(request, settings) == "user" and not session_user_has_full_access(
-        request, settings
-    ):
-        return user_home_redirect()
     return templates.TemplateResponse(
         request=request,
         name="profile.html",
@@ -108,6 +96,7 @@ async def profile_page(
 @profile_router.get("/me")
 async def profile_me(
     user: Annotated[User, Depends(require_profile_user)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> PublicUser:
     """Return the signed-in user's public identity (used by the page)."""
     return PublicUser(
@@ -116,6 +105,9 @@ async def profile_me(
         name=user.name,
         picture=user.picture,
         is_admin=user.is_admin,
+        can_create_tokens=has_admin_access(
+            user.email, user.issuer, settings, is_admin=user.is_admin
+        ),
     )
 
 
