@@ -122,6 +122,18 @@ class TestOnboardLink:
         assert '<a href="/start" class="nav-link">Onboard</a>' in page.text
         assert '<a href="/dashboard"' not in page.text
 
+    def test_full_access_user_has_no_bouncing_home_link(
+        self, user_session_client: TestClient, test_settings: Settings
+    ) -> None:
+        test_settings.auth.admin_only_tokens_full_access.append("alice@example.com")
+
+        page = user_session_client.get("/profile", follow_redirects=False)
+
+        assert page.status_code == 200
+        assert ">Onboard</a>" not in page.text
+        assert '<a href="/dashboard"' not in page.text
+        assert '<a href="/profile"' in page.text
+
     def test_admin_user_still_sees_dashboard(
         self, admin_session_client: TestClient
     ) -> None:
