@@ -192,6 +192,19 @@ class TestAvailableOnly:
         assert n.state == "provisioning"
         assert n.actions == ["cancel"]
 
+    @pytest.mark.parametrize(
+        "step",
+        ["draining", "stopping_vllm", "stopping_llamacpp", "deregistering"],
+    )
+    def test_available_host_with_teardown_task_shows_draining(self, step: str) -> None:
+        poller = _poller(hosts=[_host("gpu01")], available=["gpu01"])
+        svc = _service(poller=poller)
+
+        n = svc.get_unified_nodes(task_map={"gpu01": _task(current_step=step)})[0]
+
+        assert n.state == "draining"
+        assert n.actions == ["force_teardown"]
+
     def test_available_host_with_failed_task_shows_teardown(self) -> None:
         poller = _poller(hosts=[_host("gpu01")], available=["gpu01"])
         svc = _service(poller=poller)

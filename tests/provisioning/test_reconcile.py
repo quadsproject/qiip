@@ -314,6 +314,46 @@ async def test_provision_blocks_when_host_active(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_gate_does_not_inherit_previous_attempt_state(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provisioner, _ssh, store = harness
+    provisioner._begin_log("host1", InferenceEngine.VLLM)
+    attempt_id = provisioner.log_buffer.attempts["host1"]
+    store.update(
+        attempt_id,
+        attempt_number=3,
+        transient_retries=2,
+        progress={"completed": 4, "total": 12},
+        failure_class="transient",
+        next_action="retry",
+    )
+    provisioner.log_buffer.mark_complete("host1")
+    monkeypatch.setattr(
+        provisioner._remote_logs,
+        "host_active",
+        AsyncMock(return_value={"active": True, "status": "running"}),
+    )
+
+    with pytest.raises(ProvisioningError, match="still active on the node"):
+        await provisioner.provision("host1", model="org/model")
+
+    assert provisioner.log_buffer.attempts.get("host1") == attempt_id
+    state = json.loads(
+        cast(MagicMock, provisioner._etcd_client).put.call_args_list[-1].args[1]
+    )
+    assert state["current_step"] == "failed"
+    assert state["failed_step"] == "reconcile"
+    assert state["attempt_id"] is None
+    assert state["attempt_number"] is None
+    assert state["retry_count"] == 0
+    assert state["progress"] is None
+    assert state["failure_class"] is None
+    assert state["next_action"] is None
+
+
+@pytest.mark.asyncio
 async def test_relaunch_blocks_when_host_active(
     harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
     monkeypatch: pytest.MonkeyPatch,

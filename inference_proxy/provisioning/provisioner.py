@@ -1196,12 +1196,13 @@ class NodeProvisioner:
         ``history`` records the state transition on the current attempt.
         Callers that run before ``_begin_log`` (power-on, a cancel before the
         attempt starts) pass ``history=False``: the buffer still tracks the
-        previous finished attempt, so a history write would corrupt it.
+        previous finished attempt, so neither its history row nor its attempt
+        metadata may be borrowed for the new state.
         """
         now = datetime.now(UTC)
         store = self._log_buffer.store
         attempt_id = self._log_buffer.attempts.get(hostname)
-        if not isinstance(attempt_id, str):
+        if not isinstance(attempt_id, str) or not history:
             attempt_id = None
         if history and store is not None and attempt_id is not None:
             fields: dict[str, object] = {"stage": failed_step or step.value}
@@ -4489,6 +4490,7 @@ class NodeProvisioner:
                 failed_step="cancelled",
                 error="Provisioning cancelled by teardown",
                 history=False,
+                engine=record.identity.engine,
             )
         return record.identity
 
