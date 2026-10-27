@@ -862,6 +862,7 @@ function isTerminalTask(task) {
 }
 
 function updateLogTaskState(tasks) {
+  var wasTerminal = logTaskTerminal;
   logTaskStateKnown = true;
   if (tasks.length > 0) logTaskObserved = true;
   logTaskTerminal = logTaskObserved && (tasks.length === 0 || tasks.every(isTerminalTask));
@@ -872,6 +873,13 @@ function updateLogTaskState(tasks) {
       finishLogStream("ended", "badge badge-complete");
     }
     return;
+  }
+
+  // A new active task can appear without an action from this page. Clear a
+  // stream that ended for the previous terminal task so refreshDetail can
+  // open a fresh EventSource.
+  if (wasTerminal && logStreamDone) {
+    resetLogStreamState();
   }
 
   // A successful task poll proves the operation is still observable. A later
