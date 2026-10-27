@@ -205,6 +205,7 @@ async def test_teardown_cancels_active_provision(
         ]
         assert state_payloads[-1]["current_step"] == "failed"
         assert state_payloads[-1]["failed_step"] == "cancelled"
+        assert state_payloads[-1]["engine"] == "vllm"
         assert state_payloads[-1]["error"] == "Provisioning cancelled by teardown"
     finally:
         for task in scheduled:
