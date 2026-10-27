@@ -560,6 +560,59 @@ sandbox.fetch = async function (url) {{
     )
 
 
+def test_new_task_without_attempt_waits_for_its_own_logs() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+const terminal = {
+  hostname: "gpu01", current_step: "complete", attempt_id: "old",
+  started_at: "2026-08-05T20:00:00Z", updated_at: "2026-08-05T20:01:00Z",
+  failed_step: null, error: null,
+};
+const active = {
+  hostname: "gpu01", current_step: "powering_on",
+  started_at: "2026-08-05T21:00:00Z", updated_at: "2026-08-05T21:00:01Z",
+  failed_step: null, error: null,
+};
+installDetailFetch([terminal], true);
+(async function () {
+  await sandbox.refreshDetail();
+  const oldSource = eventSources[0];
+  installDetailFetch([active], true);
+  await sandbox.refreshDetail();
+  const waiting = {
+    sourceCount: eventSources.length,
+    oldClosed: oldSource.closed,
+    done: sandbox.logStreamDone,
+    status: byId("logs-status").textContent,
+  };
+  const ready = Object.assign({}, active, { attempt_id: "new" });
+  installDetailFetch([ready], true);
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    waiting,
+    sourceCount: eventSources.length,
+    url: eventSources[1] ? eventSources[1].url : null,
+    done: sandbox.logStreamDone,
+    status: byId("logs-status").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "waiting": {
+            "sourceCount": 1,
+            "oldClosed": True,
+            "done": False,
+            "status": "waiting for logs",
+        },
+        "sourceCount": 2,
+        "url": "/admin/provisioning/gpu01/logs?attempt_id=new",
+        "done": False,
+        "status": "connecting",
+    }
+
+
 def test_node_detail_self_setup_hides_power_and_recommendations() -> None:
     """Self-setup nodes are externally owned: power actions and software
     installation (recommendations) are hidden in the UI and rejected by the
@@ -625,7 +678,7 @@ def test_log_stream_reconnects_after_transient_drop() -> None:
     result = _run_node_detail_scenario(
         r"""
 installDetailFetch([{
-  hostname: "gpu01", current_step: "health_poll", started_at: "2026-07-31T12:00:00Z",
+  hostname: "gpu01", current_step: "health_poll", attempt_id: "attempt", started_at: "2026-07-31T12:00:00Z",
   updated_at: "2026-07-31T12:00:00Z", failed_step: null, error: null,
 }], true);
 (async function () {
@@ -665,14 +718,14 @@ def test_log_stream_stops_after_terminal_task_state() -> None:
     result = _run_node_detail_scenario(
         r"""
 installDetailFetch([{
-  hostname: "gpu01", current_step: "health_poll", started_at: "2026-07-31T12:00:00Z",
+  hostname: "gpu01", current_step: "health_poll", attempt_id: "attempt", started_at: "2026-07-31T12:00:00Z",
   updated_at: "2026-07-31T12:00:00Z", failed_step: null, error: null,
 }], true);
 (async function () {
   await sandbox.refreshDetail();
   const sourceBeforeCompletion = eventSources[0];
   installDetailFetch([{
-    hostname: "gpu01", current_step: "failed", started_at: "2026-07-31T12:00:00Z",
+    hostname: "gpu01", current_step: "failed", attempt_id: "attempt", started_at: "2026-07-31T12:00:00Z",
     updated_at: "2026-07-31T12:01:00Z", failed_step: "health_poll", error: "failed",
   }], true);
   await sandbox.refreshDetail();
@@ -704,7 +757,7 @@ def test_completed_task_replays_buffered_logs_once() -> None:
     result = _run_node_detail_scenario(
         r"""
 installDetailFetch([{
-  hostname: "gpu01", current_step: "failed", started_at: "2026-07-31T12:00:00Z",
+  hostname: "gpu01", current_step: "failed", attempt_id: "attempt", started_at: "2026-07-31T12:00:00Z",
   updated_at: "2026-07-31T12:01:00Z", failed_step: "health_poll", error: "failed",
 }], true);
 (async function () {
@@ -736,12 +789,12 @@ def test_external_new_task_after_terminal_stream_starts_fresh_stream() -> None:
     result = _run_node_detail_scenario(
         r"""
 const terminal = {
-  hostname: "gpu01", current_step: "complete",
+  hostname: "gpu01", current_step: "complete", attempt_id: "terminal",
   started_at: "2026-08-05T20:00:00Z", updated_at: "2026-08-05T20:01:00Z",
   failed_step: null, error: null,
 };
 const active = {
-  hostname: "gpu01", current_step: "vllm_install",
+  hostname: "gpu01", current_step: "vllm_install", attempt_id: "new",
   started_at: "2026-08-05T21:00:00Z", updated_at: "2026-08-05T21:00:01Z",
   failed_step: null, error: null,
 };
@@ -862,7 +915,7 @@ def test_log_reconnect_stops_when_task_status_stays_unavailable() -> None:
     result = _run_node_detail_scenario(
         r"""
 installDetailFetch([{
-  hostname: "gpu01", current_step: "health_poll", started_at: "2026-07-31T12:00:00Z",
+  hostname: "gpu01", current_step: "health_poll", attempt_id: "attempt", started_at: "2026-07-31T12:00:00Z",
   updated_at: "2026-07-31T12:00:00Z", failed_step: null, error: null,
 }], true);
 (async function () {
@@ -1315,7 +1368,7 @@ def test_llamacpp_relaunch_waits_for_new_task_before_reconnecting_logs() -> None
     result = _run_node_detail_scenario(
         r"""
 const oldTask = {
-  hostname: "gpu01", current_step: "health_poll",
+  hostname: "gpu01", current_step: "health_poll", attempt_id: "old",
   started_at: "2026-08-05T20:00:00Z", updated_at: "2026-08-05T20:01:00Z",
   failed_step: null, error: null,
 };
@@ -1334,7 +1387,7 @@ installDetailFetch([oldTask], true, "llama_cpp", runtime);
   await sandbox.refreshDetail();
   const countWithOldTask = eventSources.length;
   installDetailFetch([{
-    hostname: "gpu01", current_step: "relaunch_validating",
+    hostname: "gpu01", current_step: "relaunch_validating", attempt_id: "new",
     started_at: "2026-08-05T21:00:00Z", updated_at: "2026-08-05T21:00:00Z",
     failed_step: null, error: null,
   }], true, "llama_cpp", runtime);
@@ -1361,7 +1414,7 @@ def test_task_after_terminal_relaunch_starts_a_fresh_log_stream() -> None:
     result = _run_node_detail_scenario(
         r"""
 const oldTask = {
-  hostname: "gpu01", current_step: "complete",
+  hostname: "gpu01", current_step: "complete", attempt_id: "old",
   started_at: "2026-08-05T20:00:00Z", updated_at: "2026-08-05T20:01:00Z",
   failed_step: null, error: null,
 };
@@ -1377,20 +1430,20 @@ installDetailFetch([oldTask], true, "llama_cpp", runtime);
   await sandbox.submitLlamaCppRelaunch();
   const relaunchStartedAt = "2026-08-05T21:00:00Z";
   installDetailFetch([{
-    hostname: "gpu01", current_step: "relaunch_validating",
+    hostname: "gpu01", current_step: "relaunch_validating", attempt_id: "relaunch",
     started_at: relaunchStartedAt, updated_at: relaunchStartedAt,
     failed_step: null, error: null,
   }], true, "llama_cpp", runtime, "relaunching");
   await sandbox.refreshDetail();
   const relaunchSource = eventSources[eventSources.length - 1];
   installDetailFetch([{
-    hostname: "gpu01", current_step: "complete",
+    hostname: "gpu01", current_step: "complete", attempt_id: "relaunch",
     started_at: relaunchStartedAt, updated_at: "2026-08-05T21:01:00Z",
     failed_step: null, error: null,
   }], true, "llama_cpp", runtime);
   await sandbox.refreshDetail();
   installDetailFetch([{
-    hostname: "gpu01", current_step: "stopping_vllm",
+    hostname: "gpu01", current_step: "stopping_vllm", attempt_id: "next",
     started_at: "2026-08-05T22:00:00Z", updated_at: "2026-08-05T22:00:01Z",
     failed_step: null, error: null,
   }], true, "llama_cpp", runtime, "draining");
@@ -1419,7 +1472,7 @@ def test_ambiguous_relaunch_response_locks_form_with_reload_guidance() -> None:
     result = _run_node_detail_scenario(
         r"""
 const oldTask = {
-  hostname: "gpu01", current_step: "complete",
+  hostname: "gpu01", current_step: "complete", attempt_id: "old",
   started_at: "2026-08-05T20:00:00Z", updated_at: "2026-08-05T20:01:00Z",
   failed_step: null, error: null,
 };
@@ -1465,7 +1518,7 @@ def test_fast_terminal_llamacpp_relaunch_failure_is_not_mistaken_for_old_task() 
     result = _run_node_detail_scenario(
         r"""
 const oldTask = {
-  hostname: "gpu01", current_step: "complete",
+  hostname: "gpu01", current_step: "complete", attempt_id: "old",
   started_at: "2026-08-05T20:00:00Z", updated_at: "2026-08-05T20:01:00Z",
   failed_step: null, error: null,
 };
