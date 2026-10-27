@@ -213,6 +213,26 @@ def viewer_identity(request: Request) -> str | None:
     return None
 
 
+def nav_home_link(request: Request) -> str:
+    """Jinja global: the signed-in home link for the shared navbar.
+
+    Anonymous and admin viewers keep the operations dashboard. A normal
+    signed-in user goes to onboarding; a full-access trust-listed user goes
+    to the profile page, which is their token home.
+    """
+    from inference_proxy.config.dependencies import (
+        session_user_has_full_access,
+        viewer_role,
+    )
+
+    settings = _request_settings(request)
+    if viewer_role(request, settings) == "user":
+        if session_user_has_full_access(request, settings):
+            return "/profile"
+        return USER_HOME
+    return "/dashboard"
+
+
 def leaderboard_link_visible(request: Request) -> bool:
     """Jinja global: whether the Leaderboard link leads anywhere for the viewer.
 
@@ -228,4 +248,5 @@ templates.env.globals["static_asset_url"] = static_asset_url
 templates.env.globals["viewer_is_admin"] = viewer_is_admin
 templates.env.globals["viewer_signed_in"] = viewer_signed_in
 templates.env.globals["viewer_identity"] = viewer_identity
+templates.env.globals["nav_home_link"] = nav_home_link
 templates.env.globals["leaderboard_link_visible"] = leaderboard_link_visible
