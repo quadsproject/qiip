@@ -37,8 +37,8 @@ from inference_proxy.auth.dependencies import (
 from inference_proxy.auth.models import (
     CreatedToken,
     CreateTokenRequest,
+    ProfileUser,
     PublicToken,
-    PublicUser,
     User,
 )
 from inference_proxy.auth.scopes import (
@@ -97,9 +97,9 @@ async def profile_page(request: Request) -> HTMLResponse:
 async def profile_me(
     user: Annotated[User, Depends(require_profile_user)],
     settings: Annotated[Settings, Depends(get_settings)],
-) -> PublicUser:
+) -> ProfileUser:
     """Return the signed-in user's public identity (used by the page)."""
-    return PublicUser(
+    return ProfileUser(
         id=user.id,
         email=user.email,
         name=user.name,

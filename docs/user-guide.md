@@ -11,9 +11,9 @@ configured: a Google account (Google OAuth must be enabled by the operator;
 if your domain is restricted, it has to be on the gateway allowlist), or a
 local account on small installs that run the opt-in local OIDC provider
 (the Local Login form; the operator hands out the username/password). Once
-signed in you land on `/start`, your home page. Every operations page
-(`/dashboard`, `/models`, `/profile`, the admin pages) sends a normal user
-back there.
+signed in you land on `/start`, your home page. The operational pages
+(`/dashboard`, `/models`, and the admin pages) send a normal user back there.
+Your `/profile` page stays available for your tokens and usage.
 
 ## Chat playground
 

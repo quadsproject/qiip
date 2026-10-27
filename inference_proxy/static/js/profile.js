@@ -124,6 +124,19 @@
     return button;
   }
 
+  function tokenScope(token) {
+    if (token.name === "agent-config") return "Config (agent)";
+    if (token.endpoint_scope === null || token.endpoint_scope === undefined) {
+      if (token.model_scope && token.model_scope.length) {
+        return token.model_scope.join(", ");
+      }
+      return "Full access";
+    }
+    return token.endpoint_scope.length
+      ? token.endpoint_scope.join(", ")
+      : "None";
+  }
+
   async function loadTokens() {
     const body = $("tokens-table-body");
     let tokens = [];
@@ -167,17 +180,7 @@
         )
       );
       row.appendChild(tdCell(token.revoked ? "revoked" : "active"));
-      row.appendChild(
-        tdCell(
-          token.name === "agent-config"
-            ? "Config (agent)"
-            : token.endpoint_scope === null
-              ? "Full access"
-              : token.endpoint_scope.length
-                ? token.endpoint_scope.join(", ")
-                : "None"
-        )
-      );
+      row.appendChild(tdCell(tokenScope(token)));
       const actions = document.createElement("td");
       actions.appendChild(revokeButton(token));
       row.appendChild(actions);

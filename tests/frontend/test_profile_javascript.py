@@ -337,6 +337,15 @@ def test_revoked_tokens_are_dropped_from_display() -> None:
     assert "token-3" in result["rowNames"]
 
 
+def test_model_scoped_token_is_not_labelled_full_access() -> None:
+    token = _token(1, False)
+    token["model_scope"] = ["qwen3-coder"]
+
+    result = _run([token], [])
+
+    assert result["rowScopes"] == ["qwen3-coder"]
+
+
 def test_agent_config_token_is_labeled_distinctly() -> None:
     agent = _token(1, False)
     agent["name"] = "agent-config"
