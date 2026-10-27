@@ -55,6 +55,17 @@ class ProvisioningStep(StrEnum):
     FAILED = "failed"
 
 
+TEARDOWN_STEPS = frozenset(
+    {
+        ProvisioningStep.DRAINING,
+        ProvisioningStep.STOPPING_VLLM,
+        ProvisioningStep.STOPPING_LLAMACPP,
+        ProvisioningStep.DEREGISTERING,
+    }
+)
+TEARDOWN_FAILED_STEP = "teardown"
+
+
 class ProvisioningResumeState(StrEnum):
     """Operator action required before a fresh, fully probed setup retry."""
 

@@ -90,6 +90,7 @@ from inference_proxy.provisioning.ssh_client import (
     RemoteCommandError,
     SSHConnectionError,
 )
+from inference_proxy.provisioning.state import TEARDOWN_FAILED_STEP, TEARDOWN_STEPS
 from inference_proxy.quads.client import (
     QUADSClient,
     QUADSConnectionError,
@@ -585,6 +586,30 @@ async def setup_node(
                         "requests to finish or complete teardown"
                     ),
                 )
+
+        try:
+            task = await _task_for_host(provisioner, hostname)
+        except Exception as exc:
+            logger.exception("provisioning_task_lookup_failed", hostname=hostname)
+            raise HTTPException(
+                status_code=503, detail="Could not inspect the provisioning task"
+            ) from exc
+        if task is not None and task.current_step in TEARDOWN_STEPS:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Host '{hostname}' is still tearing down; wait for "
+                    "teardown to finish before starting setup"
+                ),
+            )
+        if task is not None and task.failed_step == TEARDOWN_FAILED_STEP:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Host '{hostname}' has a failed teardown; retry teardown "
+                    "before starting setup"
+                ),
+            )
 
         try:
             await _validate_setup_selection(provisioner, selection)
