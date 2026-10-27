@@ -309,7 +309,7 @@ async def test_provision_blocks_when_host_active(
     assert state["current_step"] == "failed"
     assert state["failed_step"] == "reconcile"
     assert state["attempt_id"] is None
-    assert state["engine"] == "vllm"
+    assert state["engine"] is None
     assert "still active on the node" in state["error"]
 
 
@@ -351,6 +351,35 @@ async def test_reconcile_gate_does_not_inherit_previous_attempt_state(
     assert state["progress"] is None
     assert state["failure_class"] is None
     assert state["next_action"] is None
+
+
+@pytest.mark.asyncio
+async def test_reconcile_gate_records_latest_attempt_engine(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provisioner, _ssh, store = harness
+    store.create(
+        "host1",
+        engine=InferenceEngine.LLAMA_CPP.value,
+        operation="provision",
+        bundle_version="sha256:abc",
+    )
+    monkeypatch.setattr(
+        provisioner._remote_logs,
+        "host_active",
+        AsyncMock(return_value={"active": True, "status": "running"}),
+    )
+
+    with pytest.raises(ProvisioningError, match="still active on the node"):
+        await provisioner.provision("host1", model="org/model")
+
+    state = json.loads(
+        cast(MagicMock, provisioner._etcd_client).put.call_args_list[-1].args[1]
+    )
+    assert state["current_step"] == "failed"
+    assert state["failed_step"] == "reconcile"
+    assert state["engine"] == InferenceEngine.LLAMA_CPP.value
 
 
 @pytest.mark.asyncio

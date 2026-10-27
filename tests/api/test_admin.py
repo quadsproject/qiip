@@ -1796,7 +1796,7 @@ class TestTeardownEndpoint:
             lifecycle_lease=ANY,
         )
 
-    def test_unregistered_host_without_task_engine_returns_404(
+    def test_unregistered_host_without_task_engine_returns_recovery_guidance(
         self,
         client: TestClient,
         mock_provisioner: MagicMock,
@@ -1814,7 +1814,11 @@ class TestTeardownEndpoint:
 
         response = client.delete("/admin/nodes/gpu01")
 
-        assert response.status_code == 404
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "force=true" in detail
+        assert "recovery_engine" in detail
+        mock_provisioner.fire_background.assert_not_called()
 
     def test_unregistered_host_with_completed_task_returns_404(
         self,
