@@ -13,6 +13,7 @@ from structlog.testing import capture_logs
 from inference_proxy.huggingface.catalog import (
     CatalogEntry,
     ModelCatalogService,
+    ModelNotCachedError,
     _SnapshotCheck,
 )
 
@@ -67,8 +68,8 @@ def _write_cached_snapshot(
     *,
     present_files: set[str],
     write_manifest: bool = True,
+    commit: str = "a" * 40,
 ) -> Path:
-    commit = "a" * 40
     repo_dir = cache_dir / f"models--{repo_id.replace('/', '--')}"
     snapshot_dir = repo_dir / "snapshots" / commit
     snapshot_dir.mkdir(parents=True)
@@ -78,12 +79,12 @@ def _write_cached_snapshot(
         path.write_text("cached", encoding="utf-8")
 
     refs_dir = repo_dir / "refs"
-    refs_dir.mkdir()
+    refs_dir.mkdir(exist_ok=True)
     (refs_dir / "main").write_text(commit, encoding="utf-8")
 
     if write_manifest:
         trees_dir = repo_dir / "trees"
-        trees_dir.mkdir()
+        trees_dir.mkdir(exist_ok=True)
         (trees_dir / f"{commit}.json").write_text(
             json.dumps(
                 {
@@ -373,3 +374,65 @@ class TestListModels:
 
         assert result.cache_warning_count == 2
         assert result.invalid_artifact_count == 0
+
+
+class TestDeleteModel:
+    @pytest.mark.asyncio
+    async def test_deletes_every_revision_and_leaves_other_repositories(
+        self, tmp_path: Path
+    ) -> None:
+        target = _write_cached_snapshot(
+            tmp_path, "org/target", present_files={"model.safetensors"}
+        )
+        _write_cached_snapshot(
+            tmp_path,
+            "org/target",
+            present_files={"model.safetensors"},
+            commit="b" * 40,
+        )
+        # Hugging Face keys revisions by commit hash across the whole cache.
+        # A mirror may share a commit with its source; deleting one repository
+        # must not remove the other.
+        other = _write_cached_snapshot(
+            tmp_path, "org/other", present_files={"model.safetensors"}
+        )
+        service = ModelCatalogService(str(tmp_path))
+
+        deleted = await service.delete_model("org/target")
+
+        assert deleted.repo_id == "org/target"
+        assert deleted.revision_count == 2
+        assert deleted.freed_bytes > 0
+        assert not target.exists()
+        assert other.is_dir()
+
+    @pytest.mark.asyncio
+    async def test_missing_repository_is_not_cached(self, tmp_path: Path) -> None:
+        service = ModelCatalogService(str(tmp_path))
+
+        with pytest.raises(ModelNotCachedError, match="is not present in the cache"):
+            await service.delete_model("org/missing")
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
+    async def test_dataset_with_matching_id_is_not_deletable(
+        self, mock_scan: MagicMock
+    ) -> None:
+        mock_scan.return_value = _mock_cache_info(
+            [_mock_repo("org/dataset", repo_type="dataset", revisions=("a" * 40,))]
+        )
+        service = ModelCatalogService(cache_dir="/data/hf")
+
+        with pytest.raises(ModelNotCachedError, match="is not present in the cache"):
+            await service.delete_model("org/dataset")
+
+    @pytest.mark.asyncio
+    @patch("inference_proxy.huggingface.catalog.scan_cache_dir")
+    async def test_repository_without_revisions_is_rejected(
+        self, mock_scan: MagicMock
+    ) -> None:
+        mock_scan.return_value = _mock_cache_info([_mock_repo("org/empty")])
+        service = ModelCatalogService(cache_dir="/data/hf")
+
+        with pytest.raises(ModelNotCachedError, match="has no cached revisions"):
+            await service.delete_model("org/empty")

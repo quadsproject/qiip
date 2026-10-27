@@ -41,8 +41,13 @@ from inference_proxy.discovery.registry import NodeRegistry
 from inference_proxy.huggingface.catalog import (
     ModelCatalogResponse,
     ModelCatalogService,
+    ModelNotCachedError,
 )
-from inference_proxy.huggingface.downloader import DownloadService
+from inference_proxy.huggingface.downloader import (
+    ActiveDownloadError,
+    CacheDeletionInProgressError,
+    DownloadService,
+)
 from inference_proxy.llmfit.errors import LLMFitParseError, LLMFitTimeoutError
 from inference_proxy.llmfit.runner import LLMFitRunner
 from inference_proxy.models.admin import (
@@ -53,6 +58,7 @@ from inference_proxy.models.admin import (
     DownloadStatusResponse,
     LlamaCppRelaunchRequest,
     LlamaCppRelaunchResponse,
+    ModelDeleteResponse,
     OwnerUpdateRequest,
     PowerActionRequest,
     PowerStateResponse,
@@ -277,12 +283,15 @@ async def trigger_download(
     Returns 202 for new downloads. Duplicate POSTs for an in-progress
     download return 200 with the existing status (D-10).
     """
-    result = await svc.trigger_download(
-        body.repo_id,
-        revision=body.revision,
-        engine=body.engine,
-        gguf=body.gguf,
-    )
+    try:
+        result = await svc.trigger_download(
+            body.repo_id,
+            revision=body.revision,
+            engine=body.engine,
+            gguf=body.gguf,
+        )
+    except CacheDeletionInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     response.status_code = 202 if result.started else 200
     return result.status
 
@@ -293,6 +302,53 @@ async def list_downloads(
 ) -> list[DownloadStatusResponse]:
     """Return status of all tracked downloads (DL-03)."""
     return svc.get_all_statuses()
+
+
+@admin_router.delete("/models/cache/{repo_id:path}")
+async def delete_cached_model(
+    repo_id: str,
+    catalog: ModelCatalogService = Depends(get_catalog_service),
+    downloads: DownloadService = Depends(get_download_service),
+    registry: NodeRegistry = Depends(get_registry),
+) -> ModelDeleteResponse:
+    """Delete every cached revision of one model repository.
+
+    The deletion is explicit and coordinated with the download service. A
+    registered node that still reports the model as its current identity blocks
+    the deletion because its running engine may need the snapshot to restart.
+    """
+    in_use_by = sorted(
+        {node.node_id for node in registry.get_all() if node.model == repo_id}
+    )
+    if in_use_by:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot delete '{repo_id}': registered node(s) still reference "
+                f"it ({', '.join(in_use_by)}). Tear them down or remove them "
+                "before deleting the cached model."
+            ),
+        )
+
+    try:
+        deleted = await downloads.run_cache_deletion(
+            repo_id, lambda: catalog.delete_model(repo_id)
+        )
+    except ActiveDownloadError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete '{repo_id}': a download is in progress.",
+        ) from exc
+    except CacheDeletionInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ModelNotCachedError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return ModelDeleteResponse(
+        repo_id=deleted.repo_id,
+        revision_count=deleted.revision_count,
+        freed_bytes=deleted.freed_bytes,
+    )
 
 
 @admin_router.post("/nodes/pool", status_code=201)

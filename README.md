@@ -50,7 +50,7 @@ Clients ──► NGINX ──► Inference Proxy  ──► vLLM Node A
 - **Node teardown** -- graceful shutdown with connection draining, force teardown option, and provisioning task cancellation
 - **Provisioning log streaming** -- live SSE stream of provisioning and inference engine logs viewable in the dashboard
 - **BMC power management (Redfish)** -- query and control node power state; supports On, ForceOff, GracefulRestart, and ForceRestart
-- **Model catalog** -- scans shared NFS-mounted HuggingFace cache, verifies model completeness via tree manifests, exposed via `/admin/models/catalog`
+- **Model catalog** -- scans the shared NFS-mounted HuggingFace cache, verifies model completeness via tree manifests, and exposes the result at `/admin/models/catalog`. Admins can delete an unused cached repository from the Models page or its admin API
 - **Background model downloads** -- concurrent HuggingFace downloads with status tracking; duplicate-safe and re-downloadable after completion or failure
 - **Hardware-aware model recommendations** -- runs llmfit via SSH on a target host to produce ranked, runtime-normalized recommendations with fit levels, throughput, memory estimates, and typed GGUF sources; auto-installs the binary on first use
 - **Request metrics** -- per-model and per-node counters exposed via `/admin/metrics`
@@ -458,6 +458,7 @@ Admin-authenticated endpoints (HTTP Basic or admin-role session):
 | `GET` | `/admin/models/catalog` | Verified models in the shared HuggingFace cache |
 | `POST` | `/admin/models/download` | Start or inspect a duplicate-safe model download |
 | `GET` | `/admin/models/downloads` | List tracked model-download states |
+| `DELETE` | `/admin/models/cache/{repo_id}` | Delete every cached revision of one model repository; 409 while a download is active or a registered node references it |
 | `POST` | `/admin/nodes/setup` | Start background node provisioning |
 | `POST` | `/admin/nodes/pool` | Add a node to the available pool, or adopt an already-running OpenAI-compatible server; `"admin_only": true` registers an admin-only server (implies `self_setup`) |
 | `POST` | `/admin/nodes/{hostname}/llamacpp/relaunch` | Drain and relaunch a healthy managed llama.cpp node with a typed sizing policy |
@@ -1650,9 +1651,16 @@ guesses a GGUF download request: it shows `No GGUF source`, `Not downloaded`,
 
 Re-downloading a mutable branch after it advances creates a distinct artifact
 generation because identity uses the resolved SHA. QIIP never automatically
-deletes snapshots. A persisted artifact ID resolves only while its native
-snapshot and exact GGUF file family remain in the shared cache, so coordinate
-retention with every running or restartable node that records that ID.
+deletes snapshots. An admin can explicitly remove a cached model with the
+Delete action on the Models page or the admin API endpoint
+`DELETE /admin/models/cache/{repo_id}`. Every cached revision of that
+repository is removed. The request is rejected with 409 while a download for
+the same repository is active or while any registered node still reports the
+model as its current identity. Tear the node down first when its engine may
+need the snapshot to restart. A persisted artifact ID resolves only while its
+native snapshot and exact GGUF file family remain in the shared cache, and a
+placement profile that references a deleted revision reports the file as
+missing until it is downloaded again.
 
 ### Proxy (HTTP client)
 
