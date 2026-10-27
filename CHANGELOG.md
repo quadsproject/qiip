@@ -2,6 +2,39 @@
 
 <!-- version list -->
 
+## v0.2.0-dev.29 (2026-10-27)
+
+### Bug Fixes
+
+- Ignore benign journal and split-log issues
+  ([`a29f8a9`](https://github.com/quadsproject/qiip/commit/a29f8a92c4823e6bef6e3a016c56d20ea17d0759))
+
+- Keep multibyte log splits out of truncation
+  ([`89354fd`](https://github.com/quadsproject/qiip/commit/89354fde9057bd089f61917b8737f37c6ca9e469))
+
+- Reconnect logs for a new task after a terminal stream
+  ([`21eca71`](https://github.com/quadsproject/qiip/commit/21eca717023be08e7a0433cc255d87b211b8db56))
+
+- Switch log stream when a new task replaces an open stream
+  ([`4bc55a5`](https://github.com/quadsproject/qiip/commit/4bc55a529dc3ba8a785cc5ecaf4ba8a901e00268))
+
+- Treat journal parse failure as an issue
+  ([`9e91f29`](https://github.com/quadsproject/qiip/commit/9e91f2918bdcd77f578a5db40cb078f1f25e95bc))
+
+- Wait for the new task attempt before opening logs
+  ([`28f1c11`](https://github.com/quadsproject/qiip/commit/28f1c11e96c867f9668883663dc8e53b409d3319))
+
+### Chores
+
+- Refresh uv.lock after version bump
+  ([`0914035`](https://github.com/quadsproject/qiip/commit/0914035f63c9b52966fbe2fa964143b216b357cb))
+
+### Features
+
+- Delete cached models from the admin UI
+  ([`8e62ab7`](https://github.com/quadsproject/qiip/commit/8e62ab7689466009a641cc677950154976605e94))
+
+
 ## v0.2.0-dev.28 (2026-10-27)
 
 ### Bug Fixes
