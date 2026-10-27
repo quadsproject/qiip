@@ -30,6 +30,17 @@ from log_store import AttemptLogStore, timestamp  # noqa: E402
 BENIGN_JOURNAL_STDERR = ("Failed to parse timestamp:",)
 
 
+def _record_cut(pending: bytearray, limit: int) -> int:
+    """Cut before a split UTF-8 codepoint so re-encoding cannot truncate again."""
+    end = min(limit, len(pending))
+    try:
+        bytes(pending[:end]).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if exc.reason == "unexpected end of data" and exc.start:
+            return exc.start
+    return end
+
+
 def journal_since(value: str) -> str:
     """Return a journalctl-compatible epoch selector for an ISO timestamp."""
     return f"@{int(datetime.fromisoformat(value).timestamp())}"
@@ -291,9 +302,9 @@ def worker(config):
                 pending.extend(chunk)
                 while b"\n" in pending or len(pending) >= config["max_record_bytes"]:
                     newline = pending.find(b"\n")
-                    length = min(
-                        newline if newline >= 0 else len(pending),
-                        config["max_record_bytes"],
+                    limit = config["max_record_bytes"]
+                    length = _record_cut(
+                        pending, newline if 0 <= newline <= limit else limit
                     )
                     emit(source, bytes(pending[:length]))
                     del pending[: length + (1 if newline == length else 0)]
@@ -452,9 +463,9 @@ def worker(config):
                 pending.extend(chunk)
                 while b"\n" in pending or len(pending) >= config["max_record_bytes"]:
                     newline = pending.find(b"\n")
-                    length = min(
-                        newline if newline >= 0 else len(pending),
-                        config["max_record_bytes"],
+                    limit = config["max_record_bytes"]
+                    length = _record_cut(
+                        pending, newline if 0 <= newline <= limit else limit
                     )
                     emit(source, bytes(pending[:length]))
                     del pending[: length + (1 if newline == length else 0)]
@@ -611,14 +622,12 @@ def capture_engine_output(config, store):
                 buffered += len(chunk)
                 while b"\n" in pending or len(pending) >= config["max_record_bytes"]:
                     newline = pending.find(b"\n")
-                    length = min(
-                        newline if newline >= 0 else len(pending),
-                        config["max_record_bytes"],
+                    limit = config["max_record_bytes"]
+                    length = _record_cut(
+                        pending, newline if 0 <= newline <= limit else limit
                     )
                     line(bytes(pending[:length]))
                     del pending[: length + (1 if newline == length else 0)]
-                    if newline < 0 or newline > length:
-                        issues.add("Long engine line split by record byte limit")
                 tail = chunk[-tail_limit:]
                 if size + len(tail) > tail_limit:
                     output.seek(0)

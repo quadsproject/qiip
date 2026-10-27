@@ -645,6 +645,54 @@ async def test_expected_long_line_split_is_not_an_issue(
 
 
 @pytest.mark.asyncio
+async def test_multibyte_long_line_split_stays_within_record_limit(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    provisioner, _ssh, store = harness
+    provisioner._settings.log_max_entry_bytes = 64
+    provisioner._begin_log("host1", InferenceEngine.VLLM)
+    attempt = provisioner.log_buffer.attempts["host1"]
+    collector = provisioner._remote_logs
+    assert collector is not None
+    command = (
+        "python3 -c 'import sys; "
+        'sys.stdout.buffer.write(b"x" + b"\\xc3\\xa9" * 50 + b"\\n")\''
+    )
+    async for _ in collector.run("host1", command, stage="setup"):
+        pass
+
+    manifest = store.get(attempt)
+    issues = manifest.get("issues") or []
+    assert not any("Record truncated by byte limit" in issue for issue in issues)
+
+
+@pytest.mark.asyncio
+async def test_engine_long_line_is_not_an_issue(
+    harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
+) -> None:
+    provisioner, ssh, store = harness
+    provisioner._settings.log_max_entry_bytes = 64
+    provisioner._begin_log("host1", InferenceEngine.VLLM)
+    attempt = provisioner.log_buffer.attempts["host1"]
+    collector = provisioner._remote_logs
+    assert collector is not None
+    raw_path = ssh.root / "logs" / f"{attempt}.engine.log"
+    async for _ in collector.run(
+        "host1",
+        "printf '%200s\\n' x | python3 common/provision-logs.py engine",
+        stage="start",
+        timeout=5,
+        engine_log=str(raw_path),
+    ):
+        pass
+    await collector.collect(attempt, finish=True)
+
+    issues = store.get(attempt).get("issues") or []
+    assert not any("Long engine line split" in issue for issue in issues)
+    assert not any("Record truncated by byte limit" in issue for issue in issues)
+
+
+@pytest.mark.asyncio
 async def test_engine_sink_rotation_bounds_raw_and_durable_output(
     harness: tuple[NodeProvisioner, LocalNodeSSH, AttemptLogStore],
 ) -> None:
