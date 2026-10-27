@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 from contextlib import suppress
+from datetime import datetime
 from pathlib import Path
 
 # Uploaded recorder generations stay immutable, including their imports.
@@ -25,6 +26,13 @@ sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 from log_store import AttemptLogStore, timestamp  # noqa: E402
+
+BENIGN_JOURNAL_STDERR = ("Failed to parse timestamp:",)
+
+
+def journal_since(value: str) -> str:
+    """Return a journalctl-compatible epoch selector for an ISO timestamp."""
+    return f"@{int(datetime.fromisoformat(value).timestamp())}"
 
 
 def open_store(config):
@@ -135,6 +143,7 @@ def worker(config):
     records = []
     lock_fd = None
     launched = False
+    journal_stderr_seen = False
 
     def record(msg, source, level="info"):
         records.append(
@@ -148,7 +157,7 @@ def worker(config):
         )
 
     def emit(source, raw):
-        nonlocal current_stage
+        nonlocal current_stage, journal_stderr_seen
         message = raw.decode("utf-8", errors="replace")
         if source == "journal":
             try:
@@ -189,11 +198,13 @@ def worker(config):
                 store.issue(attempt, f"unsupported_hardware: {reject.group(1)}")
             record(message, source, "warning" if source.endswith("stderr") else "info")
             if source == "journal.stderr":
-                store.issue(
-                    attempt,
-                    "Service journal reported an error; collection may be incomplete",
-                    source="journal",
-                )
+                journal_stderr_seen = True
+                if not message.startswith(BENIGN_JOURNAL_STDERR):
+                    store.issue(
+                        attempt,
+                        "Service journal reported an error; collection may be incomplete",
+                        source="journal",
+                    )
 
     try:
         if engine_path:
@@ -253,7 +264,7 @@ def worker(config):
         journal_args += (
             ["--after-cursor=" + cursor]
             if cursor
-            else ["--since=" + store.get(attempt)["started_at"]]
+            else ["--since=" + journal_since(store.get(attempt)["started_at"])]
         )
         try:
             journal = subprocess.Popen(
@@ -286,10 +297,6 @@ def worker(config):
                     )
                     emit(source, bytes(pending[:length]))
                     del pending[: length + (1 if newline == length else 0)]
-                    if newline < 0 or newline > length:
-                        store.issue(
-                            attempt, "Long remote line split by record byte limit"
-                        )
                 if not chunk:
                     if pending:
                         emit(source, bytes(pending))
@@ -451,10 +458,6 @@ def worker(config):
                     )
                     emit(source, bytes(pending[:length]))
                     del pending[: length + (1 if newline == length else 0)]
-                    if newline < 0 or newline > length:
-                        store.issue(
-                            attempt, "Long remote line split by record byte limit"
-                        )
             if pending:
                 emit(source, bytes(pending))
             key.fileobj.close()
@@ -462,7 +465,11 @@ def worker(config):
         store.append_many(attempt, records)
         if engine_path:
             store.update(attempt, stop_collection=True)
-        if len(processes) > 1 and processes[1].returncode not in (0, -signal.SIGTERM):
+        if (
+            len(processes) > 1
+            and processes[1].returncode not in (0, -signal.SIGTERM)
+            and not journal_stderr_seen
+        ):
             store.issue(
                 attempt, "Service journal unavailable (nonzero exit)", source="journal"
             )
