@@ -854,6 +854,7 @@ var logStreamStarted = false;
 var logResumeCursor = null;
 var logObservedTaskIdentity = "";
 var logStreamTaskIdentity = "";
+var logTaskAttemptId = "";
 var LOG_RECONNECT_BASE_MS = 1000;
 var LOG_RECONNECT_MAX_DELAY_MS = 30000;
 var LOG_RECONNECT_MAX_ELAPSED_MS = 5 * 60 * 1000;
@@ -872,6 +873,7 @@ function updateLogTaskState(tasks) {
   var latestIdentity = latest
     ? String(latest.attempt_id || latest.started_at || "")
     : "";
+  var latestAttemptId = latest ? String(latest.attempt_id || "") : "";
   if (
     logStreamStarted &&
     logStreamTaskIdentity &&
@@ -880,6 +882,8 @@ function updateLogTaskState(tasks) {
   ) {
     resetLogStreamState();
   }
+  logObservedTaskIdentity = latestIdentity;
+  logTaskAttemptId = latestAttemptId;
   if (logTaskTerminal) {
     // Let an active stream deliver its final buffered entries. If it already
     // disconnected, terminal task state cancels the pending reconnect.
@@ -894,8 +898,9 @@ function updateLogTaskState(tasks) {
   // open a fresh EventSource.
   else if (wasTerminal && logStreamDone) {
     resetLogStreamState();
+    logObservedTaskIdentity = latestIdentity;
+    logTaskAttemptId = latestAttemptId;
   }
-  logObservedTaskIdentity = latestIdentity;
 
   // A successful task poll proves the operation is still observable. A later
   // task-API outage gets a fresh, bounded reconnect window.
@@ -938,6 +943,7 @@ function resetLogStreamState() {
   logResumeCursor = null;
   logObservedTaskIdentity = "";
   logStreamTaskIdentity = "";
+  logTaskAttemptId = "";
   logStreamStarted = false;
 }
 
@@ -973,6 +979,17 @@ function connectLogStream() {
   var output = document.getElementById("logs-output");
   var status = document.getElementById("logs-status");
 
+  if (!logResumeCursor && !logTaskAttemptId && logObservedTaskIdentity) {
+    if (logTaskTerminal) {
+      finishLogStream("no logs for this attempt", "badge badge-failed");
+      logStreamStarted = true;
+      return;
+    }
+    status.textContent = "waiting for logs";
+    status.className = "badge badge-in-progress";
+    return;
+  }
+
   if (!logReceivedAny) output.textContent = "";
   status.textContent = "connecting";
   status.className = "badge badge-in-progress";
@@ -980,6 +997,8 @@ function connectLogStream() {
   var logUrl = "/admin/provisioning/" + encodeURIComponent(NODE_ID) + "/logs";
   if (logResumeCursor) {
     logUrl += "?attempt_id=" + encodeURIComponent(logResumeCursor.attempt) + "&after=" + logResumeCursor.after;
+  } else if (logTaskAttemptId) {
+    logUrl += "?attempt_id=" + encodeURIComponent(logTaskAttemptId);
   }
   var es = new EventSource(logUrl);
   logSource = es;
