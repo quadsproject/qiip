@@ -18,8 +18,9 @@
     <div class="ob-progress" aria-hidden="true"><div class="ob-progress-bar" id="ob-progress-bar"></div></div>
 
     <header class="ob-top">
-        <img class="ob-logo" src="{{ static_asset_url(request, 'img/qiip.svg') }}" alt="qiip" width="40" height="33">
-        <a class="ob-link" href="/leaderboard">Leaderboard</a>
+        <a class="ob-logo-link" href="/leaderboard" aria-label="Open leaderboard">
+            <img class="ob-logo" src="{{ static_asset_url(request, 'img/qiip.svg') }}" alt="qiip" width="40" height="33">
+        </a>
         {% include "partials/account_actions.html" %}
     </header>
 
