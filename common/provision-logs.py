@@ -27,8 +27,6 @@ os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 from log_store import AttemptLogStore, timestamp  # noqa: E402
 
-BENIGN_JOURNAL_STDERR = ("Failed to parse timestamp:",)
-
 
 def _record_cut(pending: bytearray, limit: int) -> int:
     """Cut before a split UTF-8 codepoint so re-encoding cannot truncate again."""
@@ -154,7 +152,6 @@ def worker(config):
     records = []
     lock_fd = None
     launched = False
-    journal_stderr_seen = False
 
     def record(msg, source, level="info"):
         records.append(
@@ -168,7 +165,7 @@ def worker(config):
         )
 
     def emit(source, raw):
-        nonlocal current_stage, journal_stderr_seen
+        nonlocal current_stage
         message = raw.decode("utf-8", errors="replace")
         if source == "journal":
             try:
@@ -209,13 +206,11 @@ def worker(config):
                 store.issue(attempt, f"unsupported_hardware: {reject.group(1)}")
             record(message, source, "warning" if source.endswith("stderr") else "info")
             if source == "journal.stderr":
-                journal_stderr_seen = True
-                if not message.startswith(BENIGN_JOURNAL_STDERR):
-                    store.issue(
-                        attempt,
-                        "Service journal reported an error; collection may be incomplete",
-                        source="journal",
-                    )
+                store.issue(
+                    attempt,
+                    "Service journal reported an error; collection may be incomplete",
+                    source="journal",
+                )
 
     try:
         if engine_path:
@@ -476,10 +471,9 @@ def worker(config):
         store.append_many(attempt, records)
         if engine_path:
             store.update(attempt, stop_collection=True)
-        if (
-            len(processes) > 1
-            and processes[1].returncode not in (0, -signal.SIGTERM)
-            and not journal_stderr_seen
+        if len(processes) > 1 and processes[1].returncode not in (
+            0,
+            -signal.SIGTERM,
         ):
             store.issue(
                 attempt, "Service journal unavailable (nonzero exit)", source="journal"
