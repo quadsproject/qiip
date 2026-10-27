@@ -732,6 +732,47 @@ installDetailFetch([{
     }
 
 
+def test_external_new_task_after_terminal_stream_starts_fresh_stream() -> None:
+    result = _run_node_detail_scenario(
+        r"""
+const terminal = {
+  hostname: "gpu01", current_step: "complete",
+  started_at: "2026-08-05T20:00:00Z", updated_at: "2026-08-05T20:01:00Z",
+  failed_step: null, error: null,
+};
+const active = {
+  hostname: "gpu01", current_step: "vllm_install",
+  started_at: "2026-08-05T21:00:00Z", updated_at: "2026-08-05T21:00:01Z",
+  failed_step: null, error: null,
+};
+installDetailFetch([terminal], true);
+(async function () {
+  await sandbox.refreshDetail();
+  const first = eventSources[0];
+  first.emit("error");
+  const doneAfterTerminal = sandbox.logStreamDone;
+  installDetailFetch([active], true);
+  await sandbox.refreshDetail();
+  process.stdout.write(JSON.stringify({
+    doneAfterTerminal,
+    sourceCount: eventSources.length,
+    firstClosed: first.closed,
+    done: sandbox.logStreamDone,
+    status: byId("logs-status").textContent,
+  }));
+})().catch(function (error) { console.error(error); process.exit(1); });
+"""
+    )
+
+    assert result == {
+        "doneAfterTerminal": True,
+        "sourceCount": 2,
+        "firstClosed": True,
+        "done": False,
+        "status": "connecting",
+    }
+
+
 def test_log_reconnect_stops_when_task_status_stays_unavailable() -> None:
     result = _run_node_detail_scenario(
         r"""
