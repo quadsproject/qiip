@@ -118,8 +118,27 @@ gh pr create --repo quadsproject/qiip \
   --body "Linear replay of development's non-merge commits onto main. No squash; no merge commits."
 ```
 
-If an older sync PR exists that cannot be rebase-merged, close it as superseded
-and link the new PR in the close comment. Its discussion and commit history
+If an older sync PR exists that cannot be rebase-merged, preserve its record
+before closing it as superseded:
+
+```bash
+gh pr view <old-pr-number> --repo quadsproject/qiip \
+  --json body --jq .body > <workdir>/old-sync-pr-body.md
+git log --reverse --no-merges \
+  --format='- [`%h`](../../commit/%H) %s, @%an <%ae>' \
+  origin/main..origin/development > <workdir>/sync-commits.md
+```
+
+Put the held PR body under a `## Superseded sync record` section in the new
+sync PR body, and put the complete generated list under `## Replayed commits`.
+Do not truncate or summarize the old body: it is the record of the previous
+reconcile and every commit and author. Note any patch-identical commit that was
+already on `main` under another SHA. The current body and 139-commit manifest
+fit comfortably in a GitHub PR body; if a future body exceeds the PR limit,
+commit the two files under `docs/releases/` on the sync branch instead.
+
+Close the old PR with a comment that links the new sync PR and states that its
+body and commit manifest were carried over. Its discussion and commit history
 remain available for review.
 
 Wait for the required checks, then merge with rebase:
@@ -229,6 +248,7 @@ Resume normal development merges only after this check passes. Do not rewrite
 - [ ] Stable `pyproject.toml` version restored and `uv.lock` refreshed.
 - [ ] Sync branch tree differs from development only in the version files.
 - [ ] Checks pass on the sync branch.
+- [ ] Old sync PR body and full commit manifest preserved in the new sync PR.
 - [ ] Sync PR merged with rebase.
 - [ ] Release PR merged with rebase.
 - [ ] `v<version>` tag and GitHub release exist.
