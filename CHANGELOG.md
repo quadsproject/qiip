@@ -2,6 +2,245 @@
 
 <!-- version list -->
 
+## v0.2.0 (2026-10-28)
+
+### Bug Fixes
+
+- Address 0.2.0 roll-up review findings
+  ([`a468960`](https://github.com/quadsproject/qiip/commit/a468960a755712fae690a1b930ee86339cf0c9ab))
+
+- Address GPU setup review findings ([#218](https://github.com/quadsproject/qiip/pull/218),
+  [`9666bfd`](https://github.com/quadsproject/qiip/commit/9666bfd668854f682842b08e4b2f5071c1914c96))
+
+- Address llama.cpp artifact review findings
+  ([`b3745c8`](https://github.com/quadsproject/qiip/commit/b3745c8ac9e38728dd5ba51d06aea0ed2999ae93))
+
+- Address local OIDC provider review findings
+  ([`40a9228`](https://github.com/quadsproject/qiip/commit/40a9228dc1ca00326db36f2231ef3fb26fbc797b))
+
+- Address native CPU and artifact runtime review
+  ([`f46a47c`](https://github.com/quadsproject/qiip/commit/f46a47c6ef860439cde47df8b81d1fe410c5eb35))
+
+- Address review findings on redfish power gate and bmc resolver
+  ([#228](https://github.com/quadsproject/qiip/pull/228),
+  [`e1f1dd9`](https://github.com/quadsproject/qiip/commit/e1f1dd94e490f112f50b3a9e2248a92e3dd15e27))
+
+- Copy driver reboot markers directly ([#218](https://github.com/quadsproject/qiip/pull/218),
+  [`9666bfd`](https://github.com/quadsproject/qiip/commit/9666bfd668854f682842b08e4b2f5071c1914c96))
+
+- Document new setup settings and satisfy strict typing
+  ([`13a454e`](https://github.com/quadsproject/qiip/commit/13a454ef8aae2b00021e063176eb308ebd50944f))
+
+- Drop the non-admin fleet client path
+  ([`7d50717`](https://github.com/quadsproject/qiip/commit/7d50717cbbffc35c79e81817ac6dcb5c9c5845c6))
+
+- Enforce the stale bound only where placement runs
+  ([`e2f5f00`](https://github.com/quadsproject/qiip/commit/e2f5f00ac88d20e6bfa65021b0cde4bb6cae06ce))
+
+- Gate the Google sign-in option on its provider
+  ([`ff436ce`](https://github.com/quadsproject/qiip/commit/ff436cee6bcd662040c7545b16d2ae20fadcb231))
+
+- Give admins the leaderboard ranking
+  ([`01bd37f`](https://github.com/quadsproject/qiip/commit/01bd37f07a6fa7bb7078f2de159e97a51445cbe5))
+
+- Guard Copr publishes against duplicate NVRs
+  ([`118ea2b`](https://github.com/quadsproject/qiip/commit/118ea2b1ee303ae8ef64671e666a3c485e9bd15f))
+
+- Guard the same-issuer refresh and check the ID-token audience
+  ([`cc3b2c4`](https://github.com/quadsproject/qiip/commit/cc3b2c40905a6ef797c09c4bc8cc65d615d2b967))
+
+- Harden the issuer migration crash recovery
+  ([`1f778e2`](https://github.com/quadsproject/qiip/commit/1f778e2e9a3ae1d3ff33918e70495392299aed75))
+
+- Price token estimates at Sonnet 5 rates
+  ([`9f273dd`](https://github.com/quadsproject/qiip/commit/9f273dd2b31bd4200161b6ae18d024b5214654e7))
+
+- Require quads.stale_after_seconds to be at least twice poll_interval
+  ([`b1cd32d`](https://github.com/quadsproject/qiip/commit/b1cd32d4bca09a1f060efaa75753d12e03339d4a))
+
+- Run the chat playground on the user's token
+  ([`78c9d22`](https://github.com/quadsproject/qiip/commit/78c9d22a7d8c9a344daf430bc21ff2c05a88ce55))
+
+- Tell a Copr outage apart from missing dependency RPMs
+  ([`10c3af6`](https://github.com/quadsproject/qiip/commit/10c3af61d78d86b6ca56804679496979f81ba19f))
+
+- Unify the account cluster across the top bars
+  ([`ef8f040`](https://github.com/quadsproject/qiip/commit/ef8f04081dadf8bbfb89ff7beca9c0ea15c20077))
+
+- **provisioning**: Address second review round
+  ([`99708ca`](https://github.com/quadsproject/qiip/commit/99708ca609b7edf22484c926fa251338447b283a))
+
+- **provisioning**: Address setup resume review feedback
+  ([`d9edd07`](https://github.com/quadsproject/qiip/commit/d9edd0754c0ddfcc8406d78d939839d7fe441742))
+
+- **provisioning**: Retry bare 5xx download failures
+  ([`424837f`](https://github.com/quadsproject/qiip/commit/424837f963d72904387747f02c7818db5cf10d2d))
+
+- **vllm**: Address review on memory-aware sizing
+  ([`df589f3`](https://github.com/quadsproject/qiip/commit/df589f35a48bda553cb834bd5005998daadffb21))
+
+- **vllm**: Address the second review round on memory-aware sizing
+  ([`12f6fea`](https://github.com/quadsproject/qiip/commit/12f6feab757471acbe05b5274a6bfea16103b404))
+
+- **vllm**: Keep the retried plan reason consistent with the effective context
+  ([`4b3de5f`](https://github.com/quadsproject/qiip/commit/4b3de5fbc2d19553a5e8e04f07b1faa487de7732))
+
+### Chores
+
+- Absorb transient Chrome hangs in browser tests (#215)
+  ([#216](https://github.com/quadsproject/qiip/pull/216),
+  [`25c3f7d`](https://github.com/quadsproject/qiip/commit/25c3f7d911100343880240d8cdd641d6153f5467))
+
+- Drop duplicate dev release badge from README
+  ([`f800bba`](https://github.com/quadsproject/qiip/commit/f800bba67f4c2e2eb85a520ce1dc41575aacb74b))
+
+- Refresh uv.lock after version bump
+  ([`e78bb2d`](https://github.com/quadsproject/qiip/commit/e78bb2db1ff7dcca9459acdaf97d487be1f9313f))
+
+- Refresh uv.lock after version bump
+  ([`952cc33`](https://github.com/quadsproject/qiip/commit/952cc33a87c2230500ab5d421852b41f0328a7a4))
+
+- Refresh uv.lock after version bump
+  ([`67ec929`](https://github.com/quadsproject/qiip/commit/67ec9291bff747ee57edc7f959891ce0948beb8b))
+
+- Refresh uv.lock after version bump
+  ([`670e94e`](https://github.com/quadsproject/qiip/commit/670e94efca795783252f4bbcb96613a8f6a43408))
+
+- Refresh uv.lock after version bump
+  ([`6791fa6`](https://github.com/quadsproject/qiip/commit/6791fa67138fb6d994903444222aa48f3502e669))
+
+- Refresh uv.lock after version bump
+  ([`3585431`](https://github.com/quadsproject/qiip/commit/35854316fb57bdb9c90af588e4e04cc70a2e9e4a))
+
+- Refresh uv.lock after version bump
+  ([`99d8201`](https://github.com/quadsproject/qiip/commit/99d8201af31ac1bc57102a4bb3da678e4b2ed873))
+
+- Refresh uv.lock after version bump
+  ([`59f704f`](https://github.com/quadsproject/qiip/commit/59f704ffd7aa3b90a983e74320cf553361846d85))
+
+- Refresh uv.lock after version bump
+  ([`180352d`](https://github.com/quadsproject/qiip/commit/180352d2d0159dd1e14142d06a2cd01eec1be1ba))
+
+- Refresh uv.lock after version bump
+  ([`0496752`](https://github.com/quadsproject/qiip/commit/04967527f24d3d496c93957eaacf176fc47ac2bc))
+
+- Refresh uv.lock after version bump
+  ([`441c732`](https://github.com/quadsproject/qiip/commit/441c732fc37b05ac8a03eba8a438d1e3aba53a6e))
+
+- Refresh uv.lock after version bump
+  ([`7c0b199`](https://github.com/quadsproject/qiip/commit/7c0b19902146dc396468a87bfc085c3986e6780a))
+
+- Refresh uv.lock after version bump
+  ([`912a104`](https://github.com/quadsproject/qiip/commit/912a104dee3a2f8b5b239333985eff23a16e0aa6))
+
+- Refresh uv.lock after version bump
+  ([`d7e5102`](https://github.com/quadsproject/qiip/commit/d7e5102ea9623ab4ddef2d9eaba5c781aa230a7a))
+
+- Refresh uv.lock after version bump
+  ([`7ae4097`](https://github.com/quadsproject/qiip/commit/7ae4097be2dcea2763734fc613775622c887082a))
+
+- Refresh uv.lock after version bump
+  ([`d5b291d`](https://github.com/quadsproject/qiip/commit/d5b291de10001e7be650aec6958a3a06529a8fb2))
+
+- Refresh uv.lock after version bump
+  ([`a94a1e9`](https://github.com/quadsproject/qiip/commit/a94a1e913926832d0ab60fbd6a49a98750243801))
+
+- Refresh uv.lock after version bump
+  ([`042781d`](https://github.com/quadsproject/qiip/commit/042781d19d3ac76b6235b5f56a3a647e4088494c))
+
+- Refresh uv.lock after version bump
+  ([`c56a684`](https://github.com/quadsproject/qiip/commit/c56a684a4c539fc2800661dcc9e70ec3fa1a660f))
+
+- Refresh uv.lock after version bump
+  ([`d8840bc`](https://github.com/quadsproject/qiip/commit/d8840bce717c0a8236961e8d50dc22f77740687a))
+
+- Refresh uv.lock after version bump
+  ([`d226d84`](https://github.com/quadsproject/qiip/commit/d226d84c89463abf5d6ed6addfda7b066f976169))
+
+- Refresh uv.lock after version bump
+  ([`aded796`](https://github.com/quadsproject/qiip/commit/aded796dea0aa602557c5617412304962536c859))
+
+- Refresh uv.lock after version bump
+  ([`dceb92d`](https://github.com/quadsproject/qiip/commit/dceb92d4cf51fcbd08ee02f6cc7a2ee0d24866af))
+
+- Restore stable version for the part 1 sync branch
+  ([`365ed0a`](https://github.com/quadsproject/qiip/commit/365ed0a50afe64df6045f9fee28699624423256f))
+
+- Stop diagnostics tests flaking under load
+  ([`f5160ac`](https://github.com/quadsproject/qiip/commit/f5160ac570aaad43588d095abeaef87acd98bc60))
+
+### Code Style
+
+- **tests**: Ruff format for local OIDC provider change
+  ([`531b381`](https://github.com/quadsproject/qiip/commit/531b381f60d2fd052ffee698a9678182c88592aa))
+
+### Documentation
+
+- Describe bmc credential key normalization accurately
+  ([#228](https://github.com/quadsproject/qiip/pull/228),
+  [`e1f1dd9`](https://github.com/quadsproject/qiip/commit/e1f1dd94e490f112f50b3a9e2248a92e3dd15e27))
+
+- Warn that a global SSL_CERT_FILE replaces the trust store
+  ([`32c451e`](https://github.com/quadsproject/qiip/commit/32c451e1341fa8255ba40adcea74b7fbb2772038))
+
+### Features
+
+- Add user leaderboard and token dashboard
+  ([`d617c5f`](https://github.com/quadsproject/qiip/commit/d617c5fe1ae23d9e23111e984ef87f25a3be8a78))
+
+- Auto-rediscover self-setup model drift in health cycle
+  ([`65ef1b7`](https://github.com/quadsproject/qiip/commit/65ef1b7b12c805aa61fa73e390fee1303a5827ef))
+
+- Copy the user's own token from the pages
+  ([`af4fad0`](https://github.com/quadsproject/qiip/commit/af4fad0eecc1ef91d2515eddda1ac49812f8cbdc))
+
+- Link the release RPM packages in the release notes
+  ([`170ff07`](https://github.com/quadsproject/qiip/commit/170ff07e1cd58793f6313a03a5006300bed43d12))
+
+- Local Login merges the admin and local oauth sign-in paths
+  ([`95632c4`](https://github.com/quadsproject/qiip/commit/95632c4e4056f816f7b293b742ca5e6a05d9656f))
+
+- Opt-in local OIDC auth provider (RFE #230)
+  ([`2bf1c9f`](https://github.com/quadsproject/qiip/commit/2bf1c9fd083368a56365086bf3c8c44f3501db3d))
+
+- Power on new nodes via redfish and resolve bmc creds per lab
+  ([#228](https://github.com/quadsproject/qiip/pull/228),
+  [`e1f1dd9`](https://github.com/quadsproject/qiip/commit/e1f1dd94e490f112f50b3a9e2248a92e3dd15e27))
+
+- Reuse compatible GPU drivers during setup ([#218](https://github.com/quadsproject/qiip/pull/218),
+  [`9666bfd`](https://github.com/quadsproject/qiip/commit/9666bfd668854f682842b08e4b2f5071c1914c96))
+
+- Reuse verified llama.cpp builds with bounded source fallback
+  ([`e9e12cd`](https://github.com/quadsproject/qiip/commit/e9e12cd38195943ea5765f20087d23f0e7451464))
+
+- Show token cost on the leaderboard
+  ([`8556123`](https://github.com/quadsproject/qiip/commit/85561232b3b0fead8f46a380df09371ceca08317))
+
+- Size automatic vLLM launches from available memory
+  ([`fb12176`](https://github.com/quadsproject/qiip/commit/fb1217696ca469245ca2c7d484025fa91e7552b2))
+
+- Sort the token and usage tables by column
+  ([`27980b6`](https://github.com/quadsproject/qiip/commit/27980b63ff5462fc95a5d2a209d2e1bbbe51e2e4))
+
+- Wait for QUADS to finish releasing a host before placing on it
+  ([`f1a412a`](https://github.com/quadsproject/qiip/commit/f1a412aec9bb6526f6a6d23c131089dccf6d2e1f))
+
+- **provisioning**: Resume verified stages and retry transient failures
+  ([`d0b2f56`](https://github.com/quadsproject/qiip/commit/d0b2f56217033d286370ffe88ec98b5a816bf2f0))
+
+### Testing
+
+- Guard nested BmcCredential password secrecy in repr
+  ([#228](https://github.com/quadsproject/qiip/pull/228),
+  [`e1f1dd9`](https://github.com/quadsproject/qiip/commit/e1f1dd94e490f112f50b3a9e2248a92e3dd15e27))
+
+- Satisfy strict mypy for the new auth tests
+  ([`1f20dbf`](https://github.com/quadsproject/qiip/commit/1f20dbf698fab6a8dfc281e55dcc7943ea1a17bd))
+
+- Widen timing-sensitive liveness timeouts
+  ([`06512f0`](https://github.com/quadsproject/qiip/commit/06512f055a8668f6ac413c0034aa3d407a692abf))
+
+
 ## v0.2.0-dev.24 (2026-10-20)
 
 ### Chores
