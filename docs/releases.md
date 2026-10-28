@@ -46,10 +46,13 @@ git reset --hard origin/main
 git push --force-with-lease origin development
 ```
 
-The next development release is then `v0.2.0-dev.1` (the next minor after
-`main`'s version). Do the reset only after the release tag exists and before
-new development commits land, and never rewrite `development` afterwards: the
-dev tags must stay reachable or the prerelease revision stops advancing. See
+After the reset, semantic-release computes the next prerelease from the
+commits that land after the stable tag: for example `v0.2.1-dev.1` for a fix or
+`v0.3.0-dev.1` for a feature. It does not continue the earlier
+`v0.2.0-dev.N` series, which sorts below the stable `v0.2.0`. Do the reset only
+after the release tag exists and before new development commits land, and never
+rewrite `development` afterwards: the dev tags must stay reachable or the
+prerelease revision stops advancing. See
 [maintainer-release-cycle.md](maintainer-release-cycle.md) for the full
 sequence.
 
