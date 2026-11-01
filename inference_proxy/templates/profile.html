@@ -52,7 +52,7 @@
                     </div>
                 </section>
 
-                <section class="card">
+                <section class="card" id="api-tokens">
                     <h2 class="card-title">API Tokens <button type="button" class="manual-setup-toggle" id="token-toggle">+ New token</button></h2>
                     <p id="token-required-note" class="signin-notice" hidden>
                         Agent configuration downloads mint the per-user
@@ -64,6 +64,10 @@
                     </p>
                     <form id="token-form" class="setup-form" hidden>
                         <input type="text" id="token-name" placeholder="Token name (e.g. ci-job, laptop)" maxlength="100" required aria-label="Token name">
+                        <label class="muted-status" for="token-personal">
+                            <input type="checkbox" id="token-personal" name="personal">
+                            Personal token (exportable; used by the chat playground)
+                        </label>
                         <div class="token-pin-group" id="token-pin-group">
                             <label id="token-endpoints-label">Pin to endpoints (optional)</label>
                             <div class="endpoint-picker" id="endpoint-picker">

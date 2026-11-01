@@ -133,6 +133,7 @@ class CreateTokenRequest(BaseModel):
 
     name: str = Field(min_length=1, max_length=100)
     endpoints: list[str] | None = None
+    personal: bool = False
 
     @field_validator("name")
     @classmethod

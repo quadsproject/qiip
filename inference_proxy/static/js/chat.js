@@ -290,7 +290,7 @@ async function loadModels() {
 
 // A notice means this viewer has no token to chat with: the playground stays
 // disabled instead of making unattributed anonymous requests.
-function showChatNotice(message) {
+function showChatNotice(message, linkHref, linkText) {
   failClosed();
 
   var placeholder = document.createElement("option");
@@ -304,15 +304,15 @@ function showChatNotice(message) {
   var paragraph = document.getElementById("empty-state-text");
   if (paragraph) {
     paragraph.textContent = message + " ";
-    appendStartLink(paragraph);
+    appendStartLink(paragraph, linkHref, linkText);
   }
 }
 
 // The way out of a disabled playground is always the same page.
-function appendStartLink(target) {
+function appendStartLink(target, href, text) {
   var link = document.createElement("a");
-  link.href = "/start";
-  link.textContent = "Open /start";
+  link.href = href || "/start";
+  link.textContent = text || "Open /start";
   target.appendChild(link);
 }
 
@@ -368,7 +368,32 @@ function failClosed() {
   setInputEnabled(false);
 }
 
+// A signed-in admin without a personal token is told why chat is unavailable
+// and offered the profile token manager; the page never falls back to an
+// unattributed request (issue #294).
+async function promptForPersonalToken() {
+  var create = await confirmDialog({
+    title: "No personal token",
+    message:
+      "The chat playground sends your personal token so usage is attributed. Create one now?",
+    confirmLabel: "Create personal token",
+  });
+  if (create) window.location.href = "/profile#api-tokens";
+}
+
 async function loadCredential() {
+  if (
+    typeof MISSING_PERSONAL_TOKEN !== "undefined" &&
+    MISSING_PERSONAL_TOKEN === true
+  ) {
+    showChatNotice(
+      "You don't have a personal token to chat with.",
+      "/profile#api-tokens",
+      "Open /profile"
+    );
+    await promptForPersonalToken();
+    return;
+  }
   var token = await revealCredential();
   if (token === null) {
     showChatNotice(credentialError);

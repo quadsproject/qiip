@@ -130,6 +130,40 @@ class TestTokenManagement:
         assert third.json()["token"] != first_body["token"]
         assert third.json()["id"] != first_body["id"]
 
+    def test_personal_token_keeps_the_portfolio_and_is_revealable(
+        self,
+        profile_client: TestClient,
+    ) -> None:
+        """The chat playground reveals the admin's personal token; minting it
+        must not revoke the rest of the admin's tokens (issue #294)."""
+        legacy = profile_client.post("/profile/tokens", json={"name": "ci-job"})
+        assert legacy.status_code == 201
+        personal = profile_client.post(
+            "/profile/tokens", json={"name": "chat", "personal": True}
+        )
+        assert personal.status_code == 201
+        assert personal.json()["purpose"] == "personal"
+
+        revealed = profile_client.post("/onboarding/token/reveal")
+        assert revealed.status_code == 200
+        assert revealed.json()["token"] == personal.json()["token"]
+
+        listed = profile_client.get("/profile/tokens").json()
+        active = {token["name"] for token in listed if not token["revoked"]}
+        assert {"ci-job", "chat"} <= active
+
+    def test_personal_token_cannot_be_pinned(
+        self,
+        profile_client: TestClient,
+    ) -> None:
+        response = profile_client.post(
+            "/profile/tokens",
+            json={"name": "chat", "personal": True, "endpoints": ["node-a"]},
+        )
+
+        assert response.status_code == 400
+        assert "pinned" in response.json()["detail"]
+
     def test_revoke_unknown_token_returns_404(
         self,
         profile_client: TestClient,

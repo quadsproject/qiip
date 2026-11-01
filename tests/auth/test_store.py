@@ -206,6 +206,29 @@ class TestTokens:
         with pytest.raises(KeyError):
             auth_store.create_token(4242, "ghost")
 
+    def test_personal_token_replace_all_false_keeps_the_portfolio(
+        self,
+        auth_store: AuthStore,
+    ) -> None:
+        """The admin profile mint replaces only the previous personal token
+        (issue #294); the onboarding mint still revokes everything."""
+        user = self._user(auth_store)
+        legacy = auth_store.create_token(user.id, "ci-job")
+        first = auth_store.create_personal_token(
+            user.id, "chat", None, "s3cret", replace_all=False
+        )
+        second = auth_store.create_personal_token(
+            user.id, "chat-2", None, "s3cret", replace_all=False
+        )
+
+        assert auth_store.resolve_token(legacy.token) is not None
+        assert auth_store.resolve_token(first.token) is None
+        assert auth_store.resolve_token(second.token) is not None
+        active = auth_store.get_active_token(user.id)
+        assert active is not None
+        assert active.name == "chat-2"
+        assert active.purpose == "personal"
+
     def test_get_or_create_config_token_reuses_same_key(
         self,
         auth_store: AuthStore,

@@ -1530,11 +1530,19 @@ class TestTokenReveal:
         assert mine != theirs.token
         assert user_client.post("/onboarding/token/reveal").json()["token"] == mine
 
-    def test_admin_is_refused(
+    def test_admin_reveals_only_a_personal_token(
         self, user_client: TestClient, auth_store: AuthStore
     ) -> None:
+        """Admins may reveal the personal token the chat playground uses
+        (issue #294); without one there is nothing to return."""
         admin = auth_store.list_users_with_stats()[0]
         auth_store.set_user_admin(admin.id, True)
-        response = user_client.post("/onboarding/token/reveal")
-        assert response.status_code == 403
-        assert "profile page" in response.json()["detail"]
+
+        assert user_client.post("/onboarding/token/reveal").status_code == 404
+
+        created = auth_store.create_personal_token(
+            admin.id, "chat", None, SECRET, replace_all=False
+        )
+        revealed = user_client.post("/onboarding/token/reveal")
+        assert revealed.status_code == 200
+        assert revealed.json()["token"] == created.token

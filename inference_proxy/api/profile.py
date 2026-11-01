@@ -157,6 +157,16 @@ async def create_token(
             detail="Tokens are managed from the qiip start page",
         )
     await enforce_mint_allowlist(user, settings, allowlist)
+    if body.personal and body.name == "agent-config":
+        raise HTTPException(
+            status_code=400,
+            detail="The agent-config key is not a personal token",
+        )
+    if body.personal and body.endpoints is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="A personal token cannot be pinned to endpoints",
+        )
     if body.name == "agent-config" and body.endpoints is not None:
         # The agent-config key is a single stable full-access credential
         # (get_or_create_config_token always stores a NULL scope), so a pin
@@ -196,6 +206,22 @@ async def create_token(
             raise HTTPException(status_code=503, detail="Sessions are not configured")
         created = await asyncio.to_thread(
             store.get_or_create_config_token, user.id, secret.get_secret_value()
+        )
+    elif body.personal:
+        # The chat playground reveals the signed-in viewer's personal token
+        # (issue #294); admins mint one here without losing their portfolio:
+        # only a previous personal token is replaced. No model scope means
+        # every model the fleet serves.
+        secret = settings.auth.session_secret
+        if secret is None:  # pragma: no cover - require_profile_user already
+            raise HTTPException(status_code=503, detail="Sessions are not configured")
+        created = await asyncio.to_thread(
+            store.create_personal_token,
+            user.id,
+            body.name,
+            None,
+            secret.get_secret_value(),
+            replace_all=False,
         )
     else:
         created = await asyncio.to_thread(

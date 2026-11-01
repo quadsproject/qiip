@@ -50,6 +50,14 @@ def _signed_in_user_client(app: FastAPI) -> TestClient:
     return client
 
 
+def _signed_in_admin_client(app: FastAPI, auth_store: AuthStore) -> TestClient:
+    """Return a signed-in client whose user row carries the admin role."""
+    client = _signed_in_user_client(app)
+    user_id = auth_store.list_users_with_stats()[0].id
+    auth_store.set_user_admin(user_id, True)
+    return client
+
+
 def _session_secret(settings: Settings) -> str:
     """Return the session secret the test fixtures configured."""
     secret = settings.auth.session_secret
@@ -249,10 +257,49 @@ class TestChatViewerAccess:
         self,
         client: TestClient,
     ) -> None:
+        # The HTTP Basic admin (and the local-admin session) has no user row
+        # that could own a personal token, so it keeps the anonymous branch.
         response = client.get("/chat")
 
         assert response.status_code == 200
         assert "const ANONYMOUS_PLAYGROUND = true;" in response.text
+
+    def test_signed_in_admin_without_a_personal_token_is_told_so(
+        self, app: FastAPI, auth_store: AuthStore
+    ) -> None:
+        """A signed-in admin is not sent to the anonymous playground; the
+        page says the personal token is missing and points at /profile
+        (issue #294)."""
+        client = _signed_in_admin_client(app, auth_store)
+
+        response = client.get("/chat")
+
+        assert response.status_code == 200
+        assert "const ANONYMOUS_PLAYGROUND = false;" in response.text
+        assert "const MISSING_PERSONAL_TOKEN = true;" in response.text
+
+    def test_signed_in_admin_with_a_personal_token_chats_on_it(
+        self, app: FastAPI, auth_store: AuthStore, test_settings: Settings
+    ) -> None:
+        """The playground reveals the admin's own personal token, so usage is
+        attributed even with API-token enforcement on (issue #294)."""
+        client = _signed_in_admin_client(app, auth_store)
+        admin = auth_store.list_users_with_stats()[0]
+        created = auth_store.create_personal_token(
+            admin.id,
+            "chat",
+            None,
+            _session_secret(test_settings),
+            replace_all=False,
+        )
+
+        response = client.get("/chat")
+
+        assert "const ANONYMOUS_PLAYGROUND = false;" in response.text
+        assert "const MISSING_PERSONAL_TOKEN = false;" in response.text
+        revealed = client.post("/onboarding/token/reveal")
+        assert revealed.status_code == 200
+        assert revealed.json()["token"] == created.token
 
     def test_full_access_user_gets_the_anonymous_playground(
         self,
@@ -282,10 +329,9 @@ class TestChatViewerAccess:
 class TestPlaygroundToken:
     """A normal user's playground runs on their own token (CHAT-04).
 
-    The credential is ``POST /onboarding/token/reveal``: its contract, the
-    refusals the page turns into its notice, and the admin ``403`` that keeps
-    admins anonymous are covered in test_onboarding.py. These tests pin what
-    the playground does with the revealed token.
+    The credential is ``POST /onboarding/token/reveal``: its contract and the
+    refusals the page turns into its notice are covered in test_onboarding.py.
+    These tests pin what the playground does with the revealed token.
     """
 
     def test_revealed_token_attributes_usage_and_narrows_models(

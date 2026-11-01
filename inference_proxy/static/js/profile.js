@@ -321,6 +321,9 @@
       );
       const body = { name: name };
       if (selected.length > 0) body.endpoints = selected;
+      if ($("token-personal") && $("token-personal").checked) {
+        body.personal = true;
+      }
       const button = $("token-create-btn");
       button.disabled = true;
       try {
@@ -336,6 +339,7 @@
         }
         const created = await resp.json();
         $("token-name").value = "";
+        if ($("token-personal")) $("token-personal").checked = false;
         $("token-secret-value").textContent = created.token;
         $("token-secret").hidden = false;
         pendingToken = created.token;

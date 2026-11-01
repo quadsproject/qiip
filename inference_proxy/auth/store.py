@@ -850,15 +850,21 @@ class AuthStore:
         self,
         user_id: int,
         name: str,
-        models: list[str],
+        models: list[str] | None,
         secret: str,
+        *,
+        replace_all: bool = True,
     ) -> CreatedToken:
-        """Mint the user's single personal token, replacing every other one.
+        """Mint a personal (re-derivable) token for the user.
 
-        A normal user owns exactly one token: minting revokes all of the
-        user's active tokens (and drops their pending setup links) in the
-        same transaction. *models* is the model scope enforced on /v1.
-        Raises ``KeyError`` when *user_id* does not exist.
+        The onboarding flow (``replace_all``) enforces one token per user:
+        minting revokes all of the user's active tokens (and drops their
+        pending setup links) in the same transaction. The admin profile
+        mint passes ``replace_all=False`` so an admin's token portfolio
+        survives: only a previous personal token is replaced, which is what
+        lets the chat playground use it (issue #294). *models* is the model
+        scope enforced on /v1; ``None`` means unrestricted. Raises
+        ``KeyError`` when *user_id* does not exist.
         """
         nonce = secrets.token_urlsafe(16)
         raw = _derive_personal_token(secret, user_id, nonce)
@@ -870,13 +876,20 @@ class AuthStore:
             if exists is None:
                 raise KeyError(user_id)
             try:
-                self._conn.execute(
-                    "UPDATE tokens SET revoked = 1 WHERE user_id = ? AND revoked = 0",
-                    (user_id,),
-                )
-                self._conn.execute(
-                    "DELETE FROM setup_links WHERE user_id = ?", (user_id,)
-                )
+                if replace_all:
+                    self._conn.execute(
+                        "UPDATE tokens SET revoked = 1 WHERE user_id = ? AND revoked = 0",
+                        (user_id,),
+                    )
+                    self._conn.execute(
+                        "DELETE FROM setup_links WHERE user_id = ?", (user_id,)
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE tokens SET revoked = 1 "
+                        "WHERE user_id = ? AND revoked = 0 AND purpose = ?",
+                        (user_id, _PERSONAL_TOKEN_PURPOSE),
+                    )
                 cursor = self._conn.execute(
                     """
                     INSERT INTO tokens

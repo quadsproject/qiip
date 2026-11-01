@@ -416,6 +416,7 @@ const scenario = process.argv[2];
 const calls = [];
 let domReady = null;
 let revealCount = 0;
+const confirmCalls = [];
 
 class Element {
   constructor(id) {
@@ -516,6 +517,13 @@ const sandbox = {
   Buffer,
   TextDecoder,
   ANONYMOUS_PLAYGROUND: scenario === "anonymous",
+  MISSING_PERSONAL_TOKEN:
+    scenario === "missing_personal_create" ||
+    scenario === "missing_personal_cancel",
+  confirmDialog: async function (opts) {
+    confirmCalls.push(opts);
+    return scenario === "missing_personal_create";
+  },
   document: {
     getElementById: byId,
     querySelector() { return null; },
@@ -566,6 +574,11 @@ const sandbox = {
   },
 };
 
+// In a browser `window` IS the global object; the page navigates with
+// window.location.href when the admin accepts the personal-token prompt.
+sandbox.window = sandbox;
+sandbox.location = { href: "" };
+
 vm.createContext(sandbox);
 vm.runInContext(source, sandbox);
 
@@ -606,6 +619,8 @@ vm.runInContext(source, sandbox);
       };
     }),
     history: sandbox.messages,
+    confirmCalls: confirmCalls,
+    location: sandbox.location.href,
   }));
 })().catch(function (error) { console.error(error); process.exit(1); });
 """
@@ -748,3 +763,27 @@ def test_history_is_bounded_before_it_is_resent() -> None:
     assert sum(len(message["content"]) for message in resent) <= (
         24000 + len("first") + len("hello") + len("second")
     )
+
+
+def test_admin_without_a_personal_token_is_offered_the_profile_page() -> None:
+    """An admin with no personal token gets a clear notice and, after saying
+    yes, is sent to the profile token manager (issue #294)."""
+    result = _run_node(_CREDENTIAL_HARNESS, "missing_personal_create")
+
+    # No unattributed request is made and no reveal is attempted.
+    assert _reveal_calls(result) == []
+    assert _v1_calls(result) == []
+    assert result["disabled"] is True
+    assert result["modelOptions"] == ["Chat unavailable"]
+    assert "personal token" in result["noticeText"].lower()
+    assert result["noticeLinks"] == ["/profile#api-tokens"]
+    assert result["confirmCalls"][0]["confirmLabel"] == "Create personal token"
+    assert result["location"] == "/profile#api-tokens"
+
+
+def test_admin_who_declines_stays_on_the_chat_page() -> None:
+    result = _run_node(_CREDENTIAL_HARNESS, "missing_personal_cancel")
+
+    assert _v1_calls(result) == []
+    assert result["location"] == ""
+    assert result["noticeLinks"] == ["/profile#api-tokens"]
