@@ -325,6 +325,32 @@ class TestChatViewerAccess:
         assert response.status_code == 200
         assert "const ANONYMOUS_PLAYGROUND = true;" in response.text
 
+    def test_admin_on_the_full_access_list_keeps_the_anonymous_playground(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        auth_store: AuthStore,
+    ) -> None:
+        """The admin role is granted at runtime, so a trust-listed user can
+        hold both; the trust list still keeps the anonymous playground
+        (grafuls review)."""
+        enabled = test_settings.model_copy(
+            deep=True,
+            update={
+                "auth": test_settings.auth.model_copy(
+                    update={"admin_only_tokens_full_access": ["alice@example.com"]}
+                )
+            },
+        )
+        app.dependency_overrides[get_settings] = lambda: enabled
+        client = _signed_in_admin_client(app, auth_store)
+
+        response = client.get("/chat")
+
+        assert response.status_code == 200
+        assert "const ANONYMOUS_PLAYGROUND = true;" in response.text
+        assert "const MISSING_PERSONAL_TOKEN = false;" in response.text
+
 
 class TestPlaygroundToken:
     """A normal user's playground runs on their own token (CHAT-04).

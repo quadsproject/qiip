@@ -159,7 +159,7 @@
       td.textContent = canCreateTokens
         ? "No tokens yet. Create one to start tracking usage."
         : "No tokens yet. Open Start to create your onboarding token.";
-      td.colSpan = 7;
+      td.colSpan = 8;
       td.className = "muted-status";
       row.appendChild(td);
       body.appendChild(row);
@@ -169,6 +169,7 @@
     for (const token of tokens) {
       const row = document.createElement("tr");
       row.appendChild(tdCell(token.name));
+      row.appendChild(tdCell(token.purpose || "-"));
       row.appendChild(tdCell(token.prefix));
       row.appendChild(
         tdCell(token.revoked ? "-" : formatDate(token.created_at), token.revoked ? "" : token.created_at)

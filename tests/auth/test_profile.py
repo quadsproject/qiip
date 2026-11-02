@@ -151,6 +151,9 @@ class TestTokenManagement:
         listed = profile_client.get("/profile/tokens").json()
         active = {token["name"] for token in listed if not token["revoked"]}
         assert {"ci-job", "chat"} <= active
+        by_name = {token["name"]: token for token in listed}
+        assert by_name["chat"]["purpose"] == "personal"
+        assert by_name["ci-job"]["purpose"] is None
 
     def test_personal_token_cannot_be_pinned(
         self,

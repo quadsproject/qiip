@@ -67,7 +67,7 @@
                             <input type="text" id="token-name" placeholder="Token name (e.g. ci-job, laptop)" maxlength="100" required aria-label="Token name">
                             <label class="muted-status" for="token-personal">
                                 <input type="checkbox" id="token-personal" name="personal">
-                                Personal token (exportable; used by the chat playground)
+                                Personal token (replaces your existing one; exportable, used by the chat playground)
                             </label>
                             <div class="token-pin-group" id="token-pin-group">
                                 <label id="token-endpoints-label">Pin to endpoints (optional)</label>
@@ -96,6 +96,7 @@
                             <thead id="tokens-head">
                                 <tr>
                                     <th scope="col" data-sort="text"><button type="button" class="th-sort">Name</button></th>
+                                    <th scope="col" data-sort="text"><button type="button" class="th-sort">Purpose</button></th>
                                     <th scope="col" data-sort="text"><button type="button" class="th-sort">Prefix</button></th>
                                     <th scope="col" data-sort="date"><button type="button" class="th-sort">Created</button></th>
                                     <th scope="col" data-sort="date"><button type="button" class="th-sort">Last used</button></th>
@@ -105,7 +106,7 @@
                                 </tr>
                             </thead>
                             <tbody id="tokens-table-body">
-                                <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
+                                <tr class="skeleton-row" aria-hidden="true"><td><span class="skeleton-bar skeleton-bar--lg"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td><td><span class="skeleton-bar skeleton-bar--sm"></span></td></tr>
                             </tbody>
                         </table>
                     </div>

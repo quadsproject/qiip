@@ -137,7 +137,7 @@ function buildHead(id, kinds) {
   head.appendChild(row);
 }
 
-buildHead("tokens-head", ["text", "text", "date", "date", "text", "text", null]);
+buildHead("tokens-head", ["text", "text", "text", "date", "date", "text", "text", null]);
 buildHead("usage-head", ["text", "text", "text", "number", "number", "number", "number"]);
 
 // In a browser `window` IS the global object; mirror that so helpers assigned
@@ -245,8 +245,11 @@ vm.runInContext(source, sandbox);
     rowNames: body.children.map(function (row) {
       return row.children[0] ? row.children[0].textContent : row.textContent;
     }),
+    rowPurposes: body.children.map(function (row) {
+      return row.children[1] ? row.children[1].textContent : "";
+    }),
     rowScopes: body.children.map(function (row) {
-      return row.children[5] ? row.children[5].textContent : "";
+      return row.children[6] ? row.children[6].textContent : "";
     }),
     savings: byId("usage-savings").textContent,
     tokenToggleHidden: byId("token-toggle").hidden,
@@ -344,10 +347,11 @@ def _run(
     return parsed
 
 
-def _token(token_id: int, revoked: bool) -> dict[str, Any]:
+def _token(token_id: int, revoked: bool, purpose: str | None = None) -> dict[str, Any]:
     return {
         "id": token_id,
         "name": f"token-{token_id}",
+        "purpose": purpose,
         "prefix": "qiip_abc",
         "created_at": "2026-09-14T12:00:00Z",
         "last_used_at": None,
@@ -361,6 +365,14 @@ def test_revoked_tokens_are_dropped_from_display() -> None:
     assert "token-1" in result["rowNames"]
     assert "token-2" not in result["rowNames"]
     assert "token-3" in result["rowNames"]
+
+
+def test_token_purpose_is_shown_in_the_list() -> None:
+    """The list shows the token purpose so a replaced personal token is
+    explainable (grafuls review); legacy rows without one show a dash."""
+    result = _run([_token(1, False, purpose="personal"), _token(2, False)], [])
+
+    assert result["rowPurposes"] == ["personal", "-"]
 
 
 def test_model_scoped_token_is_not_labelled_full_access() -> None:

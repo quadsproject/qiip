@@ -110,6 +110,7 @@ class PublicToken(BaseModel):
     revoked: bool
     endpoint_scope: list[str] | None = None
     model_scope: list[str] | None = None
+    purpose: str | None = None
 
     @classmethod
     def from_token(cls, token: ApiToken) -> PublicToken:
@@ -123,6 +124,7 @@ class PublicToken(BaseModel):
             revoked=token.revoked,
             endpoint_scope=token.endpoint_scope,
             model_scope=token.model_scope,
+            purpose=token.purpose,
         )
 
 

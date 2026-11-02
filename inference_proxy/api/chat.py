@@ -44,8 +44,9 @@ async def chat(
     token; without one the page says so and points at the profile token
     manager instead of sending an unattributable request (issue #294). The
     full-access trust list and the session-less local admin (HTTP Basic or the
-    local-admin form) keep the anonymous playground: they keep token
-    portfolios or have no user row that could own a personal token.
+    local-admin form) keep the anonymous playground: the trust list already
+    holds a token portfolio on /profile, and the session-less admin has no
+    user row that could own a personal token.
     """
     role = viewer_role(request, settings)
     if role is None:
@@ -56,8 +57,7 @@ async def chat(
         )
     anonymous_playground = session_user_has_full_access(request, settings)
     missing_personal_token = False
-    if role == "admin":
-        anonymous_playground = False
+    if role == "admin" and not anonymous_playground:
         user_id = get_session_user_id(request)
         if user_id is None:
             anonymous_playground = True
