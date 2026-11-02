@@ -332,9 +332,10 @@ function credentialRequired() {
   );
 }
 
-// The page shell says whether this viewer chats anonymously (admin role, the
-// full-access trust list, or the local admin): none of them has a personal
-// token to reveal. Every other viewer runs the playground on their own token.
+// The page shell says whether this viewer chats anonymously (the HTTP
+// Basic/local-admin session and the full-access trust list): those branches
+// send no credential. Every other viewer -- including an admin with a
+// session -- reveals their own personal token and sends it on every /v1 call.
 //
 // Returns the revealed token, "" for the anonymous playground, or null when
 // the reveal failed (the reason is in credentialError).

@@ -278,6 +278,24 @@ class TestChatViewerAccess:
         assert "const ANONYMOUS_PLAYGROUND = false;" in response.text
         assert "const MISSING_PERSONAL_TOKEN = true;" in response.text
 
+    def test_signed_in_admin_with_a_legacy_token_is_told_so(
+        self, app: FastAPI, auth_store: AuthStore
+    ) -> None:
+        """An active token with purpose NULL (minted outside the personal
+        flow) satisfies neither the page nor the reveal path (bspreston-esq
+        review: the 409 half of the predicate needs its own test)."""
+        client = _signed_in_admin_client(app, auth_store)
+        minted = client.post("/profile/tokens", json={"name": "legacy"})
+        assert minted.status_code == 201
+        assert minted.json()["purpose"] is None
+
+        response = client.get("/chat")
+
+        assert response.status_code == 200
+        assert "const ANONYMOUS_PLAYGROUND = false;" in response.text
+        assert "const MISSING_PERSONAL_TOKEN = true;" in response.text
+        assert client.post("/onboarding/token/reveal").status_code == 409
+
     def test_signed_in_admin_with_a_personal_token_chats_on_it(
         self, app: FastAPI, auth_store: AuthStore, test_settings: Settings
     ) -> None:
