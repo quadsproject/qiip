@@ -648,6 +648,22 @@ h1 {
   margin-bottom: 1rem;
 }
 
+/* The profile token form keeps Create anchored top-right while the field
+   row wraps on its own, so hiding the pin group cannot move the button. */
+.setup-form.token-create-form {
+  flex-wrap: nowrap;
+  align-items: flex-start;
+}
+
+.token-form-fields {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 /* One label + select pair in the leaderboard token form. The pair wraps
    as a unit so the select drops below its label in a narrow card. */
 .token-field {
