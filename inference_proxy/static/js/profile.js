@@ -302,6 +302,28 @@
     });
   }
 
+  // A personal token cannot be pinned (POST /profile/tokens rejects it), so
+  // the pin picker is hidden and cleared while the checkbox is on: the two
+  // options are mutually exclusive in the UI too (PR #295 review).
+  function syncPersonalToken() {
+    const personal = $("token-personal");
+    const group = $("token-pin-group");
+    if (!personal || !group) return;
+    const isPersonal = Boolean(personal.checked);
+    group.hidden = isPersonal;
+    if (!isPersonal) return;
+    for (const option of Array.from($("token-endpoints").children)) {
+      option.selected = false;
+    }
+    const list = $("endpoint-list");
+    for (const child of Array.from(list.children)) {
+      if (child.children && child.children[0]) child.children[0].checked = false;
+    }
+    list.hidden = true;
+    $("endpoint-toggle").setAttribute("aria-expanded", "false");
+    updateEndpointSummary();
+  }
+
   function wireTokenForm() {
     const toggle = $("token-toggle");
     const form = $("token-form");
@@ -309,21 +331,26 @@
       form.hidden = !form.hidden;
       if (!form.hidden) {
         loadEndpoints();
+        syncPersonalToken();
         $("token-name").focus();
       }
     });
+    if ($("token-personal")) {
+      $("token-personal").addEventListener("change", syncPersonalToken);
+    }
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const name = $("token-name").value.trim();
       if (!name) return;
-      const selected = Array.from($("token-endpoints").selectedOptions).map(
-        (option) => option.value
-      );
+      const personal = Boolean($("token-personal") && $("token-personal").checked);
+      const selected = personal
+        ? []
+        : Array.from($("token-endpoints").selectedOptions).map(
+            (option) => option.value
+          );
       const body = { name: name };
       if (selected.length > 0) body.endpoints = selected;
-      if ($("token-personal") && $("token-personal").checked) {
-        body.personal = true;
-      }
+      if (personal) body.personal = true;
       const button = $("token-create-btn");
       button.disabled = true;
       try {
@@ -340,6 +367,7 @@
         const created = await resp.json();
         $("token-name").value = "";
         if ($("token-personal")) $("token-personal").checked = false;
+        syncPersonalToken();
         $("token-secret-value").textContent = created.token;
         $("token-secret").hidden = false;
         pendingToken = created.token;

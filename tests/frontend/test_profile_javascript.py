@@ -185,6 +185,20 @@ vm.runInContext(source, sandbox);
     await new Promise(function (r) { setTimeout(r, 20); });
   }
 
+  let personalHiddenWhileChecked = null;
+  if (PERSONAL) {
+    // Tick Personal after any endpoint selection: the pin picker must
+    // disappear and drop the selection (PR #295 review).
+    const personal = byId("token-personal");
+    personal.checked = true;
+    if (personal._handlers.change) personal._handlers.change();
+    personalHiddenWhileChecked = byId("token-pin-group").hidden;
+    if (UNCHECK) {
+      personal.checked = false;
+      if (personal._handlers.change) personal._handlers.change();
+    }
+  }
+
   if (SHOULD_CREATE) {
     // Mint a token, then use the Copy button beside the one-time reveal.
     byId("token-name").value = "laptop";
@@ -220,6 +234,14 @@ vm.runInContext(source, sandbox);
     posted: calls
       .filter(function (call) { return call.options && call.options.method === "POST"; })
       .map(function (call) { return call.url; }),
+    postedBodies: calls
+      .filter(function (call) { return call.options && call.options.method === "POST"; })
+      .map(function (call) {
+        return call.options.body ? JSON.parse(call.options.body) : null;
+      }),
+    pinGroupHidden: byId("token-pin-group").hidden,
+    personalHiddenWhileChecked: personalHiddenWhileChecked,
+    personalChecked: byId("token-personal").checked,
     rowNames: body.children.map(function (row) {
       return row.children[0] ? row.children[0].textContent : row.textContent;
     }),
@@ -268,6 +290,8 @@ def _run(
     created_token: dict[str, Any] | None = None,
     lang: str = "en_US.UTF-8",
     can_create_tokens: bool = True,
+    personal: bool = False,
+    uncheck_personal: bool = False,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -282,6 +306,8 @@ def _run(
         .replace("USAGE_ROWS", json.dumps(usage or []))
         .replace("SORT_USAGE", "true" if sort_usage else "false")
         .replace("CAN_CREATE", "true" if can_create_tokens else "false")
+        .replace("PERSONAL", "true" if personal else "false")
+        .replace("UNCHECK", "true" if uncheck_personal else "false")
         .replace(
             "USER",
             json.dumps(
@@ -498,3 +524,48 @@ def test_premium_estimate_is_us_formatted_under_a_german_locale() -> None:
         "Estimated premium-equivalent cost (token budget saved): $9.00 "
         "\u00b7 model: gpt-neo-test"
     )
+
+
+def _created_token() -> dict[str, Any]:
+    return {
+        "token": "qiip_fresh_secret",
+        "id": 9,
+        "name": "laptop",
+        "prefix": "qiip_fresh",
+        "created_at": "2026-10-01T10:00:00Z",
+        "last_used_at": None,
+        "revoked": False,
+        "endpoint_scope": None,
+    }
+
+
+def test_personal_token_hides_and_clears_the_endpoint_picker() -> None:
+    """Ticking Personal makes the pin picker disappear and drops any
+    selection, so the form never POSTs both (PR #295 review)."""
+    result = _run(
+        [_token(1, False)],
+        [{"node_id": "gpu01", "model": "llama"}],
+        check_index=0,
+        created_token=_created_token(),
+        personal=True,
+    )
+
+    assert result["personalHiddenWhileChecked"] is True
+    assert result["selectValues"] == [{"value": "gpu01", "selected": False}]
+    assert result["checkedValues"] == [False]
+    assert result["summary"] == "All Endpoints (0 selected)"
+    assert result["postedBodies"] == [{"name": "laptop", "personal": True}]
+
+
+def test_personal_token_picker_returns_when_unchecked() -> None:
+    result = _run(
+        [_token(1, False)],
+        [{"node_id": "gpu01", "model": "llama"}],
+        check_index=0,
+        personal=True,
+        uncheck_personal=True,
+    )
+
+    assert result["personalHiddenWhileChecked"] is True
+    assert result["pinGroupHidden"] is False
+    assert result["personalChecked"] is False
