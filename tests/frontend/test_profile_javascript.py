@@ -544,7 +544,10 @@ def test_server_capability_hides_the_personal_option() -> None:
 
 
 def test_server_capability_wins_over_the_derived_policy() -> None:
-    result = _run([], [], full_access=False, personal_token_available=True)
+    """The fallback derivation would hide the option for a full-access
+    viewer; the server flag must win and keep it visible, so a client that
+    ignores the capability fails this case (bspreston-esq review)."""
+    result = _run([], [], full_access=True, personal_token_available=True)
 
     assert result["personalLabelHidden"] is False
 
