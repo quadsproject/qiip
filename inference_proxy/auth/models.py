@@ -56,6 +56,8 @@ class ProfileUser(PublicUser):
     # On the admin full-access trust list: token portfolio on /profile, but
     # the chat playground stays anonymous, so a personal token is not used.
     full_access: bool = False
+    # Server-derived capability: the profile form may offer a personal token.
+    personal_token_available: bool = False
 
 
 class ApiToken(BaseModel):

@@ -44,6 +44,7 @@ from inference_proxy.auth.models import (
 from inference_proxy.auth.scopes import (
     has_admin_access,
     is_full_access,
+    personal_token_available,
     pickable_endpoints,
 )
 from inference_proxy.auth.store import AuthStore
@@ -109,6 +110,9 @@ async def profile_me(
             user.email, user.issuer, settings, is_admin=user.is_admin
         ),
         full_access=is_full_access(user.email, user.issuer, settings),
+        personal_token_available=personal_token_available(
+            user.email, user.issuer, settings, is_admin=user.is_admin
+        ),
     )
 
 

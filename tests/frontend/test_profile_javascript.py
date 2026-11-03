@@ -303,10 +303,22 @@ def _run(
     uncheck_personal: bool = False,
     hash: str = "",
     full_access: bool = False,
+    personal_token_available: bool | None = None,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
         pytest.fail("Node.js is required for profile JS regressions")
+    user_payload: dict[str, Any] = {
+        "id": 1,
+        "email": "kambiz@example.com",
+        "name": "K",
+        "picture": None,
+        "is_admin": can_create_tokens,
+        "can_create_tokens": can_create_tokens,
+        "full_access": full_access,
+    }
+    if personal_token_available is not None:
+        user_payload["personal_token_available"] = personal_token_available
     script = (
         _HARNESS.replace("TOKENS", json.dumps(tokens))
         .replace("ENDPOINTS", json.dumps(endpoints))
@@ -320,20 +332,7 @@ def _run(
         .replace("PERSONAL", "true" if personal else "false")
         .replace("UNCHECK", "true" if uncheck_personal else "false")
         .replace("LOCATION_HASH", json.dumps(hash))
-        .replace(
-            "USER",
-            json.dumps(
-                {
-                    "id": 1,
-                    "email": "kambiz@example.com",
-                    "name": "K",
-                    "picture": None,
-                    "is_admin": can_create_tokens,
-                    "can_create_tokens": can_create_tokens,
-                    "full_access": full_access,
-                }
-            ),
-        )
+        .replace("USER", json.dumps(user_payload))
     )
     result = subprocess.run(
         [
@@ -534,6 +533,20 @@ def test_full_access_viewer_is_not_offered_a_personal_token() -> None:
     result = _run([], [], full_access=True)
 
     assert result["personalLabelHidden"] is True
+
+
+def test_server_capability_hides_the_personal_option() -> None:
+    """The server-derived capability, not the client's reading of the flags,
+    decides whether the form offers a personal token."""
+    result = _run([], [], personal_token_available=False)
+
+    assert result["personalLabelHidden"] is True
+
+
+def test_server_capability_wins_over_the_derived_policy() -> None:
+    result = _run([], [], full_access=False, personal_token_available=True)
+
+    assert result["personalLabelHidden"] is False
 
 
 def test_full_access_viewer_hash_flow_does_not_tick_personal() -> None:

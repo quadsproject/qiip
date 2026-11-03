@@ -98,9 +98,12 @@
         "Open Start to create or rotate it.";
       note.hidden = false;
     }
-    // Full-access trust-list viewers keep the anonymous chat playground, so
-    // the personal (chat) option is not offered to them (PR #295 review).
-    personalTokenAvailable = canCreateTokens && user.full_access !== true;
+    // The server owns the "trust-list viewers keep the anonymous chat
+    // playground" rule; derive only when an older payload omits the flag.
+    personalTokenAvailable =
+      user.personal_token_available !== undefined
+        ? !!user.personal_token_available
+        : canCreateTokens && user.full_access !== true;
     const personalLabel = $("token-personal-label");
     if (personalLabel) personalLabel.hidden = !personalTokenAvailable;
     if (!personalTokenAvailable && $("token-personal")) {

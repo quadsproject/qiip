@@ -63,6 +63,31 @@ class TestProfileMe:
         assert "id" in response.json()
         assert response.json()["can_create_tokens"] is True
         assert response.json()["full_access"] is False
+        assert response.json()["personal_token_available"] is True
+
+    def test_full_access_member_is_not_offered_a_personal_token(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        profile_client: TestClient,
+    ) -> None:
+        """Trust-listed viewers keep the anonymous playground, so the
+        server-derived capability must not offer the personal option
+        (bspreston-esq review)."""
+        enabled = test_settings.model_copy(
+            deep=True,
+            update={
+                "auth": test_settings.auth.model_copy(
+                    update={"admin_only_tokens_full_access": ["alice@example.com"]}
+                )
+            },
+        )
+        app.dependency_overrides[get_settings] = lambda: enabled
+
+        me = profile_client.get("/profile/me").json()
+
+        assert me["full_access"] is True
+        assert me["personal_token_available"] is False
 
     def test_normal_user_profile_is_read_only(
         self, normal_profile_client: TestClient

@@ -933,10 +933,12 @@ def test_trust_listed_users_keep_their_tokens_on_the_profile_page(
     me = user_client.get("/auth/me").json()
     assert me["can_create_tokens"] is False
     assert me["full_access"] is False
+    assert me["personal_token_available"] is False
     test_settings.auth.admin_only_tokens_full_access.append(email)
     me = user_client.get("/auth/me").json()
     assert me["can_create_tokens"] is True
     assert me["full_access"] is True
+    assert me["personal_token_available"] is False
 
     start = user_client.get("/start", follow_redirects=False)
     assert (start.status_code, start.headers["location"]) == (302, "/profile")
