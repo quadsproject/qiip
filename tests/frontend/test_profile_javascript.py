@@ -95,7 +95,7 @@ const sandbox = {
     execCommand() { return true; },
     body: element(),
   },
-  location: { search: "", reload() {} },
+  location: { search: "", hash: LOCATION_HASH, reload() {} },
   confirm() { return true },
   history: { replaceState() {} },
   requestAnimationFrame() {},
@@ -137,12 +137,15 @@ function buildHead(id, kinds) {
   head.appendChild(row);
 }
 
-buildHead("tokens-head", ["text", "text", "date", "date", "text", "text", null]);
+buildHead("tokens-head", ["text", "text", "text", "date", "date", "text", "text", null]);
 buildHead("usage-head", ["text", "text", "text", "number", "number", "number", "number"]);
 
 // In a browser `window` IS the global object; mirror that so helpers assigned
 // to `window` are reachable by their bare names, exactly like in the pages.
 sandbox.window = sandbox;
+
+// The template renders the create form hidden; init sees that state.
+byId("token-form").hidden = true;
 
 vm.createContext(sandbox);
 vm.runInContext(sortSource, sandbox);
@@ -158,12 +161,14 @@ vm.runInContext(source, sandbox);
   byId("endpoint-list").appendChild(byId("endpoint-empty"));
   // init() runs on load; wait for its fetches to settle.
   await new Promise(function (r) { setTimeout(r, 20); });
-  // The template renders the create form hidden; mirror that so the
-  // toggle actually opens it (which is what triggers loadEndpoints).
-  byId("token-form").hidden = true;
+  // Init may already have opened the form from #api-tokens; otherwise click
+  // the toggle as before (which is what triggers loadEndpoints).
   const toggle = byId("token-toggle");
-  if (CAN_CREATE && toggle && toggle._handlers.click) toggle._handlers.click();
-  await new Promise(function (r) { setTimeout(r, 20); });
+  if (sandbox.location.hash !== "#api-tokens") {
+    byId("token-form").hidden = true;
+    if (CAN_CREATE && toggle && toggle._handlers.click) toggle._handlers.click();
+    await new Promise(function (r) { setTimeout(r, 20); });
+  }
 
   if (CHECK_INDEX >= 0) {
     const empty = byId("endpoint-empty");
@@ -183,6 +188,20 @@ vm.runInContext(source, sandbox);
     await new Promise(function (r) { setTimeout(r, 20); });
     toggle._handlers.click();
     await new Promise(function (r) { setTimeout(r, 20); });
+  }
+
+  let personalHiddenWhileChecked = null;
+  if (PERSONAL) {
+    // Tick Personal after any endpoint selection: the pin picker must
+    // disappear and drop the selection (PR #295 review).
+    const personal = byId("token-personal");
+    personal.checked = true;
+    if (personal._handlers.change) personal._handlers.change();
+    personalHiddenWhileChecked = byId("token-pin-group").hidden;
+    if (UNCHECK) {
+      personal.checked = false;
+      if (personal._handlers.change) personal._handlers.change();
+    }
   }
 
   if (SHOULD_CREATE) {
@@ -220,11 +239,23 @@ vm.runInContext(source, sandbox);
     posted: calls
       .filter(function (call) { return call.options && call.options.method === "POST"; })
       .map(function (call) { return call.url; }),
+    postedBodies: calls
+      .filter(function (call) { return call.options && call.options.method === "POST"; })
+      .map(function (call) {
+        return call.options.body ? JSON.parse(call.options.body) : null;
+      }),
+    pinGroupHidden: byId("token-pin-group").hidden,
+    personalHiddenWhileChecked: personalHiddenWhileChecked,
+    personalChecked: byId("token-personal").checked,
+    personalLabelHidden: byId("token-personal-label").hidden,
     rowNames: body.children.map(function (row) {
       return row.children[0] ? row.children[0].textContent : row.textContent;
     }),
+    rowPurposes: body.children.map(function (row) {
+      return row.children[1] ? row.children[1].textContent : "";
+    }),
     rowScopes: body.children.map(function (row) {
-      return row.children[5] ? row.children[5].textContent : "";
+      return row.children[6] ? row.children[6].textContent : "";
     }),
     savings: byId("usage-savings").textContent,
     tokenToggleHidden: byId("token-toggle").hidden,
@@ -268,10 +299,26 @@ def _run(
     created_token: dict[str, Any] | None = None,
     lang: str = "en_US.UTF-8",
     can_create_tokens: bool = True,
+    personal: bool = False,
+    uncheck_personal: bool = False,
+    hash: str = "",
+    full_access: bool = False,
+    personal_token_available: bool | None = None,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
         pytest.fail("Node.js is required for profile JS regressions")
+    user_payload: dict[str, Any] = {
+        "id": 1,
+        "email": "kambiz@example.com",
+        "name": "K",
+        "picture": None,
+        "is_admin": can_create_tokens,
+        "can_create_tokens": can_create_tokens,
+        "full_access": full_access,
+    }
+    if personal_token_available is not None:
+        user_payload["personal_token_available"] = personal_token_available
     script = (
         _HARNESS.replace("TOKENS", json.dumps(tokens))
         .replace("ENDPOINTS", json.dumps(endpoints))
@@ -282,19 +329,10 @@ def _run(
         .replace("USAGE_ROWS", json.dumps(usage or []))
         .replace("SORT_USAGE", "true" if sort_usage else "false")
         .replace("CAN_CREATE", "true" if can_create_tokens else "false")
-        .replace(
-            "USER",
-            json.dumps(
-                {
-                    "id": 1,
-                    "email": "kambiz@example.com",
-                    "name": "K",
-                    "picture": None,
-                    "is_admin": can_create_tokens,
-                    "can_create_tokens": can_create_tokens,
-                }
-            ),
-        )
+        .replace("PERSONAL", "true" if personal else "false")
+        .replace("UNCHECK", "true" if uncheck_personal else "false")
+        .replace("LOCATION_HASH", json.dumps(hash))
+        .replace("USER", json.dumps(user_payload))
     )
     result = subprocess.run(
         [
@@ -318,10 +356,11 @@ def _run(
     return parsed
 
 
-def _token(token_id: int, revoked: bool) -> dict[str, Any]:
+def _token(token_id: int, revoked: bool, purpose: str | None = None) -> dict[str, Any]:
     return {
         "id": token_id,
         "name": f"token-{token_id}",
+        "purpose": purpose,
         "prefix": "qiip_abc",
         "created_at": "2026-09-14T12:00:00Z",
         "last_used_at": None,
@@ -335,6 +374,14 @@ def test_revoked_tokens_are_dropped_from_display() -> None:
     assert "token-1" in result["rowNames"]
     assert "token-2" not in result["rowNames"]
     assert "token-3" in result["rowNames"]
+
+
+def test_token_purpose_is_shown_in_the_list() -> None:
+    """The list shows the token purpose so a replaced personal token is
+    explainable (grafuls review); legacy rows without one show a dash."""
+    result = _run([_token(1, False, purpose="personal"), _token(2, False)], [])
+
+    assert result["rowPurposes"] == ["personal", "-"]
 
 
 def test_model_scoped_token_is_not_labelled_full_access() -> None:
@@ -469,6 +516,50 @@ def test_normal_user_sees_read_only_token_profile() -> None:
     ]
 
 
+def test_api_tokens_hash_opens_the_personal_token_form() -> None:
+    """The chat notice lands on /profile#api-tokens; the mint form opens with
+    Personal ticked so the flow is finished (bspreston-esq review)."""
+    result = _run([_token(1, False)], [], hash="#api-tokens")
+
+    assert result["tokenFormHidden"] is False
+    assert result["personalChecked"] is True
+    assert result["pinGroupHidden"] is True
+    assert result["personalLabelHidden"] is False
+
+
+def test_full_access_viewer_is_not_offered_a_personal_token() -> None:
+    """Full-access trust-list viewers keep the anonymous playground, so the
+    profile form hides the personal option (bspreston-esq review)."""
+    result = _run([], [], full_access=True)
+
+    assert result["personalLabelHidden"] is True
+
+
+def test_server_capability_hides_the_personal_option() -> None:
+    """The server-derived capability, not the client's reading of the flags,
+    decides whether the form offers a personal token."""
+    result = _run([], [], personal_token_available=False)
+
+    assert result["personalLabelHidden"] is True
+
+
+def test_server_capability_wins_over_the_derived_policy() -> None:
+    """The fallback derivation would hide the option for a full-access
+    viewer; the server flag must win and keep it visible, so a client that
+    ignores the capability fails this case (bspreston-esq review)."""
+    result = _run([], [], full_access=True, personal_token_available=True)
+
+    assert result["personalLabelHidden"] is False
+
+
+def test_full_access_viewer_hash_flow_does_not_tick_personal() -> None:
+    result = _run([], [], full_access=True, hash="#api-tokens")
+
+    assert result["tokenFormHidden"] is False
+    assert result["personalChecked"] is False
+    assert result["pinGroupHidden"] is False
+
+
 def test_created_token_is_copied_from_the_reveal_box() -> None:
     """The one-time reveal's Copy button uses the shared clipboard helper."""
     created = {
@@ -498,3 +589,48 @@ def test_premium_estimate_is_us_formatted_under_a_german_locale() -> None:
         "Estimated premium-equivalent cost (token budget saved): $9.00 "
         "\u00b7 model: gpt-neo-test"
     )
+
+
+def _created_token() -> dict[str, Any]:
+    return {
+        "token": "qiip_fresh_secret",
+        "id": 9,
+        "name": "laptop",
+        "prefix": "qiip_fresh",
+        "created_at": "2026-10-01T10:00:00Z",
+        "last_used_at": None,
+        "revoked": False,
+        "endpoint_scope": None,
+    }
+
+
+def test_personal_token_hides_and_clears_the_endpoint_picker() -> None:
+    """Ticking Personal makes the pin picker disappear and drops any
+    selection, so the form never POSTs both (PR #295 review)."""
+    result = _run(
+        [_token(1, False)],
+        [{"node_id": "gpu01", "model": "llama"}],
+        check_index=0,
+        created_token=_created_token(),
+        personal=True,
+    )
+
+    assert result["personalHiddenWhileChecked"] is True
+    assert result["selectValues"] == [{"value": "gpu01", "selected": False}]
+    assert result["checkedValues"] == [False]
+    assert result["summary"] == "All Endpoints (0 selected)"
+    assert result["postedBodies"] == [{"name": "laptop", "personal": True}]
+
+
+def test_personal_token_picker_returns_when_unchecked() -> None:
+    result = _run(
+        [_token(1, False)],
+        [{"node_id": "gpu01", "model": "llama"}],
+        check_index=0,
+        personal=True,
+        uncheck_personal=True,
+    )
+
+    assert result["personalHiddenWhileChecked"] is True
+    assert result["pinGroupHidden"] is False
+    assert result["personalChecked"] is False

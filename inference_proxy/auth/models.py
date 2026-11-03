@@ -53,6 +53,11 @@ class ProfileUser(PublicUser):
     """Public identity plus the signed-in caller's token-management capability."""
 
     can_create_tokens: bool = False
+    # On the admin full-access trust list: token portfolio on /profile, but
+    # the chat playground stays anonymous, so a personal token is not used.
+    full_access: bool = False
+    # Server-derived capability: the profile form may offer a personal token.
+    personal_token_available: bool = False
 
 
 class ApiToken(BaseModel):
@@ -110,6 +115,7 @@ class PublicToken(BaseModel):
     revoked: bool
     endpoint_scope: list[str] | None = None
     model_scope: list[str] | None = None
+    purpose: str | None = None
 
     @classmethod
     def from_token(cls, token: ApiToken) -> PublicToken:
@@ -123,6 +129,7 @@ class PublicToken(BaseModel):
             revoked=token.revoked,
             endpoint_scope=token.endpoint_scope,
             model_scope=token.model_scope,
+            purpose=token.purpose,
         )
 
 
@@ -133,6 +140,7 @@ class CreateTokenRequest(BaseModel):
 
     name: str = Field(min_length=1, max_length=100)
     endpoints: list[str] | None = None
+    personal: bool = False
 
     @field_validator("name")
     @classmethod

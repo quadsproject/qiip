@@ -375,17 +375,21 @@ async def create_personal_token(
 
 @onboarding_router.post("/onboarding/token/reveal")
 async def reveal_token(
-    user: Annotated[User, Depends(require_normal_user)],
+    user: Annotated[User, Depends(require_profile_user)],
     store: Annotated[AuthStore, Depends(get_auth_store)],
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> dict[str, str]:
-    """Return the caller's own raw token so the page can copy it.
+    """Return the caller's own personal token so the page can copy it.
 
     The pages hold only the prefix, so the Copy action asks for the value
     here. It is re-derived server-side exactly like the setup script and the
     config download do, and the value travels in a POST response body only,
     so the secret never lands in a URL, a page payload or a log; every
     non-static response is ``Cache-Control: no-store`` (api/middleware.py).
+    Unlike the rest of the onboarding flow this accepts admin-role sessions
+    too: an admin's personal token is the credential the chat playground
+    uses (issue #294), and ``_require_personal_token`` still refuses
+    anything that is not an active personal token.
     """
     token = await _require_personal_token(store, user)
     raw = await asyncio.to_thread(

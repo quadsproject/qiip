@@ -54,6 +54,24 @@ def has_admin_access(
     return is_full_access(email, issuer, settings) or is_admin
 
 
+def personal_token_available(
+    email: str,
+    issuer: str,
+    settings: Settings,
+    *,
+    is_admin: bool = False,
+) -> bool:
+    """Whether /profile should offer a personal token for the chat page.
+
+    Mirrors the /chat rule: the full-access trust list keeps the anonymous
+    playground, so a personal token minted there would never be revealed.
+    The option is limited to viewers who may mint tokens on /profile.
+    """
+    return has_admin_access(
+        email, issuer, settings, is_admin=is_admin
+    ) and not is_full_access(email, issuer, settings)
+
+
 def allowed_node_ids(
     auth: TokenAuth | None,
     settings: Settings,

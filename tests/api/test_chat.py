@@ -50,6 +50,14 @@ def _signed_in_user_client(app: FastAPI) -> TestClient:
     return client
 
 
+def _signed_in_admin_client(app: FastAPI, auth_store: AuthStore) -> TestClient:
+    """Return a signed-in client whose user row carries the admin role."""
+    client = _signed_in_user_client(app)
+    user_id = auth_store.list_users_with_stats()[0].id
+    auth_store.set_user_admin(user_id, True)
+    return client
+
+
 def _session_secret(settings: Settings) -> str:
     """Return the session secret the test fixtures configured."""
     secret = settings.auth.session_secret
@@ -244,15 +252,78 @@ class TestChatViewerAccess:
         assert 'id="model-select"' in response.text
         # The page must ask this viewer for their own token.
         assert "const ANONYMOUS_PLAYGROUND = false;" in response.text
+        # A normal user's way out is the onboarding page.
+        assert 'const CREDENTIAL_HELP_HREF = "/start";' in response.text
+        assert 'const CREDENTIAL_HELP_LABEL = "Open /start";' in response.text
 
     def test_admin_role_gets_the_anonymous_playground(
         self,
         client: TestClient,
     ) -> None:
+        # The HTTP Basic admin (and the local-admin session) has no user row
+        # that could own a personal token, so it keeps the anonymous branch.
         response = client.get("/chat")
 
         assert response.status_code == 200
         assert "const ANONYMOUS_PLAYGROUND = true;" in response.text
+
+    def test_signed_in_admin_without_a_personal_token_is_told_so(
+        self, app: FastAPI, auth_store: AuthStore
+    ) -> None:
+        """A signed-in admin is not sent to the anonymous playground; the
+        page says the personal token is missing and points at /profile
+        (issue #294)."""
+        client = _signed_in_admin_client(app, auth_store)
+
+        response = client.get("/chat")
+
+        assert response.status_code == 200
+        assert "const ANONYMOUS_PLAYGROUND = false;" in response.text
+        assert "const MISSING_PERSONAL_TOKEN = true;" in response.text
+        # /start redirects admin sessions away; the token manager is the way out.
+        assert 'const CREDENTIAL_HELP_HREF = "/profile#api-tokens";' in response.text
+        assert 'const CREDENTIAL_HELP_LABEL = "Open /profile";' in response.text
+
+    def test_signed_in_admin_with_a_legacy_token_is_told_so(
+        self, app: FastAPI, auth_store: AuthStore
+    ) -> None:
+        """An active token with purpose NULL (minted outside the personal
+        flow) satisfies neither the page nor the reveal path (bspreston-esq
+        review: the 409 half of the predicate needs its own test)."""
+        client = _signed_in_admin_client(app, auth_store)
+        minted = client.post("/profile/tokens", json={"name": "legacy"})
+        assert minted.status_code == 201
+        assert minted.json()["purpose"] is None
+
+        response = client.get("/chat")
+
+        assert response.status_code == 200
+        assert "const ANONYMOUS_PLAYGROUND = false;" in response.text
+        assert "const MISSING_PERSONAL_TOKEN = true;" in response.text
+        assert client.post("/onboarding/token/reveal").status_code == 409
+
+    def test_signed_in_admin_with_a_personal_token_chats_on_it(
+        self, app: FastAPI, auth_store: AuthStore, test_settings: Settings
+    ) -> None:
+        """The playground reveals the admin's own personal token, so usage is
+        attributed even with API-token enforcement on (issue #294)."""
+        client = _signed_in_admin_client(app, auth_store)
+        admin = auth_store.list_users_with_stats()[0]
+        created = auth_store.create_personal_token(
+            admin.id,
+            "chat",
+            None,
+            _session_secret(test_settings),
+            replace_all=False,
+        )
+
+        response = client.get("/chat")
+
+        assert "const ANONYMOUS_PLAYGROUND = false;" in response.text
+        assert "const MISSING_PERSONAL_TOKEN = false;" in response.text
+        revealed = client.post("/onboarding/token/reveal")
+        assert revealed.status_code == 200
+        assert revealed.json()["token"] == created.token
 
     def test_full_access_user_gets_the_anonymous_playground(
         self,
@@ -278,14 +349,39 @@ class TestChatViewerAccess:
         assert response.status_code == 200
         assert "const ANONYMOUS_PLAYGROUND = true;" in response.text
 
+    def test_admin_on_the_full_access_list_keeps_the_anonymous_playground(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        auth_store: AuthStore,
+    ) -> None:
+        """The admin role is granted at runtime, so a trust-listed user can
+        hold both; the trust list still keeps the anonymous playground
+        (grafuls review)."""
+        enabled = test_settings.model_copy(
+            deep=True,
+            update={
+                "auth": test_settings.auth.model_copy(
+                    update={"admin_only_tokens_full_access": ["alice@example.com"]}
+                )
+            },
+        )
+        app.dependency_overrides[get_settings] = lambda: enabled
+        client = _signed_in_admin_client(app, auth_store)
+
+        response = client.get("/chat")
+
+        assert response.status_code == 200
+        assert "const ANONYMOUS_PLAYGROUND = true;" in response.text
+        assert "const MISSING_PERSONAL_TOKEN = false;" in response.text
+
 
 class TestPlaygroundToken:
     """A normal user's playground runs on their own token (CHAT-04).
 
-    The credential is ``POST /onboarding/token/reveal``: its contract, the
-    refusals the page turns into its notice, and the admin ``403`` that keeps
-    admins anonymous are covered in test_onboarding.py. These tests pin what
-    the playground does with the revealed token.
+    The credential is ``POST /onboarding/token/reveal``: its contract and the
+    refusals the page turns into its notice are covered in test_onboarding.py.
+    These tests pin what the playground does with the revealed token.
     """
 
     def test_revealed_token_attributes_usage_and_narrows_models(

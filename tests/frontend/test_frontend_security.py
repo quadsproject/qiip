@@ -46,7 +46,11 @@ def _node() -> str:
 
 def test_chat_uses_pinned_local_frontend_dependencies() -> None:
     rendered = templates.get_template("chat.html").render(
-        request=_TemplateRequest(), anonymous_playground=False
+        request=_TemplateRequest(),
+        anonymous_playground=False,
+        missing_personal_token=False,
+        credential_help_href="/start",
+        credential_help_label="Open /start",
     )
 
     assert not re.search(r'<script[^>]+src=["\']https?://', rendered)

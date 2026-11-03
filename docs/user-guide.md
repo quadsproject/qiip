@@ -21,7 +21,10 @@ Your `/profile` page stays available for your tokens and usage.
 token, so the models it offers are the models your token may use (never
 admin-only servers) and its usage is recorded with your other usage, which
 `/leaderboard` shows for your tokens. If you have no token yet, the playground
-stays disabled and links you to `/start`, where you create one.
+stays disabled and links you to `/start`, where you create one. Admins use the
+same playground on their personal token: without one, the page says so and
+offers the profile token manager (`/profile`), where **Personal token** mints
+the exportable token the playground reveals.
 
 ## Connect your tool the first time
 

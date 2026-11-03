@@ -932,9 +932,13 @@ def test_trust_listed_users_keep_their_tokens_on_the_profile_page(
     email = user_client.get("/onboarding/state").json()["user"]["email"]
     me = user_client.get("/auth/me").json()
     assert me["can_create_tokens"] is False
+    assert me["full_access"] is False
+    assert me["personal_token_available"] is False
     test_settings.auth.admin_only_tokens_full_access.append(email)
     me = user_client.get("/auth/me").json()
     assert me["can_create_tokens"] is True
+    assert me["full_access"] is True
+    assert me["personal_token_available"] is False
 
     start = user_client.get("/start", follow_redirects=False)
     assert (start.status_code, start.headers["location"]) == (302, "/profile")
@@ -1530,11 +1534,19 @@ class TestTokenReveal:
         assert mine != theirs.token
         assert user_client.post("/onboarding/token/reveal").json()["token"] == mine
 
-    def test_admin_is_refused(
+    def test_admin_reveals_only_a_personal_token(
         self, user_client: TestClient, auth_store: AuthStore
     ) -> None:
+        """Admins may reveal the personal token the chat playground uses
+        (issue #294); without one there is nothing to return."""
         admin = auth_store.list_users_with_stats()[0]
         auth_store.set_user_admin(admin.id, True)
-        response = user_client.post("/onboarding/token/reveal")
-        assert response.status_code == 403
-        assert "profile page" in response.json()["detail"]
+
+        assert user_client.post("/onboarding/token/reveal").status_code == 404
+
+        created = auth_store.create_personal_token(
+            admin.id, "chat", None, SECRET, replace_all=False
+        )
+        revealed = user_client.post("/onboarding/token/reveal")
+        assert revealed.status_code == 200
+        assert revealed.json()["token"] == created.token

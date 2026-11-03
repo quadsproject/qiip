@@ -62,6 +62,32 @@ class TestProfileMe:
         assert response.json()["email"] == "alice@example.com"
         assert "id" in response.json()
         assert response.json()["can_create_tokens"] is True
+        assert response.json()["full_access"] is False
+        assert response.json()["personal_token_available"] is True
+
+    def test_full_access_member_is_not_offered_a_personal_token(
+        self,
+        app: FastAPI,
+        test_settings: Settings,
+        profile_client: TestClient,
+    ) -> None:
+        """Trust-listed viewers keep the anonymous playground, so the
+        server-derived capability must not offer the personal option
+        (bspreston-esq review)."""
+        enabled = test_settings.model_copy(
+            deep=True,
+            update={
+                "auth": test_settings.auth.model_copy(
+                    update={"admin_only_tokens_full_access": ["alice@example.com"]}
+                )
+            },
+        )
+        app.dependency_overrides[get_settings] = lambda: enabled
+
+        me = profile_client.get("/profile/me").json()
+
+        assert me["full_access"] is True
+        assert me["personal_token_available"] is False
 
     def test_normal_user_profile_is_read_only(
         self, normal_profile_client: TestClient
@@ -129,6 +155,57 @@ class TestTokenManagement:
         assert third.status_code == 201
         assert third.json()["token"] != first_body["token"]
         assert third.json()["id"] != first_body["id"]
+
+    def test_personal_token_keeps_the_portfolio_and_is_revealable(
+        self,
+        profile_client: TestClient,
+    ) -> None:
+        """The chat playground reveals the admin's personal token; minting it
+        must not revoke the rest of the admin's tokens (issue #294)."""
+        legacy = profile_client.post("/profile/tokens", json={"name": "ci-job"})
+        assert legacy.status_code == 201
+        personal = profile_client.post(
+            "/profile/tokens", json={"name": "chat", "personal": True}
+        )
+        assert personal.status_code == 201
+        assert personal.json()["purpose"] == "personal"
+
+        revealed = profile_client.post("/onboarding/token/reveal")
+        assert revealed.status_code == 200
+        assert revealed.json()["token"] == personal.json()["token"]
+
+        listed = profile_client.get("/profile/tokens").json()
+        active = {token["name"] for token in listed if not token["revoked"]}
+        assert {"ci-job", "chat"} <= active
+        by_name = {token["name"]: token for token in listed}
+        assert by_name["chat"]["purpose"] == "personal"
+        assert by_name["ci-job"]["purpose"] is None
+
+    def test_personal_token_cannot_be_pinned(
+        self,
+        profile_client: TestClient,
+    ) -> None:
+        response = profile_client.post(
+            "/profile/tokens",
+            json={"name": "chat", "personal": True, "endpoints": ["node-a"]},
+        )
+
+        assert response.status_code == 400
+        assert "pinned" in response.json()["detail"]
+
+    def test_personal_token_cannot_be_named_agent_config(
+        self,
+        profile_client: TestClient,
+    ) -> None:
+        """The agent-config key and the chat credential are different
+        tokens; minting with both selects the wrong one (bspreston-esq)."""
+        response = profile_client.post(
+            "/profile/tokens",
+            json={"name": "agent-config", "personal": True},
+        )
+
+        assert response.status_code == 400
+        assert "not a personal token" in response.json()["detail"]
 
     def test_revoke_unknown_token_returns_404(
         self,

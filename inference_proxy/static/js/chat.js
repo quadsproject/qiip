@@ -290,7 +290,7 @@ async function loadModels() {
 
 // A notice means this viewer has no token to chat with: the playground stays
 // disabled instead of making unattributed anonymous requests.
-function showChatNotice(message) {
+function showChatNotice(message, linkHref, linkText) {
   failClosed();
 
   var placeholder = document.createElement("option");
@@ -304,15 +304,26 @@ function showChatNotice(message) {
   var paragraph = document.getElementById("empty-state-text");
   if (paragraph) {
     paragraph.textContent = message + " ";
-    appendStartLink(paragraph);
+    appendStartLink(paragraph, linkHref, linkText);
   }
 }
 
-// The way out of a disabled playground is always the same page.
-function appendStartLink(target) {
+// The way out of a disabled playground depends on the viewer: /start is the
+// token home for normal users, while admin sessions are redirected away from
+// it and must use the profile token manager. The page shell passes the right
+// pair (CREDENTIAL_HELP_HREF/LABEL); /start stays the fallback.
+function appendStartLink(target, href, text) {
   var link = document.createElement("a");
-  link.href = "/start";
-  link.textContent = "Open /start";
+  link.href =
+    href ||
+    (typeof CREDENTIAL_HELP_HREF !== "undefined"
+      ? CREDENTIAL_HELP_HREF
+      : "/start");
+  link.textContent =
+    text ||
+    (typeof CREDENTIAL_HELP_LABEL !== "undefined"
+      ? CREDENTIAL_HELP_LABEL
+      : "Open /start");
   target.appendChild(link);
 }
 
@@ -332,9 +343,10 @@ function credentialRequired() {
   );
 }
 
-// The page shell says whether this viewer chats anonymously (admin role, the
-// full-access trust list, or the local admin): none of them has a personal
-// token to reveal. Every other viewer runs the playground on their own token.
+// The page shell says whether this viewer chats anonymously (the HTTP
+// Basic/local-admin session and the full-access trust list): those branches
+// send no credential. Every other viewer -- including an admin with a
+// session -- reveals their own personal token and sends it on every /v1 call.
 //
 // Returns the revealed token, "" for the anonymous playground, or null when
 // the reveal failed (the reason is in credentialError).
@@ -368,7 +380,32 @@ function failClosed() {
   setInputEnabled(false);
 }
 
+// A signed-in admin without a personal token is told why chat is unavailable
+// and offered the profile token manager; the page never falls back to an
+// unattributed request (issue #294).
+async function promptForPersonalToken() {
+  var create = await confirmDialog({
+    title: "No personal token",
+    message:
+      "The chat playground sends your personal token so usage is attributed. Create one now?",
+    confirmLabel: "Create personal token",
+  });
+  if (create) window.location.href = "/profile#api-tokens";
+}
+
 async function loadCredential() {
+  if (
+    typeof MISSING_PERSONAL_TOKEN !== "undefined" &&
+    MISSING_PERSONAL_TOKEN === true
+  ) {
+    showChatNotice(
+      "You don't have a personal token to chat with.",
+      "/profile#api-tokens",
+      "Open /profile"
+    );
+    await promptForPersonalToken();
+    return;
+  }
   var token = await revealCredential();
   if (token === null) {
     showChatNotice(credentialError);

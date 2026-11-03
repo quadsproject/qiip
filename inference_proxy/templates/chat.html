@@ -52,6 +52,9 @@
     <script src="{{ static_asset_url(request, 'vendor/dompurify-3.4.12/purify.min.js') }}"></script>
     <script src="{{ static_asset_url(request, 'js/confirm_dialog.js') }}"></script>
     <script>const ANONYMOUS_PLAYGROUND = {{ anonymous_playground | tojson }};</script>
+    <script>const MISSING_PERSONAL_TOKEN = {{ missing_personal_token | tojson }};</script>
+    <script>const CREDENTIAL_HELP_HREF = {{ credential_help_href | tojson }};</script>
+    <script>const CREDENTIAL_HELP_LABEL = {{ credential_help_label | tojson }};</script>
     <script src="{{ static_asset_url(request, 'js/chat.js') }}"></script>
 </body>
 </html>

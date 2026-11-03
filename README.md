@@ -407,7 +407,7 @@ Public endpoints:
 | `POST` | `/v1/messages/count_tokens` | Anthropic token counting |
 | `POST` | `/v1/responses` | OpenAI Responses API (Codex) |
 | `GET` | `/v1/models` | List models available across healthy nodes |
-| `GET` | `/chat` | Browser chat playground (signed-in viewers; anonymous visitors get the sign-in page, a signed-in normal user chats with their own token) |
+| `GET` | `/chat` | Browser chat playground (signed-in viewers; anonymous visitors get the sign-in page). A signed-in user chats on their own personal token (revealed per turn); a signed-in admin does the same and, when they own no personal token, the page says so and offers the profile token manager instead of sending an unattributed request (issue #294). The HTTP Basic/local admin and the full-access trust list keep the anonymous playground, which sends no credential and therefore only works while `auth.enforce_api_tokens` is off (the default); with enforcement on those viewers cannot chat |
 | `GET` | `/profile` | Profile page: Google sign-in, API-token manager, and per-token usage (signed-in normal users are redirected to `/start`) |
 | `GET` | `/start` | Onboarding wizard and token home for signed-in normal users (clipboard icon next to the token prefix copies the token); anonymous visitors get the sign-in page, admins are redirected to `/dashboard` |
 | `GET` | `/leaderboard` | Leaderboard and token dashboard for signed-in viewers (the HTTP Basic admin is redirected to `/dashboard`): the non-admin usage ranking for everyone, with an **Include admin users** checkbox for admin viewers (RFE #271); the viewer's own token (copy/create/delete) and a per-harness config download for normal users, since admins manage tokens on `/profile` |
@@ -432,7 +432,7 @@ signed-in session):
 |--------|------|-------------|
 | `GET` | `/profile/me` | Public identity of the signed-in user |
 | `GET` | `/profile/tokens` | List the user's API tokens (prefix only) |
-| `POST` | `/profile/tokens` | Admin-role users only (403 for normal users, who use `/start`). Mint a token; accepts an optional `endpoints` pin (hostnames); returns the raw secret exactly once (except `name: agent-config`, the reusable derived config key) |
+| `POST` | `/profile/tokens` | Admin-role users only (403 for normal users, who use `/start`). Mint a token; accepts an optional `endpoints` pin (hostnames); returns the raw secret exactly once (except `name: agent-config`, the reusable derived config key). `"personal": true` mints the exportable personal token the chat playground reveals, replacing only a previous personal token so the admin's portfolio survives (issue #294) |
 | `DELETE` | `/profile/tokens/{id}` | Revoke a token |
 | `GET` | `/profile/usage` | Aggregated usage per token/model plus headline totals |
 | `GET` | `/profile/endpoints` | Registered nodes the user may pin (unowned nodes plus nodes they own) |
@@ -443,7 +443,7 @@ Onboarding endpoints (signed-in normal users only; admin-role sessions get 403, 
 |--------|------|-------------|
 | `GET` | `/onboarding/state` | Identity, the user's current token (never the raw secret), models online right now, and the supported coding tools |
 | `POST` | `/onboarding/token` | Mint the user's single token; name and model list are optional (no name defaults to `default`, no models means every model online right now). Revokes every other token the user has |
-| `POST` | `/onboarding/token/reveal` | Return the caller's own raw token, re-derived server-side, for the Copy action (404 without a token, 409 for a token minted before this flow or one that can no longer be derived; `no-store`) |
+| `POST` | `/onboarding/token/reveal` | Return the caller's own raw personal token, re-derived server-side, for the Copy action and the chat playground (404 without a personal token, 409 for a token minted before this flow or one that can no longer be derived; `no-store`). Any signed-in user is accepted here, unlike the rest of the onboarding flow |
 | `PUT` | `/onboarding/token/models` | Replace the token's model list (409 for tokens minted before this flow) |
 | `POST` | `/onboarding/setup-link` | Create a `/s/{id}` link for one coding tool; returns the ready-to-paste command and its expiry |
 | `POST` | `/onboarding/config` | Download the config file for one coding tool with the user's own token embedded; models outside the token's scope are added to it first |

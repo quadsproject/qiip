@@ -416,6 +416,7 @@ const scenario = process.argv[2];
 const calls = [];
 let domReady = null;
 let revealCount = 0;
+const confirmCalls = [];
 
 class Element {
   constructor(id) {
@@ -516,6 +517,15 @@ const sandbox = {
   Buffer,
   TextDecoder,
   ANONYMOUS_PLAYGROUND: scenario === "anonymous",
+  MISSING_PERSONAL_TOKEN:
+    scenario === "missing_personal_create" ||
+    scenario === "missing_personal_cancel",
+  CREDENTIAL_HELP_HREF: scenario === "rotated" ? "/profile#api-tokens" : "/start",
+  CREDENTIAL_HELP_LABEL: scenario === "rotated" ? "Open /profile" : "Open /start",
+  confirmDialog: async function (opts) {
+    confirmCalls.push(opts);
+    return scenario === "missing_personal_create";
+  },
   document: {
     getElementById: byId,
     querySelector() { return null; },
@@ -556,6 +566,11 @@ const sandbox = {
       if (scenario === "stale" && revealCount > 2) {
         return failureResponse(404, { detail: "You don't have a token yet" });
       }
+      if (scenario === "rotated") {
+        return failureResponse(409, {
+          detail: "This token can no longer be exported. Create a new token first.",
+        });
+      }
       return jsonResponse({ token: "qiip_s3cret" });
     }
     if (url === "/v1/models") {
@@ -565,6 +580,11 @@ const sandbox = {
     throw new Error("unexpected URL: " + url);
   },
 };
+
+// In a browser `window` IS the global object; the page navigates with
+// window.location.href when the admin accepts the personal-token prompt.
+sandbox.window = sandbox;
+sandbox.location = { href: "" };
 
 vm.createContext(sandbox);
 vm.runInContext(source, sandbox);
@@ -596,6 +616,9 @@ vm.runInContext(source, sandbox);
     }),
     noticeText: notice.textContent,
     noticeLinks: notice.children.map(function (child) { return child.href; }),
+    noticeLinkTexts: notice.children.map(function (child) {
+      return child.textContent;
+    }),
     bubbles: byId("message-area-inner").children.map(function (child) {
       return {
         error: child.classList.contains("bubble-error"),
@@ -606,6 +629,8 @@ vm.runInContext(source, sandbox);
       };
     }),
     history: sandbox.messages,
+    confirmCalls: confirmCalls,
+    location: sandbox.location.href,
   }));
 })().catch(function (error) { console.error(error); process.exit(1); });
 """
@@ -686,6 +711,19 @@ def test_revoked_token_mid_session_refuses_the_turn() -> None:
     assert failure[0]["links"] == ["/start"]
 
 
+def test_rotated_token_points_an_admin_at_the_profile_page() -> None:
+    """A 409 (rotated session secret / revoked token) must point an admin at
+    the profile token manager: /start redirects admin sessions away, so the
+    default link is the wrong page for them (bspreston-esq review)."""
+    result = _run_node(_CREDENTIAL_HARNESS, "rotated")
+
+    assert _v1_calls(result) == []
+    assert result["disabled"] is True
+    assert "no longer be exported" in result["noticeText"]
+    assert result["noticeLinks"] == ["/profile#api-tokens"]
+    assert result["noticeLinkTexts"] == ["Open /profile"]
+
+
 def test_playground_stays_disabled_without_a_token() -> None:
     result = _run_node(_CREDENTIAL_HARNESS, "unavailable")
 
@@ -695,6 +733,7 @@ def test_playground_stays_disabled_without_a_token() -> None:
     assert result["modelOptions"] == ["Chat unavailable"]
     assert "You don't have a token yet" in result["noticeText"]
     assert result["noticeLinks"] == ["/start"]
+    assert result["noticeLinkTexts"] == ["Open /start"]
 
 
 def test_credential_failure_disables_the_playground() -> None:
@@ -748,3 +787,27 @@ def test_history_is_bounded_before_it_is_resent() -> None:
     assert sum(len(message["content"]) for message in resent) <= (
         24000 + len("first") + len("hello") + len("second")
     )
+
+
+def test_admin_without_a_personal_token_is_offered_the_profile_page() -> None:
+    """An admin with no personal token gets a clear notice and, after saying
+    yes, is sent to the profile token manager (issue #294)."""
+    result = _run_node(_CREDENTIAL_HARNESS, "missing_personal_create")
+
+    # No unattributed request is made and no reveal is attempted.
+    assert _reveal_calls(result) == []
+    assert _v1_calls(result) == []
+    assert result["disabled"] is True
+    assert result["modelOptions"] == ["Chat unavailable"]
+    assert "personal token" in result["noticeText"].lower()
+    assert result["noticeLinks"] == ["/profile#api-tokens"]
+    assert result["confirmCalls"][0]["confirmLabel"] == "Create personal token"
+    assert result["location"] == "/profile#api-tokens"
+
+
+def test_admin_who_declines_stays_on_the_chat_page() -> None:
+    result = _run_node(_CREDENTIAL_HARNESS, "missing_personal_cancel")
+
+    assert _v1_calls(result) == []
+    assert result["location"] == ""
+    assert result["noticeLinks"] == ["/profile#api-tokens"]

@@ -22,6 +22,7 @@
   const $ = (id) => document.getElementById(id);
   let pendingToken = "";
   let canCreateTokens = true;
+  let personalTokenAvailable = true;
 
   // ------------------------------------------------------------------
   // Column sorting (shared js/table_sort.js)
@@ -97,6 +98,17 @@
         "Open Start to create or rotate it.";
       note.hidden = false;
     }
+    // The server owns the "trust-list viewers keep the anonymous chat
+    // playground" rule; derive only when an older payload omits the flag.
+    personalTokenAvailable =
+      user.personal_token_available !== undefined
+        ? !!user.personal_token_available
+        : canCreateTokens && user.full_access !== true;
+    const personalLabel = $("token-personal-label");
+    if (personalLabel) personalLabel.hidden = !personalTokenAvailable;
+    if (!personalTokenAvailable && $("token-personal")) {
+      $("token-personal").checked = false;
+    }
     $("user-name").textContent = user.name || user.email;
     $("user-email").textContent = user.email;
     if (user.picture) {
@@ -159,7 +171,7 @@
       td.textContent = canCreateTokens
         ? "No tokens yet. Create one to start tracking usage."
         : "No tokens yet. Open Start to create your onboarding token.";
-      td.colSpan = 7;
+      td.colSpan = 8;
       td.className = "muted-status";
       row.appendChild(td);
       body.appendChild(row);
@@ -169,6 +181,7 @@
     for (const token of tokens) {
       const row = document.createElement("tr");
       row.appendChild(tdCell(token.name));
+      row.appendChild(tdCell(token.purpose || "-"));
       row.appendChild(tdCell(token.prefix));
       row.appendChild(
         tdCell(token.revoked ? "-" : formatDate(token.created_at), token.revoked ? "" : token.created_at)
@@ -302,6 +315,28 @@
     });
   }
 
+  // A personal token cannot be pinned (POST /profile/tokens rejects it), so
+  // the pin picker is hidden and cleared while the checkbox is on: the two
+  // options are mutually exclusive in the UI too (PR #295 review).
+  function syncPersonalToken() {
+    const personal = $("token-personal");
+    const group = $("token-pin-group");
+    if (!personal || !group) return;
+    const isPersonal = Boolean(personal.checked);
+    group.hidden = isPersonal;
+    if (!isPersonal) return;
+    for (const option of Array.from($("token-endpoints").children)) {
+      option.selected = false;
+    }
+    const list = $("endpoint-list");
+    for (const child of Array.from(list.children)) {
+      if (child.children && child.children[0]) child.children[0].checked = false;
+    }
+    list.hidden = true;
+    $("endpoint-toggle").setAttribute("aria-expanded", "false");
+    updateEndpointSummary();
+  }
+
   function wireTokenForm() {
     const toggle = $("token-toggle");
     const form = $("token-form");
@@ -309,18 +344,26 @@
       form.hidden = !form.hidden;
       if (!form.hidden) {
         loadEndpoints();
+        syncPersonalToken();
         $("token-name").focus();
       }
     });
+    if ($("token-personal")) {
+      $("token-personal").addEventListener("change", syncPersonalToken);
+    }
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const name = $("token-name").value.trim();
       if (!name) return;
-      const selected = Array.from($("token-endpoints").selectedOptions).map(
-        (option) => option.value
-      );
+      const personal = Boolean($("token-personal") && $("token-personal").checked);
+      const selected = personal
+        ? []
+        : Array.from($("token-endpoints").selectedOptions).map(
+            (option) => option.value
+          );
       const body = { name: name };
       if (selected.length > 0) body.endpoints = selected;
+      if (personal) body.personal = true;
       const button = $("token-create-btn");
       button.disabled = true;
       try {
@@ -336,6 +379,8 @@
         }
         const created = await resp.json();
         $("token-name").value = "";
+        if ($("token-personal")) $("token-personal").checked = false;
+        syncPersonalToken();
         $("token-secret-value").textContent = created.token;
         $("token-secret").hidden = false;
         pendingToken = created.token;
@@ -354,6 +399,24 @@
         else showToast("Couldn't copy. Select the token and press Ctrl+C.", "warning");
       });
     });
+  }
+
+  // The chat page's notice links to /profile#api-tokens. Open the mint form
+  // with Personal ticked so the flow the notice starts is finished here
+  // (PR #295 review). Only viewers allowed to mint (admins) get the form;
+  // for everyone else the hash is inert.
+  function openTokenFromHash() {
+    if (!canCreateTokens || window.location.hash !== "#api-tokens") return;
+    const form = $("token-form");
+    if (!form || !form.hidden) return;
+    form.hidden = false;
+    loadEndpoints();
+    const personal = $("token-personal");
+    if (personal && personalTokenAvailable) {
+      personal.checked = true;
+      syncPersonalToken();
+    }
+    $("token-name").focus();
   }
 
   // ------------------------------------------------------------------
@@ -447,6 +510,7 @@
       renderUser(await resp.json());
       loadTokens();
       loadUsage();
+      openTokenFromHash();
       return;
     }
     if (resp.status === 503) {
