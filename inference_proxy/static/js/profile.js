@@ -22,6 +22,7 @@
   const $ = (id) => document.getElementById(id);
   let pendingToken = "";
   let canCreateTokens = true;
+  let personalTokenAvailable = true;
 
   // ------------------------------------------------------------------
   // Column sorting (shared js/table_sort.js)
@@ -96,6 +97,14 @@
         "Your onboarding token is managed from the Start page. " +
         "Open Start to create or rotate it.";
       note.hidden = false;
+    }
+    // Full-access trust-list viewers keep the anonymous chat playground, so
+    // the personal (chat) option is not offered to them (PR #295 review).
+    personalTokenAvailable = canCreateTokens && user.full_access !== true;
+    const personalLabel = $("token-personal-label");
+    if (personalLabel) personalLabel.hidden = !personalTokenAvailable;
+    if (!personalTokenAvailable && $("token-personal")) {
+      $("token-personal").checked = false;
     }
     $("user-name").textContent = user.name || user.email;
     $("user-email").textContent = user.email;
@@ -400,7 +409,7 @@
     form.hidden = false;
     loadEndpoints();
     const personal = $("token-personal");
-    if (personal) {
+    if (personal && personalTokenAvailable) {
       personal.checked = true;
       syncPersonalToken();
     }

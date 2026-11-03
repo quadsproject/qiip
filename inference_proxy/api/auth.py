@@ -36,7 +36,7 @@ from inference_proxy.auth.dependencies import (
     require_profile_user,
 )
 from inference_proxy.auth.models import ProfileUser, User
-from inference_proxy.auth.scopes import has_admin_access
+from inference_proxy.auth.scopes import has_admin_access, is_full_access
 from inference_proxy.auth.session import (
     clear_local_admin_session,
     clear_session_user,
@@ -360,4 +360,5 @@ async def oauth_me(
         can_create_tokens=has_admin_access(
             user.email, user.issuer, settings, is_admin=user.is_admin
         ),
+        full_access=is_full_access(user.email, user.issuer, settings),
     )

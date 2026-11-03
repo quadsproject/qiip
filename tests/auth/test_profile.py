@@ -62,6 +62,7 @@ class TestProfileMe:
         assert response.json()["email"] == "alice@example.com"
         assert "id" in response.json()
         assert response.json()["can_create_tokens"] is True
+        assert response.json()["full_access"] is False
 
     def test_normal_user_profile_is_read_only(
         self, normal_profile_client: TestClient
@@ -166,6 +167,20 @@ class TestTokenManagement:
 
         assert response.status_code == 400
         assert "pinned" in response.json()["detail"]
+
+    def test_personal_token_cannot_be_named_agent_config(
+        self,
+        profile_client: TestClient,
+    ) -> None:
+        """The agent-config key and the chat credential are different
+        tokens; minting with both selects the wrong one (bspreston-esq)."""
+        response = profile_client.post(
+            "/profile/tokens",
+            json={"name": "agent-config", "personal": True},
+        )
+
+        assert response.status_code == 400
+        assert "not a personal token" in response.json()["detail"]
 
     def test_revoke_unknown_token_returns_404(
         self,

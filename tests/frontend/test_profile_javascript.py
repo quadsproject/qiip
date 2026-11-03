@@ -247,6 +247,7 @@ vm.runInContext(source, sandbox);
     pinGroupHidden: byId("token-pin-group").hidden,
     personalHiddenWhileChecked: personalHiddenWhileChecked,
     personalChecked: byId("token-personal").checked,
+    personalLabelHidden: byId("token-personal-label").hidden,
     rowNames: body.children.map(function (row) {
       return row.children[0] ? row.children[0].textContent : row.textContent;
     }),
@@ -301,6 +302,7 @@ def _run(
     personal: bool = False,
     uncheck_personal: bool = False,
     hash: str = "",
+    full_access: bool = False,
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -328,6 +330,7 @@ def _run(
                     "picture": None,
                     "is_admin": can_create_tokens,
                     "can_create_tokens": can_create_tokens,
+                    "full_access": full_access,
                 }
             ),
         )
@@ -522,6 +525,23 @@ def test_api_tokens_hash_opens_the_personal_token_form() -> None:
     assert result["tokenFormHidden"] is False
     assert result["personalChecked"] is True
     assert result["pinGroupHidden"] is True
+    assert result["personalLabelHidden"] is False
+
+
+def test_full_access_viewer_is_not_offered_a_personal_token() -> None:
+    """Full-access trust-list viewers keep the anonymous playground, so the
+    profile form hides the personal option (bspreston-esq review)."""
+    result = _run([], [], full_access=True)
+
+    assert result["personalLabelHidden"] is True
+
+
+def test_full_access_viewer_hash_flow_does_not_tick_personal() -> None:
+    result = _run([], [], full_access=True, hash="#api-tokens")
+
+    assert result["tokenFormHidden"] is False
+    assert result["personalChecked"] is False
+    assert result["pinGroupHidden"] is False
 
 
 def test_created_token_is_copied_from_the_reveal_box() -> None:

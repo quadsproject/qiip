@@ -108,6 +108,7 @@ async def profile_me(
         can_create_tokens=has_admin_access(
             user.email, user.issuer, settings, is_admin=user.is_admin
         ),
+        full_access=is_full_access(user.email, user.issuer, settings),
     )
 
 

@@ -53,6 +53,9 @@ class ProfileUser(PublicUser):
     """Public identity plus the signed-in caller's token-management capability."""
 
     can_create_tokens: bool = False
+    # On the admin full-access trust list: token portfolio on /profile, but
+    # the chat playground stays anonymous, so a personal token is not used.
+    full_access: bool = False
 
 
 class ApiToken(BaseModel):
