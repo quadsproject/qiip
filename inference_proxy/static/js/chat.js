@@ -308,11 +308,22 @@ function showChatNotice(message, linkHref, linkText) {
   }
 }
 
-// The way out of a disabled playground is always the same page.
+// The way out of a disabled playground depends on the viewer: /start is the
+// token home for normal users, while admin sessions are redirected away from
+// it and must use the profile token manager. The page shell passes the right
+// pair (CREDENTIAL_HELP_HREF/LABEL); /start stays the fallback.
 function appendStartLink(target, href, text) {
   var link = document.createElement("a");
-  link.href = href || "/start";
-  link.textContent = text || "Open /start";
+  link.href =
+    href ||
+    (typeof CREDENTIAL_HELP_HREF !== "undefined"
+      ? CREDENTIAL_HELP_HREF
+      : "/start");
+  link.textContent =
+    text ||
+    (typeof CREDENTIAL_HELP_LABEL !== "undefined"
+      ? CREDENTIAL_HELP_LABEL
+      : "Open /start");
   target.appendChild(link);
 }
 

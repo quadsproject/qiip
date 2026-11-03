@@ -252,6 +252,9 @@ class TestChatViewerAccess:
         assert 'id="model-select"' in response.text
         # The page must ask this viewer for their own token.
         assert "const ANONYMOUS_PLAYGROUND = false;" in response.text
+        # A normal user's way out is the onboarding page.
+        assert 'const CREDENTIAL_HELP_HREF = "/start";' in response.text
+        assert 'const CREDENTIAL_HELP_LABEL = "Open /start";' in response.text
 
     def test_admin_role_gets_the_anonymous_playground(
         self,
@@ -277,6 +280,9 @@ class TestChatViewerAccess:
         assert response.status_code == 200
         assert "const ANONYMOUS_PLAYGROUND = false;" in response.text
         assert "const MISSING_PERSONAL_TOKEN = true;" in response.text
+        # /start redirects admin sessions away; the token manager is the way out.
+        assert 'const CREDENTIAL_HELP_HREF = "/profile#api-tokens";' in response.text
+        assert 'const CREDENTIAL_HELP_LABEL = "Open /profile";' in response.text
 
     def test_signed_in_admin_with_a_legacy_token_is_told_so(
         self, app: FastAPI, auth_store: AuthStore

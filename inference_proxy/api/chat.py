@@ -64,6 +64,13 @@ async def chat(
         else:
             token = await asyncio.to_thread(store.get_active_token, user_id)
             missing_personal_token = token is None or token.purpose != "personal"
+    # /start redirects admin sessions away, so the credential notices must
+    # point an admin at the page that can mint a personal token.
+    credential_help_href = "/start"
+    credential_help_label = "Open /start"
+    if role == "admin" and get_session_user_id(request) is not None:
+        credential_help_href = "/profile#api-tokens"
+        credential_help_label = "Open /profile"
     return templates.TemplateResponse(
         request=request,
         name="chat.html",
@@ -71,5 +78,7 @@ async def chat(
             "active_page": "chat",
             "anonymous_playground": anonymous_playground,
             "missing_personal_token": missing_personal_token,
+            "credential_help_href": credential_help_href,
+            "credential_help_label": credential_help_label,
         },
     )

@@ -389,6 +389,24 @@
     });
   }
 
+  // The chat page's notice links to /profile#api-tokens. Open the mint form
+  // with Personal ticked so the flow the notice starts is finished here
+  // (PR #295 review). Only viewers allowed to mint (admins) get the form;
+  // for everyone else the hash is inert.
+  function openTokenFromHash() {
+    if (!canCreateTokens || window.location.hash !== "#api-tokens") return;
+    const form = $("token-form");
+    if (!form || !form.hidden) return;
+    form.hidden = false;
+    loadEndpoints();
+    const personal = $("token-personal");
+    if (personal) {
+      personal.checked = true;
+      syncPersonalToken();
+    }
+    $("token-name").focus();
+  }
+
   // ------------------------------------------------------------------
   // Usage
   // ------------------------------------------------------------------
@@ -480,6 +498,7 @@
       renderUser(await resp.json());
       loadTokens();
       loadUsage();
+      openTokenFromHash();
       return;
     }
     if (resp.status === 503) {

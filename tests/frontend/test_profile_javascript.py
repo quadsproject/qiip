@@ -95,7 +95,7 @@ const sandbox = {
     execCommand() { return true; },
     body: element(),
   },
-  location: { search: "", reload() {} },
+  location: { search: "", hash: LOCATION_HASH, reload() {} },
   confirm() { return true },
   history: { replaceState() {} },
   requestAnimationFrame() {},
@@ -144,6 +144,9 @@ buildHead("usage-head", ["text", "text", "text", "number", "number", "number", "
 // to `window` are reachable by their bare names, exactly like in the pages.
 sandbox.window = sandbox;
 
+// The template renders the create form hidden; init sees that state.
+byId("token-form").hidden = true;
+
 vm.createContext(sandbox);
 vm.runInContext(sortSource, sandbox);
 vm.runInContext(clipboardSource, sandbox);
@@ -158,12 +161,14 @@ vm.runInContext(source, sandbox);
   byId("endpoint-list").appendChild(byId("endpoint-empty"));
   // init() runs on load; wait for its fetches to settle.
   await new Promise(function (r) { setTimeout(r, 20); });
-  // The template renders the create form hidden; mirror that so the
-  // toggle actually opens it (which is what triggers loadEndpoints).
-  byId("token-form").hidden = true;
+  // Init may already have opened the form from #api-tokens; otherwise click
+  // the toggle as before (which is what triggers loadEndpoints).
   const toggle = byId("token-toggle");
-  if (CAN_CREATE && toggle && toggle._handlers.click) toggle._handlers.click();
-  await new Promise(function (r) { setTimeout(r, 20); });
+  if (sandbox.location.hash !== "#api-tokens") {
+    byId("token-form").hidden = true;
+    if (CAN_CREATE && toggle && toggle._handlers.click) toggle._handlers.click();
+    await new Promise(function (r) { setTimeout(r, 20); });
+  }
 
   if (CHECK_INDEX >= 0) {
     const empty = byId("endpoint-empty");
@@ -295,6 +300,7 @@ def _run(
     can_create_tokens: bool = True,
     personal: bool = False,
     uncheck_personal: bool = False,
+    hash: str = "",
 ) -> dict[str, Any]:
     node = shutil.which("node")
     if node is None:
@@ -311,6 +317,7 @@ def _run(
         .replace("CAN_CREATE", "true" if can_create_tokens else "false")
         .replace("PERSONAL", "true" if personal else "false")
         .replace("UNCHECK", "true" if uncheck_personal else "false")
+        .replace("LOCATION_HASH", json.dumps(hash))
         .replace(
             "USER",
             json.dumps(
@@ -505,6 +512,16 @@ def test_normal_user_sees_read_only_token_profile() -> None:
     assert result["rowNames"] == [
         "No tokens yet. Open Start to create your onboarding token."
     ]
+
+
+def test_api_tokens_hash_opens_the_personal_token_form() -> None:
+    """The chat notice lands on /profile#api-tokens; the mint form opens with
+    Personal ticked so the flow is finished (bspreston-esq review)."""
+    result = _run([_token(1, False)], [], hash="#api-tokens")
+
+    assert result["tokenFormHidden"] is False
+    assert result["personalChecked"] is True
+    assert result["pinGroupHidden"] is True
 
 
 def test_created_token_is_copied_from_the_reveal_box() -> None:

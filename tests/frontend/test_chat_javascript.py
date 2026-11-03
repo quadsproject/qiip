@@ -520,6 +520,8 @@ const sandbox = {
   MISSING_PERSONAL_TOKEN:
     scenario === "missing_personal_create" ||
     scenario === "missing_personal_cancel",
+  CREDENTIAL_HELP_HREF: scenario === "rotated" ? "/profile#api-tokens" : "/start",
+  CREDENTIAL_HELP_LABEL: scenario === "rotated" ? "Open /profile" : "Open /start",
   confirmDialog: async function (opts) {
     confirmCalls.push(opts);
     return scenario === "missing_personal_create";
@@ -563,6 +565,11 @@ const sandbox = {
       }
       if (scenario === "stale" && revealCount > 2) {
         return failureResponse(404, { detail: "You don't have a token yet" });
+      }
+      if (scenario === "rotated") {
+        return failureResponse(409, {
+          detail: "This token can no longer be exported. Create a new token first.",
+        });
       }
       return jsonResponse({ token: "qiip_s3cret" });
     }
@@ -609,6 +616,9 @@ vm.runInContext(source, sandbox);
     }),
     noticeText: notice.textContent,
     noticeLinks: notice.children.map(function (child) { return child.href; }),
+    noticeLinkTexts: notice.children.map(function (child) {
+      return child.textContent;
+    }),
     bubbles: byId("message-area-inner").children.map(function (child) {
       return {
         error: child.classList.contains("bubble-error"),
@@ -701,6 +711,19 @@ def test_revoked_token_mid_session_refuses_the_turn() -> None:
     assert failure[0]["links"] == ["/start"]
 
 
+def test_rotated_token_points_an_admin_at_the_profile_page() -> None:
+    """A 409 (rotated session secret / revoked token) must point an admin at
+    the profile token manager: /start redirects admin sessions away, so the
+    default link is the wrong page for them (bspreston-esq review)."""
+    result = _run_node(_CREDENTIAL_HARNESS, "rotated")
+
+    assert _v1_calls(result) == []
+    assert result["disabled"] is True
+    assert "no longer be exported" in result["noticeText"]
+    assert result["noticeLinks"] == ["/profile#api-tokens"]
+    assert result["noticeLinkTexts"] == ["Open /profile"]
+
+
 def test_playground_stays_disabled_without_a_token() -> None:
     result = _run_node(_CREDENTIAL_HARNESS, "unavailable")
 
@@ -710,6 +733,7 @@ def test_playground_stays_disabled_without_a_token() -> None:
     assert result["modelOptions"] == ["Chat unavailable"]
     assert "You don't have a token yet" in result["noticeText"]
     assert result["noticeLinks"] == ["/start"]
+    assert result["noticeLinkTexts"] == ["Open /start"]
 
 
 def test_credential_failure_disables_the_playground() -> None:
